@@ -20,7 +20,7 @@ S0 findings §11). Progress: [`.agents/TODO.md`](.agents/TODO.md).
 | `crates/ghostreel-cli` | `ghostreel` binary (`doctor`, `config`, `project`, `folder`, `index [--watch]`, `status`, `models [list|download|remove|dir|use]`, `script [import|list|show|export|preview|chat]`, `mcp` = MCP stdio server in `mcp.rs`) |
 | `src-tauri` | desktop app (package `ghostreel-app` → `target/*/ghostreel-app`, bundled as `GhostReel`; lib `ghostreel_lib`). Never name it `ghostreel`: it would overwrite the CLI binary in `target/` |
 | `src/` | React + TS frontend (Vite) |
-| `scripts/` | helper build, sidecar fetch/stage, CLI tarball (see Packaging) |
+| `scripts/` | helper build, sidecar fetch/stage, CLI tarball (see Packaging), `install-local.sh`, `clean-stale-target.sh` |
 | `spikes/s0-local` | throwaway S0 spike (separate workspace, CUDA builds) |
 
 ## Build & run
@@ -34,6 +34,8 @@ npm install && npx tauri dev      # desktop app
 npx tauri build --no-bundle       # release app binary (embedded frontend)
 ```
 `GHOSTREEL_CONFIG=<file>` / `GHOSTREEL_DATA=<dir>` override config/data locations (tests, demos).
+`GHOSTREEL_DEBUG_CHAT=<file>` dumps the prompt and reply of every chat turn — the way to check what
+the editor was actually told rather than assuming.
 
 ## Packaging (plan §8, M7)
 
@@ -58,11 +60,41 @@ scripts/package-cli.sh                         # target/dist/ghostreel-cli-linux
   `libcuda.so.1`) — hence `fix-appimage.sh`; always run it after an AppImage build.
 - ffmpeg pins must be month-end BtbN `autobuild-YYYY-MM-DD-*` tags (kept long-term), never `latest`.
 
+## Script chat (`chat.rs`)
+
+The editor gets the whole project's speech in the prompt before it calls anything
+(`speech_digest`, ~11.5k tokens for 96 videos): a model that has to *ask* for each transcript
+reads two tapes and builds the teaser out of whoever it found there. Tools are for pictures.
+
+A draft then goes through repair passes, in this order, and the order matters:
+`tidy_beat_ids` → shaky stretches moved → off-mic openings retimed → clips without speech muted →
+`lay_audio_beds` → grounding → `snap_to_segments` / `pad_speech` → `fit_to_target` →
+`end_on_sentences` → `clamp_beds_to_beats`. Invariants worth not breaking:
+
+- **Speech is never scaled and never ends mid-sentence.** Length is a target; a sentence is not.
+  Anything that trims clips must be followed by `end_on_sentences`.
+- **A bed is the beat's sound**, so its clips play muted and it cannot outlast them — anything that
+  moves clips must be followed by `clamp_beds_to_beats`.
+- **Repairs are reported back to the model** on the assistant message (`repair_note`), because the
+  repair runs after the last redraft and the model otherwise repeats the same mistake.
+- **The conversation is re-sent every round**, so the loop keeps three quarters of the window and
+  forgets the oldest tool results (`make_room`) rather than dying on the server's context error.
+
+## Timeline export
+
+`.otio` (`otio.rs`) and Final Cut Pro 7 XML (`fcpxml.rs`) are both written here — there is no
+Python sidecar, and re-adding one would be a regression. `tests/fixtures/golden.xml` came from the
+official `otio-fcp-adapter` and is compared byte for byte; its one deliberate difference is noted
+in the test. In xmeml, `start`/`end` count in the sequence rate and `in`/`out`/`duration` in the
+source's, gaps are positions rather than elements, and a `<file>` is spelled out once then
+referenced by id — which is what lets a bed export as a J-cut.
+
 ## Critical rules
 
 1. **Two first-class runtime profiles** (plan §2a): *standalone* (models in-process, Windows +
    Linux, nothing else installed) and *shared servers* (highllama vision `:8089`, highllama
-   embeddings `:8091`, GhostPen STT `:8771`). Each capability has `auto|local|server`. Never load
+   embeddings `:8091`, GhostPen STT `:8771`). Each capability has `auto|local|server`, and the
+   script chat additionally has `cli` (claude / agy / opencode / codex). Never load
    a local model while the matching server is usable — the dev box must not hold models twice.
 2. **Only use a server that is reachable *and capable*** (`probe.rs`): vision needs
    `modalities.vision`; embeddings must be 768-dim `embeddinggemma-300M-Q8_0` (a chat model's
@@ -77,12 +109,17 @@ scripts/package-cli.sh                         # target/dist/ghostreel-cli-linux
 7. Wayland: keep `apply_wayland_webkit_workaround()` (WebKit DMABUF "Error 71").
 8. Migrations in `db.rs` are append-only once committed. Table rebuilds run with foreign keys off
    (see `Db::migrate`) — otherwise dropping `videos` cascades into jobs/transcripts.
-10. Video identity = content hash; `video_files` are locations, unique per *(folder, path)* so
-    overlapping folders of different projects don't fight over a file.
-9. Don't create branches in `~/Code/ghostpen` or `~/Code/highllama`; work on main there.
+9. Video identity = content hash; `video_files` are locations, unique per *(folder, path)* so
+   overlapping folders of different projects don't fight over a file.
+10. Don't create branches in `~/Code/ghostpen` or `~/Code/highllama`; work on main there.
 11. **Vision model selection** (`config.vision.local_model`): the catalog has 4 pairs (bonsai-27b,
     gemma-3-4b-it, qwen2.5-vl-7b, qwen2.5-vl-3b); `models use <id>` checks the vision catalog
     **before** the generic `whisper()` function (which accepts any valid name). `ghostreel-llm`
     uses the model's own chat template via `apply_chat_template`; Qwen-style thinking is suppressed
     by appending `<think>\n\n</think>\n\n` when the template emits the ChatML assistant header.
-    Known gap: non-Bonsai templates are untested on GPU.
+    Known gap: non-Bonsai templates are untested on GPU. Ternary Bonsai 2 (`PQ2_0`/`PTQ1_0`, ggml
+    types 142/143) needs PrismML's llama.cpp fork, which highllama installs beside its own build
+    (`highllama prism install`) and selects by reading the GGUF's tensor types.
+12. **A server brain gets a token ceiling and a long timeout**, not the reverse: `max_answer_tokens`
+    exists so a model that will not stop fails as itself instead of as a dead socket, and
+    `server_timeout_s` is generous because a local model needs minutes for a long script.
