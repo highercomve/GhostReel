@@ -173,6 +173,12 @@ enum ScriptAction {
         #[arg(long)]
         json: bool,
     },
+    /// Measure a saved script: length, voices, cut sentences, silent picture, and one score.
+    Score {
+        id: i64,
+        #[arg(long)]
+        json: bool,
+    },
     /// Display a script draft.
     Show {
         id: i64,
@@ -761,6 +767,34 @@ async fn script_cmd(paths: &Paths, action: ScriptAction) -> anyhow::Result<ExitC
                         "#{:<4} {:<24} v{:<3} {:>2} beats {:>2} clips {:>6.1}s",
                         s.id, s.title, s.version, s.beats, s.clips, s.duration_s
                     );
+                }
+            }
+        }
+        ScriptAction::Score { id, json } => {
+            let stored = ghostreel_core::script::load(&db, id)?;
+            let issues = ghostreel_core::script::validate(&db, stored.project_id, &stored.script)?;
+            let m = ghostreel_core::chat::measure(&db, None, &stored.script, &issues);
+            let sc = ghostreel_core::chat::score(&m);
+            if json {
+                println!("{}", serde_json::to_string(&serde_json::json!({ "metrics": m, "score": sc }))?);
+            } else {
+                println!("#{id} \"{}\"  score {:.0}/100", stored.script.title, sc.total);
+                println!(
+                    "  {:.1} s{}  ·  {} beats, {} clips  ·  {} of {} voices",
+                    m.total_s,
+                    m.target_s.map(|t| format!(" against {t:.0} s ({:+.0}%)", m.duration_error.unwrap_or(0.0) * 100.0))
+                        .unwrap_or_default(),
+                    m.beats,
+                    m.clips,
+                    m.speaking_sources,
+                    m.speaking_sources_available
+                );
+                println!(
+                    "  {} cut mid-sentence  ·  {:.0} s of silent picture  ·  {} errors, {} warnings",
+                    m.mid_sentence_cuts, m.silent_picture_s, m.errors, m.warnings
+                );
+                for (part, cost) in &sc.parts {
+                    println!("  -{cost:>5.1}  {part}");
                 }
             }
         }

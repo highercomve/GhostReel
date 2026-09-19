@@ -11,7 +11,9 @@ use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+pub mod metrics;
 pub mod tools;
+pub use metrics::{ScriptMetrics, ScriptScore, measure, score};
 pub use tools::{Detail, tools_definition};
 
 use crate::Error;
