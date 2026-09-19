@@ -11,6 +11,9 @@ use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+pub mod tools;
+pub use tools::{Detail, tools_definition};
+
 use crate::Error;
 use crate::db::Db;
 use crate::embed::Embedder;
@@ -582,74 +585,6 @@ pub fn script_json_schema() -> Value {
     })
 }
 
-/// OpenAI tools schema definition for the 4 tools.
-pub fn tools_definition() -> Value {
-    json!([
-        {
-            "type": "function",
-            "function": {
-                "name": "search_moments",
-                "description": "Search indexed footage by keyword or meaning in the project",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "query": { "type": "string", "description": "Search query terms" },
-                        "limit": { "type": "integer", "description": "Max results (1-20, default 10)" }
-                    },
-                    "required": ["query"],
-                    "additionalProperties": false
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "get_transcript",
-                "description": "Get timestamped transcript segments for a video within a time range",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "video_id": { "type": "integer", "description": "Video ID" },
-                        "start_s": { "type": "number", "description": "Start timestamp in seconds" },
-                        "end_s": { "type": "number", "description": "End timestamp in seconds" }
-                    },
-                    "required": ["video_id", "start_s", "end_s"],
-                    "additionalProperties": false
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "get_video",
-                "description": "Get video metadata and keyframe descriptions (what is visible at each time). Pass start_s/end_s to see every keyframe in a range before choosing a clip.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "video_id": { "type": "integer", "description": "Video ID" },
-                        "start_s": { "type": "number", "description": "Optional range start in seconds" },
-                        "end_s": { "type": "number", "description": "Optional range end in seconds" }
-                    },
-                    "required": ["video_id"],
-                    "additionalProperties": false
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "list_videos",
-                "description": "List all videos belonging to the project with summaries",
-                "parameters": {
-                    "type": "object",
-                    "properties": {},
-                    "additionalProperties": false
-                }
-            }
-        }
-    ])
-}
-
 /// Local LLM action schema (oneOf tool action or final script action).
 pub fn local_action_schema() -> Value {
     json!({
@@ -659,7 +594,7 @@ pub fn local_action_schema() -> Value {
                 "type": "object",
                 "properties": {
                     "action": { "type": "string", "enum": ["tool"] },
-                    "tool": { "type": "string", "enum": ["search_moments", "get_transcript", "get_video", "list_videos"] },
+                    "tool": { "type": "string", "enum": tools::tool_names() },
                     "args": { "type": "object" }
                 },
                 "required": ["action", "tool", "args"],
@@ -1743,7 +1678,12 @@ HOW TO EDIT
 
 /// Construct the system prompt for the editor agent: the editing instructions (`custom` or the
 /// default), the fixed tool contract, and the current draft.
-pub fn build_system_prompt(project: &Project, latest_script_json: Option<&str>, custom: Option<&str>) -> String {
+pub fn build_system_prompt(
+    project: &Project,
+    latest_script_json: Option<&str>,
+    custom: Option<&str>,
+    detail: tools::Detail,
+) -> String {
     let template = custom.map(str::trim).filter(|c| !c.is_empty()).unwrap_or(DEFAULT_EDITOR_PROMPT);
     let fps = if project.fps_den == 1 {
         project.fps_num.to_string()
@@ -1758,16 +1698,7 @@ pub fn build_system_prompt(project: &Project, latest_script_json: Option<&str>, 
         .replace("{fps}", &fps)
         .replace("{width}", &project.width.to_string())
         .replace("{height}", &project.height.to_string());
-    prompt.push_str(
-        "\n\nTOOLS (use them generously before writing; your clips can only come from what they return)\n\
-         - list_videos(): every video with a short summary.\n\
-         - search_moments(query, limit): find moments by meaning or keyword across speech, on-screen text and visuals.\n\
-         - get_video(video_id, start_s, end_s): keyframe descriptions - what is actually visible and when.\n\
-         - get_transcript(video_id, start_s, end_s): what people say, with timestamps - only needed for a tape \
-         listed as left out of WHAT PEOPLE SAY below.\n\n\
-         CLIP RANGES: in_s/out_s must lie inside ranges returned by the tools; never use a video_id or range you \
-         have not inspected. Search results are search windows, not clips: cut a sub-range out of them.\n",
-    );
+    prompt.push_str(&tools::tools_prose(detail));
 
     if let Some(draft) = latest_script_json {
         prompt.push_str(&format!(
@@ -2352,7 +2283,18 @@ pub async fn run_turn(
         params![session_id, message, now()],
     )?;
 
-    let mut sys_prompt = build_system_prompt(&project, latest_script_json.as_deref(), ctx.system_prompt.as_deref());
+    // A roomy brain gets the whole of every tool description; a small local model, whose window
+    // is already half transcripts, gets the summary, the parameters and the costliest warning.
+    let detail = match ctx.script.tool_docs.as_str() {
+        "full" => tools::Detail::Full,
+        "short" => tools::Detail::Short,
+        _ => match &ctx.backend {
+            ChatBackend::Local { ctx_tokens, .. } if *ctx_tokens < 16_384 => tools::Detail::Short,
+            _ => tools::Detail::Full,
+        },
+    };
+    let mut sys_prompt =
+        build_system_prompt(&project, latest_script_json.as_deref(), ctx.system_prompt.as_deref(), detail);
     let reference_chars = match &ctx.backend {
         ChatBackend::Server { .. } => 6000,
         // Roughly an eighth of the window (~4 chars per token), so results leave room for the draft.
@@ -2422,7 +2364,7 @@ pub async fn run_turn(
                     // A tool call is short, but a model that reasons first spends the same budget
                     // on the thought, so it gets the same ceiling.
                     "max_tokens": ctx.script.max_answer_tokens,
-                    "tools": tools_definition(),
+                    "tools": tools::render_openai(detail),
                     "tool_choice": "auto",
                     "temperature": 0.3,
                     "chat_template_kwargs": { "enable_thinking": false },

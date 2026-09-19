@@ -228,6 +228,11 @@ pub struct ScriptConfig {
     /// whoever it found there; an editor reads the interviews first. Off for a brain with a small
     /// context that needs the room for tool results.
     pub speech_in_prompt: bool,
+    /// How much of each tool's description to send: `auto`, `full` or `short`. Rich descriptions
+    /// — what a result means, what the repair passes will do to a draft that misuses it — are
+    /// worth far more than their tokens, but a small local model's window is already half
+    /// transcripts, so `auto` shortens them there.
+    pub tool_docs: String,
     /// Ceiling on a single model answer, in tokens. Generous: a long script with forty clips is
     /// thousands of tokens and must never be cut off. It exists only so a model that will not
     /// stop fails as itself instead of as a dead socket.
@@ -294,6 +299,7 @@ impl Default for ScriptConfig {
             speech_lead_s: 0.5,
             infer_audio_beds: true,
             speech_in_prompt: true,
+            tool_docs: "auto".into(),
             max_answer_tokens: 16384,
             server_timeout_s: 1800,
             max_bed_extend_s: 20.0,
@@ -560,6 +566,7 @@ impl Config {
                 "speech_lead_s" => f.speech_lead_s = num(key, value)?,
                 "infer_audio_beds" => f.infer_audio_beds = flag(value),
                 "speech_in_prompt" => f.speech_in_prompt = flag(value),
+                "tool_docs" => f.tool_docs = value.to_string(),
                 "max_answer_tokens" => f.max_answer_tokens = num(key, value)?,
                 "server_timeout_s" => f.server_timeout_s = num(key, value)?,
                 "max_bed_extend_s" => f.max_bed_extend_s = num(key, value)?,
