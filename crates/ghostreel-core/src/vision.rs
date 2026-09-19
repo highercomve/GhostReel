@@ -365,12 +365,35 @@ impl LocalLlm {
         max_tokens: usize,
         think: bool,
     ) -> Result<String, Error> {
+        self.complete_draw(prompt, schema, max_tokens, think, None).await
+    }
+
+    /// One draw of an answer. `draw` picks the sampling seed, so the same prompt asked twice with
+    /// different draws gives different answers — without it the helper is deterministic and asking
+    /// again is pointless. An older helper ignores the field and simply repeats itself, which the
+    /// caller detects by comparing the bytes.
+    pub async fn complete_draw(
+        &mut self,
+        prompt: &str,
+        schema: Option<Value>,
+        max_tokens: usize,
+        think: bool,
+        draw: Option<u32>,
+    ) -> Result<String, Error> {
         let mut req = json!({
             "cmd": "complete",
             "prompt": prompt,
             "max_tokens": max_tokens,
             "think": think,
         });
+        if let Some(n) = draw {
+            // 42 is what the helper has always used; later draws move off it, and a little heat
+            // is needed or top_k alone would keep returning the same tokens.
+            req["seed"] = json!(42u32.wrapping_add(n));
+            if n > 0 {
+                req["temperature"] = json!(0.7);
+            }
+        }
         if let Some(s) = schema {
             req["schema"] = s;
         }

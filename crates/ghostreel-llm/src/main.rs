@@ -122,6 +122,14 @@ struct Request {
     /// reasoning is free text; without this a schema forces JSON from the very first token.
     #[serde(default)]
     think: Option<bool>,
+    /// Sampling seed. The same seed and prompt give the same answer, which is what makes a run
+    /// reproducible — and what makes asking twice pointless unless the caller varies it.
+    #[serde(default)]
+    seed: Option<u32>,
+    /// Sampling temperature. 0 is greedy; the default is deliberately low, because the answer is
+    /// usually a structured draft rather than prose.
+    #[serde(default)]
+    temperature: Option<f32>,
 }
 
 const OPEN_THINK: &str = "<think>";
@@ -165,6 +173,8 @@ impl Vision<'_> {
         max_tokens: usize,
         t0: Instant,
         think: bool,
+        seed: u32,
+        temperature: f32,
     ) -> Result<Value, String> {
         let mut grammar = match schema {
             Some(s) if !s.is_null() => {
@@ -176,8 +186,8 @@ impl Vision<'_> {
         let mut chain = LlamaSampler::chain_simple([
             LlamaSampler::penalties(self.model.n_vocab(), 64, 1.1, 0.0, 0.0),
             LlamaSampler::top_k(40),
-            LlamaSampler::temp(0.2),
-            LlamaSampler::dist(42),
+            LlamaSampler::temp(temperature),
+            LlamaSampler::dist(seed),
         ]);
 
         let mut decoder = encoding_rs::UTF_8.new_decoder();
@@ -279,15 +289,18 @@ impl Vision<'_> {
             .eval_chunks(&self.mtmd, &self.ctx, 0, 0, self.n_batch as i32, true)
             .map_err(|e| format!("prompt eval: {e:?}"))?;
 
-        self.sample(prompt_tokens, n_past, schema, max_tokens, t0, false)
+        self.sample(prompt_tokens, n_past, schema, max_tokens, t0, false, 42, 0.2)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn complete(
         &mut self,
         prompt: &str,
         schema: Option<&Value>,
         max_tokens: usize,
         think: bool,
+        seed: u32,
+        temperature: f32,
     ) -> Result<Value, String> {
         let t0 = Instant::now();
         self.ctx.clear_kv_cache();
@@ -321,7 +334,7 @@ impl Vision<'_> {
             .eval_chunks(&self.mtmd, &self.ctx, 0, 0, self.n_batch as i32, true)
             .map_err(|e| format!("prompt eval: {e:?}"))?;
 
-        self.sample(prompt_tokens, n_past, schema, max_tokens, t0, think)
+        self.sample(prompt_tokens, n_past, schema, max_tokens, t0, think, seed, temperature)
     }
 }
 
@@ -480,7 +493,16 @@ fn run() -> Result<(), String> {
             },
             "complete" => match (&mut vision, &req.prompt) {
                 (Some(v), Some(prompt)) => {
-                    v.complete(prompt, req.schema.as_ref(), req.max_tokens.unwrap_or(2048), req.think.unwrap_or(false))
+                    // 42 and 0.2 were the hard-coded values: keep them as the defaults so a
+                    // caller that says nothing gets exactly what it always got.
+                    v.complete(
+                        prompt,
+                        req.schema.as_ref(),
+                        req.max_tokens.unwrap_or(2048),
+                        req.think.unwrap_or(false),
+                        req.seed.unwrap_or(42),
+                        req.temperature.unwrap_or(0.2),
+                    )
                 }
                 (None, _) => Err("vision/llm model not loaded".into()),
                 (_, None) => Err("complete needs prompt".into()),
