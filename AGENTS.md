@@ -27,6 +27,7 @@ S0 findings §11). Progress: [`.agents/TODO.md`](.agents/TODO.md).
 
 ```bash
 scripts/install-local.sh          # build + install app and CLI into ~/.local (see -h)
+scripts/clean-stale-target.sh     # after moving the checkout: drop build caches pointing at the old path
 cargo test --workspace            # core tests (no GPU, no servers needed)
 cargo run -p ghostreel-cli -- doctor
 npm install && npx tauri dev      # desktop app

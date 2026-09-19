@@ -100,6 +100,11 @@ if [ "$DO_BUILD" -eq 1 ]; then
     command -v npm >/dev/null 2>&1 || die "npm not found. Install Node.js and re-run."
 
     cd "$ROOT"
+    # A renamed checkout leaves build-script caches pointing at the old path, and tauri-build
+    # then fails on a file under a directory that is gone. Clear those first; it is a no-op
+    # when nothing moved.
+    "$ROOT/scripts/clean-stale-target.sh" >/dev/null || true
+
     if [ ! -d node_modules ]; then
         info "Installing frontend dependencies (npm ci)…"
         npm ci || npm install

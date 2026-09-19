@@ -12,6 +12,16 @@ versions follow [SemVer](https://semver.org/) while the project is 0.x (minor = 
   It builds through `tauri build`, since a bare `cargo build` leaves the app pointing at the Vite
   dev server and opening on a blank window.
 
+### Fixed
+- **Renaming the checkout no longer breaks the build in a way nobody can read.** Cargo records
+  absolute paths in build-script output and never notices the directory moved, so tauri-build read
+  its plugin permissions from the old location and failed with a path naming a repository that no
+  longer exists (`.../Code/HighVid/target/...`). The app's build script now stops with what
+  actually happened and what to run, `scripts/clean-stale-target.sh` removes exactly the build
+  directories whose recorded paths have stopped existing — 54 of them here — and the installer
+  runs it first. A path that points elsewhere but still exists is left alone: that is a shared
+  `CARGO_TARGET_DIR`, not a stale cache.
+
 ## [0.2.0] — 2026-09-19
 
 The script chat stopped being a lottery. Every word spoken in the project goes to the editor before
