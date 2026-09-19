@@ -1785,3 +1785,16 @@ pre.cli-test-result { background: var(--panel, #171a21); border: 1px solid var(-
   text-align: center;
   color: var(--text);
 }
+
+/* Work with no measurable end (a model writing a draft): a stripe that travels, rather than a
+   percentage nobody can compute. */
+.meter.indeterminate > div {
+  width: 35%;
+  animation: meter-travel 1.6s ease-in-out infinite;
+}
+
+@keyframes meter-travel {
+  0% { margin-left: 0; }
+  50% { margin-left: 65%; }
+  100% { margin-left: 0; }
+}

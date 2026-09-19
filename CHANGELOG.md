@@ -13,6 +13,16 @@ versions follow [SemVer](https://semver.org/) while the project is 0.x (minor = 
   dev server and opening on a blank window.
 
 ### Fixed
+- **A chat no longer looks empty if you leave it mid-turn.** Everything a turn produced — the
+  question, the tools it ran, the reply — was written to the database only when the turn finished,
+  so the message you had just sent lived solely in the panel's own state: navigate away and back
+  while it worked, and the conversation was blank although Activity still showed the task. Closing
+  the app mid-turn lost the question entirely. What was asked is now recorded before the work
+  starts.
+- **The chat progress bar never moved.** The task reported its note but never its progress, so the
+  bar sat at zero for the whole turn. Researching is now counted against the round budget, and
+  drafting — where nothing can be counted until the model stops — shows a travelling stripe and
+  says what it is doing, instead of a percentage that would be a guess.
 - **Renaming the checkout no longer breaks the build in a way nobody can read.** Cargo records
   absolute paths in build-script output and never notices the directory moved, so tauri-build read
   its plugin permissions from the old location and failed with a path naming a repository that no

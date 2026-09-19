@@ -33,6 +33,10 @@ pub struct Progress {
     pub elapsed_secs: f64,
     /// File most recently handled.
     pub current: Option<PathBuf>,
+    /// The work has no measurable end — a model generating a draft, where nothing can be counted
+    /// until it stops. The bar animates instead of claiming a percentage it does not know.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub indeterminate: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -186,6 +190,7 @@ impl Tracker {
             eta_secs: if self.all_zero() { None } else { Some(remaining_time) },
             elapsed_secs: self.started.elapsed().as_secs_f64(),
             current,
+            indeterminate: false,
         }
     }
 

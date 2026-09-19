@@ -118,9 +118,14 @@ export default function TaskCard({ task, compact = false }: { task: Task; compac
         </span>
         <span className="muted small">
           {running && p ? (
-            <>
-              {pct}%{p.eta_secs != null && p.fraction < 1 ? ` · ${etaText(p.eta_secs)} left` : ""}
-            </>
+            p.indeterminate ? (
+              // Nothing to count: say what it is doing instead of a number that would be a guess.
+              <>{PHASE_LABELS[p.phase] ?? "Working"}…</>
+            ) : (
+              <>
+                {pct}%{p.eta_secs != null && p.fraction < 1 ? ` · ${etaText(p.eta_secs)} left` : ""}
+              </>
+            )
           ) : (
             STATE_LABEL[task.state]
           )}
@@ -128,8 +133,8 @@ export default function TaskCard({ task, compact = false }: { task: Task; compac
       </div>
       {running && (
         <>
-          <div className="meter big">
-            <div style={{ width: `${Math.max(2, pct)}%` }} />
+          <div className={`meter big${p?.indeterminate ? " indeterminate" : ""}`}>
+            <div style={p?.indeterminate ? undefined : { width: `${Math.max(2, pct)}%` }} />
           </div>
           {p && (
             <div className="muted small">

@@ -435,6 +435,7 @@ async fn run_preview(
                         eta_secs: None,
                         elapsed_secs: t0.elapsed().as_secs_f64(),
                         current: None,
+                        indeterminate: false,
                     });
                 })
                 .await;
@@ -520,7 +521,41 @@ async fn run_chat(
     };
 
     let app_handle = app.clone();
+    // A chat turn has two halves and only one of them can be measured. Researching is countable —
+    // tool rounds against the budget — and drafting is not: the model generates for minutes with
+    // nothing to count, so the bar says so rather than inventing a number. Before this the bar was
+    // never touched at all and sat at zero for the whole turn.
+    let round_budget = {
+        let configured = config.chat_model().max_tool_rounds;
+        if configured > 0 { configured } else { config.script.roomy_tool_rounds }
+    }
+    .max(1) as f64;
+    let mut rounds = 0u64;
+    let started = std::time::Instant::now();
     let mut on_event = move |event: ghostreel_core::chat::ChatEvent| {
+        let progress = {
+            if matches!(event, ghostreel_core::chat::ChatEvent::ToolStarted { .. }) {
+                rounds += 1;
+            }
+            let drafting = matches!(
+                event,
+                ghostreel_core::chat::ChatEvent::Drafting | ghostreel_core::chat::ChatEvent::Validating
+            );
+            // Research is capped at 0.8: the draft is still to come, and a bar that reaches the
+            // end while the work continues is worse than one that stops short.
+            let fraction = if drafting { 0.85 } else { (rounds as f64 / round_budget).min(0.8) };
+            ghostreel_core::progress::Progress {
+                phase: if drafting { "drafting".into() } else { "researching".into() },
+                phase_done: rounds,
+                phase_total: round_budget as u64,
+                fraction,
+                eta_secs: None,
+                elapsed_secs: started.elapsed().as_secs_f64(),
+                current: None,
+                indeterminate: drafting,
+            }
+        };
+
         let note = match &event {
             ghostreel_core::chat::ChatEvent::ToolStarted { tool, args } => {
                 let s = serde_json::to_string(args).unwrap_or_default();
@@ -547,7 +582,12 @@ async fn run_chat(
         let app_clone = app_handle.clone();
         tauri::async_runtime::spawn(async move {
             let queue = app_clone.state::<Queue>();
-            queue.update(&app_clone, task_id, |t| t.note = Some(note)).await;
+            queue
+                .update(&app_clone, task_id, |t| {
+                    t.note = Some(note);
+                    t.progress = Some(progress);
+                })
+                .await;
         });
     };
 
@@ -648,6 +688,7 @@ async fn run_download_model(
                             eta_secs,
                             elapsed_secs: elapsed,
                             current: Some(std::path::PathBuf::from(&file_name)),
+                            indeterminate: false,
                         });
                     })
                     .await;

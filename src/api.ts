@@ -215,9 +215,13 @@ export interface Progress {
   eta_secs: number | null;
   elapsed_secs: number;
   current: string | null;
+  /** No measurable end — the bar animates rather than claiming a percentage. */
+  indeterminate?: boolean;
 }
 
 export const PHASE_LABELS: Record<string, string> = {
+  researching: "Reading the footage",
+  drafting: "Writing the script",
   hash: "Reading new files",
   probe: "Reading video details",
   download: "Downloading speech model",

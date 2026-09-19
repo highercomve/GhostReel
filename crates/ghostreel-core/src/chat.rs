@@ -2342,6 +2342,16 @@ pub async fn run_turn(
         latest_script_json = stored_json;
     }
 
+    // Write down what was asked before doing any of it. Everything used to be stored when the turn
+    // finished, so a chat looked empty if you left the panel and came back while it ran — the
+    // message lived only in the window's own state — and closing the app mid-turn lost it
+    // altogether. After `prior_messages` is read, so it is not replayed twice.
+    ctx.db.conn.execute(
+        "INSERT INTO chat_messages(session_id, role, content, tool_calls_json, created_at)
+         VALUES (?1, 'user', ?2, NULL, ?3)",
+        params![session_id, message, now()],
+    )?;
+
     let mut sys_prompt = build_system_prompt(&project, latest_script_json.as_deref(), ctx.system_prompt.as_deref());
     let reference_chars = match &ctx.backend {
         ChatBackend::Server { .. } => 6000,
@@ -3039,12 +3049,7 @@ pub async fn run_turn(
     // Persist messages in database
     let now_ts = now();
 
-    // 1. User message
-    ctx.db.conn.execute(
-        "INSERT INTO chat_messages(session_id, role, content, tool_calls_json, created_at)
-         VALUES (?1, 'user', ?2, NULL, ?3)",
-        params![session_id, message, now_ts],
-    )?;
+    // 1. The user's message was stored before the work started.
 
     // 2. Tool summary row if any tools were called
     if !tool_records.is_empty() {
@@ -3511,6 +3516,43 @@ mod tests {
     /// The model never hears about a repair in the turn that caused it, so the note rides on the
     /// assistant message the next turn replays. Errors are the model's problem to fix and are
     /// reported separately; this is only what was already done for it.
+    /// What was asked is written down before the work starts. Everything used to be stored when
+    /// the turn finished, so a turn that died took the question with it and a chat reopened
+    /// mid-turn looked empty.
+    #[tokio::test]
+    async fn a_failed_turn_still_records_what_was_asked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = Db::open_in_memory().unwrap();
+        let p = db.create_project(&NewProject::named("P")).unwrap();
+
+        let mut ctx = ChatContext {
+            db,
+            data_dir: tmp.path().to_path_buf(),
+            // Nothing is listening here, so the turn fails as soon as it tries to think.
+            backend: ChatBackend::Server {
+                url: "http://127.0.0.1:1".into(),
+                model: "none".into(),
+                api_key: String::new(),
+                ctx_tokens: 8192,
+            },
+            embedder: None,
+            system_prompt: None,
+            max_tool_rounds: 0,
+            script: sc(),
+            cancel: None,
+        };
+
+        let res = run_turn(&mut ctx, p.id, None, "a 40 second teaser", &mut |_| {}).await;
+        assert!(res.is_err(), "the turn fails without a server");
+
+        let asked: String = ctx
+            .db
+            .conn
+            .query_row("SELECT content FROM chat_messages WHERE role = 'user'", [], |r| r.get(0))
+            .expect("the question was written down before the work started");
+        assert_eq!(asked, "a 40 second teaser");
+    }
+
     #[test]
     fn repairs_are_written_down_for_the_next_turn() {
         let issue = |sev: IssueSeverity, msg: &str| Issue {
