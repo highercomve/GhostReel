@@ -5,6 +5,13 @@ versions follow [SemVer](https://semver.org/) while the project is 0.x (minor = 
 
 ## [Unreleased]
 
+### Added
+- **`scripts/install-local.sh`** — build from source and install for the current user, the way
+  GhostPen does it: `ghostreel-app` and `ghostreel` into `~/.local/bin` with a desktop entry and
+  icon, `--helpers` to add the local model helpers, `--no-build` to install what is already there.
+  It builds through `tauri build`, since a bare `cargo build` leaves the app pointing at the Vite
+  dev server and opening on a blank window.
+
 ## [0.2.0] — 2026-09-19
 
 The script chat stopped being a lottery. Every word spoken in the project goes to the editor before
