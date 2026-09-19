@@ -13,6 +13,11 @@ versions follow [SemVer](https://semver.org/) while the project is 0.x (minor = 
   dev server and opening on a blank window.
 
 ### Fixed
+- **A redraft that came back worse used to win.** When the checks found a problem the model gets
+  one more attempt, and whatever it returned was accepted — so a model that answered the complaint
+  by breaking something else quietly replaced a better draft. The redraft is now kept only when it
+  scores at least as well by the same measure the score command uses, and the turn says when it
+  threw one away.
 - **A chat no longer looks empty if you leave it mid-turn.** Everything a turn produced — the
   question, the tools it ran, the reply — was written to the database only when the turn finished,
   so the message you had just sent lived solely in the panel's own state: navigate away and back

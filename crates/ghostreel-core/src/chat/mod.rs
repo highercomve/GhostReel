@@ -2505,6 +2505,8 @@ pub async fn run_turn(
             let v: Value = resp.json().await.map_err(|e| Error::Vision(format!("bad final JSON: {e}")))?;
             let content = v["choices"][0]["message"]["content"].as_str().unwrap_or_default();
 
+            // Set when a redraft came back worse and was thrown away, so the turn can say so.
+            let mut kept_first_draft: Option<(f64, f64)> = None;
             let mut script_res = Script::parse_for_project(content, &project);
             if let (Ok(s), Some(t)) = (&mut script_res, requested_s) {
                 s.target_duration_s = Some(t);
@@ -2548,8 +2550,29 @@ pub async fn run_turn(
                     && let Ok(rv) = retry_resp.json::<Value>().await
                 {
                     let retry_content = rv["choices"][0]["message"]["content"].as_str().unwrap_or_default();
-                    if let Ok(rescript) = Script::parse_for_project(retry_content, &project) {
-                        script_res = Ok(rescript);
+                    if let Ok(mut rescript) = Script::parse_for_project(retry_content, &project) {
+                        if let Some(t) = requested_s {
+                            rescript.target_duration_s = Some(t);
+                        }
+                        // The redraft used to be accepted whatever it was, so a model that
+                        // answered one complaint by breaking something else quietly won. Keep it
+                        // only when it is better by the same measure the eval uses.
+                        let after_issues = {
+                            let mut i = check_grounding(&ctx.db, project_id, &rescript, &grounding, &ctx.script);
+                            i.extend(pacing_issues(&rescript, enforce_target, &ctx.script));
+                            i.extend(content_issues(&ctx.db, &rescript, &ctx.script));
+                            i
+                        };
+                        let after = score(&measure(&ctx.db, None, &rescript, &after_issues)).total;
+                        let before = match &script_res {
+                            Ok(first) => score(&measure(&ctx.db, None, first, &redraft_reasons)).total,
+                            Err(_) => f64::MIN,
+                        };
+                        if after >= before {
+                            script_res = Ok(rescript);
+                        } else {
+                            kept_first_draft = Some((before, after));
+                        }
                     }
                 }
             }
@@ -2560,6 +2583,14 @@ pub async fn run_turn(
                 }
                 pre_issues =
                     enforce_grounding_and_pacing(&ctx.db, project_id, &mut s, &grounding, enforce_target, &ctx.script);
+                if let Some((before, after)) = kept_first_draft {
+                    pre_issues.push(Issue {
+                        severity: IssueSeverity::Info,
+                        beat_id: None,
+                        clip_index: None,
+                        message: format!("kept the first draft: the redraft scored {after:.0} against {before:.0}"),
+                    });
+                }
                 parsed_script = Some(s);
             }
 
@@ -4168,6 +4199,123 @@ mod tests {
             dispatch_tool(&db, tmp.path(), p.id, "get_video", &json!({"video_id": 999}), &mut grounding, None, &sc());
         assert!(res.contains("error"));
         assert!(sum.contains("error"));
+    }
+
+    /// A redraft used to be accepted whatever came back, so a model that answered one complaint
+    /// by breaking something worse quietly won. Here the second draft is four times its target;
+    /// the first has to survive.
+    #[tokio::test]
+    async fn a_redraft_that_scores_worse_is_thrown_away() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server_url = format!("http://127.0.0.1:{port}");
+
+        // A clip of a video the tools never returned: enough to trigger the one redraft.
+        // The first draft is the right length but its narration is too thin for the beat, which
+        // is what asks for a redraft. The redraft answers by making the cut four times as long.
+        let draft = |title: &str, out_s: f64, narration: &str| {
+            json!({
+                "title": title,
+                "target_duration_s": 5.0,
+                "beats": [{
+                    "id": "b1", "purpose": "hook", "narration": narration,
+                    "clips": [{ "video_id": 1, "in_s": 0.0, "out_s": out_s, "audio": "mute" }]
+                }]
+            })
+            .to_string()
+        };
+
+        tokio::spawn(async move {
+            for step in 1..=3 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0u8; 8192];
+                let mut total = 0;
+                loop {
+                    if total == buf.len() {
+                        buf.resize(buf.len() * 2, 0);
+                    }
+                    let n = socket.read(&mut buf[total..]).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    total += n;
+                    let text = String::from_utf8_lossy(&buf[..total]);
+                    if let Some(head) = text.find("\r\n\r\n")
+                        && let Some(idx) = text.to_lowercase().find("content-length:")
+                    {
+                        let rest = &text[idx + 15..];
+                        let len: usize = rest[..rest.find("\r\n").unwrap()].trim().parse().unwrap();
+                        if total >= head + 4 + len {
+                            break;
+                        }
+                    }
+                }
+                let content = match step {
+                    1 => "Looked at the footage.".to_string(),
+                    2 => draft("first", 5.0, "a short line"),
+                    _ => draft("worse", 20.0, "a short line"),
+                };
+                let body =
+                    json!({ "choices": [{ "message": { "role": "assistant", "content": content } }] }).to_string();
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                socket.write_all(resp.as_bytes()).await.unwrap();
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = Db::open_in_memory().unwrap();
+        let p = db.create_project(&NewProject::named("Redraft")).unwrap();
+        let folder = db.add_folder(p.id, tmp.path(), true).unwrap();
+        let file_path = tmp.path().join("clip.mp4");
+        std::fs::write(&file_path, b"test").unwrap();
+        let c = &db.conn;
+        c.execute("INSERT INTO videos(id, content_hash, size, duration_s) VALUES (1,'h',500,60.0)", []).unwrap();
+        c.execute(
+            "INSERT INTO video_files(video_id, folder_id, path, size, mtime, last_seen) VALUES (1, ?1, ?2, 500, 0, 0)",
+            params![folder.id, file_path.to_str().unwrap()],
+        )
+        .unwrap();
+        // Something really is visible there, so the clip survives grounding and the two drafts
+        // differ only in the thing under test: their length.
+        for t in [0.0, 4.0, 8.0, 12.0, 16.0, 20.0] {
+            c.execute(
+                "INSERT INTO frames(video_id, t_s, description_json) VALUES (1, ?1, '{\"description\":\"a street\"}')",
+                params![t],
+            )
+            .unwrap();
+        }
+
+        let mut ctx = ChatContext {
+            db,
+            data_dir: tmp.path().to_path_buf(),
+            backend: ChatBackend::Server {
+                url: server_url,
+                model: "m".into(),
+                api_key: String::new(),
+                ctx_tokens: 32768,
+            },
+            embedder: None,
+            system_prompt: None,
+            max_tool_rounds: 0,
+            script: sc(),
+            cancel: None,
+        };
+
+        let res = run_turn(&mut ctx, p.id, None, "a 5 second teaser", &mut |_| {}).await.unwrap();
+        let script = res.script.expect("a script");
+        assert_eq!(script.title, "first", "the worse redraft was kept");
+        assert!(
+            res.issues.iter().any(|i| i.message.contains("kept the first draft")),
+            "the turn should say it threw one away: {:?}",
+            res.issues.iter().map(|i| &i.message).collect::<Vec<_>>()
+        );
     }
 
     #[tokio::test]
