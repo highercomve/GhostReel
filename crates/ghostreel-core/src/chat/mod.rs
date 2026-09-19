@@ -902,6 +902,66 @@ pub fn dispatch_tool(
     )
 }
 
+/// What the turn has already asked for, so it is not asked again.
+///
+/// A model that loses track of what it has read asks for it again, and again: Bonsai 2 spent 24
+/// of 55 calls re-fetching the same four ranges, seven times round a four-call cycle, until the
+/// round budget stopped it with nothing drafted. The work is wasted twice over — the database is
+/// queried again and the same text is appended to a context that was already full.
+///
+/// The first repeat gets its answer back with a note. A model still asking after that gets only
+/// the note: the payload it keeps re-reading is what it is stuck on, and taking it away is what
+/// breaks the cycle.
+#[derive(Default)]
+pub struct ToolMemo {
+    seen: std::collections::HashMap<String, (String, String, usize)>,
+}
+
+impl ToolMemo {
+    /// Tool plus arguments, with object keys in a fixed order so `{a,b}` and `{b,a}` are one call.
+    fn key(tool: &str, args: &Value) -> String {
+        fn canonical(v: &Value) -> String {
+            match v {
+                Value::Object(map) => {
+                    let mut keys: Vec<&String> = map.keys().collect();
+                    keys.sort();
+                    let inner: Vec<String> = keys.iter().map(|k| format!("{k}:{}", canonical(&map[*k]))).collect();
+                    format!("{{{}}}", inner.join(","))
+                }
+                Value::Array(items) => format!("[{}]", items.iter().map(canonical).collect::<Vec<_>>().join(",")),
+                other => other.to_string(),
+            }
+        }
+        format!("{tool}{}", canonical(args))
+    }
+
+    /// The answer to a call already made this turn, if there is one.
+    pub fn recall(&mut self, tool: &str, args: &Value) -> Option<(String, String)> {
+        let key = Self::key(tool, args);
+        let (result, summary, times) = self.seen.get_mut(&key)?;
+        *times += 1;
+        if *times == 1 {
+            Some((
+                format!("(you already called this; the answer has not changed)\n{result}"),
+                format!("{summary} — repeat"),
+            ))
+        } else {
+            Some((
+                format!(
+                    "You have asked for this {} times and already have the answer. Stop looking and write the \
+                     script with what you have.",
+                    *times + 1
+                ),
+                "repeat — withheld".to_string(),
+            ))
+        }
+    }
+
+    pub fn remember(&mut self, tool: &str, args: &Value, result: &str, summary: &str) {
+        self.seen.insert(Self::key(tool, args), (result.to_string(), summary.to_string(), 0));
+    }
+}
+
 /// Tool results for the local helper (8k context) stay small.
 pub const LOCAL_TOOL_RESULT_CHARS: usize = 1500;
 /// Servers have large contexts (highllama: 120k); richer results make much better edits.
@@ -2232,6 +2292,9 @@ pub async fn run_turn(
     };
 
     let mut grounding = Grounding::default();
+    // What this turn has already fetched, so asking twice costs nothing and asking a third time
+    // is told to stop.
+    let mut memo = ToolMemo::default();
     let mut prior_messages = Vec::new();
     let mut latest_script_json = None;
 
@@ -2427,19 +2490,26 @@ pub async fn run_turn(
                         None
                     };
 
-                    let (result_str, summary) = dispatch_tool_limited(
-                        &ctx.db,
-                        &ctx.data_dir,
-                        project_id,
-                        &tool_name,
-                        &tool_args,
-                        &mut grounding,
-                        vector.as_deref(),
-                        ctx.script.roomy_tool_result_chars,
-                        ctx.script.max_shake_jerk,
-                        ctx.script.shake_relative,
-                        ctx.script.max_sway,
-                    );
+                    let (result_str, summary) = match memo.recall(&tool_name, &tool_args) {
+                        Some(known) => known,
+                        None => {
+                            let fresh = dispatch_tool_limited(
+                                &ctx.db,
+                                &ctx.data_dir,
+                                project_id,
+                                &tool_name,
+                                &tool_args,
+                                &mut grounding,
+                                vector.as_deref(),
+                                ctx.script.roomy_tool_result_chars,
+                                ctx.script.max_shake_jerk,
+                                ctx.script.shake_relative,
+                                ctx.script.max_sway,
+                            );
+                            memo.remember(&tool_name, &tool_args, &fresh.0, &fresh.1);
+                            fresh
+                        }
+                    };
 
                     on_event(ChatEvent::ToolFinished { tool: tool_name.clone(), summary: summary.clone() });
 
@@ -2840,19 +2910,26 @@ pub async fn run_turn(
                             None
                         };
 
-                        let (res, summary) = dispatch_tool_limited(
-                            &ctx.db,
-                            &ctx.data_dir,
-                            project_id,
-                            &tool,
-                            &args,
-                            &mut grounding,
-                            vector.as_deref(),
-                            ctx.script.roomy_tool_result_chars,
-                            ctx.script.max_shake_jerk,
-                            ctx.script.shake_relative,
-                            ctx.script.max_sway,
-                        );
+                        let (res, summary) = match memo.recall(&tool, &args) {
+                            Some(known) => known,
+                            None => {
+                                let fresh = dispatch_tool_limited(
+                                    &ctx.db,
+                                    &ctx.data_dir,
+                                    project_id,
+                                    &tool,
+                                    &args,
+                                    &mut grounding,
+                                    vector.as_deref(),
+                                    ctx.script.roomy_tool_result_chars,
+                                    ctx.script.max_shake_jerk,
+                                    ctx.script.shake_relative,
+                                    ctx.script.max_sway,
+                                );
+                                memo.remember(&tool, &args, &fresh.0, &fresh.1);
+                                fresh
+                            }
+                        };
                         on_event(ChatEvent::ToolFinished { tool: tool.clone(), summary: summary.clone() });
                         let empty = is_empty_search(&tool, &summary);
                         tool_records.push(ToolCallRecord { tool: tool.clone(), args: args.clone(), summary });
@@ -4199,6 +4276,38 @@ mod tests {
             dispatch_tool(&db, tmp.path(), p.id, "get_video", &json!({"video_id": 999}), &mut grounding, None, &sc());
         assert!(res.contains("error"));
         assert!(sum.contains("error"));
+    }
+
+    /// Bonsai 2 spent 24 of 55 calls re-fetching four ranges it already had, seven times round a
+    /// four-call cycle, and ran out of budget with nothing drafted.
+    #[test]
+    fn asking_for_the_same_thing_twice_costs_nothing_and_a_third_time_is_refused() {
+        let mut memo = ToolMemo::default();
+        let args = json!({ "video_id": 100, "start_s": 52.0, "end_s": 80.0 });
+
+        assert!(memo.recall("get_video", &args).is_none(), "nothing is known yet");
+        memo.remember("get_video", &args, "241s, 14 frames", "14 frames");
+
+        // Asked again: the answer it already had, and told so.
+        let (second, summary) = memo.recall("get_video", &args).expect("remembered");
+        assert!(second.contains("241s, 14 frames"), "the answer is still there: {second}");
+        assert!(second.contains("already called this"));
+        assert!(summary.contains("repeat"));
+
+        // Still asking: the payload is what it is stuck on, so it is withheld.
+        let (third, _) = memo.recall("get_video", &args).expect("remembered");
+        assert!(!third.contains("241s, 14 frames"), "the payload should be withheld: {third}");
+        assert!(third.contains("Stop looking"));
+    }
+
+    /// The same call written two ways is the same call.
+    #[test]
+    fn argument_order_does_not_make_a_new_call() {
+        let mut memo = ToolMemo::default();
+        memo.remember("get_video", &json!({ "start_s": 1.0, "video_id": 7 }), "result", "sum");
+        assert!(memo.recall("get_video", &json!({ "video_id": 7, "start_s": 1.0 })).is_some());
+        // A different range is a different question.
+        assert!(memo.recall("get_video", &json!({ "video_id": 7, "start_s": 2.0 })).is_none());
     }
 
     /// A redraft used to be accepted whatever came back, so a model that answered one complaint
