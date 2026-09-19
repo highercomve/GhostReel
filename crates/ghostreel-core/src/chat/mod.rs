@@ -1842,10 +1842,6 @@ async fn fill_missing_narration(
     filled
 }
 
-/// Spoken voice-over rate used to check that narration fills its beat.
-
-/// Narration covering less than this share of its beat triggers a redraft.
-
 /// Editorial problems the model can fix in a redraft: narration too short for its beat, and clips
 /// over footage the tools know nothing about (no speech and no described keyframe nearby).
 pub fn content_issues(db: &Db, script: &Script, cfg: &crate::config::ScriptConfig) -> Vec<Issue> {
@@ -1961,12 +1957,6 @@ fn clip_has_described_frame(db: &Db, video_id: i64, in_s: f64, out_s: f64) -> bo
         )
         .unwrap_or(false)
 }
-
-/// Silence kept after the last words of a speaking clip, so the cut doesn't clip the person off.
-
-/// Breath kept before the first words.
-
-/// Never extend a clip further than this to finish a sentence.
 
 /// Make every clip that carries someone's voice begin and end on a whole sentence.
 ///
