@@ -80,10 +80,19 @@ impl Judgement {
     pub fn notes(&self) -> Vec<String> {
         let mut out = Vec::new();
         for m in self.mismatched.iter().take(4) {
-            out.push(format!(
-                "beat '{}': the pictures do not show what is heard over them (\"{}\") — pick shots of what is being talked about, or move this voice under pictures that fit it",
-                m.beat_id, m.heard
-            ));
+            // Nothing quoted means nothing is heard there: the fault is the beat having no voice,
+            // not the shots failing to match one.
+            out.push(if m.heard.trim().is_empty() {
+                format!(
+                    "beat '{}': nothing is heard over these pictures — put a voice under them, or cut them",
+                    m.beat_id
+                )
+            } else {
+                format!(
+                    "beat '{}': the pictures do not show what is heard over them (\"{}\") — pick shots of what is being talked about, or move this voice under pictures that fit it",
+                    m.beat_id, m.heard
+                )
+            });
         }
         for p in &self.parts {
             if p.name == "ending" && p.value < 0.4 {
@@ -148,6 +157,12 @@ pub fn state(db: &Db, script: &Script, brief: Option<&str>, cfg: &JevConfig) -> 
                 (truncate(&text, cap), kind)
             }
         };
+        // Narration is a voice too. A beat with written narration over muted pictures was
+        // labelled "nothing — the pictures play silent" and reported as hearing nothing, so the
+        // judge scored it against an absence and the note told the editor to "pick shots of what
+        // is being talked about ("")" — advice about a quote that does not exist.
+        let narrated = beat.narration.as_deref().map(str::trim).is_some_and(|n| !n.is_empty());
+        let sound = if heard.is_empty() && narrated { "narration written for this beat" } else { sound };
 
         let mut seen = Vec::new();
         for c in &beat.clips {
@@ -310,10 +325,15 @@ pub fn compose(state: &Value, a: &Answers) -> Judgement {
         };
         matches.push(p);
         if p < 0.5 {
+            // What the viewer actually hears there: the quote if there is one, the editor's own
+            // line if not. Reporting "" for a narrated beat told the editor nothing was heard
+            // over pictures that have a line written for them.
+            let heard = beat["heard"].as_str().unwrap_or("").trim();
+            let heard = if heard.is_empty() { beat["narration"].as_str().unwrap_or("").trim() } else { heard };
             mismatched.push(Mismatch {
                 beat_id: beat["id"].as_str().unwrap_or("?").to_string(),
                 match_p: p,
-                heard: truncate(beat["heard"].as_str().unwrap_or(""), 90),
+                heard: truncate(heard, 90),
             });
         }
     }
@@ -733,5 +753,62 @@ mod tests {
         assert_eq!(s["beats"][0]["pictures_described"], true, "this beat is judgeable after all");
         // The later frame is not in range and must not be dragged in.
         assert!(!seen[0].as_str().unwrap().contains("later"));
+    }
+
+    #[test]
+    fn a_beat_carried_by_written_narration_is_not_silent() {
+        let db = db_with_footage();
+        let mut script = bedded_script();
+        // Muted pictures, no bed, but the editor wrote a line for it: the viewer hears that line.
+        script.beats[0].bed = None;
+        script.beats[0].narration = Some("This stone home anchors our community.".into());
+        let s = state(&db, &script, None, &JevConfig::default());
+
+        assert_eq!(s["beats"][0]["sound"], "narration written for this beat");
+        assert_eq!(s["beats"][0]["narration"], "This stone home anchors our community.");
+        // Still nothing in `heard` — that is transcript speech, and there is none — but the beat
+        // is no longer described to the judge as playing silent.
+        assert_eq!(s["beats"][0]["heard"], "");
+    }
+
+    #[test]
+    fn a_beat_with_no_voice_is_told_so_rather_than_told_to_match_one() {
+        let judged = |heard: &str| Judgement {
+            total: 0.0,
+            parts: Vec::new(),
+            mismatched: vec![Mismatch { beat_id: "beat_6".into(), match_p: 0.2, heard: heard.into() }],
+            unjudged_beats: 0,
+            held_closing_picture: false,
+            model: "m".into(),
+            input_tokens: 0,
+        };
+        // Advice about a quote that does not exist is not advice.
+        let empty = judged("").notes();
+        assert!(empty[0].contains("nothing is heard over these pictures"), "{empty:?}");
+        assert!(!empty[0].contains("(\"\")"), "the empty quote must not be printed: {empty:?}");
+
+        let real = judged("we love the deer running around").notes();
+        assert!(real[0].contains("deer running around"));
+    }
+
+    #[test]
+    fn a_narrated_beat_is_quoted_by_its_narration_not_by_silence() {
+        let db = db_with_footage();
+        let mut script = bedded_script();
+        script.beats[0].bed = None;
+        script.beats[0].narration = Some("This stone home anchors our community.".into());
+        let s = state(&db, &script, None, &JevConfig::default());
+
+        let j = compose(
+            &s,
+            &serde_json::from_str::<Answers>(
+                r#"{"model":"m","answers":{"beat_0_pictures_match":{"type":"noul","noul":0.1}}}"#,
+            )
+            .unwrap(),
+        );
+        assert_eq!(j.mismatched.len(), 1);
+        assert!(j.mismatched[0].heard.contains("stone home"), "{:?}", j.mismatched[0]);
+        // And so the note is about the line, not about an absence.
+        assert!(j.notes()[0].contains("stone home"), "{:?}", j.notes());
     }
 }

@@ -136,6 +136,10 @@ one number live in `compose`, in code, so they can be changed without asking any
 - **The state is what is heard and seen**, never timecodes or video ids: transcript text for each
   clip and bed, the vision model's frame descriptions, and whether the cut closes on a held image.
   Jev reads text only, and a judgement it cannot ground is a judgement of nothing.
+- **Narration is a voice.** A beat with a written line over muted pictures was described to the
+  judge as "nothing — the pictures play silent" and reported as hearing `""`, so it was scored
+  against an absence and the editor was told to "pick shots of what is being talked about ("")".
+  `state` labels it, and a mismatch quotes the narration when there is no transcript speech.
 - **A beat with no frame descriptions is not asked about.** Asking anyway returned a flat "no" and
   scored good footage as filler; `unjudged_beats` reports the gap instead of averaging it away.
 - **A stretch with no frame of its own is described by the last frame before it.** Not a guess:
