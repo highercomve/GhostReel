@@ -1414,6 +1414,76 @@ pub fn trim_to_target(script: &mut Script, cfg: &crate::config::ScriptConfig) ->
     trim_to_target_with(script, |_| false, cfg)
 }
 
+/// Cut the pictures back to the voice carrying them, so a cutaway is not a pause.
+///
+/// A beat that ends its bed before its last picture leaves the cutaway hanging in silence — the
+/// b-roll stops being something you see *while* someone talks and becomes a gap between
+/// interviews, which is exactly what it should not be. Two of four beats in an agy cut ran on for
+/// 2.6 s and 4.4 s after the speaker had finished.
+///
+/// The trailing pictures give way, last first, and a clip trimmed below `min_trimmed_clip_s`
+/// goes rather than becoming a flash. The clip that opens the beat is never dropped: it is the
+/// face, and the beat exists to show it.
+pub fn trim_pictures_to_bed(script: &mut Script, cfg: &crate::config::ScriptConfig) -> usize {
+    let mut trimmed = 0usize;
+    for beat in &mut script.beats {
+        // Narration covers the whole beat, so pictures may outlast a bed when there is some.
+        if beat.narration.as_deref().map(str::trim).is_some_and(|n| !n.is_empty()) {
+            continue;
+        }
+        let Some(bed) = &beat.bed else { continue };
+        let bed_len = bed.duration_s();
+        if bed_len <= 0.0 {
+            continue;
+        }
+
+        let mut excess = beat.clips.iter().map(|c| (c.out_s - c.in_s).max(0.0)).sum::<f64>() - bed_len;
+        if excess <= 0.1 {
+            continue;
+        }
+        let mut touched = false;
+
+        // Take it from wherever there is room, in proportion: holding the face a shade less is
+        // better than losing the cutaway, which is the picture the beat cut away to show.
+        let room = |c: &crate::script::ScriptClip| ((c.out_s - c.in_s) - cfg.min_trimmed_clip_s).max(0.0);
+        let total_room: f64 = beat.clips.iter().map(room).sum();
+        if total_room >= excess {
+            let share = excess / total_room;
+            for c in beat.clips.iter_mut() {
+                let give = room(c) * share;
+                if give > 0.01 {
+                    c.out_s -= give;
+                    touched = true;
+                }
+            }
+        } else {
+            // Not enough give: the trailing pictures go, last first, rather than becoming
+            // flashes. The clip that opens the beat stays — it is the face the beat is for.
+            while excess > 0.1 && beat.clips.len() > 1 {
+                let last = beat.clips.len() - 1;
+                let len = (beat.clips[last].out_s - beat.clips[last].in_s).max(0.0);
+                excess -= len;
+                beat.clips.remove(last);
+                touched = true;
+            }
+            if excess > 0.1
+                && let Some(first) = beat.clips.first_mut()
+            {
+                let give = ((first.out_s - first.in_s) - cfg.min_trimmed_clip_s).max(0.0).min(excess);
+                if give > 0.01 {
+                    first.out_s -= give;
+                    touched = true;
+                }
+            }
+        }
+
+        if touched {
+            trimmed += 1;
+        }
+    }
+    trimmed
+}
+
 /// Keep every bed inside the beat it plays under.
 ///
 /// Beds are laid before the cut is fitted to its target, and fitting trims the pictures. A bed
@@ -3080,6 +3150,15 @@ pub async fn run_turn(
                     // length gives way to the speaker, not the other way round.
                     let _ = snap_to_segments(&ctx.db, &mut s)?;
                     let mended = end_on_sentences(&ctx.db, &mut s, &ctx.script);
+                    let shortened = trim_pictures_to_bed(&mut s, &ctx.script);
+                    if shortened > 0 {
+                        issues.push(Issue {
+                            severity: IssueSeverity::Info,
+                            beat_id: None,
+                            clip_index: None,
+                            message: format!("cut the pictures back to the voice in {shortened} beat(s)"),
+                        });
+                    }
                     if mended > 0 {
                         issues.push(Issue {
                             severity: IssueSeverity::Info,
@@ -3605,7 +3684,7 @@ mod tests {
     #[tokio::test]
     async fn a_failed_turn_still_records_what_was_asked() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut db = Db::open_in_memory().unwrap();
+        let db = Db::open_in_memory().unwrap();
         let p = db.create_project(&NewProject::named("P")).unwrap();
 
         let mut ctx = ChatContext {
@@ -4317,6 +4396,104 @@ mod tests {
             dispatch_tool(&db, tmp.path(), p.id, "get_video", &json!({"video_id": 999}), &mut grounding, None, &sc());
         assert!(res.contains("error"));
         assert!(sum.contains("error"));
+    }
+
+    /// A cutaway that outlasts the voice under it is a pause between interviews, which is the
+    /// one thing b-roll should not be. Two of four beats in an agy cut ran on 2.6 s and 4.4 s.
+    #[test]
+    fn pictures_do_not_outlast_the_voice_carrying_them() {
+        use crate::script::{Audio, AudioBed, Beat, ScriptClip};
+        let mut script = Script {
+            title: "t".into(),
+            target_duration_s: None,
+            fps: Default::default(),
+            width: None,
+            height: None,
+            beats: vec![Beat {
+                id: "b1".into(),
+                purpose: "p".into(),
+                narration: None,
+                on_screen_text: None,
+                notes: None,
+                // Her face, then a cutaway: 14.5 s of picture over 11.9 s of voice.
+                clips: vec![
+                    ScriptClip { video_id: 1, in_s: 0.0, out_s: 10.5, audio: Audio::Mute, why: None },
+                    ScriptClip { video_id: 2, in_s: 0.0, out_s: 4.0, audio: Audio::Mute, why: None },
+                ],
+                bed: Some(AudioBed { video_id: 1, in_s: 0.0, out_s: 11.9, why: None, inferred: true }),
+            }],
+        };
+
+        assert_eq!(trim_pictures_to_bed(&mut script, &sc()), 1);
+        let beat = &script.beats[0];
+        let pictures: f64 = beat.clips.iter().map(|c| c.out_s - c.in_s).sum();
+        assert!((pictures - 11.9).abs() < 0.05, "pictures end with the voice: {pictures}");
+        assert_eq!(beat.clips.len(), 2, "the cutaway survives");
+        assert!(beat.clips[0].out_s < 10.5, "the face gave some of it: {}", beat.clips[0].out_s);
+        assert!(beat.clips[1].out_s - beat.clips[1].in_s > 2.0, "and the cutaway is still a shot");
+    }
+
+    /// When there is not enough give in the shots to reach the voice, the trailing pictures go
+    /// rather than becoming flashes — and never the opening face.
+    #[test]
+    fn a_cutaway_is_dropped_only_when_trimming_cannot_reach() {
+        use crate::script::{Audio, AudioBed, Beat, ScriptClip};
+        let mut script = Script {
+            title: "t".into(),
+            target_duration_s: None,
+            fps: Default::default(),
+            width: None,
+            height: None,
+            beats: vec![Beat {
+                id: "b1".into(),
+                purpose: "p".into(),
+                narration: None,
+                on_screen_text: None,
+                notes: None,
+                // 12 s of picture over 3 s of voice: no amount of trimming keeps both shots.
+                clips: vec![
+                    ScriptClip { video_id: 1, in_s: 0.0, out_s: 8.0, audio: Audio::Mute, why: None },
+                    ScriptClip { video_id: 2, in_s: 0.0, out_s: 4.0, audio: Audio::Mute, why: None },
+                ],
+                bed: Some(AudioBed { video_id: 1, in_s: 0.0, out_s: 3.0, why: None, inferred: true }),
+            }],
+        };
+
+        trim_pictures_to_bed(&mut script, &sc());
+        let beat = &script.beats[0];
+        assert_eq!(beat.clips.len(), 1, "the cutaway goes rather than flashing by");
+        assert_eq!(beat.clips[0].video_id, 1, "the face stays");
+        // As close to the voice as the minimum shot length allows: a picture held under 4 s
+        // reads as a flash, which is worse than a second of tail.
+        let pictures: f64 = beat.clips.iter().map(|c| c.out_s - c.in_s).sum();
+        assert!(
+            (pictures - sc().min_trimmed_clip_s).abs() < 0.05,
+            "left at the shortest a shot may be: {pictures}"
+        );
+    }
+
+    /// A beat read over by narration may hold its pictures: there is something to hear.
+    #[test]
+    fn a_narrated_beat_keeps_its_pictures() {
+        use crate::script::{Audio, AudioBed, Beat, ScriptClip};
+        let mut script = Script {
+            title: "t".into(),
+            target_duration_s: None,
+            fps: Default::default(),
+            width: None,
+            height: None,
+            beats: vec![Beat {
+                id: "b1".into(),
+                purpose: "p".into(),
+                narration: Some("a line read across the whole beat".into()),
+                on_screen_text: None,
+                notes: None,
+                clips: vec![ScriptClip { video_id: 2, in_s: 0.0, out_s: 12.0, audio: Audio::Mute, why: None }],
+                bed: Some(AudioBed { video_id: 1, in_s: 0.0, out_s: 4.0, why: None, inferred: true }),
+            }],
+        };
+        assert_eq!(trim_pictures_to_bed(&mut script, &sc()), 0);
+        assert!((script.beats[0].clips[0].out_s - 12.0).abs() < 0.01);
     }
 
     /// The bed is where most of the speech lives once one is laid, and the sentence guarantee

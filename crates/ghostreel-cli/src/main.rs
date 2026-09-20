@@ -734,6 +734,10 @@ async fn script_cmd(paths: &Paths, action: ScriptAction) -> anyhow::Result<ExitC
             if mended > 0 {
                 println!("  [info] put {mended} range(s) back on whole sentences");
             }
+            let shortened = ghostreel_core::chat::trim_pictures_to_bed(&mut script, &script_cfg);
+            if shortened > 0 {
+                println!("  [info] cut the pictures back to the voice in {shortened} beat(s)");
+            }
             let issues = ghostreel_core::script::validate(&db, p.id, &script)?;
             for issue in &issues {
                 let tag = match issue.severity {
