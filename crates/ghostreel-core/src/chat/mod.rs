@@ -1002,6 +1002,10 @@ fn truncate_json_list<T: Serialize>(items: &mut Vec<T>, max_len: usize) -> Strin
 }
 
 /// Dispatch a tool call using DB and optional precomputed query vector. Returns (json_result, summary).
+///
+/// Eight arguments, and every one is a distinct thing the tools need. Bundling them into a struct
+/// would name the bundle after nothing.
+#[allow(clippy::too_many_arguments)]
 pub fn dispatch_tool(
     db: &Db,
     data_dir: &Path,
@@ -3892,8 +3896,6 @@ mod tests {
         assert!(!drop_beats_to_target(&db, &mut script, &cfg));
         assert_eq!(script.beats.len(), 2);
     }
-
-    use super::*;
 
     /// Default script settings for tests.
     fn sc() -> crate::config::ScriptConfig {

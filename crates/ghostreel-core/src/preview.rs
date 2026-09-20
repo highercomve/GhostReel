@@ -777,6 +777,77 @@ pub fn render_preview(
     })
 }
 
+/// Where a video's playback proxy lives under the data dir.
+pub fn playback_proxy_path(data_dir: &Path, content_hash: &str) -> PathBuf {
+    let hex = content_hash.rsplit(':').next().unwrap_or(content_hash);
+    data_dir.join("proxies").join(&hex[..2.min(hex.len())]).join(format!("{hex}.mp4"))
+}
+
+/// Whether a browser engine can be expected to play this file as it is: 8-bit 4:2:0 H.264 at
+/// 1080p or less. Camera originals — 4K, 10-bit 4:2:2, HEVC — are none of that, and WebKit
+/// software-decodes them so slowly the player sits black for a long time.
+pub async fn plays_natively(ffprobe: &Path, video: &Path) -> bool {
+    let out = crate::proc::command(ffprobe)
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=codec_name,pix_fmt,height",
+            "-of",
+            "csv=p=0",
+        ])
+        .arg(video)
+        .kill_on_drop(true)
+        .output()
+        .await;
+    let Ok(out) = out else { return false };
+    let line = String::from_utf8_lossy(&out.stdout);
+    let f: Vec<&str> = line.lines().next().unwrap_or("").trim().split(',').collect();
+    f.len() >= 3 && f[0] == "h264" && f[1] == "yuv420p" && f[2].parse::<u32>().is_ok_and(|h| h <= 1080)
+}
+
+/// A copy of the video the player can actually play: 720p, 8-bit 4:2:0 H.264 with AAC audio,
+/// built once and kept. The original stays the source for keyframes, previews and exports.
+pub async fn playback_proxy(
+    ffmpeg: &Path,
+    data_dir: &Path,
+    video: &Path,
+    content_hash: &str,
+) -> Result<PathBuf, Error> {
+    let out = playback_proxy_path(data_dir, content_hash);
+    if out.metadata().is_ok_and(|m| m.len() > 0) {
+        return Ok(out);
+    }
+    if let Some(dir) = out.parent() {
+        tokio::fs::create_dir_all(dir).await.map_err(|e| Error::Io(dir.to_path_buf(), e))?;
+    }
+    let tmp = out.with_extension("part.mp4");
+    let enc = pick_encoder(ffmpeg);
+    let mut cmd = crate::proc::command(ffmpeg);
+    cmd.args(["-y", "-v", "error", "-i"])
+        .arg(video)
+        .args(["-vf", "scale=-2:720,format=yuv420p"])
+        .args(enc.args.iter().map(String::as_str))
+        .args(["-c:a", "aac", "-b:a", "128k", "-ac", "2", "-movflags", "+faststart"])
+        .arg(&tmp)
+        .kill_on_drop(true);
+    let status = cmd
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .await
+        .map_err(|e| Error::Vision(format!("ffmpeg: {e}")))?;
+    if !status.status.success() {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        let msg: String = String::from_utf8_lossy(&status.stderr).chars().take(300).collect();
+        return Err(Error::Vision(format!("proxy encode failed: {msg}")));
+    }
+    tokio::fs::rename(&tmp, &out).await.map_err(|e| Error::Io(out.clone(), e))?;
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1186,75 +1257,4 @@ mod tests {
             assert!((dur - 3.5).abs() < 0.1, "duration {} should be ≈ 3.5s (tolerance 0.1s)", dur);
         }
     }
-}
-
-/// Where a video's playback proxy lives under the data dir.
-pub fn playback_proxy_path(data_dir: &Path, content_hash: &str) -> PathBuf {
-    let hex = content_hash.rsplit(':').next().unwrap_or(content_hash);
-    data_dir.join("proxies").join(&hex[..2.min(hex.len())]).join(format!("{hex}.mp4"))
-}
-
-/// Whether a browser engine can be expected to play this file as it is: 8-bit 4:2:0 H.264 at
-/// 1080p or less. Camera originals — 4K, 10-bit 4:2:2, HEVC — are none of that, and WebKit
-/// software-decodes them so slowly the player sits black for a long time.
-pub async fn plays_natively(ffprobe: &Path, video: &Path) -> bool {
-    let out = crate::proc::command(ffprobe)
-        .args([
-            "-v",
-            "error",
-            "-select_streams",
-            "v:0",
-            "-show_entries",
-            "stream=codec_name,pix_fmt,height",
-            "-of",
-            "csv=p=0",
-        ])
-        .arg(video)
-        .kill_on_drop(true)
-        .output()
-        .await;
-    let Ok(out) = out else { return false };
-    let line = String::from_utf8_lossy(&out.stdout);
-    let f: Vec<&str> = line.lines().next().unwrap_or("").trim().split(',').collect();
-    f.len() >= 3 && f[0] == "h264" && f[1] == "yuv420p" && f[2].parse::<u32>().is_ok_and(|h| h <= 1080)
-}
-
-/// A copy of the video the player can actually play: 720p, 8-bit 4:2:0 H.264 with AAC audio,
-/// built once and kept. The original stays the source for keyframes, previews and exports.
-pub async fn playback_proxy(
-    ffmpeg: &Path,
-    data_dir: &Path,
-    video: &Path,
-    content_hash: &str,
-) -> Result<PathBuf, Error> {
-    let out = playback_proxy_path(data_dir, content_hash);
-    if out.metadata().is_ok_and(|m| m.len() > 0) {
-        return Ok(out);
-    }
-    if let Some(dir) = out.parent() {
-        tokio::fs::create_dir_all(dir).await.map_err(|e| Error::Io(dir.to_path_buf(), e))?;
-    }
-    let tmp = out.with_extension("part.mp4");
-    let enc = pick_encoder(ffmpeg);
-    let mut cmd = crate::proc::command(ffmpeg);
-    cmd.args(["-y", "-v", "error", "-i"])
-        .arg(video)
-        .args(["-vf", "scale=-2:720,format=yuv420p"])
-        .args(enc.args.iter().map(String::as_str))
-        .args(["-c:a", "aac", "-b:a", "128k", "-ac", "2", "-movflags", "+faststart"])
-        .arg(&tmp)
-        .kill_on_drop(true);
-    let status = cmd
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .await
-        .map_err(|e| Error::Vision(format!("ffmpeg: {e}")))?;
-    if !status.status.success() {
-        let _ = tokio::fs::remove_file(&tmp).await;
-        let msg: String = String::from_utf8_lossy(&status.stderr).chars().take(300).collect();
-        return Err(Error::Vision(format!("proxy encode failed: {msg}")));
-    }
-    tokio::fs::rename(&tmp, &out).await.map_err(|e| Error::Io(out.clone(), e))?;
-    Ok(out)
 }

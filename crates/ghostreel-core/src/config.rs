@@ -424,7 +424,7 @@ impl ScriptConfig {
             ("final_target_tolerance", self.final_target_tolerance),
         ];
         for (name, v) in positive {
-            if !(v > 0.0) {
+            if v <= 0.0 || v.is_nan() {
                 return Err(format!("script.{name} must be greater than 0, got {v}"));
             }
         }

@@ -395,6 +395,9 @@ fn stage_name(stage: &str) -> &str {
     }
 }
 
+/// Eight arguments, and each is a separate thing the render needs: a struct here would be named
+/// after the argument list rather than after anything real.
+#[allow(clippy::too_many_arguments)]
 async fn run_preview(
     app: &AppHandle,
     task_id: u64,

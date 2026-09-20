@@ -244,8 +244,11 @@ fn match_patch(a: &[u8], b: &[u8], x0: usize, y0: usize, guess: (i32, i32)) -> O
     Some((bdx as f64 + fx, bdy as f64 + fy))
 }
 
+/// One tracked point between two frames: where it was, and where it went.
+type PointPair = ((f64, f64), (f64, f64));
+
 /// Least-squares similarity fit through a set of (from, to) point pairs, about the frame centre.
-fn fit_similarity(pairs: &[((f64, f64), (f64, f64))]) -> Option<Motion> {
+fn fit_similarity(pairs: &[PointPair]) -> Option<Motion> {
     if pairs.len() < 2 {
         return None;
     }

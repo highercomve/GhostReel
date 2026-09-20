@@ -85,8 +85,10 @@ pub fn build_timeline_pure(
         // A bed is one voice across the whole beat: A1 carries it once, and the pictures above
         // contribute no sound of their own. In an NLE that is a J-cut, audio and video cut apart.
         let mut bed_written = false;
-        if let Some(bed) = &beat.bed {
-            if let Some(res) = media.get(&bed.video_id) {
+        if let Some(bed) = &beat.bed
+            && let Some(res) = media.get(&bed.video_id)
+        {
+            {
                 bed_written = true;
                 let rate = res.fps.as_f64();
                 let in_frames = (bed.in_s * rate).round();
