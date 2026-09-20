@@ -124,6 +124,14 @@ pub struct VisionConfig {
     /// Let the local model reason before it answers. Worth its cost for a whole script, not for
     /// a keyframe: descriptions run once per frame, so they default to off and scripts to on.
     pub think: bool,
+    /// Frames described at once when the backend is a server. Generating a token means reading
+    /// every weight out of VRAM, so the GPU spends most of decode waiting on memory; a batch
+    /// reads those weights once and answers several frames from it. The server must be started
+    /// with a matching `--parallel` or the requests queue — which is harmless (2.87 s a frame
+    /// against 3.03 s sequential), so over-asking costs nothing and under-asking leaves the card
+    /// idle. Ignored for local and CLI backends.
+    #[serde(default = "default_describe_concurrency")]
+    pub describe_concurrency: u32,
     /// CLI agent settings (used when `backend = "cli"`).
     pub cli: CliAgentConfig,
 }
@@ -134,6 +142,10 @@ pub const DESCRIBE_CTX_TOKENS: u32 = 8192;
 pub const CHAT_CTX_TOKENS: u32 = 32768;
 pub const KV_CACHE_KINDS: &[&str] = &["f16", "q8_0", "q4_0"];
 pub const FLASH_ATTN_KINDS: &[&str] = &["auto", "on", "off"];
+
+fn default_describe_concurrency() -> u32 {
+    4
+}
 
 impl Default for VisionConfig {
     fn default() -> Self {
@@ -148,6 +160,7 @@ impl Default for VisionConfig {
             flash_attn: "auto".into(),
             max_tool_rounds: 0,
             think: false,
+            describe_concurrency: default_describe_concurrency(),
             cli: CliAgentConfig::default(),
         }
     }
@@ -640,6 +653,7 @@ impl Config {
                 "flash_attn" => llm.flash_attn = value.to_string(),
                 "think" => llm.think = flag(value),
                 "max_tool_rounds" => llm.max_tool_rounds = num(key, value)?,
+                "describe_concurrency" => llm.describe_concurrency = num(key, value)?,
                 other => return Err(format!("unknown config key '{section}.{other}'")),
             }
             llm.validate(section)?;

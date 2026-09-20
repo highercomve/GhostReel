@@ -135,6 +135,9 @@ pub struct Runtime {
     pub data_dir: PathBuf,
     /// Keyframe extraction settings; `None` disables the frames stage (tests).
     pub frames: Option<crate::frames::FrameOptions>,
+    /// Frames described at once against a server (`vision.describe_concurrency`). Describing is
+    /// memory-bandwidth bound, so a batch amortises one read of the weights over several answers.
+    pub describe_concurrency: usize,
     pub vision: VisionSetup,
     pub embed: EmbedSetup,
     /// How steady the camera is, measured alongside keyframes. `None` skips it (tests).
@@ -200,6 +203,7 @@ pub async fn resolve(paths: &Paths, config: &Config) -> Result<Runtime, crate::E
         stt,
         data_dir: paths.data_dir.clone(),
         frames: Some(crate::frames::FrameOptions::from_config(&config.frames)),
+        describe_concurrency: config.vision.describe_concurrency.max(1) as usize,
         vision,
         embed,
         steadiness: (&config.script).into(),
