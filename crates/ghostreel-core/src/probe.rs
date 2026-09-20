@@ -9,7 +9,7 @@
 
 use std::time::Duration;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::config::{Backend, EMBED_DIM};
@@ -24,18 +24,110 @@ pub struct Probe {
     pub model: Option<String>,
     /// Human-readable explanation (shown by `doctor`).
     pub detail: String,
+    /// What this particular server can do beyond answering. Everything here is `None`/false for a
+    /// server that does not tell us, which is most of them: GhostReel talks to anything
+    /// OpenAI-compatible, and only llama.cpp reports its own shape.
+    #[serde(default, skip_serializing_if = "Capabilities::is_empty")]
+    pub caps: Capabilities,
+}
+
+/// What a server admits about itself.
+///
+/// This exists so the app never offers a control that quietly does nothing. Describing frames
+/// several at a time only pays off against a server started with matching slots, and switching
+/// model or context without a restart only works against a router — neither is true of LM Studio,
+/// Ollama, or a plain `llama-server`, and a setting that silently no-ops is worse than one that
+/// is not there.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Capabilities {
+    /// Requests the server will genuinely work on at once (llama.cpp `/props.total_slots`). One
+    /// means concurrency buys nothing; `None` means the server did not say.
+    pub slots: Option<u32>,
+    /// Context each slot has, which is the whole window divided by the slots — not the number the
+    /// server was started with.
+    pub slot_ctx: Option<u32>,
+    /// llama.cpp router mode: models can be loaded, unloaded and swapped over HTTP, so the model
+    /// and its flags can change without stopping anything.
+    pub router: bool,
+}
+
+impl Capabilities {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// What to append to a doctor line. Empty for a server that told us nothing, so the report
+    /// stays honest about the difference between "one slot" and "did not say".
+    pub fn summary(&self) -> String {
+        let mut bits = Vec::new();
+        if let Some(n) = self.slots {
+            let ctx = self.slot_ctx.map(|c| format!(" × {c} tokens")).unwrap_or_default();
+            bits.push(format!("{n} slot{}{ctx}", if n == 1 { "" } else { "s" }));
+        }
+        if self.router {
+            bits.push("router (models switchable)".into());
+        }
+        if bits.is_empty() { String::new() } else { format!(", {}", bits.join(", ")) }
+    }
 }
 
 impl Probe {
     fn down(url: &str, detail: impl Into<String>) -> Self {
-        Self { url: url.into(), reachable: false, capable: false, model: None, detail: detail.into() }
+        Self {
+            url: url.into(),
+            reachable: false,
+            capable: false,
+            model: None,
+            detail: detail.into(),
+            caps: Capabilities::default(),
+        }
     }
     fn incapable(url: &str, model: Option<String>, detail: impl Into<String>) -> Self {
-        Self { url: url.into(), reachable: true, capable: false, model, detail: detail.into() }
+        Self {
+            url: url.into(),
+            reachable: true,
+            capable: false,
+            model,
+            detail: detail.into(),
+            caps: Capabilities::default(),
+        }
     }
     fn ok(url: &str, model: Option<String>, detail: impl Into<String>) -> Self {
-        Self { url: url.into(), reachable: true, capable: true, model, detail: detail.into() }
+        Self {
+            url: url.into(),
+            reachable: true,
+            capable: true,
+            model,
+            detail: detail.into(),
+            caps: Capabilities::default(),
+        }
     }
+    fn with_caps(mut self, caps: Capabilities) -> Self {
+        self.caps = caps;
+        self
+    }
+}
+
+/// Ask a llama.cpp server what it can do. Everything here is best-effort: a server that does not
+/// answer these endpoints is not broken, it is simply not llama.cpp, and gets the default.
+async fn capabilities(client: &reqwest::Client, base: &str, models: &serde_json::Value) -> Capabilities {
+    // Router mode lists models with a `status`; a plain server's entries carry only id, aliases,
+    // meta and tags. That difference is the whole detection — there is no version to ask for.
+    let router = models["data"]
+        .as_array()
+        .is_some_and(|rows| rows.iter().any(|m| m.get("status").is_some()));
+
+    let slots = match get_json(client, &format!("{base}/props")).await {
+        Ok(props) => props["total_slots"].as_u64().map(|n| n as u32),
+        Err(_) => None,
+    };
+    // Per-slot context, which is what a request actually gets. Asking `/props` for `n_ctx` would
+    // report the whole window and overstate it by the number of slots.
+    let slot_ctx = match get_json(client, &format!("{base}/slots")).await {
+        Ok(v) => v.as_array().and_then(|s| s.first()).and_then(|f| f["n_ctx"].as_u64()).map(|n| n as u32),
+        Err(_) => None,
+    };
+    Capabilities { slots, slot_ctx, router }
 }
 
 /// Where a capability will run.
@@ -62,9 +154,11 @@ pub fn resolve(backend: Backend, probe: Option<Probe>) -> Resolution {
         (Backend::Local, _) => (Target::Local, "backend = local".to_string()),
         (Backend::Cli, _) => (Target::Local, "backend = cli (handled by runtime)".to_string()),
         (_, None) => (Target::Local, "server not probed".to_string()),
-        (Backend::Auto, Some(p)) if p.capable => (Target::Server, format!("server OK: {}", p.detail)),
+        (Backend::Auto, Some(p)) if p.capable => (Target::Server, format!("server OK: {}{}", p.detail, p.caps.summary())),
         (Backend::Auto, Some(p)) => (Target::Local, format!("server not usable ({}) → local", p.detail)),
-        (Backend::Server, Some(p)) if p.capable => (Target::Server, format!("server OK: {}", p.detail)),
+        (Backend::Server, Some(p)) if p.capable => {
+            (Target::Server, format!("server OK: {}{}", p.detail, p.caps.summary()))
+        }
         (Backend::Server, Some(p)) => (Target::Unavailable, format!("backend = server but {}", p.detail)),
     };
     Resolution { backend, target, probe, reason }
@@ -118,14 +212,19 @@ pub async fn vision(client: &reqwest::Client, url: &str, model: &str) -> Probe {
         Some(m) => format!("{b}/props?model={m}"),
         None => format!("{b}/props"),
     };
+    let caps = capabilities(client, b, &models).await;
     match get_json(client, &props_url).await {
         Ok(props) => match props["modalities"]["vision"].as_bool() {
-            Some(true) => Probe::ok(url, model_id, "model accepts images"),
-            Some(false) => Probe::incapable(url, model_id, "loaded model has no vision (no mmproj)"),
-            None => Probe::incapable(url, model_id, "server does not report modalities"),
+            Some(true) => Probe::ok(url, model_id, "model accepts images").with_caps(caps),
+            Some(false) => {
+                Probe::incapable(url, model_id, "loaded model has no vision (no mmproj)").with_caps(caps)
+            }
+            None => Probe::incapable(url, model_id, "server does not report modalities").with_caps(caps),
         },
         // Not llama.cpp (Ollama, LM Studio…): can't confirm images are supported.
-        Err(e) => Probe::incapable(url, model_id, format!("cannot confirm vision support (/props: {e})")),
+        Err(e) => {
+            Probe::incapable(url, model_id, format!("cannot confirm vision support (/props: {e})")).with_caps(caps)
+        }
     }
 }
 
@@ -337,5 +436,56 @@ mod tests {
         let url = serve(vec![("GET /v1/models", 200, r#"{"data":[{"id":"model-a"},{"id":"model-b"}]}"#.into())]).await;
         let list = server_models(&url).await.unwrap();
         assert_eq!(list, vec!["model-a", "model-b"]);
+    }
+
+    /// The `/models` shapes are copied from a real llama.cpp on this machine: the plain server
+    /// lists id/aliases/meta/tags, and only the router adds `status`. There is no version
+    /// endpoint to ask, so that difference *is* the detection.
+    const PLAIN_MODELS: &str = r#"{"data":[{"id":"Qwen3.5-9B","aliases":[],"created":1,"meta":{},
+        "object":"model","owned_by":"llamacpp","tags":[]}],"object":"list"}"#;
+    const ROUTER_MODELS: &str = r#"{"data":[
+        {"id":"chat","aliases":[],"object":"model","owned_by":"llamacpp","tags":[],
+         "status":{"value":"unloaded","args":[]},
+         "architecture":{"input_modalities":["text","image"]}},
+        {"id":"describe","aliases":[],"object":"model","owned_by":"llamacpp","tags":[],
+         "status":{"value":"running","args":[]},
+         "architecture":{"input_modalities":["text","image"]}}],"object":"list"}"#;
+
+    #[tokio::test]
+    async fn a_plain_llama_server_reports_its_slots_but_not_a_router() {
+        let url = serve(vec![
+            ("GET /v1/models", 200, PLAIN_MODELS.into()),
+            ("GET /props", 200, r#"{"modalities":{"vision":true},"total_slots":4}"#.into()),
+            ("GET /slots", 200, r#"[{"id":0,"n_ctx":16384},{"id":1,"n_ctx":16384}]"#.into()),
+        ])
+        .await;
+        let p = vision(&reqwest::Client::new(), &url, "").await;
+        assert!(p.capable);
+        assert_eq!(p.caps.slots, Some(4), "four slots is four frames at a time");
+        // Per slot, not the whole window: /props would say 65536 and overstate it four times.
+        assert_eq!(p.caps.slot_ctx, Some(16384));
+        assert!(!p.caps.router, "one model, no swapping");
+    }
+
+    #[tokio::test]
+    async fn router_mode_is_recognised_by_the_status_field() {
+        let url = serve(vec![
+            ("GET /v1/models", 200, ROUTER_MODELS.into()),
+            ("GET /props", 200, r#"{"modalities":{"vision":true},"total_slots":4}"#.into()),
+            ("GET /slots", 200, r#"[{"id":0,"n_ctx":16384}]"#.into()),
+        ])
+        .await;
+        let p = vision(&reqwest::Client::new(), &url, "").await;
+        assert!(p.caps.router, "models carry a status, so this one can load and unload them");
+    }
+
+    #[tokio::test]
+    async fn a_server_that_is_not_llama_cpp_claims_nothing() {
+        // LM Studio, Ollama, a hosted endpoint: answers /v1/models and nothing else here. The
+        // app must not offer slots or model-switching on the strength of a guess.
+        let url = serve(vec![("GET /v1/models", 200, PLAIN_MODELS.into())]).await;
+        let p = vision(&reqwest::Client::new(), &url, "").await;
+        assert!(p.reachable && !p.capable, "vision cannot be confirmed without /props");
+        assert!(p.caps.is_empty(), "no slots, no router, no claims: {:?}", p.caps);
     }
 }

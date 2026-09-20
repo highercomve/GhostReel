@@ -583,6 +583,8 @@ export interface VisionSettings {
   /** auto | on | off */
   flash_attn: string;
   think: boolean;
+  /** Frames described at once against a server; only meaningful when the server has slots. */
+  describe_concurrency: number;
   cli: CliSettings;
 }
 
@@ -613,6 +615,15 @@ export interface FrameSettings {
   max_interval_s: number;
 }
 
+/** What a server admits it can do; drives whether a control is offered at all. */
+export interface ServerCaps {
+  /** Requests handled at once. null = the server didn't say (LM Studio, Ollama…), not "one". */
+  slots: number | null;
+  slot_ctx: number | null;
+  /** llama.cpp router: model and flags changeable without a restart. */
+  router: boolean;
+}
+
 export interface JevSettings {
   enabled: boolean;
   /** Whether a key exists at all. The key itself never comes back. */
@@ -638,6 +649,7 @@ export interface AiSettings {
   embed: EmbedSettings;
   frames: FrameSettings;
   jev: JevSettings;
+  vision_caps: ServerCaps;
 }
 
 export interface BackendsResolution {
@@ -650,6 +662,8 @@ export interface BackendsResolution {
 
 export interface VisionSettingsPatch {
   backend?: string;
+  /** Frames described at once against a server. Only meaningful when the server has slots. */
+  describe_concurrency?: number;
   url?: string;
   model?: string;
   local_model?: string;

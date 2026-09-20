@@ -1508,6 +1508,19 @@ fn print_report(r: &Report) {
         "  local windows: descriptions {} tokens (kv {}), chat {} tokens (kv {})",
         r.local_runtime.describe_ctx, r.local_runtime.describe_kv, r.local_runtime.chat_ctx, r.local_runtime.chat_kv
     );
+    // A server's window is divided among its slots, so `--parallel 4 -c 65536` gives each request
+    // 16k — not the 65536 the chat was configured for. Nothing errors when that is wrong; the
+    // model just runs out of room mid-script, which is a confusing way to find out.
+    if let Some(p) = &r.chat.probe
+        && let Some(slot_ctx) = p.caps.slot_ctx
+        && r.local_runtime.chat_ctx > slot_ctx
+    {
+        println!(
+            "  ! the chat is set to {} tokens but each of the server's slots has {}: \n    \
+             lower chat_model.ctx_tokens, or restart the server with fewer slots or a bigger -c",
+            r.local_runtime.chat_ctx, slot_ctx
+        );
+    }
     print_backend("embeddings", &r.embeddings);
     print_backend("stt", &r.stt);
 

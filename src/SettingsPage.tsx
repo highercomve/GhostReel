@@ -106,6 +106,65 @@ export default function SettingsPage() {
         </>
       )}
 
+      {ai && (ai.vision.backend === "server" || ai.vision.backend === "auto") && (
+        <>
+          <h2>Frame descriptions · server</h2>
+          <section className="card">
+            {ai.vision_caps.slots == null ? (
+              <p className="muted small">
+                This server doesn't report what it can do, so GhostReel describes one frame at a time. That is the
+                safe choice for LM Studio, Ollama or a hosted endpoint — only llama.cpp says how many requests it
+                will really work on at once, and guessing wrong just makes requests queue.
+              </p>
+            ) : (
+              <>
+                <p className="muted small">
+                  The server reports <strong>{ai.vision_caps.slots} slot{ai.vision_caps.slots === 1 ? "" : "s"}</strong>
+                  {ai.vision_caps.slot_ctx != null && <> of {ai.vision_caps.slot_ctx.toLocaleString()} tokens each</>}.
+                  Generating a token means reading every weight out of VRAM, so the card spends most of its time
+                  waiting on memory; describing several frames at once reads those weights once and answers all of
+                  them, which measured 1.7× faster on real footage. Asking for more than the server has is harmless —
+                  the extra requests simply queue.
+                </p>
+                <div className="settings-fields">
+                  <div className="settings-field">
+                    <label>Frames at once</label>
+                    <input
+                      type="number"
+                      min={1}
+                      max={16}
+                      style={{ width: "5em" }}
+                      defaultValue={ai.vision.describe_concurrency ?? 4}
+                      onChange={async (e) => {
+                        const v = Number(e.currentTarget.value);
+                        if (v < 1 || v > 16) return;
+                        try {
+                          setAi(await setAiSettings({ vision: { describe_concurrency: v } }));
+                          setError(null);
+                        } catch (err) {
+                          setError(String(err));
+                        }
+                      }}
+                    />
+                    <span className="muted small">
+                      {ai.vision_caps.slots === 1
+                        ? "this server runs one at a time — start it with more slots to gain anything"
+                        : `up to ${ai.vision_caps.slots} will run in parallel here`}
+                    </span>
+                  </div>
+                </div>
+              </>
+            )}
+            {ai.vision_caps.router && (
+              <p className="muted small">
+                This server is a <strong>llama.cpp router</strong>: the model and the flags it runs with can be
+                changed without restarting it.
+              </p>
+            )}
+          </section>
+        </>
+      )}
+
       <h2>Script chat · editorial judge</h2>
       <section className="card">
         <p className="muted small">

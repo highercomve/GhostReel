@@ -108,6 +108,23 @@ one number live in `compose`, in code, so they can be changed without asking any
 - `ghostreel script judge <id> --brief "…"`; `tests/eval_judge.rs` (`--ignored`) re-runs the four
   recorded drafts when the questions change, since a reworded question is a different measurement.
 
+## What a server admits it can do (`probe.rs`)
+
+GhostReel talks to anything OpenAI-compatible, but only llama.cpp describes its own shape. Never
+offer a control the server behind it cannot honour — a setting that silently does nothing is worse
+than one that is not there. `Probe::caps` carries what was actually asked:
+
+- **`slots`** — `/props.total_slots`. Describing several frames at once only pays against a server
+  started with matching slots. `None` means the server did not say (LM Studio, Ollama, a hosted
+  endpoint) and is *not* the same as one; the settings page says so rather than guessing.
+- **`slot_ctx`** — from `/slots`, because a server's window is divided among them. `--parallel 4
+  -c 65536` gives each request 16k, and nothing errors when `chat_model.ctx_tokens` is larger —
+  the model just runs out of room mid-script. `doctor` warns.
+- **`router`** — llama.cpp router mode, detected by `/models` entries carrying a `status` field
+  (a plain server's carry only id/aliases/meta/tags). There is no version endpoint; that
+  difference *is* the detection. Only then can the model or its flags change without a restart
+  (`highllama router use <preset>`).
+
 ## Keyframe sampling (`frames.rs`)
 
 One low-resolution decode at 4 fps reads every frame's scene score. A score over

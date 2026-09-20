@@ -390,6 +390,9 @@ struct VisionSettingsView {
     kv_cache: String,
     flash_attn: String,
     think: bool,
+    /// Frames described at once against a server. Meaningless without slots, which is why the
+    /// settings page shows it only when the server reports them.
+    describe_concurrency: u32,
     cli: CliSettingsView,
 }
 
@@ -429,6 +432,21 @@ struct AiSettingsView {
     embed: EmbedSettingsView,
     frames: FrameSettingsView,
     jev: JevSettingsView,
+    /// What the frame-description server admits it can do. The settings page offers a control
+    /// only when the server behind it can honour it — a slider that silently does nothing on LM
+    /// Studio is worse than no slider.
+    vision_caps: ServerCapsView,
+}
+
+/// What one server admits it can do, for the settings page to gate on.
+#[derive(Serialize, Deserialize)]
+struct ServerCapsView {
+    /// Requests the server really works on at once. `None` = it did not say (LM Studio, Ollama,
+    /// anything not llama.cpp), which is not the same as one.
+    slots: Option<u32>,
+    slot_ctx: Option<u32>,
+    /// llama.cpp router: models and their flags can be changed without a restart.
+    router: bool,
 }
 
 /// The editorial judge. `has_key` rather than the key itself: a secret that has been typed in
@@ -453,6 +471,7 @@ struct JevSettingsPatch {
 #[derive(Deserialize, Default)]
 struct VisionSettingsPatch {
     backend: Option<String>,
+    describe_concurrency: Option<u32>,
     url: Option<String>,
     model: Option<String>,
     local_model: Option<String>,
@@ -526,6 +545,7 @@ fn llm_view(c: &ghostreel_core::config::VisionConfig) -> VisionSettingsView {
         kv_cache: c.kv_cache.clone(),
         flash_attn: c.flash_attn.clone(),
         think: c.think,
+        describe_concurrency: c.describe_concurrency,
         cli: CliSettingsView {
             tool: c.cli.tool.clone(),
             command: c.cli.command.clone(),
@@ -582,6 +602,9 @@ fn apply_llm_patch(
     if let Some(t) = v.think {
         cfg.think = t;
     }
+    if let Some(n) = v.describe_concurrency {
+        cfg.describe_concurrency = n.clamp(1, 16);
+    }
     if let Some(c) = v.cli {
         if let Some(t) = c.tool {
             cfg.cli.tool = t;
@@ -600,6 +623,18 @@ fn apply_llm_patch(
         }
     }
     cfg.validate(section)
+}
+
+/// Probe the frame-description server for what it supports. Best-effort and short-timeout: the
+/// settings page must open whether or not a server is up.
+async fn vision_caps_view(config: &Config) -> ServerCapsView {
+    use ghostreel_core::config::Backend;
+    if !matches!(config.vision.backend, Backend::Auto | Backend::Server) {
+        return ServerCapsView { slots: None, slot_ctx: None, router: false };
+    }
+    let client = ghostreel_core::probe::probe_client();
+    let p = ghostreel_core::probe::vision(&client, &config.vision.url, &config.vision.model).await;
+    ServerCapsView { slots: p.caps.slots, slot_ctx: p.caps.slot_ctx, router: p.caps.router }
 }
 
 fn jev_view(cfg: &ghostreel_core::config::JevConfig) -> JevSettingsView {
@@ -652,10 +687,12 @@ async fn build_script_with_jev(project_id: i64, brief: String, target_s: f64) ->
 }
 
 #[tauri::command]
-fn get_ai_settings() -> CmdResult<AiSettingsView> {
+async fn get_ai_settings() -> CmdResult<AiSettingsView> {
     let p = paths()?;
     let config = Config::load(&p.config_file).unwrap_or_default();
+    let vision_caps = vision_caps_view(&config).await;
     Ok(AiSettingsView {
+        vision_caps,
         vision: llm_view(&config.vision),
         chat_model: llm_view(&config.chat_model()),
         stt: SttSettingsView { backend: config.stt.backend.to_string(), url: config.stt.url, model: config.stt.model },
@@ -782,7 +819,9 @@ async fn set_ai_settings(patch: AiSettingsPatch, search_state: State<'_, SearchS
 
     config.save(&p.config_file).map_err(err)?;
 
+    let vision_caps = vision_caps_view(&config).await;
     Ok(AiSettingsView {
+        vision_caps,
         jev: jev_view(&config.jev),
         vision: llm_view(&config.vision),
         chat_model: llm_view(&config.chat_model()),
