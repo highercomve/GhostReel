@@ -2802,6 +2802,23 @@ pub async fn run_turn(
     }
     // A length the user states ("60 second promo", "2 minutos") wins over whatever the model sets.
     let requested_s = requested_duration_s(message);
+
+    // The arithmetic of the length, spelled out. "40 seconds" plus "a clip may run to 30 s" is a
+    // contradiction a model resolves by ignoring the first: one drafted seven quotes of twenty
+    // seconds, all legal, and came out 349% over with nothing left to trim. Saying how many
+    // beats and how long each shot costs a line and is the only lever that works before the
+    // draft exists — afterwards speech cannot be scaled and dropping beats has a floor.
+    if let Some(target) = requested_s.filter(|t| *t > 0.0) {
+        let beats = ((target / 9.0).round() as usize).clamp(3, 8);
+        sys_prompt.push_str(&format!(
+            "\nTHE LENGTH YOU WERE ASKED FOR\n{target:.0} seconds. That is about {beats} beats of \
+             {:.0} s each, and no single shot may run longer than {:.0} s — a third of the piece. \
+             Choosing more or longer than that does not make a longer piece, it makes one that has \
+             to be cut back before anyone sees it.\n",
+            target / beats as f64,
+            target / 3.0,
+        ));
+    }
     // Only a first draft (or an explicit length) is squeezed to its target; revisions follow feedback.
     let enforce_target = latest_script_json.is_none() || requested_s.is_some();
 

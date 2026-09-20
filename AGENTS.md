@@ -79,6 +79,10 @@ A draft then goes through repair passes, in this order, and the order matters:
   its floor leaves the cut over the ceiling and the next pass drops again (53.0 s → 43.4 s), and
   it never takes a script below half the clips the model chose — past that the score reports the
   overrun instead.
+- **The length is spelled out as arithmetic.** "40 seconds" plus "a clip may run to 30 s" is a
+  contradiction, and a model resolves it by ignoring the first. The prompt states the beats and
+  the per-shot limit a requested duration implies; it is the only lever that works before the
+  draft exists, and it took a local run from 179.6 s to 60.7 s against a 40 s target.
 - **No shot may take more than a third of the target.** `max_clip_s` is an absolute 30 s and says
   nothing about a 40 s cut: a local model filled one with eight clips of twenty-odd seconds, every
   one legal, and it ran 349% over with nothing to trim. `pacing_issues` flags it while the model
