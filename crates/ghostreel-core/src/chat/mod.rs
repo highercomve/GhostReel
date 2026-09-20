@@ -2028,65 +2028,106 @@ fn clip_has_described_frame(db: &Db, video_id: i64, in_s: f64, out_s: f64) -> bo
 ///
 /// An edge moves out to the sentence boundary when that is within `max_speech_extend_s`, and back
 /// to the previous one when it is further, so a clip is never left in the middle of a thought.
-fn end_on_sentences(db: &Db, script: &mut Script, cfg: &crate::config::ScriptConfig) -> usize {
+pub fn end_on_sentences(db: &Db, script: &mut Script, cfg: &crate::config::ScriptConfig) -> usize {
     let mut fixed = 0usize;
-    for c in script.beats.iter_mut().flat_map(|b| b.clips.iter_mut()) {
-        if c.audio != crate::script::Audio::Source {
-            continue;
-        }
-        let Ok(mut st) = db
-            .conn
-            .prepare_cached("SELECT start_s, end_s FROM transcript_segments WHERE video_id = ?1 ORDER BY start_s")
-        else {
-            continue;
-        };
-        let segs: Vec<(f64, f64)> = st
-            .query_map([c.video_id], |r| Ok((r.get::<_, f64>(0)?, r.get::<_, f64>(1)?)))
-            .map(|rows| rows.flatten().collect())
-            .unwrap_or_default();
-        let overlapping: Vec<usize> =
-            (0..segs.len()).filter(|&i| segs[i].1 > c.in_s + 0.05 && segs[i].0 < c.out_s - 0.05).collect();
-        let (Some(&first), Some(&last)) = (overlapping.first(), overlapping.last()) else { continue };
-        let duration = video_duration(db, c.video_id).unwrap_or(f64::MAX);
-        let (old_in, old_out) = (c.in_s, c.out_s);
+    for beat in &mut script.beats {
+        let beat_len: f64 = beat.clips.iter().map(|c| (c.out_s - c.in_s).max(0.0)).sum();
 
-        // The end. Run on to the last word, or fall back to where the previous sentence stopped.
-        let sentence_end = segs[last].1;
-        if sentence_end > c.out_s + 0.05 {
-            let wanted = (sentence_end + cfg.speech_overrun_s).min(duration);
-            if wanted - c.out_s <= cfg.max_speech_extend_s {
-                c.out_s = wanted;
-            } else {
-                let back = overlapping
-                    .iter()
-                    .rev()
-                    .map(|&i| segs[i].1)
-                    .find(|&e| e <= c.out_s + 0.05 && e - c.in_s >= cfg.min_trimmed_clip_s);
-                match back {
-                    Some(end) => c.out_s = (end + cfg.speech_overrun_s).min(duration),
-                    // Nothing to fall back to: a whole sentence long is better than half of one.
-                    None => c.out_s = wanted,
-                }
+        for c in beat.clips.iter_mut() {
+            if c.audio != crate::script::Audio::Source {
+                continue;
+            }
+            let segs = sentence_edges(db, c.video_id);
+            let duration = video_duration(db, c.video_id).unwrap_or(f64::MAX);
+            let (in_s, out_s) = snap_range(&segs, duration, c.in_s, c.out_s, None, cfg);
+            if (in_s - c.in_s).abs() > 0.05 || (out_s - c.out_s).abs() > 0.05 {
+                c.in_s = in_s;
+                c.out_s = out_s;
+                fixed += 1;
             }
         }
 
-        // The start. Never open in the middle of a sentence.
-        let sentence_start = segs[first].0;
-        if sentence_start < c.in_s - 0.05 {
-            if c.in_s - sentence_start <= cfg.max_speech_extend_s {
-                c.in_s = (sentence_start - cfg.speech_lead_s).max(0.0);
-            } else if let Some(&next) = overlapping.iter().find(|&&i| segs[i].0 >= c.in_s) {
-                if c.out_s - segs[next].0 >= cfg.min_trimmed_clip_s {
-                    c.in_s = (segs[next].0 - cfg.speech_lead_s).max(0.0);
-                }
+        // A bed is where most of the speech lives once one is laid, and it was never covered
+        // here: three clips in a Bonsai 2 cut and one in agy's stopped mid-sentence because of
+        // it. Its end may not pass the pictures it plays under, or `clamp_beds_to_beats` would
+        // cut it back to exactly the place this pass exists to avoid.
+        if let Some(bed) = &mut beat.bed {
+            let segs = sentence_edges(db, bed.video_id);
+            let duration = video_duration(db, bed.video_id).unwrap_or(f64::MAX);
+            let cap = if beat_len > 0.0 { Some(bed.in_s + beat_len) } else { None };
+            let (in_s, out_s) = snap_range(&segs, duration, bed.in_s, bed.out_s, cap, cfg);
+            if (in_s - bed.in_s).abs() > 0.05 || (out_s - bed.out_s).abs() > 0.05 {
+                bed.in_s = in_s;
+                bed.out_s = out_s;
+                fixed += 1;
             }
-        }
-
-        if (c.in_s - old_in).abs() > 0.05 || (c.out_s - old_out).abs() > 0.05 {
-            fixed += 1;
         }
     }
     fixed
+}
+
+/// Every sentence boundary in a video, as (start, end) pairs in order.
+fn sentence_edges(db: &Db, video_id: i64) -> Vec<(f64, f64)> {
+    db.conn
+        .prepare_cached("SELECT start_s, end_s FROM transcript_segments WHERE video_id = ?1 ORDER BY start_s")
+        .and_then(|mut st| {
+            st.query_map([video_id], |r| Ok((r.get::<_, f64>(0)?, r.get::<_, f64>(1)?)))
+                .map(|rows| rows.flatten().collect())
+        })
+        .unwrap_or_default()
+}
+
+/// Pull one range onto whole sentences.
+///
+/// `cap_out` is the furthest the end may travel — a bed may not outlast the pictures above it.
+/// When finishing the sentence would pass it, the range falls back to where an earlier sentence
+/// ended rather than stopping in the middle of this one.
+fn snap_range(
+    segs: &[(f64, f64)],
+    duration: f64,
+    in_s: f64,
+    out_s: f64,
+    cap_out: Option<f64>,
+    cfg: &crate::config::ScriptConfig,
+) -> (f64, f64) {
+    let overlapping: Vec<usize> =
+        (0..segs.len()).filter(|&i| segs[i].1 > in_s + 0.05 && segs[i].0 < out_s - 0.05).collect();
+    let (Some(&first), Some(&last)) = (overlapping.first(), overlapping.last()) else { return (in_s, out_s) };
+    let (mut in_s, mut out_s) = (in_s, out_s);
+    let ceiling = cap_out.unwrap_or(f64::MAX).min(duration);
+
+    // The end. Run on to the last word, or fall back to where an earlier sentence stopped.
+    let sentence_end = segs[last].1;
+    if sentence_end > out_s + 0.05 {
+        let wanted = (sentence_end + cfg.speech_overrun_s).min(duration);
+        if wanted - out_s <= cfg.max_speech_extend_s && wanted <= ceiling {
+            out_s = wanted;
+        } else {
+            let back = overlapping
+                .iter()
+                .rev()
+                .map(|&i| segs[i].1)
+                .find(|&e| e <= out_s + 0.05 && e - in_s >= cfg.min_trimmed_clip_s);
+            match back {
+                Some(end) => out_s = (end + cfg.speech_overrun_s).min(ceiling),
+                // Nothing to fall back to: a whole sentence long is better than half of one.
+                None => out_s = wanted.min(ceiling.max(wanted.min(duration))),
+            }
+        }
+    }
+
+    // The start. Never open in the middle of a sentence.
+    let sentence_start = segs[first].0;
+    if sentence_start < in_s - 0.05 {
+        if in_s - sentence_start <= cfg.max_speech_extend_s {
+            in_s = (sentence_start - cfg.speech_lead_s).max(0.0);
+        } else if let Some(&next) = overlapping.iter().find(|&&i| segs[i].0 >= in_s)
+            && out_s - segs[next].0 >= cfg.min_trimmed_clip_s
+        {
+            in_s = (segs[next].0 - cfg.speech_lead_s).max(0.0);
+        }
+    }
+    (in_s, out_s)
 }
 
 /// Let speaking clips breathe: finish the sentence the clip is in, then hold ~1.5 s of the person
@@ -4276,6 +4317,91 @@ mod tests {
             dispatch_tool(&db, tmp.path(), p.id, "get_video", &json!({"video_id": 999}), &mut grounding, None, &sc());
         assert!(res.contains("error"));
         assert!(sum.contains("error"));
+    }
+
+    /// The bed is where most of the speech lives once one is laid, and the sentence guarantee
+    /// never covered it: three clips in a Bonsai 2 cut and one in agy's stopped mid-sentence.
+    #[test]
+    fn a_bed_ends_on_a_whole_sentence_too() {
+        use crate::script::{Audio, AudioBed, Beat, ScriptClip};
+        let db = Db::open_in_memory().unwrap();
+        db.conn.execute("INSERT INTO videos(id, content_hash, size, duration_s) VALUES (1,'h',1,300.0)", []).unwrap();
+        db.conn.execute("INSERT INTO videos(id, content_hash, size, duration_s) VALUES (2,'i',1,300.0)", []).unwrap();
+        // She speaks from 10 s to 31 s, in two sentences.
+        db.conn
+            .execute(
+                "INSERT INTO transcript_segments(video_id, start_s, end_s, text) VALUES
+                 (1, 10.0, 20.0, 'the first whole sentence'), (1, 20.0, 31.0, 'the second whole sentence')",
+                [],
+            )
+            .unwrap();
+
+        // A beat of 25 s of pictures, with her voice under it cut off at 28.4 s — mid-sentence.
+        let mut script = Script {
+            title: "t".into(),
+            target_duration_s: None,
+            fps: Default::default(),
+            width: None,
+            height: None,
+            beats: vec![Beat {
+                id: "b1".into(),
+                purpose: "p".into(),
+                narration: None,
+                on_screen_text: None,
+                notes: None,
+                clips: vec![
+                    ScriptClip { video_id: 1, in_s: 10.0, out_s: 20.0, audio: Audio::Mute, why: None },
+                    ScriptClip { video_id: 2, in_s: 0.0, out_s: 15.0, audio: Audio::Mute, why: None },
+                ],
+                bed: Some(AudioBed { video_id: 1, in_s: 10.0, out_s: 28.4, why: None, inferred: true }),
+            }],
+        };
+
+        assert_eq!(end_on_sentences(&db, &mut script, &sc()), 1);
+        let bed = script.beats[0].bed.clone().unwrap();
+        assert!((bed.out_s - 31.35).abs() < 0.01, "the bed runs to the end of her sentence: {}", bed.out_s);
+        // And it still fits the pictures, so clamp_beds_to_beats will not cut it back again.
+        clamp_beds_to_beats(&mut script);
+        assert!((script.beats[0].bed.as_ref().unwrap().out_s - 31.35).abs() < 0.01, "clamped away again");
+    }
+
+    /// A bed may not outlast its beat: finishing the sentence would, so it falls back instead of
+    /// being cut off mid-word by the clamp that runs afterwards.
+    #[test]
+    fn a_bed_that_cannot_finish_the_sentence_falls_back_to_the_last_one() {
+        use crate::script::{Audio, AudioBed, Beat, ScriptClip};
+        let db = Db::open_in_memory().unwrap();
+        db.conn.execute("INSERT INTO videos(id, content_hash, size, duration_s) VALUES (1,'h',1,300.0)", []).unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO transcript_segments(video_id, start_s, end_s, text) VALUES
+                 (1, 10.0, 20.0, 'the first whole sentence'), (1, 20.0, 60.0, 'a very long answer')",
+                [],
+            )
+            .unwrap();
+
+        let mut script = Script {
+            title: "t".into(),
+            target_duration_s: None,
+            fps: Default::default(),
+            width: None,
+            height: None,
+            beats: vec![Beat {
+                id: "b1".into(),
+                purpose: "p".into(),
+                narration: None,
+                on_screen_text: None,
+                notes: None,
+                // Only 12 s of pictures.
+                clips: vec![ScriptClip { video_id: 1, in_s: 10.0, out_s: 22.0, audio: Audio::Mute, why: None }],
+                bed: Some(AudioBed { video_id: 1, in_s: 10.0, out_s: 22.0, why: None, inferred: true }),
+            }],
+        };
+
+        end_on_sentences(&db, &mut script, &sc());
+        let bed = script.beats[0].bed.clone().unwrap();
+        assert!(bed.out_s <= 22.05, "the bed stays inside its pictures: {}", bed.out_s);
+        assert!((bed.out_s - 20.35).abs() < 0.01, "and stops where the first sentence did: {}", bed.out_s);
     }
 
     /// Bonsai 2 spent 24 of 55 calls re-fetching four ranges it already had, seven times round a

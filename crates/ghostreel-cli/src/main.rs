@@ -729,6 +729,11 @@ async fn script_cmd(paths: &Paths, action: ScriptAction) -> anyhow::Result<ExitC
             for issue in ghostreel_core::chat::lay_audio_beds(&db, &mut script, &script_cfg) {
                 println!("  [info] {}", issue.message);
             }
+            // And the same guarantee a drafted script gets: nothing stops mid-sentence.
+            let mended = ghostreel_core::chat::end_on_sentences(&db, &mut script, &script_cfg);
+            if mended > 0 {
+                println!("  [info] put {mended} range(s) back on whole sentences");
+            }
             let issues = ghostreel_core::script::validate(&db, p.id, &script)?;
             for issue in &issues {
                 let tag = match issue.severity {

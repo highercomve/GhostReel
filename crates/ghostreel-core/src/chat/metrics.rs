@@ -124,17 +124,23 @@ pub fn measure(db: &Db, draft: Option<&Script>, script: &Script, issues: &[Issue
 }
 
 /// Does this range stop while someone is still speaking?
-fn ends_mid_sentence(db: &Db, video_id: i64, in_s: f64, out_s: f64) -> bool {
+///
+/// A range that ends on a sentence boundary still reaches a little into the next one: the cut runs
+/// past the last word on purpose, so its decay is not chopped off. Touching the next sentence is
+/// not cutting into it — only a range that plays a real part of a sentence and then stops counts,
+/// which is what a listener would call being cut off.
+const CUT_INTO_SENTENCE_S: f64 = 0.6;
+
+fn ends_mid_sentence(db: &Db, video_id: i64, _in_s: f64, out_s: f64) -> bool {
     db.conn
         .query_row(
-            "SELECT MAX(end_s) FROM transcript_segments
-              WHERE video_id = ?1 AND end_s > ?2 AND start_s < ?3",
-            rusqlite::params![video_id, in_s, out_s],
-            |r| r.get::<_, Option<f64>>(0),
+            "SELECT COUNT(*) FROM transcript_segments
+              WHERE video_id = ?1 AND end_s > ?2 + 0.25 AND start_s < ?2 - ?3",
+            rusqlite::params![video_id, out_s, CUT_INTO_SENTENCE_S],
+            |r| r.get::<_, i64>(0),
         )
-        .ok()
-        .flatten()
-        .is_some_and(|last_end| last_end > out_s + 0.25)
+        .unwrap_or(0)
+        > 0
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]

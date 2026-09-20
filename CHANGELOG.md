@@ -13,6 +13,11 @@ versions follow [SemVer](https://semver.org/) while the project is 0.x (minor = 
   dev server and opening on a blank window.
 
 ### Fixed
+- **A bed could still stop in the middle of a sentence.** The guarantee that a cut never leaves
+  someone half-spoken covered clips only, and a bed is where most of the speech lives once one is
+  laid — three of four beds in a Bonsai 2 cut and one in agy's ended mid-thought. A bed is now
+  pulled onto whole sentences like any clip, within the pictures it plays under, so the clamp that
+  keeps it inside its beat cannot undo the fix.
 - **A redraft that came back worse used to win.** When the checks found a problem the model gets
   one more attempt, and whatever it returned was accepted — so a model that answered the complaint
   by breaking something else quietly replaced a better draft. The redraft is now kept only when it
