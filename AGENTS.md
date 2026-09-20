@@ -117,8 +117,10 @@ the video's median level is somebody off the lav — which only works when the i
 finished cut opened with "Okay, cool. So just tell me your name and the line of business that
 you're in." The editor's verdict: "it's like I asked for bloopers."
 
-`ghostreel script interviewer -p <project> [--dry-run]` asks Jev instead, one Noul per line. It
-only ever *adds* flags — the acoustic test is evidence too.
+`ghostreel script interviewer -p <project> [--dry-run|--undo]` asks Jev instead, one Noul per
+line. It only ever *adds* flags — the acoustic test is evidence too — and records how each one was
+set (`off_mic_source` 'level' or 'speech', with `off_mic_p`), because one bit cannot be reviewed,
+re-judged at a different threshold, or undone without re-measuring every video.
 
 - **Batch per video, never across the project.** "The surrounding lines are context" is only true
   if they are the same conversation: batched project-wide that line scored 0.53 and survived; among

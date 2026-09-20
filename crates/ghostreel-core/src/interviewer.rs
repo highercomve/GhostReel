@@ -146,13 +146,32 @@ pub async fn find(db: &Db, project_id: i64, cfg: &JevConfig) -> Result<Vec<Verdi
 pub fn apply(db: &Db, verdicts: &[Verdict], cfg: &JevConfig) -> Result<usize, Error> {
     let mut n = 0;
     for v in verdicts.iter().filter(|v| v.is_interviewer(cfg)) {
+        // 'speech' with the probability that produced it, so this can be reviewed, re-judged at a
+        // different threshold, or undone — none of which is possible from one bit. The `off_mic`
+        // guard keeps an acoustic flag's own provenance intact.
         n += db.conn.execute(
-            "UPDATE transcript_segments SET off_mic = 1
+            "UPDATE transcript_segments SET off_mic = 1, off_mic_source = 'speech', off_mic_p = ?3
              WHERE video_id = ?1 AND ABS(start_s - ?2) < 0.001 AND COALESCE(off_mic, 0) = 0",
-            params![v.video_id, v.start_s],
+            params![v.video_id, v.start_s, v.p],
         )?;
     }
     Ok(n)
+}
+
+/// Undo what this pass did, leaving the acoustic flags alone. Returns how many were cleared.
+///
+/// The point of recording the source: a threshold changed on evidence should be re-runnable, and
+/// an editor who disagrees with a call should not have to re-measure every video's levels.
+pub fn undo(db: &Db, project_id: i64) -> Result<usize, Error> {
+    Ok(db.conn.execute(
+        "UPDATE transcript_segments SET off_mic = 0, off_mic_source = NULL, off_mic_p = NULL
+         WHERE off_mic_source = 'speech' AND video_id IN (
+             SELECT vf.video_id FROM video_files vf
+             JOIN folders f ON f.id = vf.folder_id
+             JOIN project_folders pf ON pf.folder_id = f.id
+             WHERE pf.project_id = ?1)",
+        params![project_id],
+    )?)
 }
 
 #[cfg(test)]
@@ -266,5 +285,36 @@ mod tests {
         assert_eq!(by_video[0].len(), 2);
         assert_eq!(by_video[1].len(), 1);
         assert!(by_video.iter().all(|g| g.iter().all(|r| r.1 == g[0].1)));
+    }
+
+    #[test]
+    fn a_semantic_flag_records_itself_and_can_be_taken_back() {
+        let (db, project_id) = project_with_an_interview();
+        let cfg = JevConfig::default();
+        let verdicts = vec![Verdict { video_id: 1, start_s: 2.0, text: "So just tell me…".into(), p: 0.97 }];
+        assert_eq!(apply(&db, &verdicts, &cfg).unwrap(), 1);
+
+        let (source, p): (String, f64) = db
+            .conn
+            .query_row(
+                "SELECT off_mic_source, off_mic_p FROM transcript_segments WHERE start_s = 2.0",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(source, "speech");
+        assert!((p - 0.97).abs() < 1e-9, "the probability is kept, so it can be re-judged");
+
+        // Undone, and the acoustic flag on "Perfect." is untouched — it was measured, not read.
+        assert_eq!(undo(&db, project_id).unwrap(), 1);
+        let still_off: Vec<String> = db
+            .conn
+            .prepare("SELECT text FROM transcript_segments WHERE COALESCE(off_mic,0)=1")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(still_off, vec!["Perfect."]);
     }
 }

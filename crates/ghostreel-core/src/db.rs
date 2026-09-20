@@ -254,6 +254,16 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE videos ADD COLUMN audio_track INTEGER;
     ALTER TABLE transcript_segments ADD COLUMN off_mic INTEGER;
     "#,
+    // v9 — why a segment is off-mic, and how sure we are. There are two ways of being the wrong
+    // voice and they are not interchangeable: 'level' is the acoustic test in audio.rs, which
+    // only catches an interviewer quieter than the subject, and 'speech' is a judgement about
+    // what was said (interviewer.rs), which catches one sitting next to the mic. Without this the
+    // column is one bit and a semantic flag cannot be reviewed, re-judged at a different
+    // threshold, or undone without re-running the audio pass over every video.
+    r#"
+    ALTER TABLE transcript_segments ADD COLUMN off_mic_source TEXT;
+    ALTER TABLE transcript_segments ADD COLUMN off_mic_p REAL;
+    "#,
 ];
 
 static REGISTER_VEC: Once = Once::new();
@@ -350,8 +360,12 @@ impl Db {
 
     /// Mark which transcript segments are someone off the microphone, by segment start.
     pub fn set_off_mic(&self, video_id: i64, flags: &[(f64, Option<bool>)]) -> Result<(), Error> {
-        let mut st =
-            self.conn.prepare("UPDATE transcript_segments SET off_mic = ?3 WHERE video_id = ?1 AND start_s = ?2")?;
+        // 'level': measured, not read. The semantic pass records itself separately and never
+        // overwrites one of these, so re-running either is safe.
+        let mut st = self.conn.prepare(
+            "UPDATE transcript_segments SET off_mic = ?3, off_mic_source = 'level', off_mic_p = NULL
+             WHERE video_id = ?1 AND start_s = ?2",
+        )?;
         for (start_s, flag) in flags {
             st.execute(rusqlite::params![video_id, start_s, flag])?;
         }

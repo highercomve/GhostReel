@@ -188,6 +188,9 @@ enum ScriptAction {
         /// Show what would be flagged without changing anything.
         #[arg(long)]
         dry_run: bool,
+        /// Clear the flags this pass set, leaving the acoustic ones alone.
+        #[arg(long, conflicts_with = "dry_run")]
+        undo: bool,
     },
     /// Build a cut by choosing rather than writing: Jev picks the quotes and the shots out of the
     /// index, and nothing is generated, so no clip can refer to footage that does not exist.
@@ -843,9 +846,14 @@ async fn script_cmd(paths: &Paths, action: ScriptAction) -> anyhow::Result<ExitC
                 }
             }
         }
-        ScriptAction::Interviewer { project, dry_run } => {
+        ScriptAction::Interviewer { project, dry_run, undo } => {
             let p = db.require_project(&project)?;
             let config = Config::load(&paths.config_file).unwrap_or_default();
+            if undo {
+                let n = ghostreel_core::interviewer::undo(&db, p.id)?;
+                println!("cleared {n} line(s) this pass had flagged; the measured ones are untouched");
+                return Ok(ExitCode::SUCCESS);
+            }
             let verdicts = ghostreel_core::interviewer::find(&db, p.id, &config.jev).await?;
 
             let found: Vec<_> = verdicts.iter().filter(|v| v.is_interviewer(&config.jev)).collect();
