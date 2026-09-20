@@ -1439,8 +1439,16 @@ pub fn trim_pictures_to_bed(script: &mut Script, cfg: &crate::config::ScriptConf
             continue;
         }
 
-        let mut excess = beat.clips.iter().map(|c| (c.out_s - c.in_s).max(0.0)).sum::<f64>() - bed_len;
+        let beat_len = beat.clips.iter().map(|c| (c.out_s - c.in_s).max(0.0)).sum::<f64>();
+        let mut excess = beat_len - bed_len;
         if excess <= 0.1 {
+            continue;
+        }
+        // This trims a tail, not a piece. When the voice covers less than half the beat the
+        // model has built something else — pictures that needed narration, or a second speaker —
+        // and cutting to the bed would throw most of the cut away: a Qwen draft collapsed from
+        // 53.6 s to 8.0 s. Leave it, and let the silent picture show in the score.
+        if excess > beat_len * 0.5 {
             continue;
         }
         let mut touched = false;
@@ -4515,6 +4523,36 @@ mod tests {
         assert!(beat.clips[1].out_s - beat.clips[1].in_s > 2.0, "and the cutaway is still a shot");
     }
 
+    /// The trim takes a tail, not a piece: a beat whose voice covers a fraction of its pictures
+    /// is a different mistake, and cutting to the bed threw most of a Qwen cut away.
+    #[test]
+    fn a_beat_whose_voice_covers_little_of_it_is_left_alone() {
+        use crate::script::{Audio, AudioBed, Beat, ScriptClip};
+        let mut script = Script {
+            title: "t".into(),
+            target_duration_s: None,
+            fps: Default::default(),
+            width: None,
+            height: None,
+            beats: vec![Beat {
+                id: "b1".into(),
+                purpose: "p".into(),
+                narration: None,
+                on_screen_text: None,
+                notes: None,
+                // 40 s of pictures over 8 s of voice.
+                clips: vec![
+                    ScriptClip { video_id: 1, in_s: 0.0, out_s: 8.0, audio: Audio::Mute, why: None },
+                    ScriptClip { video_id: 2, in_s: 0.0, out_s: 16.0, audio: Audio::Mute, why: None },
+                    ScriptClip { video_id: 3, in_s: 0.0, out_s: 16.0, audio: Audio::Mute, why: None },
+                ],
+                bed: Some(AudioBed { video_id: 1, in_s: 0.0, out_s: 8.0, why: None, inferred: true }),
+            }],
+        };
+        assert_eq!(trim_pictures_to_bed(&mut script, &sc()), 0, "the cut is not thrown away");
+        assert_eq!(script.beats[0].clips.len(), 3);
+    }
+
     /// When there is not enough give in the shots to reach the voice, the trailing pictures go
     /// rather than becoming flashes — and never the opening face.
     #[test]
@@ -4532,12 +4570,13 @@ mod tests {
                 narration: None,
                 on_screen_text: None,
                 notes: None,
-                // 12 s of picture over 3 s of voice: no amount of trimming keeps both shots.
+                // 12 s of picture over 7 s of voice: a tail worth taking, but not enough give in
+                // the two shots to reach it without one of them going.
                 clips: vec![
                     ScriptClip { video_id: 1, in_s: 0.0, out_s: 8.0, audio: Audio::Mute, why: None },
                     ScriptClip { video_id: 2, in_s: 0.0, out_s: 4.0, audio: Audio::Mute, why: None },
                 ],
-                bed: Some(AudioBed { video_id: 1, in_s: 0.0, out_s: 3.0, why: None, inferred: true }),
+                bed: Some(AudioBed { video_id: 1, in_s: 0.0, out_s: 7.0, why: None, inferred: true }),
             }],
         };
 
@@ -4548,10 +4587,7 @@ mod tests {
         // As close to the voice as the minimum shot length allows: a picture held under 4 s
         // reads as a flash, which is worse than a second of tail.
         let pictures: f64 = beat.clips.iter().map(|c| c.out_s - c.in_s).sum();
-        assert!(
-            (pictures - sc().min_trimmed_clip_s).abs() < 0.05,
-            "left at the shortest a shot may be: {pictures}"
-        );
+        assert!((pictures - 7.0).abs() < 0.05, "what is left ends with the voice: {pictures}");
     }
 
     /// A beat read over by narration may hold its pictures: there is something to hear.
