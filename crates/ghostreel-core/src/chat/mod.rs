@@ -193,9 +193,34 @@ pub const CANCELLED: &str = "stopped";
 /// `enforce_target`) a total far from the target.
 pub fn pacing_issues(script: &Script, enforce_target: bool, cfg: &crate::config::ScriptConfig) -> Vec<Issue> {
     let mut issues = Vec::new();
+    // No single shot may dominate the piece. `max_clip_s` is an absolute 30 s, which says nothing
+    // useful about a 40 s cut: a local model filled one with eight clips of twenty-odd seconds,
+    // every one of them "legal", and the result ran 349% over with nothing to trim — speech is
+    // never scaled, and dropping beats could not reach the target without gutting the cut. The
+    // only cure is upstream, while the model can still choose differently.
+    let dominant_s = script
+        .target_duration_s
+        .filter(|t| *t > 0.0 && enforce_target)
+        .map(|t| (t / 3.0).max(cfg.min_clip_s * 2.0))
+        .unwrap_or(f64::MAX);
     for beat in &script.beats {
         for (i, c) in beat.clips.iter().enumerate() {
             let len = c.out_s - c.in_s;
+            if len > dominant_s && len <= cfg.max_clip_s {
+                issues.push(Issue {
+                    severity: IssueSeverity::Warning,
+                    beat_id: Some(beat.id.clone()),
+                    clip_index: Some(i),
+                    message: format!(
+                        "clip is {len:.1} s of a {:.0} s piece (video #{} {:.1}–{:.1}); no shot should take more \
+                         than a third — keep it under {dominant_s:.0} s or use fewer beats",
+                        script.target_duration_s.unwrap_or_default(),
+                        c.video_id,
+                        c.in_s,
+                        c.out_s
+                    ),
+                });
+            }
             if len > cfg.max_clip_s {
                 issues.push(Issue {
                     severity: IssueSeverity::Warning,
@@ -1751,7 +1776,71 @@ fn fit_to_target(db: &Db, script: &mut Script, cfg: &crate::config::ScriptConfig
         }
     }
     clamp_beds_to_beats(db, script, cfg);
+
+    // Pictures alone cannot save a cut made of speech. A model that chose seven quotes of
+    // twenty-five seconds is 349% over and there is nothing to scale: the rule that speech is
+    // never scaled is what stops it, and rightly. What it can lose is a whole quote — that ends
+    // on a sentence by construction, so dropping one breaks nothing.
+    //
+    // The opening and the closing stay: they are the two positions a viewer notices, and a piece
+    // that keeps its hook and its ending and loses a middle is still the piece. Middles go from
+    // the back, so what survives is what was set up earliest.
+    changed |= drop_beats_to_target(db, script, cfg);
     changed
+}
+
+/// Drop whole beats, from the middle and the back, until the cut is near its target.
+///
+/// Returns whether anything was dropped. Never leaves fewer than two beats: below that it is no
+/// longer the script the model wrote, and the score reports the overrun instead.
+fn drop_beats_to_target(db: &Db, script: &mut Script, cfg: &crate::config::ScriptConfig) -> bool {
+    let Some(target) = script.target_duration_s.filter(|t| *t > 0.0) else { return false };
+    let ceiling = target * cfg.target_overshoot;
+    if script.total_duration_s() <= ceiling || script.beats.len() <= 2 {
+        return false;
+    }
+
+    // Dropping has to stop before the cut stops being the model's. Half the clips is the line the
+    // replay eval draws — "a cut assembled from a third of what the model chose is not the cut it
+    // wrote" — and a wall of eleven talking heads hit it immediately.
+    //
+    // Decided up front, not greedily, because a greedy loop that stops at the floor leaves the
+    // cut still over the ceiling, and the next pass recomputes a lower floor and drops again:
+    // repairing an already-repaired script took it from 53.0 s to 43.4 s. Either the target is
+    // reachable while keeping half the clips, or nothing is dropped and the score reports the
+    // overrun.
+    let floor = script.clip_count().div_ceil(2);
+    let mut plan: Vec<usize> = Vec::new();
+    let mut length = script.total_duration_s();
+    let mut clips = script.clip_count();
+    let mut beats = script.beats.len();
+    // Walk the middles from the back, as `remove` would.
+    for i in (1..script.beats.len() - 1).rev() {
+        if length <= ceiling || beats <= 2 {
+            break;
+        }
+        let beat = &script.beats[i];
+        if clips - beat.clips.len() < floor {
+            break;
+        }
+        length -= beat.clips.iter().map(|c| (c.out_s - c.in_s).max(0.0)).sum::<f64>();
+        clips -= beat.clips.len();
+        beats -= 1;
+        plan.push(i);
+    }
+    if length > ceiling {
+        return false; // cannot get there without gutting it
+    }
+
+    let mut dropped = false;
+    for i in plan {
+        script.beats.remove(i);
+        dropped = true;
+    }
+    if dropped {
+        clamp_beds_to_beats(db, script, cfg);
+    }
+    dropped
 }
 
 /// Hold the b-roll longer when the cut came in short.
@@ -3732,6 +3821,75 @@ pub fn lay_audio_beds(db: &Db, s: &mut Script, cfg: &crate::config::ScriptConfig
 mod tests {
     use super::*;
 
+    /// A speech-heavy cut far over target loses whole quotes, not seconds off each one.
+    ///
+    /// Picture scaling cannot touch it — `speech_factor` is 1.0 on purpose — so before this a
+    /// local model's seven-beat draft stayed at 179.6 s against a 40 s target and the only thing
+    /// that happened was a warning.
+    #[test]
+    fn a_cut_made_of_speech_loses_beats_rather_than_sentences() {
+        use crate::script::{Audio, Beat, ScriptClip};
+        let db = Db::open_in_memory().unwrap();
+        let cfg = crate::config::ScriptConfig::default();
+
+        let beat = |id: &str, secs: f64| Beat {
+            id: id.into(),
+            purpose: format!("beat {id}"),
+            narration: None,
+            on_screen_text: None,
+            clips: vec![ScriptClip { video_id: 1, in_s: 0.0, out_s: secs, audio: Audio::Source, why: None }],
+            bed: None,
+            notes: None,
+        };
+        let mut script = Script {
+            title: "t".into(),
+            target_duration_s: Some(40.0),
+            fps: None,
+            width: None,
+            height: None,
+            beats: vec![beat("open", 25.0), beat("mid-1", 25.0), beat("mid-2", 25.0), beat("close", 25.0)],
+        };
+
+        assert!(drop_beats_to_target(&db, &mut script, &cfg), "100 s against 40 s must lose something");
+
+        let ids: Vec<&str> = script.beats.iter().map(|b| b.id.as_str()).collect();
+        // The hook and the ending are the two positions a viewer notices; middles go from the back.
+        assert_eq!(ids.first(), Some(&"open"));
+        assert_eq!(ids.last(), Some(&"close"));
+        assert!(!ids.contains(&"mid-2"), "the last middle goes first: {ids:?}");
+        assert!(script.total_duration_s() <= 40.0 * cfg.target_overshoot);
+    }
+
+    #[test]
+    fn dropping_stops_before_it_stops_being_the_script() {
+        use crate::script::{Audio, Beat, ScriptClip};
+        let db = Db::open_in_memory().unwrap();
+        let cfg = crate::config::ScriptConfig::default();
+        let beat = |id: &str| Beat {
+            id: id.into(),
+            purpose: "p".into(),
+            narration: None,
+            on_screen_text: None,
+            clips: vec![ScriptClip { video_id: 1, in_s: 0.0, out_s: 90.0, audio: Audio::Source, why: None }],
+            bed: None,
+            notes: None,
+        };
+        // Two beats of 90 s against a 10 s target: hopeless, and dropping to one would not be
+        // the script any more. The score reports the overrun instead.
+        let mut script = Script {
+            title: "t".into(),
+            target_duration_s: Some(10.0),
+            fps: None,
+            width: None,
+            height: None,
+            beats: vec![beat("open"), beat("close")],
+        };
+        assert!(!drop_beats_to_target(&db, &mut script, &cfg));
+        assert_eq!(script.beats.len(), 2);
+    }
+
+    use super::*;
+
     /// Default script settings for tests.
     fn sc() -> crate::config::ScriptConfig {
         crate::config::ScriptConfig::default()
@@ -4265,7 +4423,7 @@ mod tests {
         // produced no matter what the rules say.
         let schema = serde_json::to_string(&local_action_schema()).unwrap();
         assert!(schema.contains("reply"), "the action schema must allow a reply");
-        let forced = serde_json::to_string(&local_final_action_schema()).unwrap();
+        let forced = serde_json::to_string(&local_final_action_schema(true)).unwrap();
         assert!(forced.contains("reply"), "even when pushed to finish, it may answer instead");
 
         // A tool call and a script still parse as before.

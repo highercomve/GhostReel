@@ -72,7 +72,17 @@ A draft then goes through repair passes, in this order, and the order matters:
 `end_on_sentences` → `clamp_beds_to_beats`. Invariants worth not breaking:
 
 - **Speech is never scaled and never ends mid-sentence.** Length is a target; a sentence is not.
-  Anything that trims clips must be followed by `end_on_sentences`.
+  Anything that trims clips must be followed by `end_on_sentences`. A cut made mostly of speech
+  therefore cannot be squeezed at all — what it loses instead is a whole beat, which ends on a
+  sentence by construction (`drop_beats_to_target`). The opening and the closing stay; middles go
+  from the back. It is planned up front rather than greedily, because a greedy loop that stops at
+  its floor leaves the cut over the ceiling and the next pass drops again (53.0 s → 43.4 s), and
+  it never takes a script below half the clips the model chose — past that the score reports the
+  overrun instead.
+- **No shot may take more than a third of the target.** `max_clip_s` is an absolute 30 s and says
+  nothing about a 40 s cut: a local model filled one with eight clips of twenty-odd seconds, every
+  one legal, and it ran 349% over with nothing to trim. `pacing_issues` flags it while the model
+  can still choose differently.
 - **A bed is the beat's sound**, so its clips play muted and it cannot outlast them — anything that
   moves clips must be followed by `clamp_beds_to_beats`. That clamp is the *last* thing to touch a
   bed and so the last chance to cut a speaker off: when trimming the bed to its pictures would land
