@@ -12,6 +12,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub mod metrics;
+pub mod repair;
+pub use enforce_grounding_and_pacing as repair_draft;
 pub mod tools;
 pub use metrics::{ScriptMetrics, ScriptScore, measure, score};
 pub use tools::{Detail, tools_definition};
@@ -227,7 +229,7 @@ pub fn pacing_issues(script: &Script, enforce_target: bool, cfg: &crate::config:
 /// Drop ungrounded/foreign clips and trim over-long ones; with `enforce_target`, also squeeze the
 /// total toward the target. Revisions don't enforce it: the user's feedback ("slower", "longer")
 /// must be able to change the length. Returns the issues describing the changes.
-fn enforce_grounding_and_pacing(
+pub fn enforce_grounding_and_pacing(
     db: &Db,
     project_id: i64,
     s: &mut Script,
@@ -1500,6 +1502,16 @@ pub fn hold_the_last_picture(db: &Db, script: &mut Script, cfg: &crate::config::
     if beat.narration.as_deref().map(str::trim).is_some_and(|n| !n.is_empty()) {
         return 0.0;
     }
+    // Already held? A hold leaves the last picture outlasting the sound under it, and doing it
+    // again on every repair would add two seconds each time.
+    let pictures: f64 = beat.clips.iter().map(|c| (c.out_s - c.in_s).max(0.0)).sum();
+    match &beat.bed {
+        Some(bed) if pictures > bed.duration_s() + 0.2 => return 0.0,
+        // Without a bed the voice is the last clip's own, so a silent last picture is a held one.
+        None if beat.clips.last().is_some_and(|c| c.audio == crate::script::Audio::Mute) => return 0.0,
+        _ => {}
+    }
+
     let Some(last) = beat.clips.last_mut() else { return 0.0 };
     let duration = video_duration(db, last.video_id).unwrap_or(f64::MAX);
     let room = (duration - last.out_s).max(0.0);
@@ -2167,6 +2179,10 @@ pub fn end_on_sentences(db: &Db, script: &mut Script, cfg: &crate::config::Scrip
     fixed
 }
 
+/// How much of a sentence a range has to play before stopping in it counts as cutting into it.
+/// Below this it is the deliberate overrun past the last word, not an interruption.
+const CUT_INTO_SENTENCE_S: f64 = 0.6;
+
 /// Every sentence boundary in a video, as (start, end) pairs in order.
 fn sentence_edges(db: &Db, video_id: i64) -> Vec<(f64, f64)> {
     db.conn
@@ -2197,8 +2213,11 @@ fn snap_range(
     let (mut in_s, mut out_s) = (in_s, out_s);
     let ceiling = cap_out.unwrap_or(f64::MAX).min(duration);
 
-    // The end. Run on to the last word, or fall back to where an earlier sentence stopped.
-    let sentence_end = segs[last].1;
+    // The end. The sentence to finish is one the range is genuinely inside — a range that ends on
+    // a boundary still reaches a little past it on purpose, and treating that as "inside the next
+    // sentence" makes every pass swallow one more: a cut grew 126 s to 154 s being repaired twice.
+    let cut_into = overlapping.iter().rev().find(|&&i| segs[i].0 < out_s - CUT_INTO_SENTENCE_S).copied();
+    let sentence_end = cut_into.map(|i| segs[i].1).unwrap_or(out_s);
     if sentence_end > out_s + 0.05 {
         let wanted = (sentence_end + cfg.speech_overrun_s).min(duration);
         if wanted - out_s <= cfg.max_speech_extend_s && wanted <= ceiling {
@@ -2253,7 +2272,17 @@ fn pad_speech(db: &Db, script: &mut Script, cfg: &crate::config::ScriptConfig) -
         let duration = video_duration(db, c.video_id).unwrap_or(f64::MAX);
         let (old_in, old_out) = (c.in_s, c.out_s);
 
-        let speech_end = segs[last].1;
+        // The sentence to hold after is the last one the clip really contains — not one its own
+        // padding reached into. Without that distinction each pass swallows another sentence:
+        // repairing an already-repaired script grew a cut from 152.9 s to 178.7 s, and every
+        // `script import` of a saved script inflated it a little more.
+        let speech_end = overlapping
+            .iter()
+            .rev()
+            .map(|&i| segs[i].1)
+            .find(|&e| e <= c.out_s + 0.05)
+            .unwrap_or(segs[last].1);
+        let last = overlapping.iter().rev().find(|&&i| segs[i].1 <= c.out_s + 0.05).copied().unwrap_or(last);
         let mut out = speech_end + cfg.speech_tail_s;
         if let Some(next) = segs.get(last + 1) {
             // Stop short of the next sentence — but when the speaker runs straight on there is
@@ -3156,75 +3185,14 @@ pub async fn run_turn(
     let mut issues = pre_issues;
 
     if let Some(mut s) = parsed_script {
-        if s.clip_count() > 0 && !s.beats.is_empty() {
-            let _ = snap_to_segments(&ctx.db, &mut s)?;
-            pad_speech(&ctx.db, &mut s, &ctx.script);
-            clamp_to_duration(&ctx.db, &mut s);
-            let muted = mute_silent_clips(&ctx.db, &mut s);
-            if muted > 0 {
-                issues.push(Issue {
-                    severity: IssueSeverity::Info,
-                    beat_id: None,
-                    clip_index: None,
-                    message: format!("muted {muted} clip(s) without speech under the narration"),
-                });
+        match repair::finish_script(&ctx.db, project_id, &mut s, enforce_target, &ctx.script)? {
+            Some(more) => {
+                issues.extend(more);
+                let sid = save_version(&ctx.db, project_id, &s, Some(session_id))?;
+                script_id = Some(sid);
+                parsed_script = Some(s);
             }
-            // snap_to_segments and pad_speech above pull clips out to whole sentences, which
-            // undoes the trim enforce_grounding_and_pacing just made: an interview-led cut came
-            // out 37% over target because the last word on the subject was padding, not trimming.
-            // Fit once more, now that the clips are their final length.
-            if enforce_target {
-                let before = s.total_duration_s();
-                if fit_to_target(&ctx.db, &mut s, &ctx.script) {
-                    // Trimming can cut a sentence short again. Snapping only reaches 0.75 s, so
-                    // this puts every voice back on a whole sentence whatever the trim did — the
-                    // length gives way to the speaker, not the other way round.
-                    let _ = snap_to_segments(&ctx.db, &mut s)?;
-                    let mended = end_on_sentences(&ctx.db, &mut s, &ctx.script);
-                    let shortened = trim_pictures_to_bed(&mut s, &ctx.script);
-                    let held = hold_the_last_picture(&ctx.db, &mut s, &ctx.script);
-                    if held > 0.0 {
-                        issues.push(Issue {
-                            severity: IssueSeverity::Info,
-                            beat_id: None,
-                            clip_index: None,
-                            message: format!("held the closing picture for {held:.1} s of quiet"),
-                        });
-                    }
-                    if shortened > 0 {
-                        issues.push(Issue {
-                            severity: IssueSeverity::Info,
-                            beat_id: None,
-                            clip_index: None,
-                            message: format!("cut the pictures back to the voice in {shortened} beat(s)"),
-                        });
-                    }
-                    if mended > 0 {
-                        issues.push(Issue {
-                            severity: IssueSeverity::Info,
-                            beat_id: None,
-                            clip_index: None,
-                            message: format!("put {mended} clip(s) back on whole sentences after fitting"),
-                        });
-                    }
-                    issues.push(Issue {
-                        severity: IssueSeverity::Info,
-                        beat_id: None,
-                        clip_index: None,
-                        message: format!(
-                            "fitted to target after padding: {before:.1} s → {:.1} s",
-                            s.total_duration_s()
-                        ),
-                    });
-                }
-            }
-            issues.extend(content_issues(&ctx.db, &s, &ctx.script));
-            issues.extend(validate(&ctx.db, project_id, &s)?);
-            let sid = save_version(&ctx.db, project_id, &s, Some(session_id))?;
-            script_id = Some(sid);
-            parsed_script = Some(s);
-        } else {
-            parsed_script = None;
+            None => parsed_script = None,
         }
     }
 
@@ -4482,7 +4450,9 @@ mod tests {
             narration: narration.map(str::to_string),
             on_screen_text: None,
             notes: None,
-            clips: vec![ScriptClip { video_id: 1, in_s: 10.0, out_s, audio: Audio::Mute, why: None }],
+            // A beat that ends on someone speaking: the case a hold is for. A last picture that
+            // is already silent has ended the piece by itself and is left alone.
+            clips: vec![ScriptClip { video_id: 1, in_s: 10.0, out_s, audio: Audio::Source, why: None }],
             bed: None,
         };
         let script_of = |b: Beat| Script {

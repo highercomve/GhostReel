@@ -1,0 +1,128 @@
+{
+  "title": "Northwest Hills: A Community That Feels Like Home",
+  "target_duration_s": 40.0,
+  "fps": {
+    "num": 30,
+    "den": 1
+  },
+  "width": 3840,
+  "height": 2160,
+  "beats": [
+    {
+      "id": "beat_1",
+      "purpose": "Open with the community's defining trait: a tight, old-school neighborhood feel. Chad's line names the feeling, then b-roll shows the actual streets, hills, and houses that create it.",
+      "narration": "",
+      "on_screen_text": "Northwest Hills",
+      "clips": [
+        {
+          "video_id": 41,
+          "in_s": 195.3,
+          "out_s": 201.07,
+          "audio": "mute"
+        },
+        {
+          "video_id": 9,
+          "in_s": 16.77,
+          "out_s": 20.77,
+          "audio": "mute"
+        },
+        {
+          "video_id": 14,
+          "in_s": 20.68,
+          "out_s": 24.68,
+          "audio": "mute"
+        },
+        {
+          "video_id": 15,
+          "in_s": 1.0,
+          "out_s": 5.0,
+          "audio": "mute"
+        },
+        {
+          "video_id": 24,
+          "in_s": 15.87,
+          "out_s": 19.869999999999997,
+          "audio": "mute"
+        }
+      ],
+      "bed": {
+        "video_id": 41,
+        "in_s": 195.3,
+        "out_s": 217.07,
+        "inferred": true
+      }
+    },
+    {
+      "id": "beat_2",
+      "purpose": "Adrienne adds the 'big small town' and deer angle, grounding the community in its natural, lived-in character.",
+      "narration": "",
+      "on_screen_text": "",
+      "clips": [
+        {
+          "video_id": 100,
+          "in_s": 53.0,
+          "out_s": 62.35,
+          "audio": "mute"
+        },
+        {
+          "video_id": 14,
+          "in_s": 40.37,
+          "out_s": 44.37,
+          "audio": "mute"
+        }
+      ],
+      "bed": {
+        "video_id": 100,
+        "in_s": 53.0,
+        "out_s": 66.35,
+        "inferred": true
+      }
+    },
+    {
+      "id": "beat_3",
+      "purpose": "Hunter counters the 'stuffy' assumption with warmth and friendliness, showing the community's welcoming social fabric.",
+      "narration": "",
+      "on_screen_text": "",
+      "clips": [
+        {
+          "video_id": 103,
+          "in_s": 191.32,
+          "out_s": 198.75,
+          "audio": "mute"
+        },
+        {
+          "video_id": 14,
+          "in_s": 60.05,
+          "out_s": 68.0,
+          "audio": "mute"
+        }
+      ],
+      "bed": {
+        "video_id": 103,
+        "in_s": 191.32,
+        "out_s": 206.7,
+        "inferred": true
+      }
+    },
+    {
+      "id": "beat_4",
+      "purpose": "Rob closes the story by naming the neighborhood's identity and local pride, leaving the viewer with a sense of place and belonging.",
+      "narration": "",
+      "on_screen_text": "Home in Northwest Hills",
+      "clips": [
+        {
+          "video_id": 40,
+          "in_s": 18.16,
+          "out_s": 26.36,
+          "audio": "mute"
+        }
+      ],
+      "bed": {
+        "video_id": 40,
+        "in_s": 18.16,
+        "out_s": 26.36,
+        "inferred": true
+      }
+    }
+  ]
+}

@@ -1,0 +1,120 @@
+{
+  "title": "Northwest Hills \u2014 Real Neighborhood, Real Community",
+  "target_duration_s": 40.0,
+  "fps": {
+    "num": 30,
+    "den": 1
+  },
+  "width": 3840,
+  "height": 2160,
+  "beats": [
+    {
+      "id": "old-school-neighborhood",
+      "purpose": "Establish Northwest Hills as a genuine, old-school neighborhood through lifelong resident Chad Adams.",
+      "narration": "",
+      "clips": [
+        {
+          "video_id": 41,
+          "in_s": 223.76,
+          "out_s": 234.28,
+          "audio": "mute",
+          "why": "Show Chad Adams on camera as he introduces the character of Northwest Hills."
+        },
+        {
+          "video_id": 34,
+          "in_s": 0.0,
+          "out_s": 4.0,
+          "audio": "mute",
+          "why": "Cut to the iconic Mesa Drive and North Hills Drive neighborhood street signpost."
+        }
+      ],
+      "bed": {
+        "video_id": 41,
+        "in_s": 223.76,
+        "out_s": 235.68,
+        "why": "Chad Adams describes how Northwest Hills embodies a genuine, old-school neighborhood."
+      }
+    },
+    {
+      "id": "small-town-feel",
+      "purpose": "Highlight the small-town community atmosphere and scenic green valley described by resident Adrienne Calhoun.",
+      "narration": "",
+      "clips": [
+        {
+          "video_id": 100,
+          "in_s": 72.0,
+          "out_s": 77.0,
+          "audio": "mute",
+          "why": "Show Adrienne Calhoun speaking on camera about the small-town community."
+        },
+        {
+          "video_id": 24,
+          "in_s": 4.0,
+          "out_s": 8.0,
+          "audio": "mute",
+          "why": "Cut to a steady wide vista of the lush valley and hillside homes."
+        }
+      ],
+      "bed": {
+        "video_id": 100,
+        "in_s": 72.0,
+        "out_s": 80.0,
+        "why": "Adrienne Calhoun reflects on the small-town neighborhood feel and beauty of the area."
+      }
+    },
+    {
+      "id": "welcoming-atmosphere",
+      "purpose": "Showcase the unpretentious and friendly spirit of Northwest Hills through local business owner Austin Stone.",
+      "narration": "",
+      "clips": [
+        {
+          "video_id": 103,
+          "in_s": 193.32,
+          "out_s": 198.4,
+          "audio": "mute",
+          "why": "Show Austin Stone speaking on camera about the community vibe."
+        },
+        {
+          "video_id": 15,
+          "in_s": 151.4,
+          "out_s": 157.43657362848893,
+          "audio": "mute",
+          "why": "Cut to stabilized b-roll of tree-lined residential roads nestled into the hills."
+        }
+      ],
+      "bed": {
+        "video_id": 103,
+        "in_s": 193.32,
+        "out_s": 204.78657362848892,
+        "why": "Austin Stone shares how welcoming and unstuffy Northwest Hills is compared to other high-end areas."
+      }
+    },
+    {
+      "id": "tight-knit-support",
+      "purpose": "Land on the deep community roots and mutual support that define Northwest Hills with Hunter Malloy.",
+      "narration": "",
+      "clips": [
+        {
+          "video_id": 102,
+          "in_s": 56.02,
+          "out_s": 62.26,
+          "audio": "mute",
+          "why": "Show Hunter Malloy speaking on camera about community representation and support."
+        },
+        {
+          "video_id": 24,
+          "in_s": 8.0,
+          "out_s": 12.0,
+          "audio": "mute",
+          "why": "Cut to a broad scenic view across the Northwest Hills neighborhood canopy."
+        }
+      ],
+      "bed": {
+        "video_id": 102,
+        "in_s": 56.28,
+        "out_s": 66.22,
+        "why": "Hunter Malloy concludes with their tight-knit commitment to supporting neighbors and local youth."
+      }
+    }
+  ]
+}

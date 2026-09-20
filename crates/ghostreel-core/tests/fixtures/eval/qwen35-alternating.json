@@ -1,0 +1,124 @@
+{
+  "title": "Northwest Hills",
+  "target_duration_s": 40.0,
+  "fps": {
+    "num": 30,
+    "den": 1
+  },
+  "width": 3840,
+  "height": 2160,
+  "beats": [
+    {
+      "id": "hook-establish-the-genuine",
+      "purpose": "Hook: Establish the genuine, real nature of the neighborhood.",
+      "narration": "",
+      "on_screen_text": "Northwest Hills",
+      "clips": [
+        {
+          "video_id": 41,
+          "in_s": 136.3,
+          "out_s": 145.65,
+          "audio": "source"
+        }
+      ]
+    },
+    {
+      "id": "1",
+      "purpose": "Visualize the small-town feel with a wide valley shot.",
+      "narration": "It feels like you're in a more of a small town neighborhood and we just love it.",
+      "on_screen_text": "",
+      "clips": [
+        {
+          "video_id": 9,
+          "in_s": 16.77,
+          "out_s": 20.77,
+          "audio": "mute"
+        }
+      ]
+    },
+    {
+      "id": "2",
+      "purpose": "Show the community connection through another resident.",
+      "narration": "",
+      "on_screen_text": "",
+      "clips": [
+        {
+          "video_id": 100,
+          "in_s": 102.0,
+          "out_s": 108.35,
+          "audio": "source"
+        }
+      ]
+    },
+    {
+      "id": "3",
+      "purpose": "Show the family-friendly aspect with a hillside view.",
+      "narration": "It's a place that not only you want to live but when you get to be an adult you want to be back there with your kids.",
+      "on_screen_text": "",
+      "clips": [
+        {
+          "video_id": 24,
+          "in_s": 15.87,
+          "out_s": 19.869999999999997,
+          "audio": "mute"
+        }
+      ]
+    },
+    {
+      "id": "4",
+      "purpose": "Highlight local business support and community roots.",
+      "narration": "",
+      "on_screen_text": "",
+      "clips": [
+        {
+          "video_id": 102,
+          "in_s": 71.9,
+          "out_s": 79.61,
+          "audio": "source"
+        }
+      ]
+    },
+    {
+      "id": "5",
+      "purpose": "Reinforce the community bond with a scenic shot.",
+      "narration": "The Northwest Hills community is very unique and special because people recognize each other and support each other.",
+      "on_screen_text": "",
+      "clips": [
+        {
+          "video_id": 9,
+          "in_s": 32.53,
+          "out_s": 36.53,
+          "audio": "mute"
+        }
+      ]
+    },
+    {
+      "id": "6",
+      "purpose": "Show the welcoming, non-stuffy atmosphere.",
+      "narration": "",
+      "on_screen_text": "",
+      "clips": [
+        {
+          "video_id": 103,
+          "in_s": 157.46,
+          "out_s": 166.07,
+          "audio": "source"
+        }
+      ]
+    },
+    {
+      "id": "7",
+      "purpose": "End with a strong statement on community support over a valley view.",
+      "narration": "That's what's great about the community of the Great Magazine because everyone kind of is on each other's side.",
+      "on_screen_text": "",
+      "clips": [
+        {
+          "video_id": 29,
+          "in_s": 0.56,
+          "out_s": 4.5600000000000005,
+          "audio": "mute"
+        }
+      ]
+    }
+  ]
+}

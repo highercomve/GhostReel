@@ -1,0 +1,166 @@
+{
+  "title": "Greet Mag: Northwest Hills Community",
+  "target_duration_s": 40.0,
+  "fps": {
+    "num": 30,
+    "den": 1
+  },
+  "width": 3840,
+  "height": 2160,
+  "beats": [
+    {
+      "id": "chad",
+      "purpose": "introduce",
+      "narration": "",
+      "on_screen_text": "Chad Adams",
+      "clips": [
+        {
+          "video_id": 41,
+          "in_s": 165.04,
+          "out_s": 172.56,
+          "audio": "source"
+        }
+      ]
+    },
+    {
+      "id": "chad-2",
+      "purpose": "develop",
+      "narration": "",
+      "on_screen_text": "",
+      "clips": [
+        {
+          "video_id": 41,
+          "in_s": 195.3,
+          "out_s": 205.03,
+          "audio": "source"
+        }
+      ]
+    },
+    {
+      "id": "hunter",
+      "purpose": "develop",
+      "narration": "",
+      "on_screen_text": "Hunter Malloy",
+      "clips": [
+        {
+          "video_id": 102,
+          "in_s": 26.0,
+          "out_s": 30.41,
+          "audio": "source"
+        }
+      ]
+    },
+    {
+      "id": "hunter-2",
+      "purpose": "develop",
+      "narration": "",
+      "on_screen_text": "",
+      "clips": [
+        {
+          "video_id": 103,
+          "in_s": 193.32,
+          "out_s": 208.51,
+          "audio": "source"
+        }
+      ]
+    },
+    {
+      "id": "adrienne",
+      "purpose": "develop",
+      "narration": "",
+      "on_screen_text": "Adrienne Calhoun",
+      "clips": [
+        {
+          "video_id": 100,
+          "in_s": 53.0,
+          "out_s": 62.35,
+          "audio": "source"
+        }
+      ]
+    },
+    {
+      "id": "adrienne-2",
+      "purpose": "develop",
+      "narration": "",
+      "on_screen_text": "",
+      "clips": [
+        {
+          "video_id": 100,
+          "in_s": 101.0,
+          "out_s": 108.35,
+          "audio": "source"
+        }
+      ]
+    },
+    {
+      "id": "rob",
+      "purpose": "develop",
+      "narration": "",
+      "on_screen_text": "Rob Gillette",
+      "clips": [
+        {
+          "video_id": 40,
+          "in_s": 18.16,
+          "out_s": 23.990000000000002,
+          "audio": "source"
+        }
+      ]
+    },
+    {
+      "id": "rob-2",
+      "purpose": "develop",
+      "narration": "",
+      "on_screen_text": "",
+      "clips": [
+        {
+          "video_id": 40,
+          "in_s": 65.12,
+          "out_s": 70.13,
+          "audio": "source"
+        }
+      ]
+    },
+    {
+      "id": "chad-3",
+      "purpose": "develop",
+      "narration": "",
+      "on_screen_text": "",
+      "clips": [
+        {
+          "video_id": 41,
+          "in_s": 233.48,
+          "out_s": 240.29,
+          "audio": "source"
+        }
+      ]
+    },
+    {
+      "id": "chad-4",
+      "purpose": "develop",
+      "narration": "",
+      "on_screen_text": "",
+      "clips": [
+        {
+          "video_id": 41,
+          "in_s": 244.0,
+          "out_s": 251.97,
+          "audio": "source"
+        }
+      ]
+    },
+    {
+      "id": "chad-5",
+      "purpose": "develop",
+      "narration": "",
+      "on_screen_text": "",
+      "clips": [
+        {
+          "video_id": 41,
+          "in_s": 252.82,
+          "out_s": 257.57000000000005,
+          "audio": "source"
+        }
+      ]
+    }
+  ]
+}
