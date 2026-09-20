@@ -113,9 +113,7 @@ impl Probe {
 async fn capabilities(client: &reqwest::Client, base: &str, models: &serde_json::Value) -> Capabilities {
     // Router mode lists models with a `status`; a plain server's entries carry only id, aliases,
     // meta and tags. That difference is the whole detection — there is no version to ask for.
-    let router = models["data"]
-        .as_array()
-        .is_some_and(|rows| rows.iter().any(|m| m.get("status").is_some()));
+    let router = models["data"].as_array().is_some_and(|rows| rows.iter().any(|m| m.get("status").is_some()));
 
     let slots = match get_json(client, &format!("{base}/props")).await {
         Ok(props) => props["total_slots"].as_u64().map(|n| n as u32),
@@ -154,7 +152,9 @@ pub fn resolve(backend: Backend, probe: Option<Probe>) -> Resolution {
         (Backend::Local, _) => (Target::Local, "backend = local".to_string()),
         (Backend::Cli, _) => (Target::Local, "backend = cli (handled by runtime)".to_string()),
         (_, None) => (Target::Local, "server not probed".to_string()),
-        (Backend::Auto, Some(p)) if p.capable => (Target::Server, format!("server OK: {}{}", p.detail, p.caps.summary())),
+        (Backend::Auto, Some(p)) if p.capable => {
+            (Target::Server, format!("server OK: {}{}", p.detail, p.caps.summary()))
+        }
         (Backend::Auto, Some(p)) => (Target::Local, format!("server not usable ({}) → local", p.detail)),
         (Backend::Server, Some(p)) if p.capable => {
             (Target::Server, format!("server OK: {}{}", p.detail, p.caps.summary()))
@@ -216,9 +216,7 @@ pub async fn vision(client: &reqwest::Client, url: &str, model: &str) -> Probe {
     match get_json(client, &props_url).await {
         Ok(props) => match props["modalities"]["vision"].as_bool() {
             Some(true) => Probe::ok(url, model_id, "model accepts images").with_caps(caps),
-            Some(false) => {
-                Probe::incapable(url, model_id, "loaded model has no vision (no mmproj)").with_caps(caps)
-            }
+            Some(false) => Probe::incapable(url, model_id, "loaded model has no vision (no mmproj)").with_caps(caps),
             None => Probe::incapable(url, model_id, "server does not report modalities").with_caps(caps),
         },
         // Not llama.cpp (Ollama, LM Studio…): can't confirm images are supported.

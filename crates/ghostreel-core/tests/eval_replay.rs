@@ -69,8 +69,14 @@ fn measured() {
         let sc = metrics::score(&m);
         println!(
             "{name:<10} {:.0} pts  {:.1}s/{:?}  {} voices  {} cuts  {:.1}s silent  {} dropped  {:?}",
-            sc.total, m.total_s, m.target_s, m.speaking_sources, m.mid_sentence_cuts,
-            m.silent_picture_s, m.dropped_clips, sc.parts
+            sc.total,
+            m.total_s,
+            m.target_s,
+            m.speaking_sources,
+            m.mid_sentence_cuts,
+            m.silent_picture_s,
+            m.dropped_clips,
+            sc.parts
         );
     }
 }

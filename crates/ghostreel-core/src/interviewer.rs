@@ -296,11 +296,9 @@ mod tests {
 
         let (source, p): (String, f64) = db
             .conn
-            .query_row(
-                "SELECT off_mic_source, off_mic_p FROM transcript_segments WHERE start_s = 2.0",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
+            .query_row("SELECT off_mic_source, off_mic_p FROM transcript_segments WHERE start_s = 2.0", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
             .unwrap();
         assert_eq!(source, "speech");
         assert!((p - 0.97).abs() < 1e-9, "the probability is kept, so it can be re-judged");

@@ -108,4 +108,3 @@ pub fn fixture_project(tmp: &std::path::Path) -> (Db, i64) {
     }
     (db, project.id)
 }
-

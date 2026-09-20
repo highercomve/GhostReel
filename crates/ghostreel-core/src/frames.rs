@@ -160,7 +160,6 @@ pub async fn scene_scan(
     Ok(scan)
 }
 
-
 /// One scene score, folded into the running scan. Split out so the rule can be tested against a
 /// list of numbers instead of against ffmpeg.
 ///
@@ -518,7 +517,16 @@ mod tests {
         let (mut acc, mut last) = (0.0, f64::NEG_INFINITY);
         for (i, &sc) in scores.iter().enumerate() {
             let pts = i as f64 / 4.0;
-            accumulate(sc, pts, opts.scene_threshold, opts.change_budget, opts.min_interval_s, &mut acc, &mut last, &mut scan);
+            accumulate(
+                sc,
+                pts,
+                opts.scene_threshold,
+                opts.change_budget,
+                opts.min_interval_s,
+                &mut acc,
+                &mut last,
+                &mut scan,
+            );
         }
         scan
     }
@@ -549,11 +557,7 @@ mod tests {
         // The measured rate on a tripod interview: 0.005 per frame, 0.02 per second.
         let scan = scan_scores(&vec![0.005; 240], &opts());
         assert!(scan.cuts.is_empty());
-        assert!(
-            scan.changes.len() <= 1,
-            "a talking head must not be resampled by drift: {:?}",
-            scan.changes
-        );
+        assert!(scan.changes.len() <= 1, "a talking head must not be resampled by drift: {:?}", scan.changes);
     }
 
     #[test]
@@ -565,10 +569,7 @@ mod tests {
         let scan = scan_scores(&vec![0.29; 240], &opts());
         assert!(scan.cuts.is_empty(), "fast is not the same as cut");
         let gaps: Vec<f64> = scan.changes.windows(2).map(|w| w[1] - w[0]).collect();
-        assert!(
-            gaps.iter().all(|g| *g >= opts().min_interval_s - 1e-9),
-            "the floor was crossed: {gaps:?}"
-        );
+        assert!(gaps.iter().all(|g| *g >= opts().min_interval_s - 1e-9), "the floor was crossed: {gaps:?}");
         // 60 s at a 2 s floor: about 30 frames, not the ~69 the budget alone would have asked for.
         assert!(scan.changes.len() <= 31, "{} frames in 60 s", scan.changes.len());
         assert!(scan.changes.len() >= 25, "the floor must not starve it either: {}", scan.changes.len());

@@ -1268,8 +1268,10 @@ async fn run_describe_jobs(
                     Err(e) if is_transport_error(&e) => gone = Some(e.to_string()),
                     Err(e) => {
                         let json = serde_json::json!({ "error": e.to_string() }).to_string();
-                        db.conn
-                            .execute("UPDATE frames SET description_json = ?1 WHERE id = ?2", params![json, frame_id])?;
+                        db.conn.execute(
+                            "UPDATE frames SET description_json = ?1 WHERE id = ?2",
+                            params![json, frame_id],
+                        )?;
                     }
                 }
                 tracker.advance(phase, 1);

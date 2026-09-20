@@ -663,7 +663,10 @@ pub fn render_preview(
         }
         // normalize=0: a bed mixed onto silence must keep its own level, not be halved because
         // there are two inputs. duration=first: the cut is as long as its pictures.
-        graph.push_str(&format!("amix=inputs={}:normalize=0:duration=first:dropout_transition=0[a]", bed_files.len() + 1));
+        graph.push_str(&format!(
+            "amix=inputs={}:normalize=0:duration=first:dropout_transition=0[a]",
+            bed_files.len() + 1
+        ));
         cmd.args(["-filter_complex", &graph]);
         cmd.args(["-map", "0:v", "-map", "[a]", "-c:v", "copy"]);
         cmd.args(["-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2", "-movflags", "+faststart"]);
@@ -675,7 +678,8 @@ pub fn render_preview(
         }
         if !mix_out.status.success() {
             let stderr = String::from_utf8_lossy(&mix_out.stderr);
-            let tail = stderr.lines().rev().take(10).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
+            let tail =
+                stderr.lines().rev().take(10).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
             let _ = std::fs::remove_file(&mixed);
             return Err(Error::Preview(format!("audio bed mix failed: {tail}")));
         }

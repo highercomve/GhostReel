@@ -830,7 +830,8 @@ async fn script_cmd(paths: &Paths, action: ScriptAction) -> anyhow::Result<ExitC
                 println!(
                     "  {:.1} s{}  ·  {} beats, {} clips  ·  {} of {} voices",
                     m.total_s,
-                    m.target_s.map(|t| format!(" against {t:.0} s ({:+.0}%)", m.duration_error.unwrap_or(0.0) * 100.0))
+                    m.target_s
+                        .map(|t| format!(" against {t:.0} s ({:+.0}%)", m.duration_error.unwrap_or(0.0) * 100.0))
                         .unwrap_or_default(),
                     m.beats,
                     m.clips,
@@ -879,8 +880,7 @@ async fn script_cmd(paths: &Paths, action: ScriptAction) -> anyhow::Result<ExitC
                 footage.quotes.len(),
                 footage.shots.len()
             );
-            let script =
-                ghostreel_core::chat::build::build(&footage, &project, &brief, target_s, &config.jev).await?;
+            let script = ghostreel_core::chat::build::build(&footage, &project, &brief, target_s, &config.jev).await?;
             println!("chose {} line(s):", script.beats.len());
             for beat in &script.beats {
                 println!("  {}", beat.purpose);
@@ -899,8 +899,13 @@ async fn script_cmd(paths: &Paths, action: ScriptAction) -> anyhow::Result<ExitC
         }
         ScriptAction::Judge { id, brief, json } => {
             let stored = ghostreel_core::script::load(&db, id)?;
-            let Some(j) =
-                ghostreel_core::chat::judge::judge(&db, &stored.script, brief.as_deref(), &Config::load(&paths.config_file).unwrap_or_default().jev).await?
+            let Some(j) = ghostreel_core::chat::judge::judge(
+                &db,
+                &stored.script,
+                brief.as_deref(),
+                &Config::load(&paths.config_file).unwrap_or_default().jev,
+            )
+            .await?
             else {
                 eprintln!(
                     "the editorial judge is off. Turn it on with:\n  \
@@ -923,7 +928,10 @@ async fn script_cmd(paths: &Paths, action: ScriptAction) -> anyhow::Result<ExitC
                     );
                 }
                 for m in &j.mismatched {
-                    println!("  pictures do not match the voice in '{}' (p={:.2}): \"{}\"", m.beat_id, m.match_p, m.heard);
+                    println!(
+                        "  pictures do not match the voice in '{}' (p={:.2}): \"{}\"",
+                        m.beat_id, m.match_p, m.heard
+                    );
                 }
                 for n in j.notes() {
                     println!("  → {n}");
@@ -1029,7 +1037,9 @@ async fn script_cmd(paths: &Paths, action: ScriptAction) -> anyhow::Result<ExitC
             let config = Config::load(&paths.config_file)?;
             let vision_setup = runtime::resolve_chat(paths, &config).await;
             eprintln!("Chat model: {}", vision_setup.describe());
-            let backend = ghostreel_core::chat::ChatBackend::from_vision_setup(&vision_setup).await?.with_window(config.chat_model().ctx_tokens);
+            let backend = ghostreel_core::chat::ChatBackend::from_vision_setup(&vision_setup)
+                .await?
+                .with_window(config.chat_model().ctx_tokens);
 
             let mut embedder = None;
             let embed_setup = runtime::resolve_embed(paths, &config).await;

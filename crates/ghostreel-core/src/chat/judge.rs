@@ -104,7 +104,9 @@ impl Judgement {
                 });
             }
             if p.name == "opening" && p.value < 0.4 {
-                out.push("the opening does not earn the next ten seconds: lead with the strongest thing anybody says".into());
+                out.push(
+                    "the opening does not earn the next ten seconds: lead with the strongest thing anybody says".into(),
+                );
             }
         }
         out
@@ -140,7 +142,9 @@ pub fn state(db: &Db, script: &Script, brief: Option<&str>, cfg: &JevConfig) -> 
         // not muted. Narration is the editor's own words and is carried separately, because a
         // beat can have both and they are judged against different things.
         let (heard, sound) = match &beat.bed {
-            Some(bed) => (speech_text(db, bed.video_id, bed.in_s, bed.out_s, cap), "a voice continues under the pictures"),
+            Some(bed) => {
+                (speech_text(db, bed.video_id, bed.in_s, bed.out_s, cap), "a voice continues under the pictures")
+            }
             None => {
                 let mut text = String::new();
                 let mut kind = "nothing — the pictures play silent";
@@ -403,12 +407,7 @@ impl Planned {
 
 /// Judge a cut, or return `None` when Jev is not configured. The convenient call, for anywhere
 /// that is not holding a database open across the request.
-pub async fn judge(
-    db: &Db,
-    script: &Script,
-    brief: Option<&str>,
-    cfg: &JevConfig,
-) -> Result<Option<Judgement>, Error> {
+pub async fn judge(db: &Db, script: &Script, brief: Option<&str>, cfg: &JevConfig) -> Result<Option<Judgement>, Error> {
     let Some(planned) = plan(db, script, brief, cfg) else { return Ok(None) };
     planned.ask().await.map(Some)
 }
@@ -738,13 +737,7 @@ mod tests {
             .unwrap();
 
         let mut script = bedded_script();
-        script.beats[0].clips[0] = ScriptClip {
-            video_id: 1,
-            in_s: 20.0,
-            out_s: 30.0,
-            audio: Audio::Mute,
-            why: None,
-        };
+        script.beats[0].clips[0] = ScriptClip { video_id: 1, in_s: 20.0, out_s: 30.0, audio: Audio::Mute, why: None };
         let s = state(&db, &script, None, &JevConfig::default());
 
         let seen = s["beats"][0]["seen"].as_array().unwrap();

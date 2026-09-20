@@ -478,7 +478,9 @@ async fn call_tool(paths: &Paths, name: &str, args: &Value) -> anyhow::Result<Va
             let session_id = args.get("session_id").and_then(|v| v.as_i64());
             let config = Config::load(&paths.config_file).unwrap_or_default();
             let vision = runtime::resolve_chat(paths, &config).await;
-            let backend = ghostreel_core::chat::ChatBackend::from_vision_setup(&vision).await?.with_window(config.chat_model().ctx_tokens);
+            let backend = ghostreel_core::chat::ChatBackend::from_vision_setup(&vision)
+                .await?
+                .with_window(config.chat_model().ctx_tokens);
             let embed_setup = runtime::resolve_embed(paths, &config).await;
             let embedder = runtime::start_embedder(&embed_setup, |_, _| {}).await.ok();
             let mut ctx = ghostreel_core::chat::ChatContext {

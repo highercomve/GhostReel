@@ -61,12 +61,7 @@ pub struct ExportResult {
 }
 
 /// Export a script to an OpenTimelineIO or Final Cut Pro 7 XML timeline file.
-pub fn export_script(
-    db: &Db,
-    script_id: i64,
-    format: ExportFormat,
-    out_path: &Path,
-) -> Result<ExportResult, Error> {
+pub fn export_script(db: &Db, script_id: i64, format: ExportFormat, out_path: &Path) -> Result<ExportResult, Error> {
     let stored = script::load(db, script_id)?;
     let timeline = otio::build_timeline(db, stored.project_id, &stored.script)?;
 

@@ -788,10 +788,7 @@ pub fn speech_digest(db: &Db, project_id: i64, max_chars: usize) -> String {
                 if text.is_empty() {
                     continue;
                 }
-                block.push_str(&format!(
-                    "  {start:.2}-{end:.2}{} {text}\n",
-                    if off { " [off-mic]" } else { "" }
-                ));
+                block.push_str(&format!("  {start:.2}-{end:.2}{} {text}\n", if off { " [off-mic]" } else { "" }));
             }
         }
         if out.len() + block.len() <= max_chars {
@@ -849,9 +846,7 @@ pub fn picture_digest(db: &Db, project_id: i64, max_chars: usize) -> String {
         return String::new();
     };
     let videos: Vec<(i64, String, i64, f64, f64)> = st
-        .query_map([project_id], |r| {
-            Ok((r.get(0)?, r.get::<_, String>(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
-        })
+        .query_map([project_id], |r| Ok((r.get(0)?, r.get::<_, String>(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
         .map(|rows| rows.filter_map(|r| r.ok()).collect())
         .unwrap_or_default();
     if videos.is_empty() {
@@ -883,8 +878,7 @@ pub fn picture_digest(db: &Db, project_id: i64, max_chars: usize) -> String {
             })
             .unwrap_or_default();
         let shows: String = shows.trim().chars().take(180).collect();
-        let block =
-            format!("  #{video_id} {name} — {count} moments, {first_t:.0}-{last_t:.0}s: {shows}\n");
+        let block = format!("  #{video_id} {name} — {count} moments, {first_t:.0}-{last_t:.0}s: {shows}\n");
         if out.len() + block.len() <= max_chars {
             out.push_str(&block);
         } else {
@@ -2530,12 +2524,8 @@ fn pad_speech(db: &Db, script: &mut Script, cfg: &crate::config::ScriptConfig) -
         // padding reached into. Without that distinction each pass swallows another sentence:
         // repairing an already-repaired script grew a cut from 152.9 s to 178.7 s, and every
         // `script import` of a saved script inflated it a little more.
-        let speech_end = overlapping
-            .iter()
-            .rev()
-            .map(|&i| segs[i].1)
-            .find(|&e| e <= c.out_s + 0.05)
-            .unwrap_or(segs[last].1);
+        let speech_end =
+            overlapping.iter().rev().map(|&i| segs[i].1).find(|&e| e <= c.out_s + 0.05).unwrap_or(segs[last].1);
         let last = overlapping.iter().rev().find(|&&i| segs[i].1 <= c.out_s + 0.05).copied().unwrap_or(last);
         let mut out = speech_end + cfg.speech_tail_s;
         if let Some(next) = segs.get(last + 1) {
@@ -2832,8 +2822,8 @@ pub async fn run_turn(
             let client = reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(5))
                 // A local model at 40 tokens a second needs minutes for a long script, and reads the
-        // whole prompt before it starts. Waiting is cheaper than losing the turn.
-        .timeout(Duration::from_secs(ctx.script.server_timeout_s))
+                // whole prompt before it starts. Waiting is cheaper than losing the turn.
+                .timeout(Duration::from_secs(ctx.script.server_timeout_s))
                 .build()
                 .map_err(|e| Error::Invalid(format!("reqwest client: {e}")))?;
 
@@ -3561,9 +3551,11 @@ pub async fn run_turn(
         },
         None => None,
     };
-    let judge_note = judgement.as_ref().map(Judgement::notes).filter(|n| !n.is_empty()).map(|notes| {
-        format!("[editorial read of the saved cut, fix these next time: {}]", notes.join("; "))
-    });
+    let judge_note = judgement
+        .as_ref()
+        .map(Judgement::notes)
+        .filter(|n| !n.is_empty())
+        .map(|notes| format!("[editorial read of the saved cut, fix these next time: {}]", notes.join("; ")));
 
     let reply = if !raw_reply.trim().is_empty() {
         raw_reply
@@ -3627,12 +3619,8 @@ pub async fn run_turn(
 /// it makes the same edit next time and the pipeline undoes it again. Carried on the assistant
 /// message, this reaches the server, local and CLI brains alike, since all three replay it.
 fn repair_note(issues: &[Issue]) -> Option<String> {
-    let repairs: Vec<&str> = issues
-        .iter()
-        .filter(|i| i.severity != IssueSeverity::Error)
-        .map(|i| i.message.as_str())
-        .take(6)
-        .collect();
+    let repairs: Vec<&str> =
+        issues.iter().filter(|i| i.severity != IssueSeverity::Error).map(|i| i.message.as_str()).take(6).collect();
     if repairs.is_empty() {
         return None;
     }
@@ -3976,7 +3964,9 @@ mod tests {
     fn a_trimmed_speech_clip_is_put_back_on_a_whole_sentence() {
         use crate::script::{Audio, Beat, ScriptClip};
         let db = Db::open_in_memory().unwrap();
-        db.conn.execute("INSERT INTO videos(id, content_hash, size, duration_s) VALUES (1, 'h', 1, 300.0)", []).unwrap();
+        db.conn
+            .execute("INSERT INTO videos(id, content_hash, size, duration_s) VALUES (1, 'h', 1, 300.0)", [])
+            .unwrap();
         // Two sentences: 10–20 s and 20–31 s.
         db.conn
             .execute(
@@ -4070,10 +4060,10 @@ mod tests {
         let folder = db.add_folder(p.id, tmp.path(), true).unwrap();
         for (id, name) in [(1, "talky.mp4"), (2, "quiet.mp4")] {
             db.conn
-                .execute("INSERT INTO videos(id, content_hash, size, duration_s) VALUES (?1, ?2, 1, 60.0)", params![
-                    id,
-                    format!("h{id}")
-                ])
+                .execute(
+                    "INSERT INTO videos(id, content_hash, size, duration_s) VALUES (?1, ?2, 1, 60.0)",
+                    params![id, format!("h{id}")],
+                )
                 .unwrap();
             db.conn
                 .execute(
@@ -4235,7 +4225,10 @@ mod tests {
             width: None,
             height: None,
             beats: vec![
-                beat("So was that Northwest Hills where you grew up? I grew up in Northwest Hills.", "Establish the deep roots"),
+                beat(
+                    "So was that Northwest Hills where you grew up? I grew up in Northwest Hills.",
+                    "Establish the deep roots",
+                ),
                 beat("", "Establish the deep roots"),
                 beat("keep-me", "Something else"),
             ],

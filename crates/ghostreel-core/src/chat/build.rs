@@ -181,13 +181,7 @@ pub fn survey(db: &Db, project_id: i64) -> Result<Footage, Error> {
                         .take_while(|&e| e < seg.1 - 0.01)
                         .filter(|&e| e > segs[i].0)
                         .collect();
-                    best = Some(Quote {
-                        video_id: vid,
-                        in_s: segs[i].0,
-                        out_s: seg.1,
-                        text: text.clone(),
-                        breaks,
-                    });
+                    best = Some(Quote { video_id: vid, in_s: segs[i].0, out_s: seg.1, text: text.clone(), breaks });
                 }
             }
             if let Some(q) = best {
@@ -230,12 +224,7 @@ fn shorten(s: &str, max: usize) -> String {
 /// answers, and the first attempt proved it: one strong line won opening, middle *and* closing at
 /// once, and the cut was two quotes long. Each request now excludes what is already taken, which
 /// is the case the docs say a second request is for.
-async fn pick(
-    client: &Jev,
-    pool: &[&Quote],
-    instructions: Value,
-    brief: &str,
-) -> Result<Option<(usize, f64)>, Error> {
+async fn pick(client: &Jev, pool: &[&Quote], instructions: Value, brief: &str) -> Result<Option<(usize, f64)>, Error> {
     if pool.is_empty() {
         return Ok(None);
     }
@@ -262,12 +251,7 @@ async fn pick(
 /// Opening and closing first, because those are the two positions a viewer notices, and then the
 /// middle filled against what is already in the piece rather than against the brief alone — a
 /// middle question asked in isolation returns the same strong line every time.
-async fn choose_quotes(
-    client: &Jev,
-    footage: &Footage,
-    brief: &str,
-    target_s: f64,
-) -> Result<Vec<Quote>, Error> {
+async fn choose_quotes(client: &Jev, footage: &Footage, brief: &str, target_s: f64) -> Result<Vec<Quote>, Error> {
     let all: Vec<&Quote> = spread(&footage.quotes, MAX_OPTIONS, |q| q.video_id);
     let mut taken: Vec<Quote> = Vec::new();
 
@@ -287,10 +271,12 @@ async fn choose_quotes(
     let Some((i, _)) = pick(
         client,
         &pool,
-        json!("Which of the lines in `quotes` is the strongest OPENING for the piece described in \
+        json!(
+            "Which of the lines in `quotes` is the strongest OPENING for the piece described in \
                `brief`? Pick the one that makes a viewer want to keep watching: a clear statement, \
                a vivid detail, or a claim the rest of the piece can answer. Not a fragment, not an \
-               interviewer's question, not somebody correcting themselves."),
+               interviewer's question, not somebody correcting themselves."
+        ),
         brief,
     )
     .await?
@@ -304,9 +290,11 @@ async fn choose_quotes(
     let closing = match pick(
         client,
         &pool,
-        json!("Which of the lines in `quotes` is the strongest CLOSING line for the piece described \
+        json!(
+            "Which of the lines in `quotes` is the strongest CLOSING line for the piece described \
                in `brief`? It should give the viewer something to take away and sound final, rather \
-               than leave a thought open or trail off into an aside."),
+               than leave a thought open or trail off into an aside."
+        ),
         brief,
     )
     .await?
@@ -365,8 +353,7 @@ async fn choose_shots(
     brief: &str,
 ) -> Result<Vec<Option<Shot>>, Error> {
     let speakers: std::collections::HashSet<i64> = lines.iter().map(|q| q.video_id).collect();
-    let eligible: Vec<Shot> =
-        footage.shots.iter().filter(|s| !speakers.contains(&s.video_id)).cloned().collect();
+    let eligible: Vec<Shot> = footage.shots.iter().filter(|s| !speakers.contains(&s.video_id)).cloned().collect();
     let pool: Vec<&Shot> = spread(&eligible, MAX_OPTIONS, |s| s.video_id);
     if pool.is_empty() {
         return Ok(vec![None; lines.len()]);
@@ -422,14 +409,10 @@ pub fn lay_out(project: &Project, lines: &[Quote], shots: &[Option<Shot>], targe
     for (i, q) in lines.iter().enumerate() {
         // Cut away from the speaker on a sentence end, never inside one, and only for a stretch
         // long enough to read and short enough to still have established who is talking.
-        let cut_at = q
-            .breaks
-            .iter()
-            .copied()
-            .rfind(|&b| {
-                let picture = q.out_s - b;
-                b - q.in_s >= MIN_SPEAKER_S && (MIN_CUTAWAY_S..=MAX_CUTAWAY_S).contains(&picture)
-            });
+        let cut_at = q.breaks.iter().copied().rfind(|&b| {
+            let picture = q.out_s - b;
+            b - q.in_s >= MIN_SPEAKER_S && (MIN_CUTAWAY_S..=MAX_CUTAWAY_S).contains(&picture)
+        });
 
         let mut clips = vec![ScriptClip {
             video_id: q.video_id,
@@ -488,9 +471,8 @@ pub async fn build(
     target_s: f64,
     cfg: &JevConfig,
 ) -> Result<Script, Error> {
-    let client = Jev::from_config(cfg).ok_or_else(|| {
-        Error::Jev("building a cut this way needs Jev: set jev.enabled and an API key".into())
-    })?;
+    let client = Jev::from_config(cfg)
+        .ok_or_else(|| Error::Jev("building a cut this way needs Jev: set jev.enabled and an API key".into()))?;
     if footage.quotes.is_empty() {
         return Err(Error::Jev("no quotable speech in this project — index the transcripts first".into()));
     }
@@ -635,9 +617,7 @@ mod tests {
         let project = db.create_project(&NewProject::named("T")).unwrap();
         let tmp = std::env::temp_dir();
         let folder = db.add_folder(project.id, &tmp, true).unwrap();
-        db.conn
-            .execute("INSERT INTO videos(id, content_hash, size, duration_s) VALUES (1, 'a', 1, 60)", [])
-            .unwrap();
+        db.conn.execute("INSERT INTO videos(id, content_hash, size, duration_s) VALUES (1, 'a', 1, 60)", []).unwrap();
         db.conn
             .execute(
                 "INSERT INTO video_files(video_id, folder_id, path, size, mtime, last_seen)
@@ -686,8 +666,7 @@ mod tests {
 
     #[test]
     fn a_pool_that_already_fits_is_left_exactly_as_it_was() {
-        let shots: Vec<Shot> =
-            (0..5).map(|i| Shot { video_id: 1, t_s: i as f64, text: String::new() }).collect();
+        let shots: Vec<Shot> = (0..5).map(|i| Shot { video_id: 1, t_s: i as f64, text: String::new() }).collect();
         let picked = spread(&shots, 200, |s| s.video_id);
         assert_eq!(picked.len(), 5);
         assert_eq!(picked.iter().map(|s| s.t_s).collect::<Vec<_>>(), vec![0.0, 1.0, 2.0, 3.0, 4.0]);

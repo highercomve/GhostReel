@@ -130,7 +130,12 @@ const GET_VIDEO: ToolSpec = ToolSpec {
          bed from a video where someone speaks.",
     ],
     params: &[
-        ToolParam { name: "video_id", ty: ParamType::Integer, required: true, doc: "From a search hit or list_videos." },
+        ToolParam {
+            name: "video_id",
+            ty: ParamType::Integer,
+            required: true,
+            doc: "From a search hit or list_videos.",
+        },
         ToolParam {
             name: "start_s",
             ty: ParamType::Number,
@@ -157,7 +162,12 @@ const GET_TRANSCRIPT: ToolSpec = ToolSpec {
     ],
     chains_with: &["A segment's start_s and end_s are the only cut points a speaking clip should use."],
     params: &[
-        ToolParam { name: "video_id", ty: ParamType::Integer, required: true, doc: "From a search hit or list_videos." },
+        ToolParam {
+            name: "video_id",
+            ty: ParamType::Integer,
+            required: true,
+            doc: "From a search hit or list_videos.",
+        },
         ToolParam { name: "start_s", ty: ParamType::Number, required: false, doc: "Seconds; omit for the whole file." },
         ToolParam { name: "end_s", ty: ParamType::Number, required: false, doc: "Seconds." },
     ],
@@ -168,10 +178,8 @@ const LIST_VIDEOS: ToolSpec = ToolSpec {
     summary: "Every video in the project, with a short summary of each.",
     when: "To see the shape of the material, or when searching has stopped finding anything.",
     returns: "For each video: id, file, duration, camera work and whether anyone speaks in it.",
-    misuse: &[
-        "Listing is not looking: an id seen only here grounds nothing, and a clip written from it \
-         survives only if something happens to be indexed where you guessed. Open it first.",
-    ],
+    misuse: &["Listing is not looking: an id seen only here grounds nothing, and a clip written from it \
+         survives only if something happens to be indexed where you guessed. Open it first."],
     chains_with: &["get_video(video_id) on anything that looks promising."],
     params: &[],
 };
@@ -241,11 +249,8 @@ pub fn tools_prose(detail: Detail) -> String {
     out.push_str(TOOL_CONTRACT);
     out.push('\n');
     for spec in TOOLS {
-        let args: Vec<String> = spec
-            .params
-            .iter()
-            .map(|p| if p.required { p.name.to_string() } else { format!("{}?", p.name) })
-            .collect();
+        let args: Vec<String> =
+            spec.params.iter().map(|p| if p.required { p.name.to_string() } else { format!("{}?", p.name) }).collect();
         out.push_str(&format!("- {}({}): {}\n", spec.name, args.join(", "), describe(spec, detail)));
         if detail == Detail::Full {
             for p in spec.params {
@@ -288,12 +293,12 @@ mod tests {
     fn the_descriptions_state_what_the_pipeline_will_do() {
         let prose = tools_prose(Detail::Full);
         for claim in [
-            "list_videos makes nothing legal",       // Grounding::record_tool_call
-            "trimmed to its first seconds",          // trimmed_clip_s
-            "moved to the nearest steady stretch",   // shaky repair
-            "retimed to where someone answers",      // off-mic repair
-            "pulled out to the sentence's edge",     // end_on_sentences
-            "cannot carry source audio",             // mute_silent_clips
+            "list_videos makes nothing legal",     // Grounding::record_tool_call
+            "trimmed to its first seconds",        // trimmed_clip_s
+            "moved to the nearest steady stretch", // shaky repair
+            "retimed to where someone answers",    // off-mic repair
+            "pulled out to the sentence's edge",   // end_on_sentences
+            "cannot carry source audio",           // mute_silent_clips
         ] {
             assert!(prose.contains(claim), "the tools no longer say: {claim}");
         }

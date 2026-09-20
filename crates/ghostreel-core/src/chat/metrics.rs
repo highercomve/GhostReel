@@ -167,11 +167,7 @@ pub fn score(m: &ScriptMetrics) -> ScriptScore {
 
     let mut total = 100.0;
     total -= penalty("errors", m.errors as f64 * 30.0, 60.0);
-    total -= penalty(
-        "duration",
-        m.duration_error.map(|e| 60.0 * (e.abs() / 0.5).min(1.0)).unwrap_or(0.0),
-        60.0,
-    );
+    total -= penalty("duration", m.duration_error.map(|e| 60.0 * (e.abs() / 0.5).min(1.0)).unwrap_or(0.0), 60.0);
     total -= penalty("mid-sentence cuts", m.mid_sentence_cuts as f64 * 6.0, 18.0);
     total -= penalty("dropped clips", m.dropped_clips as f64 * 4.0, 20.0);
     // A little silence is editing; a third of the piece is a fault.
@@ -212,7 +208,14 @@ mod tests {
     }
 
     fn script_of(beats: Vec<Beat>, target: Option<f64>) -> Script {
-        Script { title: "t".into(), target_duration_s: target, fps: Some(Fps::new(25, 1)), width: None, height: None, beats }
+        Script {
+            title: "t".into(),
+            target_duration_s: target,
+            fps: Some(Fps::new(25, 1)),
+            width: None,
+            height: None,
+            beats,
+        }
     }
 
     fn beat(id: &str, clips: Vec<ScriptClip>, bed: Option<AudioBed>) -> Beat {
@@ -324,7 +327,11 @@ mod tests {
         let draft = script_of(
             vec![beat(
                 "b1",
-                vec![clip(1, 0.0, 10.0, Audio::Source), clip(2, 0.0, 10.0, Audio::Mute), clip(3, 0.0, 10.0, Audio::Mute)],
+                vec![
+                    clip(1, 0.0, 10.0, Audio::Source),
+                    clip(2, 0.0, 10.0, Audio::Mute),
+                    clip(3, 0.0, 10.0, Audio::Mute),
+                ],
                 None,
             )],
             Some(10.0),

@@ -66,7 +66,9 @@ impl Clip {
 enum Item {
     Clip(Clip),
     /// Nothing on the track; only its length matters.
-    Gap { duration_s: f64 },
+    Gap {
+        duration_s: f64,
+    },
 }
 
 impl Item {
@@ -158,7 +160,11 @@ fn read_media_ref(clip: &Value) -> Result<Option<MediaRef>, Error> {
         Some(range) if !range.is_null() => {
             let start = want(range, "start_time", "media reference")?;
             let d = want(range, "duration", "media reference")?;
-            (want_f64(start, "rate", "media reference")?, want_f64(start, "value", "media reference")?, want_f64(d, "value", "media reference")?)
+            (
+                want_f64(start, "rate", "media reference")?,
+                want_f64(start, "value", "media reference")?,
+                want_f64(d, "value", "media reference")?,
+            )
         }
         _ => (0.0, 0.0, 0.0),
     };
@@ -597,7 +603,9 @@ pub fn summarize_fcp_xml(xml: &str) -> Result<Summary, Error> {
     let mut buf = Vec::new();
     loop {
         match reader.read_event_into(&mut buf) {
-            Err(e) => return Err(Error::Export(format!("malformed FCP XML at byte {}: {e}", reader.buffer_position()))),
+            Err(e) => {
+                return Err(Error::Export(format!("malformed FCP XML at byte {}: {e}", reader.buffer_position())));
+            }
             Ok(Event::Eof) => {
                 // quick-xml stops at the end of input without complaining about what is still
                 // open; a truncated export would otherwise read as a valid empty timeline.
@@ -609,7 +617,9 @@ pub fn summarize_fcp_xml(xml: &str) -> Result<Summary, Error> {
             Ok(Event::Start(e)) => {
                 let name = e.name().as_ref().to_string();
                 match name.as_str() {
-                    "video" | "audio" if path.iter().any(|p| p == "media") && path.last().map(String::as_str) == Some("media") => {
+                    "video" | "audio"
+                        if path.iter().any(|p| p == "media") && path.last().map(String::as_str) == Some("media") =>
+                    {
                         in_kind = if name == "video" { "Video".into() } else { "Audio".into() };
                     }
                     "track" => {
@@ -641,7 +651,13 @@ pub fn summarize_fcp_xml(xml: &str) -> Result<Summary, Error> {
                         }
                     }
                 } else if name == "track" {
-                    tracks.push(TrackSummary { name: String::new(), kind: in_kind.clone(), items: 0, clips: 0, duration_s: 0.0 });
+                    tracks.push(TrackSummary {
+                        name: String::new(),
+                        kind: in_kind.clone(),
+                        items: 0,
+                        clips: 0,
+                        duration_s: 0.0,
+                    });
                 }
             }
             Ok(Event::Text(t)) => {

@@ -483,12 +483,11 @@ async fn run_export(
         })
         .await;
 
-    let res = tokio::task::spawn_blocking(move || {
-        ghostreel_core::export::export_script(&db, script_id, format, &out_path)
-    })
-    .await
-    .map_err(|e| e.to_string())?
-    .map_err(|e| e.to_string())?;
+    let res =
+        tokio::task::spawn_blocking(move || ghostreel_core::export::export_script(&db, script_id, format, &out_path))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
 
     Ok(res.path.to_string_lossy().to_string())
 }
@@ -505,7 +504,10 @@ async fn run_chat(
     let config = Config::load(&p.config_file).map_err(|e| e.to_string())?;
     // The chat has its own model settings (bigger context); the describe stage keeps [vision].
     let chat_setup = ghostreel_core::runtime::resolve_chat(&p, &config).await;
-    let backend = ghostreel_core::chat::ChatBackend::from_vision_setup(&chat_setup).await.map_err(|e| e.to_string())?.with_window(config.chat_model().ctx_tokens);
+    let backend = ghostreel_core::chat::ChatBackend::from_vision_setup(&chat_setup)
+        .await
+        .map_err(|e| e.to_string())?
+        .with_window(config.chat_model().ctx_tokens);
     let setup = runtime::resolve_embed(&p, &config).await;
     let embedder = runtime::start_embedder(&setup, |_, _| {}).await.ok();
     let db = Db::open(&p.db_file()).map_err(|e| e.to_string())?;

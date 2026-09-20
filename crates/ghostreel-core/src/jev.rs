@@ -55,10 +55,7 @@ impl Question {
     }
 
     pub fn score(instructions: impl Into<Value>, levels: &[&str]) -> Self {
-        Self::Score {
-            instructions: instructions.into(),
-            criteria: levels.iter().map(|l| Value::from(*l)).collect(),
-        }
+        Self::Score { instructions: instructions.into(), criteria: levels.iter().map(|l| Value::from(*l)).collect() }
     }
 }
 
@@ -177,10 +174,7 @@ impl Jev {
         if questions.is_empty() {
             return Err(Error::Jev("no questions to ask".into()));
         }
-        let client = reqwest::Client::builder()
-            .timeout(self.timeout)
-            .build()
-            .map_err(|e| Error::Jev(e.to_string()))?;
+        let client = reqwest::Client::builder().timeout(self.timeout).build().map_err(|e| Error::Jev(e.to_string()))?;
         let url = format!("{}/v1/systemone", self.base_url);
         let body = Request { state, model: &self.model, questions };
 
