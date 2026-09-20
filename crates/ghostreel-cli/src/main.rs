@@ -738,6 +738,10 @@ async fn script_cmd(paths: &Paths, action: ScriptAction) -> anyhow::Result<ExitC
             if shortened > 0 {
                 println!("  [info] cut the pictures back to the voice in {shortened} beat(s)");
             }
+            let held = ghostreel_core::chat::hold_the_last_picture(&db, &mut script, &script_cfg);
+            if held > 0.0 {
+                println!("  [info] held the closing picture for {held:.1} s of quiet");
+            }
             let issues = ghostreel_core::script::validate(&db, p.id, &script)?;
             for issue in &issues {
                 let tag = match issue.severity {

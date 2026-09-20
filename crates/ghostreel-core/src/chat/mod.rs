@@ -1484,6 +1484,37 @@ pub fn trim_pictures_to_bed(script: &mut Script, cfg: &crate::config::ScriptConf
     trimmed
 }
 
+/// Let the last picture run on after the last word, in silence, so the piece ends instead of
+/// stopping.
+///
+/// Every brain tested cuts on the final syllable. An editor holds the closing image for a moment
+/// and lets it go quiet — it is what tells a viewer the thing is over. The hold comes out of
+/// footage already chosen and already grounded: the last shot simply plays a little longer, and
+/// the bed is deliberately not extended with it, because the silence is the point.
+pub fn hold_the_last_picture(db: &Db, script: &mut Script, cfg: &crate::config::ScriptConfig) -> f64 {
+    if cfg.closing_hold_s <= 0.0 {
+        return 0.0;
+    }
+    let Some(beat) = script.beats.last_mut() else { return 0.0 };
+    // Narration read to the end is already an ending; a hold under it would be dead air.
+    if beat.narration.as_deref().map(str::trim).is_some_and(|n| !n.is_empty()) {
+        return 0.0;
+    }
+    let Some(last) = beat.clips.last_mut() else { return 0.0 };
+    let duration = video_duration(db, last.video_id).unwrap_or(f64::MAX);
+    let room = (duration - last.out_s).max(0.0);
+    let held = cfg.closing_hold_s.min(room);
+    if held < 0.2 {
+        return 0.0;
+    }
+    last.out_s += held;
+    // Whatever was being heard stops where it stopped: this is the quiet at the end.
+    if last.audio == crate::script::Audio::Source {
+        last.audio = crate::script::Audio::Mute;
+    }
+    held
+}
+
 /// Keep every bed inside the beat it plays under.
 ///
 /// Beds are laid before the cut is fitted to its target, and fitting trims the pictures. A bed
@@ -3151,6 +3182,15 @@ pub async fn run_turn(
                     let _ = snap_to_segments(&ctx.db, &mut s)?;
                     let mended = end_on_sentences(&ctx.db, &mut s, &ctx.script);
                     let shortened = trim_pictures_to_bed(&mut s, &ctx.script);
+                    let held = hold_the_last_picture(&ctx.db, &mut s, &ctx.script);
+                    if held > 0.0 {
+                        issues.push(Issue {
+                            severity: IssueSeverity::Info,
+                            beat_id: None,
+                            clip_index: None,
+                            message: format!("held the closing picture for {held:.1} s of quiet"),
+                        });
+                    }
                     if shortened > 0 {
                         issues.push(Issue {
                             severity: IssueSeverity::Info,
@@ -4396,6 +4436,78 @@ mod tests {
             dispatch_tool(&db, tmp.path(), p.id, "get_video", &json!({"video_id": 999}), &mut grounding, None, &sc());
         assert!(res.contains("error"));
         assert!(sum.contains("error"));
+    }
+
+    /// Every brain tested cuts on the final syllable. A piece needs a moment to land.
+    #[test]
+    fn the_last_picture_is_held_in_silence() {
+        use crate::script::{Audio, AudioBed, Beat, ScriptClip};
+        let db = Db::open_in_memory().unwrap();
+        db.conn.execute("INSERT INTO videos(id, content_hash, size, duration_s) VALUES (1,'h',1,120.0)", []).unwrap();
+
+        let mut script = Script {
+            title: "t".into(),
+            target_duration_s: None,
+            fps: Default::default(),
+            width: None,
+            height: None,
+            beats: vec![Beat {
+                id: "last".into(),
+                purpose: "p".into(),
+                narration: None,
+                on_screen_text: None,
+                notes: None,
+                clips: vec![ScriptClip { video_id: 1, in_s: 10.0, out_s: 20.0, audio: Audio::Mute, why: None }],
+                bed: Some(AudioBed { video_id: 1, in_s: 10.0, out_s: 20.0, why: None, inferred: true }),
+            }],
+        };
+
+        let held = hold_the_last_picture(&db, &mut script, &sc());
+        assert!((held - 2.0).abs() < 0.01, "held {held}");
+        let clip = &script.beats[0].clips[0];
+        assert!((clip.out_s - 22.0).abs() < 0.01, "the picture runs on: {}", clip.out_s);
+        // The voice is not extended with it: the quiet is the point.
+        assert!((script.beats[0].bed.as_ref().unwrap().out_s - 20.0).abs() < 0.01);
+    }
+
+    /// There has to be footage left to hold, and a beat already read over does not need one.
+    #[test]
+    fn the_hold_takes_what_the_footage_and_the_beat_allow() {
+        use crate::script::{Audio, Beat, ScriptClip};
+        let db = Db::open_in_memory().unwrap();
+        db.conn.execute("INSERT INTO videos(id, content_hash, size, duration_s) VALUES (1,'h',1,20.6)", []).unwrap();
+        let beat_of = |narration: Option<&str>, out_s: f64| Beat {
+            id: "last".into(),
+            purpose: "p".into(),
+            narration: narration.map(str::to_string),
+            on_screen_text: None,
+            notes: None,
+            clips: vec![ScriptClip { video_id: 1, in_s: 10.0, out_s, audio: Audio::Mute, why: None }],
+            bed: None,
+        };
+        let script_of = |b: Beat| Script {
+            title: "t".into(),
+            target_duration_s: None,
+            fps: Default::default(),
+            width: None,
+            height: None,
+            beats: vec![b],
+        };
+
+        // Only 0.6 s of the file is left: hold that and no more.
+        let mut s = script_of(beat_of(None, 20.0));
+        let held = hold_the_last_picture(&db, &mut s, &sc());
+        assert!((held - 0.6).abs() < 0.01, "held {held}");
+
+        // Narration runs to the end: the piece already has an ending.
+        let mut s = script_of(beat_of(Some("a closing line"), 15.0));
+        assert_eq!(hold_the_last_picture(&db, &mut s, &sc()), 0.0);
+
+        // Turned off.
+        let mut cfg = sc();
+        cfg.closing_hold_s = 0.0;
+        let mut s = script_of(beat_of(None, 15.0));
+        assert_eq!(hold_the_last_picture(&db, &mut s, &cfg), 0.0);
     }
 
     /// A cutaway that outlasts the voice under it is a pause between interviews, which is the

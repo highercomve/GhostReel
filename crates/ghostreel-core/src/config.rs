@@ -233,6 +233,10 @@ pub struct ScriptConfig {
     /// worth far more than their tokens, but a small local model's window is already half
     /// transcripts, so `auto` shortens them there.
     pub tool_docs: String,
+    /// Picture held after the last voice stops, in silence, so the piece lands instead of
+    /// stopping (s). 0 turns it off. Every brain tested ends on the last word; an editor holds
+    /// the closing image for a beat and lets it go quiet.
+    pub closing_hold_s: f64,
     /// Ceiling on a single model answer, in tokens. Generous: a long script with forty clips is
     /// thousands of tokens and must never be cut off. It exists only so a model that will not
     /// stop fails as itself instead of as a dead socket.
@@ -300,6 +304,7 @@ impl Default for ScriptConfig {
             infer_audio_beds: true,
             speech_in_prompt: true,
             tool_docs: "auto".into(),
+            closing_hold_s: 2.0,
             max_answer_tokens: 16384,
             server_timeout_s: 1800,
             max_bed_extend_s: 20.0,
@@ -567,6 +572,7 @@ impl Config {
                 "infer_audio_beds" => f.infer_audio_beds = flag(value),
                 "speech_in_prompt" => f.speech_in_prompt = flag(value),
                 "tool_docs" => f.tool_docs = value.to_string(),
+                "closing_hold_s" => f.closing_hold_s = num(key, value)?,
                 "max_answer_tokens" => f.max_answer_tokens = num(key, value)?,
                 "server_timeout_s" => f.server_timeout_s = num(key, value)?,
                 "max_bed_extend_s" => f.max_bed_extend_s = num(key, value)?,
