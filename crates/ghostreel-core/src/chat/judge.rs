@@ -446,9 +446,17 @@ fn speech_text(db: &Db, video_id: i64, in_s: f64, out_s: f64, cap: usize) -> Str
 /// it takes text, never pictures.
 fn frame_text(db: &Db, video_id: i64, in_s: f64, out_s: f64, max: usize) -> Vec<String> {
     let mut out = Vec::new();
+    // Falling back to the last frame *before* the range is not a guess. Keyframes are de-duped by
+    // perceptual hash, so a stretch with no frame of its own is a stretch where nothing changed —
+    // a locked-off interview collapses to one frame every 16–24 s, and the last one kept is a
+    // literal description of what is still on screen. Without this a bedded beat over a static
+    // camera looked unindexed and the judge scored it on its cutaway alone.
     let Ok(mut st) = db.conn.prepare(
         "SELECT description_json FROM frames
-         WHERE video_id = ?1 AND t_s >= ?2 AND t_s <= ?3 AND description_json IS NOT NULL ORDER BY t_s",
+         WHERE video_id = ?1 AND t_s <= ?3 AND description_json IS NOT NULL
+           AND (t_s >= ?2 OR t_s = (SELECT MAX(t_s) FROM frames
+                                    WHERE video_id = ?1 AND t_s < ?2 AND description_json IS NOT NULL))
+         ORDER BY t_s",
     ) else {
         return out;
     };
@@ -693,5 +701,37 @@ mod tests {
         assert!(stops.get("ends_with").is_none());
         let j = compose(&stops, &serde_json::from_str::<Answers>(weak).unwrap());
         assert!(j.notes()[0].contains("hold a closing image"));
+    }
+
+    #[test]
+    fn a_deduped_stretch_is_described_by_the_last_frame_before_it() {
+        let db = db_with_footage();
+        // A locked-off interview: frames at 10 s and 40 s, nothing between, because the de-dupe
+        // dropped what did not change. A clip at 20-30 s has no frame of its own.
+        db.conn
+            .execute(
+                "INSERT INTO frames(video_id, t_s, description_json) VALUES
+                 (1, 10.0, '{\"description\":\"A woman on a patio, talking to camera.\"}'),
+                 (1, 40.0, '{\"description\":\"The same patio, later.\"}')",
+                [],
+            )
+            .unwrap();
+
+        let mut script = bedded_script();
+        script.beats[0].clips[0] = ScriptClip {
+            video_id: 1,
+            in_s: 20.0,
+            out_s: 30.0,
+            audio: Audio::Mute,
+            why: None,
+        };
+        let s = state(&db, &script, None, &JevConfig::default());
+
+        let seen = s["beats"][0]["seen"].as_array().unwrap();
+        assert_eq!(seen.len(), 1, "one frame carries the stretch: {seen:?}");
+        assert!(seen[0].as_str().unwrap().contains("talking to camera"));
+        assert_eq!(s["beats"][0]["pictures_described"], true, "this beat is judgeable after all");
+        // The later frame is not in range and must not be dragged in.
+        assert!(!seen[0].as_str().unwrap().contains("later"));
     }
 }

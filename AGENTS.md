@@ -102,6 +102,10 @@ one number live in `compose`, in code, so they can be changed without asking any
   Jev reads text only, and a judgement it cannot ground is a judgement of nothing.
 - **A beat with no frame descriptions is not asked about.** Asking anyway returned a flat "no" and
   scored good footage as filler; `unjudged_beats` reports the gap instead of averaging it away.
+- **A stretch with no frame of its own is described by the last frame before it.** Not a guess:
+  keyframes are de-duped by perceptual hash, so no frame means nothing changed — a locked-off
+  interview collapses to one every 16–24 s. Without this a bedded beat over a static camera looked
+  unindexed and was judged on its cutaway alone.
 - **What it finds goes back to the model** on the assistant message, beside the repair note — a
   repair pass cannot make a shot of a road illustrate a sentence about a dog, so only the brain
   that picked the shot can fix it.
