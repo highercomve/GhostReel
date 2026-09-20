@@ -213,6 +213,20 @@ struct SearchView {
     note: Option<String>,
 }
 
+/// The models the chosen coding-agent CLI will accept, asked of the tool.
+///
+/// Empty when the tool has no way to say (claude has no such command, codex wants a terminal) or
+/// when it is not installed — the page then leaves the field as free text.
+#[tauri::command]
+async fn cli_models(tool: String) -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let cfg = ghostreel_core::config::CliAgentConfig { tool, ..Default::default() };
+        ghostreel_core::cliagent::list_models(&cfg)
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
 /// Open a video in the system player at `t` seconds (mpv/VLC when installed, else the default app).
 #[tauri::command]
 fn open_external(app: AppHandle, path: PathBuf, t: Option<f64>) -> CmdResult<()> {
@@ -1004,6 +1018,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             doctor,
+            cli_models,
             list_projects,
             create_project,
             rename_project,

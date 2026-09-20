@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import {
+  cliModels,
   cancelTask,
   enqueueModelDownload,
   getAiSettings,
@@ -69,6 +70,21 @@ function CliAgentFields({
 }) {
   const [testing, setTesting] = useState(false);
   const [result, setResult] = useState<string | null>(null);
+  // What this tool says it can run. Fetched when the tool changes rather than kept in the app:
+  // every one of these catalogues moves without us.
+  const [cliModelList, setCliModelList] = useState<string[]>([]);
+  useEffect(() => {
+    let cancelled = false;
+    setCliModelList([]);
+    cliModels(cfg.cli.tool)
+      .then((m) => {
+        if (!cancelled) setCliModelList(m);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [cfg.cli.tool]);
   const perFrame = capability === "vision";
   return (
     <>
@@ -87,12 +103,31 @@ function CliAgentFields({
         </div>
         <div className="settings-field">
           <label>Model</label>
-          <input
-            type="text"
-            defaultValue={cfg.cli.model}
-            placeholder="— the tool's default —"
-            onChange={(e) => onPatch({ cli: { model: e.currentTarget.value } })}
-          />
+          {cliModelList.length > 0 ? (
+            // The tool told us what it has. Its own default stays available, and a model it did
+            // not list is still shown, so switching tools never silently discards a setting.
+            <select
+              value={cfg.cli.model}
+              onChange={(e) => onPatch({ cli: { model: e.currentTarget.value } })}
+            >
+              <option value="">— the tool's default —</option>
+              {!cliModelList.includes(cfg.cli.model) && cfg.cli.model && (
+                <option value={cfg.cli.model}>{cfg.cli.model} (not in its list)</option>
+              )}
+              {cliModelList.map((m) => (
+                <option key={m} value={m}>
+                  {m}
+                </option>
+              ))}
+            </select>
+          ) : (
+            <input
+              type="text"
+              defaultValue={cfg.cli.model}
+              placeholder="— the tool's default —"
+              onChange={(e) => onPatch({ cli: { model: e.currentTarget.value } })}
+            />
+          )}
         </div>
         {perFrame && (
           <div className="settings-field">

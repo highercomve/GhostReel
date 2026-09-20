@@ -718,3 +718,71 @@ mod tests {
         assert_eq!(find_binary(&real_cfg), Some(real));
     }
 }
+
+/// The models a coding-agent CLI will accept, asked of the tool itself.
+///
+/// Every one of these has its own catalogue that changes without us, so the list is fetched
+/// rather than kept here — a hard-coded one would be wrong within a month. `opencode models` and
+/// `agy models` print one per line; `claude` has no such command and `codex` wants a terminal, so
+/// those return nothing and the field stays free text.
+///
+/// Runs with stdin closed and a short timeout: this is called to fill a menu, and a tool that
+/// decides to wait for input must not hang the window.
+pub fn list_models(cfg: &CliAgentConfig) -> Vec<String> {
+    let Some(bin) = find_binary(cfg) else { return Vec::new() };
+    if !matches!(cfg.tool.as_str(), "opencode" | "agy") {
+        return Vec::new();
+    }
+
+    let mut cmd = crate::proc::std_command(&bin);
+    cmd.arg("models").stdin(std::process::Stdio::null());
+    let Ok(out) = cmd.output() else { return Vec::new() };
+    if !out.status.success() {
+        return Vec::new();
+    }
+
+    parse_model_list(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Pull model ids out of what a tool prints.
+///
+/// Both print one per line as `<id>` or `<id>\t<description>`, mixed with prose it writes while
+/// it works and, in opencode's case, `[provider]` headings. An id has a `/` or a `-` in it; a
+/// heading is bracketed and a status line ends in an ellipsis.
+fn parse_model_list(text: &str) -> Vec<String> {
+    let mut models: Vec<String> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('['))
+        .filter_map(|l| l.split(['\t', ' ']).next())
+        .filter(|id| id.contains(['/', '-']) && !id.ends_with("...") && !id.starts_with('-'))
+        .map(str::to_string)
+        .collect();
+    models.sort();
+    models.dedup();
+    models
+}
+
+#[cfg(test)]
+mod model_list_tests {
+    use super::parse_model_list;
+
+    /// Real output from both tools, trimmed: a heading, a status line, tab-separated descriptions.
+    #[test]
+    fn model_ids_are_picked_out_of_what_the_tools_print() {
+        let opencode = "[opencode-go]\nopencode-go/glm-5.3\nopencode-go/glm-5.3-flash\n\
+                        [opencode-lmstudio]\nlmstudio/bonsai-27b\n";
+        assert_eq!(
+            parse_model_list(opencode),
+            vec!["lmstudio/bonsai-27b", "opencode-go/glm-5.3", "opencode-go/glm-5.3-flash"]
+        );
+
+        let agy = "Fetching available models...\n\
+                   gemini-3.8-flash-high\tGemini 3.8 Flash (High)\n\
+                   claude-sonnet-4-6\tClaude Sonnet 4.6\n";
+        assert_eq!(parse_model_list(agy), vec!["claude-sonnet-4-6", "gemini-3.8-flash-high"]);
+
+        // Nothing usable in, nothing out — the field stays free text.
+        assert!(parse_model_list("no models configured\n").is_empty());
+    }
+}

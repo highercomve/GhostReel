@@ -174,6 +174,9 @@ export interface TranscriptSegment {
   text: string;
 }
 
+/** The models a coding-agent CLI will accept; empty when it cannot say. */
+export const cliModels = (tool: string) => invoke<string[]>("cli_models", { tool });
+
 export const videoTranscript = (videoId: number) => invoke<TranscriptSegment[]>("video_transcript", { videoId });
 
 export interface ProjectView {
