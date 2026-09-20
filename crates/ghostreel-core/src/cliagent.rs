@@ -80,6 +80,38 @@ fn home_dir() -> Option<PathBuf> {
     std::env::var_os(key).filter(|v| !v.is_empty()).map(PathBuf::from)
 }
 
+/// Turn the ChatML transcript into something a coding agent reads as its own brief.
+///
+/// claude and agy take `<|im_start|>system … <|im_end|>` as instructions and get on with it.
+/// opencode reads it as somebody else's conversation pasted at it and says so — verbatim: "I'm
+/// not going to echo that back or invent fake entries — I'm opencode, not your tool runtime."
+/// The markers go, the turns are labelled in plain words, and the job is stated first.
+fn as_plain_brief(prompt: &str) -> String {
+    let mut out = String::from(
+        "You are the editor described below. These are your instructions, not a transcript to \
+         comment on: follow them and reply with only the JSON object they ask for.\n\n",
+    );
+    for chunk in prompt.split("<|im_start|>") {
+        let chunk = chunk.trim_end_matches("<|im_end|>").trim_end().trim_end_matches("<|im_end|>");
+        let chunk = chunk.trim();
+        if chunk.is_empty() {
+            continue;
+        }
+        let (role, body) = chunk.split_once('\n').unwrap_or(("", chunk));
+        let body = body.replace("<|im_end|>", "").trim().to_string();
+        if body.is_empty() {
+            continue;
+        }
+        match role.trim() {
+            "system" => out.push_str(&format!("{body}\n\n")),
+            "user" => out.push_str(&format!("WHAT YOU WERE ASKED\n{body}\n\n")),
+            "assistant" => out.push_str(&format!("WHAT YOU ANSWERED LAST\n{body}\n\n")),
+            _ => out.push_str(&format!("{body}\n\n")),
+        }
+    }
+    out
+}
+
 pub struct CliAgent {
     pub cfg: CliAgentConfig,
 }
@@ -206,7 +238,12 @@ impl CliAgent {
                     args.insert(i + 2, "--last".into());
                 }
             }
-            // opencode has no continue; it keeps re-sending.
+            // opencode continues too — `run -c`. It has to come after the `run` subcommand.
+            "opencode" => {
+                if let Some(i) = args.iter().position(|a| a == "run") {
+                    args.insert(i + 1, "-c".into());
+                }
+            }
             _ => {}
         }
         args
@@ -250,7 +287,7 @@ impl CliAgent {
                     args.push("-m".into());
                     args.push(self.cfg.model.clone().into());
                 }
-                args.push(prompt.into());
+                args.push(as_plain_brief(prompt).into());
             }
             "codex" => {
                 args.extend(codex_exec_prefix(bin));
@@ -784,5 +821,27 @@ mod model_list_tests {
 
         // Nothing usable in, nothing out — the field stays free text.
         assert!(parse_model_list("no models configured\n").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod brief_tests {
+    use super::as_plain_brief;
+
+    /// opencode read the ChatML transcript as someone else's conversation and refused to play:
+    /// "I'm opencode, not your tool runtime." The same content, framed as its own brief, is a job.
+    #[test]
+    fn a_transcript_becomes_a_brief_it_can_act_on() {
+        let transcript = "<|im_start|>system\nYou are an editor. Reply with JSON.<|im_end|>\n\
+                          <|im_start|>user\nMake a 40 second teaser.<|im_end|>\n\
+                          <|im_start|>assistant\n{\"action\":\"tool\"}<|im_end|>\n";
+        let brief = as_plain_brief(transcript);
+
+        assert!(!brief.contains("<|im_start|>"), "the markers are gone:\n{brief}");
+        assert!(!brief.contains("<|im_end|>"));
+        assert!(brief.starts_with("You are the editor described below"), "the job is stated first");
+        assert!(brief.contains("You are an editor. Reply with JSON."));
+        assert!(brief.contains("WHAT YOU WERE ASKED\nMake a 40 second teaser."));
+        assert!(brief.contains("WHAT YOU ANSWERED LAST"));
     }
 }
