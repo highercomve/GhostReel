@@ -179,6 +179,16 @@ enum ScriptAction {
         #[arg(long)]
         json: bool,
     },
+    /// Find the interviewer's own lines — questions, prompts, "okay", "perfect" — and mark them
+    /// off-mic so no draft can quote them. The acoustic test only catches an interviewer who is
+    /// quieter than the subject; this reads what was said. Needs `jev.enabled` and a key.
+    Interviewer {
+        #[arg(long, short)]
+        project: String,
+        /// Show what would be flagged without changing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Build a cut by choosing rather than writing: Jev picks the quotes and the shots out of the
     /// index, and nothing is generated, so no clip can refer to footage that does not exist.
     /// Fast, and limited to what the interviews already say. Needs `jev.enabled` and a key.
@@ -831,6 +841,23 @@ async fn script_cmd(paths: &Paths, action: ScriptAction) -> anyhow::Result<ExitC
                 for (part, cost) in &sc.parts {
                     println!("  -{cost:>5.1}  {part}");
                 }
+            }
+        }
+        ScriptAction::Interviewer { project, dry_run } => {
+            let p = db.require_project(&project)?;
+            let config = Config::load(&paths.config_file).unwrap_or_default();
+            let verdicts = ghostreel_core::interviewer::find(&db, p.id, &config.jev).await?;
+
+            let found: Vec<_> = verdicts.iter().filter(|v| v.is_interviewer(&config.jev)).collect();
+            println!("read {} line(s) still believed to be the subject", verdicts.len());
+            for v in &found {
+                println!("  #{} {:>7.1}s  p={:.2}  {}", v.video_id, v.start_s, v.p, v.text.trim());
+            }
+            if dry_run {
+                println!("\n{} line(s) would be marked off-mic (nothing changed)", found.len());
+            } else {
+                let n = ghostreel_core::interviewer::apply(&db, &verdicts, &config.jev)?;
+                println!("\nmarked {n} line(s) off-mic");
             }
         }
         ScriptAction::Build { project, brief, target_s } => {

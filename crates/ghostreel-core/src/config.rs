@@ -312,6 +312,15 @@ pub struct JevConfig {
     /// 32k tokens of state; a forty-clip cut with the full transcript under it would spend that
     /// on material no judgement needs.
     pub max_quote_chars: usize,
+    /// Above this probability a transcript line is the interviewer rather than the subject, and
+    /// is marked off-mic so no draft can quote it (`script interviewer`).
+    ///
+    /// Measured on the Greet Mag footage: the unmistakable lines — "so just tell me your name",
+    /// a mic check, a countdown — sit at 0.84–0.97, and real answers wrongly caught sit at
+    /// 0.70–0.76. 0.78 is the gap between them. Lower it to catch more chatter at the cost of
+    /// losing the occasional good quote; raise it to keep every answer and do the last of the
+    /// weeding by hand.
+    pub interviewer_threshold: f64,
 }
 
 impl Default for JevConfig {
@@ -324,6 +333,7 @@ impl Default for JevConfig {
             timeout_s: 60,
             max_beats: 24,
             max_quote_chars: 600,
+            interviewer_threshold: 0.78,
         }
     }
 }
@@ -338,6 +348,12 @@ impl JevConfig {
         }
         if self.timeout_s == 0 {
             return Err("jev.timeout_s must be greater than 0".into());
+        }
+        if !(0.5..=1.0).contains(&self.interviewer_threshold) {
+            return Err(format!(
+                "jev.interviewer_threshold is a probability above a coin flip (0.5–1.0), got {}",
+                self.interviewer_threshold
+            ));
         }
         Ok(())
     }
@@ -624,6 +640,7 @@ impl Config {
                 "timeout_s" => f.timeout_s = num(key, value)?,
                 "max_beats" => f.max_beats = num(key, value)?,
                 "max_quote_chars" => f.max_quote_chars = num(key, value)?,
+                "interviewer_threshold" => f.interviewer_threshold = num(key, value)?,
                 other => return Err(format!("unknown config key 'jev.{other}'")),
             }
             return self.jev.validate();

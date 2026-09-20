@@ -15,6 +15,7 @@ pub mod export;
 pub mod fcpxml;
 pub mod frames;
 pub mod index;
+pub mod interviewer;
 pub mod jev;
 pub mod media;
 pub mod models;

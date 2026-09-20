@@ -108,6 +108,27 @@ one number live in `compose`, in code, so they can be changed without asking any
 - `ghostreel script judge <id> --brief "…"`; `tests/eval_judge.rs` (`--ignored`) re-runs the four
   recorded drafts when the questions change, since a reworded question is a different measurement.
 
+## Who is the interviewer (`interviewer.rs`)
+
+`off_mic` decides whose voice to ignore, and everything reads it: the prompt's speech digest, the
+quote candidates, the judge's "heard". `audio.rs` sets it acoustically — a segment a margin below
+the video's median level is somebody off the lav — which only works when the interviewer is
+*quieter*. On one Greet Mag tape they were not (9 off-mic of 76, against 24–26 elsewhere) and a
+finished cut opened with "Okay, cool. So just tell me your name and the line of business that
+you're in." The editor's verdict: "it's like I asked for bloopers."
+
+`ghostreel script interviewer -p <project> [--dry-run]` asks Jev instead, one Noul per line. It
+only ever *adds* flags — the acoustic test is evidence too.
+
+- **Batch per video, never across the project.** "The surrounding lines are context" is only true
+  if they are the same conversation: batched project-wide that line scored 0.53 and survived; among
+  its own interview it is 0.97.
+- **`jev.interviewer_threshold` is 0.78**, which is the gap the footage showed: unmistakable lines
+  (a question, a mic check, a countdown) sit at 0.84–0.97 and real answers wrongly caught at
+  0.70–0.76. Change it with evidence, not taste.
+- It also catches slates ("Three, two, one, two"), mic checks, and — below the threshold — Whisper's
+  silence hallucination "ご視聴ありがとうございました".
+
 ## Building a cut by choosing (`chat/build.rs`)
 
 A third way to get a script, beside the chat brains and importing JSON: `ghostreel script build`
