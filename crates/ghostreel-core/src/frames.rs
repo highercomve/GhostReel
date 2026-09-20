@@ -1,6 +1,12 @@
 //! Keyframes (plan §3 step 5): pick moments worth describing, save them as JPEGs, drop duplicates.
 //!
-//! 1. One fast low-resolution decode finds scene changes (`select=gt(scene,…)`).
+//! 1. One fast low-resolution decode reads every frame's scene score at 4 fps. A score over
+//!    `scene_threshold` is a cut; the scores *below* it are accumulated, and when the running sum
+//!    passes `change_budget` that moment is worth a frame too. This is the cumulative half of the
+//!    twin-comparison algorithm (Zhang, Kankanhalli & Smoliar, 1993), and it exists because a
+//!    moving camera is formally an endless gradual transition: it never trips a cut threshold, so
+//!    a drive through a neighbourhood used to be sampled by the 20 s fallback alone and every
+//!    keyframe showed a different street with everything between them unindexed.
 //! 2. Gaps longer than `max_interval_s` are filled so static footage (talking heads, screen
 //!    recordings) still gets a frame every so often; cuts closer than `min_interval_s` are thinned.
 //! 3. Each chosen moment is extracted at full quality (long side 1280 px — enough for a vision model
@@ -18,7 +24,16 @@ use crate::Error;
 #[derive(Debug, Clone)]
 pub struct FrameOptions {
     pub scene_threshold: f64,
+    /// Accumulated sub-cut change that earns a keyframe. 0 turns it off, leaving cuts and the
+    /// `max_interval_s` clock alone.
+    ///
+    /// Measured on the Greet Mag footage: ffmpeg's scene score accumulates at 0.12/s on a moving
+    /// camera and 0.02/s on a locked-off interview, so 1.0 asks for a frame every ~8 s of travel
+    /// and never fires on a talking head, which the interval clock already covers.
+    pub change_budget: f64,
     pub max_interval_s: f64,
+    /// Floor between keyframes, and the only thing standing between fast footage and a describe
+    /// job that runs all night: whatever the budget wants, nothing is sampled closer than this.
     pub min_interval_s: f64,
     pub long_side: u32,
     /// Hamming distance at or below which two frames count as duplicates.
@@ -33,6 +48,7 @@ impl Default for FrameOptions {
     fn default() -> Self {
         Self {
             scene_threshold: 0.3,
+            change_budget: 1.0,
             max_interval_s: 20.0,
             min_interval_s: 2.0,
             long_side: 1280,
@@ -53,7 +69,14 @@ impl FrameOptions {
     ///   global cap of 5000 so very long videos aren't silently truncated.
     pub fn from_config(cfg: &crate::config::FramesConfig) -> Self {
         let interval = cfg.clamped_interval();
-        Self { max_interval_s: interval, max_dup_gap_s: (2.0 * interval).max(4.0), max_frames: 5000, ..Self::default() }
+        Self {
+            max_interval_s: interval,
+            max_dup_gap_s: (2.0 * interval).max(4.0),
+            max_frames: 5000,
+            change_budget: cfg.change_budget,
+            min_interval_s: cfg.clamped_min_interval(),
+            ..Self::default()
+        }
     }
 }
 
@@ -64,17 +87,33 @@ pub struct Frame {
     pub dhash: u64,
 }
 
-/// Scene-change timestamps from one low-resolution decode. `on_progress` gets seconds decoded.
+/// What one low-resolution decode found: where the picture cut, and where it had drifted far
+/// enough to be worth another look.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SceneScan {
+    /// Scores over `scene_threshold` — an outright cut.
+    pub cuts: Vec<f64>,
+    /// Moments where the accumulated sub-cut change passed `change_budget`. Empty when the budget
+    /// is 0. These are what a travelling shot gets instead of nothing.
+    pub changes: Vec<f64>,
+}
+
+/// One low-resolution decode: cuts, accumulated change, and progress in seconds decoded.
 ///
 /// Every sampled frame prints its scene score (`metadata=print`), so progress advances steadily
-/// instead of only at cuts. Decoding uses CUDA when available (4K HEVC is ~8× faster than on the
-/// CPU); ffmpeg falls back to software decoding by itself when it isn't.
-pub async fn scene_times(
+/// instead of only at cuts — and the scores below the cut threshold, which used to be read and
+/// thrown away, are the signal a moving camera has. Accumulating them costs a few additions on a
+/// line we already parse: no second pass, no extra decode.
+///
+/// Decoding uses CUDA when available (4K HEVC is ~8× faster than on the CPU); ffmpeg falls back
+/// to software decoding by itself when it isn't.
+pub async fn scene_scan(
     ffmpeg: &Path,
     video: &Path,
-    threshold: f64,
+    opts: &FrameOptions,
     mut on_progress: impl FnMut(f64),
-) -> Result<Vec<f64>, Error> {
+) -> Result<SceneScan, Error> {
+    let threshold = opts.scene_threshold;
     let filter = "fps=4,scale=256:-2,select='gte(scene\\,0)',metadata=print:key=lavfi.scene_score";
     let mut child = crate::proc::command(ffmpeg)
         .args(["-nostdin", "-hide_banner", "-nostats"])
@@ -89,9 +128,17 @@ pub async fn scene_times(
         .map_err(|e| Error::Frames(format!("cannot run {}: {e}", ffmpeg.display())))?;
 
     let stderr = child.stderr.take().ok_or_else(|| Error::Frames("ffmpeg stderr unavailable".into()))?;
-    let mut times = Vec::new();
+    let mut scan = SceneScan::default();
     let mut last_error = String::new();
     let mut pts = 0.0f64;
+    // The running sum since the last frame this pass asked for, and when that was. A cut resets
+    // both: a new shot starts its own drift, and carrying the old one over would ask for a frame
+    // moments after the cut already got one.
+    let mut accumulated = 0.0f64;
+    let mut last_pick = f64::NEG_INFINITY;
+    let budget = opts.change_budget;
+    let floor = opts.min_interval_s;
+
     let mut lines = BufReader::new(stderr).lines();
     while let Ok(Some(l)) = lines.next_line().await {
         if let Some(t) = l.split("pts_time:").nth(1).and_then(|v| v.split_whitespace().next()) {
@@ -100,9 +147,8 @@ pub async fn scene_times(
                 on_progress(t);
             }
         } else if let Some(score) = l.split("lavfi.scene_score=").nth(1) {
-            if score.trim().parse::<f64>().is_ok_and(|s| s > threshold) {
-                times.push(pts);
-            }
+            let Ok(score) = score.trim().parse::<f64>() else { continue };
+            accumulate(score, pts, threshold, budget, floor, &mut accumulated, &mut last_pick, &mut scan);
         } else if !l.trim().is_empty() {
             last_error = l;
         }
@@ -111,7 +157,41 @@ pub async fn scene_times(
     if !status.success() {
         return Err(Error::Frames(format!("scene detection failed: {last_error}")));
     }
-    Ok(times)
+    Ok(scan)
+}
+
+
+/// One scene score, folded into the running scan. Split out so the rule can be tested against a
+/// list of numbers instead of against ffmpeg.
+///
+/// A cut resets the accumulator: a new shot starts its own drift, and carrying the old one over
+/// would ask for a frame moments after the cut already got one. The floor is enforced here rather
+/// than in the plan, and it does *not* reset the accumulator — change that happened is change
+/// that happened, so footage moving faster than the floor allows gets a frame the moment it is
+/// allowed one instead of losing the overflow.
+#[allow(clippy::too_many_arguments)]
+fn accumulate(
+    score: f64,
+    pts: f64,
+    threshold: f64,
+    budget: f64,
+    floor: f64,
+    accumulated: &mut f64,
+    last_pick: &mut f64,
+    scan: &mut SceneScan,
+) {
+    if score > threshold {
+        scan.cuts.push(pts);
+        *accumulated = 0.0;
+        *last_pick = pts;
+    } else if budget > 0.0 {
+        *accumulated += score;
+        if *accumulated >= budget && pts - *last_pick >= floor {
+            scan.changes.push(pts);
+            *accumulated = 0.0;
+            *last_pick = pts;
+        }
+    }
 }
 
 /// Hardware decoding for the full-length scan. macOS uses VideoToolbox; elsewhere CUDA (NVIDIA).
@@ -125,9 +205,10 @@ fn hwaccel_args() -> &'static [&'static str] {
     }
 }
 
-/// Final sampling plan: an early frame, scene cuts (thinned to `min_interval_s`), and fillers so no
-/// gap exceeds `max_interval_s`. Sorted, within `[0, duration)`, at most `max_frames`.
-pub fn plan_times(duration_s: f64, scenes: &[f64], opts: &FrameOptions) -> Vec<f64> {
+/// Final sampling plan: an early frame, scene cuts (thinned to `min_interval_s`), the moments the
+/// picture had drifted far enough, and fillers so no gap exceeds `max_interval_s`. Sorted, within
+/// `[0, duration)`, at most `max_frames`.
+pub fn plan_times(duration_s: f64, scan: &SceneScan, opts: &FrameOptions) -> Vec<f64> {
     if duration_s <= 0.0 {
         return vec![0.0];
     }
@@ -135,11 +216,19 @@ pub fn plan_times(duration_s: f64, scenes: &[f64], opts: &FrameOptions) -> Vec<f
     let first = (duration_s * 0.05).min(1.0);
     let last_ok = (duration_s - 0.05).max(0.0);
     let mut picks = vec![first];
-    let mut sorted: Vec<f64> = scenes.iter().copied().filter(|t| *t > first && *t < last_ok).collect();
-    sorted.sort_by(f64::total_cmp);
-    for t in sorted {
-        // Land slightly after the cut so the new shot is fully on screen.
-        let t = (t + 0.2).min(last_ok);
+
+    // Cuts land 0.2 s late so the new shot is fully on screen; a drift moment is already the
+    // picture we want, so it is taken where it is. Merged in time order, thinned once.
+    let mut sorted: Vec<(f64, bool)> = scan
+        .cuts
+        .iter()
+        .map(|t| (*t, true))
+        .chain(scan.changes.iter().map(|t| (*t, false)))
+        .filter(|(t, _)| *t > first && *t < last_ok)
+        .collect();
+    sorted.sort_by(|a, b| a.0.total_cmp(&b.0));
+    for (t, is_cut) in sorted {
+        let t = if is_cut { (t + 0.2).min(last_ok) } else { t };
         if t - picks.last().unwrap() >= opts.min_interval_s {
             picks.push(t);
         }
@@ -219,13 +308,13 @@ pub async fn extract_keyframes(
     opts: &FrameOptions,
     mut on_progress: impl FnMut(f64),
 ) -> Result<Vec<Frame>, Error> {
-    let scenes = scene_times(ffmpeg, video, opts.scene_threshold, |secs| {
+    let scan = scene_scan(ffmpeg, video, opts, |secs| {
         if duration_s > 0.0 {
             on_progress(0.7 * (secs / duration_s).min(1.0));
         }
     })
     .await?;
-    let times = plan_times(duration_s, &scenes, opts);
+    let times = plan_times(duration_s, &scan, opts);
 
     // Extract in parallel (ffmpeg seeks are cheap), then dedupe in time order.
     let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(4));
@@ -292,26 +381,30 @@ mod tests {
         FrameOptions::default()
     }
 
+    fn cuts(at: &[f64]) -> SceneScan {
+        SceneScan { cuts: at.to_vec(), changes: Vec::new() }
+    }
+
     #[test]
     fn plan_fills_gaps_and_thins_cuts() {
         // 69 s video, cuts at 8, 8.5 (flash), 53, 63.
-        let t = plan_times(69.0, &[8.0, 8.5, 53.0, 63.0], &opts());
+        let t = plan_times(69.0, &cuts(&[8.0, 8.5, 53.0, 63.0]), &opts());
         assert_eq!(t[0], 1.0);
         assert!(t.contains(&8.2) && !t.contains(&8.7), "cut 0.5 s after another is thinned: {t:?}");
         assert!(t.windows(2).all(|w| w[1] - w[0] <= 20.0 + 1e-9), "no gap over 20 s: {t:?}");
         assert!(t.windows(2).all(|w| w[1] > w[0]));
         assert!(*t.last().unwrap() < 69.0);
         // Static 5-minute screen recording: a frame at least every 20 s.
-        let t = plan_times(300.0, &[], &opts());
+        let t = plan_times(300.0, &cuts(&[]), &opts());
         assert!(t.len() >= 15, "{}", t.len());
         // Tiny clip.
-        assert_eq!(plan_times(0.8, &[], &opts()), vec![0.04000000000000001]);
+        assert_eq!(plan_times(0.8, &cuts(&[]), &opts()), vec![0.04000000000000001]);
     }
 
     #[test]
     fn plan_caps_frame_count_evenly() {
         let o = FrameOptions { max_frames: 10, ..opts() };
-        let t = plan_times(3600.0, &[], &o);
+        let t = plan_times(3600.0, &cuts(&[]), &o);
         assert_eq!(t.len(), 10);
         assert!(*t.last().unwrap() > 3000.0, "spread across the video, not just the start");
     }
@@ -379,7 +472,7 @@ mod tests {
     fn from_config_derives_dup_gap_and_raises_max_frames() {
         use crate::config::FramesConfig;
 
-        let mut fc = FramesConfig { max_interval_s: 8.0 };
+        let mut fc = FramesConfig { max_interval_s: 8.0, ..Default::default() };
         // Default 8 s → dup_gap = 16 s
         let opts = FrameOptions::from_config(&fc);
         assert_eq!(opts.max_interval_s, 8.0);
@@ -411,11 +504,96 @@ mod tests {
     fn short_interval_enforced_in_plan() {
         use crate::config::FramesConfig;
 
-        let fc = FramesConfig { max_interval_s: 5.0 };
+        let fc = FramesConfig { max_interval_s: 5.0, ..Default::default() };
         let opts = FrameOptions::from_config(&fc);
         // 60 s video, no scene cuts: frames should be at most 5 s apart
-        let t = plan_times(60.0, &[], &opts);
+        let t = plan_times(60.0, &cuts(&[]), &opts);
         assert!(t.windows(2).all(|w| w[1] - w[0] <= 5.0 + 1e-9), "gap exceeds interval: {t:?}");
         assert!(t.len() >= 11, "expected ≥ 11 frames for 60 s / 5 s interval, got {}", t.len());
+    }
+
+    /// Run a list of per-frame scores through the rule, at 4 fps, as the decode loop would.
+    fn scan_scores(scores: &[f64], opts: &FrameOptions) -> SceneScan {
+        let mut scan = SceneScan::default();
+        let (mut acc, mut last) = (0.0, f64::NEG_INFINITY);
+        for (i, &sc) in scores.iter().enumerate() {
+            let pts = i as f64 / 4.0;
+            accumulate(sc, pts, opts.scene_threshold, opts.change_budget, opts.min_interval_s, &mut acc, &mut last, &mut scan);
+        }
+        scan
+    }
+
+    #[test]
+    fn a_moving_camera_earns_frames_a_cut_threshold_never_would() {
+        // 60 s at 4 fps. The measured rate on the DJI walk: 0.031 per frame, 0.12 per second,
+        // and not one frame anywhere near the 0.3 cut threshold.
+        let travelling = vec![0.031; 240];
+        let scan = scan_scores(&travelling, &opts());
+        assert!(scan.cuts.is_empty(), "nothing here is a cut, which is the whole problem");
+        // Budget 1.0 at 0.12/s ≈ a frame every 8 s.
+        assert!(
+            (7..=9).contains(&scan.changes.len()),
+            "expected ~8 frames over 60 s, got {}: {:?}",
+            scan.changes.len(),
+            scan.changes
+        );
+
+        // The same footage with the budget off is what GhostReel did before: nothing at all, and
+        // the 20 s interval clock left to do the whole job.
+        let off = FrameOptions { change_budget: 0.0, ..opts() };
+        assert!(scan_scores(&travelling, &off).changes.is_empty());
+    }
+
+    #[test]
+    fn a_locked_off_interview_is_left_to_the_interval_clock() {
+        // The measured rate on a tripod interview: 0.005 per frame, 0.02 per second.
+        let scan = scan_scores(&vec![0.005; 240], &opts());
+        assert!(scan.cuts.is_empty());
+        assert!(
+            scan.changes.len() <= 1,
+            "a talking head must not be resampled by drift: {:?}",
+            scan.changes
+        );
+    }
+
+    #[test]
+    fn the_floor_holds_when_the_footage_is_far_faster_than_anything_measured() {
+        // A car at speed: nine times the drift of the DJI walk, and still never a cut — which is
+        // the point, a continuously moving camera has no cuts at any speed. The budget alone
+        // would ask for a frame every 0.9 s; min_interval_s is the only thing between that and an
+        // overnight describe job.
+        let scan = scan_scores(&vec![0.29; 240], &opts());
+        assert!(scan.cuts.is_empty(), "fast is not the same as cut");
+        let gaps: Vec<f64> = scan.changes.windows(2).map(|w| w[1] - w[0]).collect();
+        assert!(
+            gaps.iter().all(|g| *g >= opts().min_interval_s - 1e-9),
+            "the floor was crossed: {gaps:?}"
+        );
+        // 60 s at a 2 s floor: about 30 frames, not the ~69 the budget alone would have asked for.
+        assert!(scan.changes.len() <= 31, "{} frames in 60 s", scan.changes.len());
+        assert!(scan.changes.len() >= 25, "the floor must not starve it either: {}", scan.changes.len());
+    }
+
+    #[test]
+    fn a_cut_starts_the_drift_over() {
+        // Drift almost to the budget, then cut. The cut gets its own frame and the leftover
+        // drift is discarded, so the next frame is not asked for a moment later.
+        let mut scores = vec![0.09; 10];
+        scores.push(0.9);
+        scores.extend(vec![0.09; 10]);
+        let scan = scan_scores(&scores, &opts());
+        assert_eq!(scan.cuts.len(), 1);
+        assert!(scan.changes.is_empty(), "the cut absorbed the drift: {:?}", scan.changes);
+    }
+
+    #[test]
+    fn drift_moments_join_the_plan_where_they_happened() {
+        let scan = SceneScan { cuts: vec![10.0], changes: vec![20.0, 40.0] };
+        let t = plan_times(60.0, &scan, &opts());
+        // A cut lands 0.2 s late so the new shot is on screen; a drift moment is already the
+        // picture we want, so it is taken where it is.
+        assert!(t.contains(&10.2), "{t:?}");
+        assert!(t.contains(&20.0) && t.contains(&40.0), "{t:?}");
+        assert!(t.windows(2).all(|w| w[1] > w[0]), "still in order: {t:?}");
     }
 }

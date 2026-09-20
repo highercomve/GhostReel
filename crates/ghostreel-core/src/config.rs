@@ -504,15 +504,35 @@ pub struct FramesConfig {
     /// Shorter = more detail for search and scripts; longer = faster indexing.
     /// Scene changes always get a frame regardless of this setting.
     pub max_interval_s: f64,
+    /// How much accumulated picture change earns a keyframe, on top of cuts and the interval
+    /// clock. 0 turns it off.
+    ///
+    /// A fixed interval is wrong in both directions at once: it wastes frames on a locked-off
+    /// talking head and starves a moving camera, which never trips a cut threshold and so used to
+    /// be sampled by the clock alone. Measured on real footage, ffmpeg's scene score accumulates
+    /// at ~0.12/s while travelling and ~0.02/s on a static interview, so 1.0 asks for a frame
+    /// every ~8 s of travel and never fires on a talking head. Lower it for more detail on
+    /// moving footage, at a describe call per extra frame.
+    pub change_budget: f64,
+    /// Never sample closer together than this (s). The budget is self-calibrating — footage that
+    /// changes five times faster gets five times the frames, with no notion of what a car is —
+    /// and this is what stops that from becoming an overnight describe job.
+    pub min_interval_s: f64,
 }
 
 impl Default for FramesConfig {
     fn default() -> Self {
-        Self { max_interval_s: 8.0 }
+        Self { max_interval_s: 8.0, change_budget: 1.0, min_interval_s: 2.0 }
     }
 }
 
 impl FramesConfig {
+    /// Clamp `min_interval_s` to 0.5–30 s, and never above `max_interval_s`: a floor longer than
+    /// the ceiling would silently disable the interval clock.
+    pub fn clamped_min_interval(&self) -> f64 {
+        self.min_interval_s.clamp(0.5, 30.0).min(self.clamped_interval())
+    }
+
     /// Clamp `max_interval_s` to the valid range (1–60 s) without erroring.
     pub fn clamped_interval(&self) -> f64 {
         self.max_interval_s.clamp(1.0, 60.0)
@@ -695,6 +715,20 @@ impl Config {
                 }
                 self.frames.max_interval_s = v;
             }
+            "frames.change_budget" => {
+                let v: f64 = num(key, value)?;
+                if !(0.0..=20.0).contains(&v) {
+                    return Err(format!("frames.change_budget must be between 0 (off) and 20, got {v}"));
+                }
+                self.frames.change_budget = v;
+            }
+            "frames.min_interval_s" => {
+                let v: f64 = num(key, value)?;
+                if !(0.5..=30.0).contains(&v) {
+                    return Err(format!("frames.min_interval_s must be between 0.5 and 30, got {v}"));
+                }
+                self.frames.min_interval_s = v;
+            }
             other => {
                 return Err(format!(
                     "unknown or unsupported config key '{other}'; supported keys: \
@@ -875,7 +909,7 @@ mod tests {
 
     #[test]
     fn frames_config_clamping_and_validation() {
-        let mut fc = FramesConfig { max_interval_s: 0.5 };
+        let mut fc = FramesConfig { max_interval_s: 0.5, ..Default::default() };
         assert_eq!(fc.clamped_interval(), 1.0);
         assert!(fc.validate().is_err());
 

@@ -108,6 +108,34 @@ one number live in `compose`, in code, so they can be changed without asking any
 - `ghostreel script judge <id> --brief "…"`; `tests/eval_judge.rs` (`--ignored`) re-runs the four
   recorded drafts when the questions change, since a reworded question is a different measurement.
 
+## Keyframe sampling (`frames.rs`)
+
+One low-resolution decode at 4 fps reads every frame's scene score. A score over
+`scene_threshold` is a cut; the scores *below* it are accumulated, and when the running sum passes
+`frames.change_budget` that moment earns a frame too — the cumulative half of the **twin-comparison
+algorithm** (Zhang, Kankanhalli & Smoliar, 1993). A moving camera is formally an endless gradual
+transition: it never trips a cut threshold, so a drive through a neighbourhood used to be sampled
+by the interval clock alone, every keyframe a different street and everything between them
+unindexed.
+
+- **Accumulate, never compare to the last kept frame.** Measured on the DJI walk, distance from a
+  fixed frame saturates at ~0.25 after four seconds and never grows: at 90 s and a completely
+  different street it reads the same as at 4 s. Same budget, accumulation picked 10 keyframes and
+  reference-distance picked 1. Do not "improve" this into a reference comparison.
+- **`min_interval_s` is the only cost control that matters.** The budget is self-calibrating —
+  footage changing five times faster gets five times the frames, with no notion of what a car is —
+  and the floor is what stops that from becoming an overnight describe job. It is enforced in the
+  scan, and it does *not* reset the accumulator, so fast footage gets its frame the moment it is
+  allowed one instead of losing the overflow.
+- **Cost lives in frame count**, not in the scan: the decode is O(duration) and unchanged, but
+  extraction spawns an ffmpeg per frame and the describe stage is one vision call per frame.
+- Calibration (Greet Mag, Sep 2026): ffmpeg's scene score accumulates at ~0.12/s on a moving
+  camera and ~0.02/s on a locked-off interview. `change_budget = 1.0` therefore asks for a frame
+  every ~8 s of travel and never fires on a talking head. Change it with measurements.
+- PySceneDetect's `AdaptiveDetector` solves the *opposite* problem (suppressing false cuts during
+  camera motion); AKS/Q-Frame score frames against the *query*, which an index built once and
+  searched later cannot do. Neither applies here.
+
 ## Who is the interviewer (`interviewer.rs`)
 
 `off_mic` decides whose voice to ignore, and everything reads it: the prompt's speech digest, the
