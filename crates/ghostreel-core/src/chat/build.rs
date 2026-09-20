@@ -75,6 +75,46 @@ const MIN_QUOTE_WORDS: usize = 10;
 const MIN_LAST_SENTENCE_WORDS: usize = 4;
 /// A Choice takes at most 255 options, and the state has to fit beside them.
 const MAX_OPTIONS: usize = 200;
+
+/// Cut a pool down to `max` by taking a turn from each video, rather than the first `max`.
+///
+/// Truncating in video order quietly hid most of the project: 639 described shots across 96
+/// videos, and the first 200 of them covered 25. Re-indexing made that worse, because more frames
+/// per video pushed *more* videos out of the window — the same four quotes came back from a cut
+/// built on half again as much footage. A round-robin means every video is represented before any
+/// video is represented twice, which is the only honest way to spend a fixed number of options.
+fn spread<T>(items: &[T], max: usize, video_of: impl Fn(&T) -> i64) -> Vec<&T> {
+    if items.len() <= max {
+        return items.iter().collect();
+    }
+    let mut by_video: Vec<(i64, Vec<&T>)> = Vec::new();
+    for it in items {
+        let v = video_of(it);
+        match by_video.iter_mut().find(|(id, _)| *id == v) {
+            Some((_, group)) => group.push(it),
+            None => by_video.push((v, vec![it])),
+        }
+    }
+    let mut out = Vec::with_capacity(max);
+    let mut round = 0usize;
+    while out.len() < max {
+        let mut took_any = false;
+        for (_, group) in &by_video {
+            if let Some(it) = group.get(round) {
+                out.push(*it);
+                took_any = true;
+                if out.len() == max {
+                    break;
+                }
+            }
+        }
+        if !took_any {
+            break;
+        }
+        round += 1;
+    }
+    out
+}
 /// The speaker has to be on screen long enough to be somebody before we cut away from them.
 const MIN_SPEAKER_S: f64 = 2.0;
 /// A cutaway shorter than this flashes past; longer than this and the speaker is forgotten.
@@ -228,7 +268,7 @@ async fn choose_quotes(
     brief: &str,
     target_s: f64,
 ) -> Result<Vec<Quote>, Error> {
-    let all: Vec<&Quote> = footage.quotes.iter().take(MAX_OPTIONS).collect();
+    let all: Vec<&Quote> = spread(&footage.quotes, MAX_OPTIONS, |q| q.video_id);
     let mut taken: Vec<Quote> = Vec::new();
 
     // Voices already used are off the menu while anything else is left. The middle question asks
@@ -325,7 +365,9 @@ async fn choose_shots(
     brief: &str,
 ) -> Result<Vec<Option<Shot>>, Error> {
     let speakers: std::collections::HashSet<i64> = lines.iter().map(|q| q.video_id).collect();
-    let pool: Vec<&Shot> = footage.shots.iter().filter(|s| !speakers.contains(&s.video_id)).take(MAX_OPTIONS).collect();
+    let eligible: Vec<Shot> =
+        footage.shots.iter().filter(|s| !speakers.contains(&s.video_id)).cloned().collect();
+    let pool: Vec<&Shot> = spread(&eligible, MAX_OPTIONS, |s| s.video_id);
     if pool.is_empty() {
         return Ok(vec![None; lines.len()]);
     }
@@ -620,5 +662,34 @@ mod tests {
             "a closing line ending on an acknowledgement is what a viewer is left with: {:?}",
             f.quotes.iter().map(|q| &q.text).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn capping_the_options_takes_a_turn_from_each_video_not_the_first_few() {
+        // Three videos, ten shots each, room for six options.
+        let shots: Vec<Shot> = (1..=3)
+            .flat_map(|v| (0..10).map(move |i| Shot { video_id: v, t_s: i as f64, text: String::new() }))
+            .collect();
+        let picked = spread(&shots, 6, |s| s.video_id);
+
+        assert_eq!(picked.len(), 6);
+        let videos: std::collections::BTreeSet<i64> = picked.iter().map(|s| s.video_id).collect();
+        assert_eq!(videos.len(), 3, "every video is represented: {videos:?}");
+        // Truncation would have given six shots of video 1 and nothing else, which is what hid
+        // 71 of 96 videos from the real build.
+        assert_eq!(picked.iter().filter(|s| s.video_id == 1).count(), 2);
+
+        // Round order: one from each, then the next from each.
+        let order: Vec<(i64, f64)> = picked.iter().map(|s| (s.video_id, s.t_s)).collect();
+        assert_eq!(order, vec![(1, 0.0), (2, 0.0), (3, 0.0), (1, 1.0), (2, 1.0), (3, 1.0)]);
+    }
+
+    #[test]
+    fn a_pool_that_already_fits_is_left_exactly_as_it_was() {
+        let shots: Vec<Shot> =
+            (0..5).map(|i| Shot { video_id: 1, t_s: i as f64, text: String::new() }).collect();
+        let picked = spread(&shots, 200, |s| s.video_id);
+        assert_eq!(picked.len(), 5);
+        assert_eq!(picked.iter().map(|s| s.t_s).collect::<Vec<_>>(), vec![0.0, 1.0, 2.0, 3.0, 4.0]);
     }
 }

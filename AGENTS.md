@@ -199,6 +199,10 @@ that questions only *suggest* are enforced in code, because "mostly" is not a ru
   question gave a four-line cut drawn from two people out of fifty-six.
 - **Shots come only from footage nobody in the cut speaks in**, so a talking head can never be the
   b-roll under somebody else's voice.
+- **A capped pool is spread, never truncated.** `.take(200)` in video order showed Jev shots from
+  25 of 96 videos, and re-indexing made it *worse*: more frames per video pushed more videos out
+  of the window, so half again as much footage produced the identical cut. `spread` takes a turn
+  from each video instead.
 - **The cutaway falls on a transcript boundary**, never inside a sentence. Cutting anywhere else
   is undone by `end_on_sentences` and the first real build came out 84% over its target.
 
