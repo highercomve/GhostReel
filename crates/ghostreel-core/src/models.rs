@@ -299,6 +299,30 @@ pub fn catalog() -> Vec<CatalogEntry> {
             vram_mb: Some(4500),
         },
         CatalogEntry {
+            id: "qwen3.5-9b".into(),
+            kind: ModelKind::Vision,
+            file_name: "Qwen3.5-9B-UD-Q4_K_XL.gguf".into(),
+            url: "https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-UD-Q4_K_XL.gguf".into(),
+            size_bytes: 5_966_095_584,
+            speed: 3,
+            accuracy: 5,
+            // The only local model here that can actually write a script. Bonsai-27B describes a
+            // frame well but its Q1_0 quantisation cannot hold a 15k-token speech digest: given a
+            // prompt naming "Northwest Hills" nineteen times it replied that no such footage
+            // existed. Qwen2.5-VL is a different failure — `vision: Unknown Token Type`, a chat
+            // template this build cannot apply — so neither 3B nor 7B of that family works at all.
+            note: "writes scripts as well as describes; needs ~7 GB".into(),
+            languages: "multilingual".into(),
+            // Upstream's own name, unprefixed, because a paired entry counts as installed only
+            // when *both* files resolve — and discovery matches on the file name, so renaming it
+            // here would hide a copy already on disk (it did: this read "not installed" beside a
+            // 5.7 GB file it was looking straight at).
+            mmproj_file_name: Some("mmproj-F16.gguf".into()),
+            mmproj_url: Some("https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/mmproj-F16.gguf".into()),
+            mmproj_size_bytes: Some(918_166_080),
+            vram_mb: Some(7500),
+        },
+        CatalogEntry {
             id: "qwen2.5-vl-7b".into(),
             kind: ModelKind::Vision,
             file_name: "Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf".into(),
@@ -698,6 +722,12 @@ mod tests {
         );
         assert!(
             cat.iter().any(|e| e.id == "qwen2.5-vl-7b" && e.kind == ModelKind::Vision && e.mmproj_file_name.is_some())
+        );
+        // The standalone script writer. Without a vision pair it cannot be selected at all, and
+        // without it standalone has no local model that can draft: Bonsai refuses on a long
+        // digest and Qwen2.5-VL's template does not load.
+        assert!(
+            cat.iter().any(|e| e.id == "qwen3.5-9b" && e.kind == ModelKind::Vision && e.mmproj_file_name.is_some())
         );
         assert!(cat.iter().any(|e| e.id == "embeddinggemma-300M-Q8_0" && e.kind == ModelKind::Embedding));
 

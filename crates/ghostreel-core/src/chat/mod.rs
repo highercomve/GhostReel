@@ -634,19 +634,30 @@ pub fn local_action_schema() -> Value {
 }
 
 /// Local LLM final action schema only.
-pub fn local_final_action_schema() -> Value {
+/// The last call of a turn. `allow_reply` is false once the model has opened footage.
+///
+/// Leaving the reply branch here is what a grammar-constrained model reaches for at the end: one
+/// local run did the whole job — searched, chose four quotes, laid out a 40 s structure with real
+/// timecodes — and then handed it over as markdown prose inside a `reply`, because that branch
+/// was still reachable and prose is easier than a schema. A model that has looked at the footage
+/// has nothing left to ask, so the grammar stops offering.
+pub fn local_final_action_schema(allow_reply: bool) -> Value {
+    let final_branch = json!({
+        "type": "object",
+        "properties": {
+            "action": { "type": "string", "enum": ["final"] },
+            "script": script_json_schema()
+        },
+        "required": ["action", "script"],
+        "additionalProperties": false
+    });
+    if !allow_reply {
+        return final_branch;
+    }
     json!({
         "type": "object",
         "oneOf": [
-            {
-                "type": "object",
-                "properties": {
-                    "action": { "type": "string", "enum": ["final"] },
-                    "script": script_json_schema()
-                },
-                "required": ["action", "script"],
-                "additionalProperties": false
-            },
+            final_branch,
             {
                 "type": "object",
                 "properties": {
@@ -784,6 +795,88 @@ pub fn speech_digest(db: &Db, project_id: i64, max_chars: usize) -> String {
     out
 }
 
+/// What the footage *looks* like, the way [`speech_digest`] is what it sounds like.
+///
+/// The prompt gave the model every word anybody said and not one word about what is on screen —
+/// pictures were reachable only by calling a tool. A model that does not call one therefore
+/// concludes, correctly from what it was given, that there is no b-roll: both local models
+/// refused this project with "the only clips containing people speaking contain no visual
+/// descriptions of the neighborhood's scenery", while the index held 639 described frames of
+/// exactly that. It is not a hallucination, it is an honest reading of an incomplete prompt.
+///
+/// Deliberately a *digest*, not the descriptions: one line per video, the first description and a
+/// count, so the model learns which tapes hold pictures and goes looking. The full text is still
+/// `search_moments` and `get_video`.
+pub fn picture_digest(db: &Db, project_id: i64, max_chars: usize) -> String {
+    let Ok(mut st) = db.conn.prepare(
+        "SELECT fr.video_id, MIN(vf.path), COUNT(*), MIN(fr.t_s), MAX(fr.t_s)
+           FROM frames fr
+           JOIN video_files vf ON vf.video_id = fr.video_id
+           JOIN folders f ON f.id = vf.folder_id
+           JOIN project_folders pf ON pf.folder_id = f.id
+          WHERE pf.project_id = ?1 AND fr.description_json IS NOT NULL
+            AND fr.description_json NOT LIKE '{\"error\"%'
+            AND NOT EXISTS (SELECT 1 FROM project_exclusions x
+                             WHERE x.project_id = pf.project_id AND x.video_id = fr.video_id)
+          GROUP BY fr.video_id
+          ORDER BY COUNT(*) DESC",
+    ) else {
+        return String::new();
+    };
+    let videos: Vec<(i64, String, i64, f64, f64)> = st
+        .query_map([project_id], |r| {
+            Ok((r.get(0)?, r.get::<_, String>(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default();
+    if videos.is_empty() {
+        return String::new();
+    }
+
+    let mut out = String::from(
+        "\nWHAT THE FOOTAGE SHOWS\nOne line per video that has pictures: how many moments were described and what \
+         the first one shows. This is a table of contents, not the pictures themselves — when a line sounds like \
+         what somebody is talking about, open it with get_video or search_moments for the exact moments and their \
+         timestamps. A video listed here HAS usable b-roll.\n",
+    );
+    let mut left_out = Vec::new();
+
+    for (video_id, path, count, first_t, last_t) in &videos {
+        let name = Path::new(path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        let first: Option<String> = db
+            .conn
+            .query_row(
+                "SELECT description_json FROM frames
+                  WHERE video_id = ?1 AND description_json IS NOT NULL ORDER BY t_s LIMIT 1",
+                [video_id],
+                |r| r.get(0),
+            )
+            .ok();
+        let shows = first
+            .and_then(|raw| {
+                serde_json::from_str::<Value>(&raw).ok().and_then(|v| v["description"].as_str().map(str::to_string))
+            })
+            .unwrap_or_default();
+        let shows: String = shows.trim().chars().take(180).collect();
+        let block =
+            format!("  #{video_id} {name} — {count} moments, {first_t:.0}-{last_t:.0}s: {shows}\n");
+        if out.len() + block.len() <= max_chars {
+            out.push_str(&block);
+        } else {
+            left_out.push(format!("#{video_id}"));
+        }
+    }
+
+    if !left_out.is_empty() {
+        out.push_str(&format!(
+            "\nAlso pictures in {} more: {} — open them with get_video.\n",
+            left_out.len(),
+            left_out.join(", ")
+        ));
+    }
+    out
+}
+
 /// The project's reference edits (finished videos made by a person) as a study guide for the model:
 /// length, keyframe timeline and transcript. Empty when there are none.
 pub fn reference_edits_text(db: &Db, project_id: i64, max_chars: usize) -> String {
@@ -847,6 +940,10 @@ pub fn reference_edits_text(db: &Db, project_id: i64, max_chars: usize) -> Strin
 /// After this many searches in a row come back empty, the model is told to look at the footage
 /// directly instead: a weak local model otherwise repeats the same query until it runs out of turns.
 const EMPTY_SEARCHES_BEFORE_HINT: usize = 2;
+
+/// How often the loop insists a local model looks before it answers. Two: the first nudge names
+/// the tools, the second shows the JSON. A third would be arguing with it.
+const MAX_PUSHBACKS: usize = 2;
 
 const EMPTY_SEARCH_HINT: &str = "Those searches found nothing — the words you are searching for are not in this \
 footage. Stop searching: call list_videos, then get_video and get_transcript on the videos that look useful, and \
@@ -2607,6 +2704,12 @@ pub async fn run_turn(
     };
     if ctx.script.speech_in_prompt {
         sys_prompt.push_str(&speech_digest(&ctx.db, project_id, speech_chars));
+        // And a table of contents for the pictures. Without it the prompt describes every word
+        // anybody said and nothing at all about what is on screen, so a model that does not
+        // happen to call a tool concludes there is no b-roll — which is what both local models
+        // did on a project holding 639 described frames. A line per video is a fraction of the
+        // speech digest and removes the whole failure.
+        sys_prompt.push_str(&picture_digest(&ctx.db, project_id, speech_chars / 4));
     }
     // A length the user states ("60 second promo", "2 minutos") wins over whatever the model sets.
     let requested_s = requested_duration_s(message);
@@ -2922,6 +3025,10 @@ pub async fn run_turn(
             let mut tool_rounds = 0;
             let mut empty_searches = 0usize;
             let mut hinted = false;
+            // Whether any footage has been opened, and whether the "you have not looked yet"
+            // nudge has already been spent.
+            let mut tools_used = 0usize;
+            let mut pushed_back = 0usize;
             while tool_rounds < rounds_budget {
                 if cancelled() {
                     // The generation runs inside the helper process; ending the turn means
@@ -2934,15 +3041,57 @@ pub async fn run_turn(
                 // the thought — at the default 2048 it ran out mid-round and the turn died.
                 let out_str =
                     helper.complete_full(&transcript, Some(local_action_schema()), script_token_budget, *think).await?;
+                // Every round, not just the final draft: a turn that ends in `Reply` never
+                // reaches the draft call, so the one dump that existed showed nothing at all
+                // about why a local model talked instead of editing.
+                debug_dump(&format!("local-round-{tool_rounds}"), &transcript, &out_str);
                 let action: Result<LocalAction, _> = serde_json::from_str(&out_str);
                 match action {
                     // Answering in words is a complete turn: nothing is drafted and the previous
                     // version stays as it is.
                     Ok(LocalAction::Reply { text }) => {
+                        // Replying before looking at anything is the cheapest branch of the
+                        // grammar and models take it: asked for a 40 s piece about a
+                        // neighbourhood, two different local models declined in one round —
+                        // "nobody explicitly states 'I live here'" — while the transcripts named
+                        // the place nineteen times and three speakers said they grew up there.
+                        // The prompt already forbids this ("do not reply to avoid work"); a rule
+                        // the harness can enforce should not be left to the model's manners.
+                        //
+                        // Pushed back on once, and only once: a second reply is a considered one
+                        // and ends the turn, which is what the escape hatch is for.
+                        if tools_used == 0 && pushed_back < MAX_PUSHBACKS {
+                            pushed_back += 1;
+                            transcript.push_str(&format!(
+                                "<|im_start|>assistant\n{{\"action\":\"reply\",\"text\":{}}}<|im_end|>\n",
+                                serde_json::to_string(&text).unwrap_or_else(|_| "\"\"".into())
+                            ));
+                            // The second nudge spells out the action, because the first earns
+                            // answers like "I need to verify the visual content for the
+                            // interviewee" — the model knows what to do and describes doing it
+                            // instead of doing it. Saying "use a tool" is not enough; showing the
+                            // JSON is.
+                            transcript.push_str(if pushed_back == 1 {
+                                "<|im_start|>user\nYou have not opened any footage yet, so that answer is a guess. \
+                                 WHAT THE FOOTAGE SHOWS lists every video that has pictures, and WHAT PEOPLE SAY has \
+                                 every word with its timestamps. Use a tool — search_moments for a subject, \
+                                 get_video to open a tape — and then draft. Only say the footage cannot support the \
+                                 request after you have looked.<|im_end|>\n"
+                            } else {
+                                "<|im_start|>user\nDo not describe what you need to check: check it. Answer with \
+                                 the tool action itself, for example \
+                                 {\"action\":\"tool\",\"tool\":\"search_moments\",\"args\":{\"query\":\"quiet \
+                                 residential street\"}} or \
+                                 {\"action\":\"tool\",\"tool\":\"get_video\",\"args\":{\"video_id\":41}}. The \
+                                 length you were given is the target; it is not something to ask about.<|im_end|>\n"
+                            });
+                            continue;
+                        }
                         raw_reply = text;
                         break;
                     }
                     Ok(LocalAction::Tool { tool, args }) => {
+                        tools_used += 1;
                         on_event(ChatEvent::ToolStarted { tool: tool.clone(), args: args.clone() });
                         let vector = if tool == "search_moments" {
                             if let (Some(e), Some(q)) =
@@ -2956,16 +3105,27 @@ pub async fn run_turn(
                             None
                         };
 
-                        let (res, summary) = dispatch_tool(
-                            &ctx.db,
-                            &ctx.data_dir,
-                            project_id,
-                            &tool,
-                            &args,
-                            &mut grounding,
-                            vector.as_deref(),
-                            &ctx.script,
-                        );
+                        // Remembered, like the server and CLI paths already do. Without it a
+                        // local model asked the same question forever: four identical
+                        // get_video calls for video #100, 52-79 s, one after another, each
+                        // answered afresh and none of them advancing the turn.
+                        let (res, summary) = match memo.recall(&tool, &args) {
+                            Some(known) => known,
+                            None => {
+                                let fresh = dispatch_tool(
+                                    &ctx.db,
+                                    &ctx.data_dir,
+                                    project_id,
+                                    &tool,
+                                    &args,
+                                    &mut grounding,
+                                    vector.as_deref(),
+                                    &ctx.script,
+                                );
+                                memo.remember(&tool, &args, &fresh.0, &fresh.1);
+                                fresh
+                            }
+                        };
                         on_event(ChatEvent::ToolFinished { tool: tool.clone(), summary: summary.clone() });
                         let empty = is_empty_search(&tool, &summary);
                         tool_records.push(ToolCallRecord { tool: tool.clone(), args: args.clone(), summary });
@@ -3008,7 +3168,12 @@ pub async fn run_turn(
                     allowed_clips_text(&grounding)
                 ));
                 let final_str = helper
-                    .complete_full(&transcript, Some(local_final_action_schema()), script_token_budget, *think)
+                    .complete_full(
+                        &transcript,
+                        Some(local_final_action_schema(tools_used == 0)),
+                        script_token_budget,
+                        *think,
+                    )
                     .await?;
                 debug_dump("final-draft", &transcript, &final_str);
                 // Failing to parse here used to leave `parsed_script` as None, which surfaced as
@@ -3059,7 +3224,7 @@ pub async fn run_turn(
                         allowed_clips_text(&grounding)
                     ));
                     if let Ok(retry_str) = helper
-                        .complete_full(&transcript, Some(local_final_action_schema()), script_token_budget, *think)
+                        .complete_full(&transcript, Some(local_final_action_schema(false)), script_token_budget, *think)
                         .await
                         && let Ok(LocalAction::Final { mut script }) = serde_json::from_str::<LocalAction>(&retry_str)
                     {
@@ -3100,7 +3265,7 @@ pub async fn run_turn(
             transcript.push_str(&format!("<|im_start|>user\n{message}<|im_end|>\n"));
 
             let schema_json = serde_json::to_string(&local_action_schema()).unwrap_or_default();
-            let final_schema_json = serde_json::to_string(&local_final_action_schema()).unwrap_or_default();
+            let final_schema_json = serde_json::to_string(&local_final_action_schema(true)).unwrap_or_default();
 
             let mut tool_rounds = 0;
             let mut empty_searches = 0usize;

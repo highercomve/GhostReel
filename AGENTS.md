@@ -85,6 +85,28 @@ A draft then goes through repair passes, in this order, and the order matters:
 - **The conversation is re-sent every round**, so the loop keeps three quarters of the window and
   forgets the oldest tool results (`make_room`) rather than dying on the server's context error.
 
+## The local (standalone) chat path
+
+A local model is grammar-constrained to one action per round — `tool`, `final` or `reply` — and
+`reply` is the cheapest branch to commit to. Left alone it is chosen constantly, and the turn ends
+having done nothing. Four things keep standalone working; each was a real failure first:
+
+- **The prompt must describe the pictures, not only the speech.** `speech_digest` gave every word
+  and nothing about what is on screen, so a model that called no tool concluded there was no
+  b-roll — both local models refused a project holding 639 described frames. `picture_digest` is
+  one line per video and removes the whole class.
+- **A `reply` before any tool call is pushed back on, twice** (`MAX_PUSHBACKS`). The first nudge
+  names the tools; the second shows the JSON, because the first earns "I need to verify the visual
+  content" — the model describing the tool call instead of making it.
+- **`ToolMemo` applies here too.** Without it a local model asked the same question forever: four
+  identical `get_video` calls for the same range, each answered afresh.
+- **The final call drops the `reply` branch once footage has been opened**
+  (`local_final_action_schema(allow_reply)`). A model that had done the whole job handed it over as
+  markdown prose because that branch was still reachable.
+
+`GHOSTREEL_DEBUG_CHAT` dumps every local round, not just the final draft — a turn that ends in
+`reply` never reaches the draft, which is exactly the failure worth seeing.
+
 ## The editorial judge (`chat/judge.rs`, `jev.rs`)
 
 `chat/metrics.rs` counts craft faults and every one has a pass that drives it to zero. It cannot
