@@ -284,6 +284,65 @@ pub struct ScriptConfig {
     pub shake_stride_s: f64,
 }
 
+/// Jev, TypeSafe's System One model, used as an editorial judge.
+///
+/// Everything else in GhostReel runs on this machine. This does not: it is a hosted model, and a
+/// judgement sends the cut's narration, the words spoken under it and the descriptions of what is
+/// on screen to `api.typesafe.ai`. That is why it is off by default and why turning it on takes
+/// both a switch and a key — a shortcut through either would mean a local-first tool quietly
+/// posting somebody's interview to a third party.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct JevConfig {
+    /// Ask Jev at all. Without this nothing here is reached, whatever else is set.
+    pub enabled: bool,
+    /// The API key. `TYPESAFE_API_KEY` in the environment wins over this, because a config file
+    /// is committed by accident far more often than an environment is.
+    pub api_key: String,
+    /// Which model answers. `jev-latest` moves with each release; pin a version once thresholds
+    /// have been tuned against one.
+    pub model: String,
+    pub base_url: String,
+    /// One request carries every question, so this covers the whole judgement.
+    pub timeout_s: u64,
+    /// How many beats are asked about individually. The per-beat questions are the ones that
+    /// grow with the script; the whole-cut ones are fixed.
+    pub max_beats: usize,
+    /// Characters of transcript quoted per beat, and of picture description per clip. Jev reads
+    /// 32k tokens of state; a forty-clip cut with the full transcript under it would spend that
+    /// on material no judgement needs.
+    pub max_quote_chars: usize,
+}
+
+impl Default for JevConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            api_key: String::new(),
+            model: "jev-latest".into(),
+            base_url: "https://api.typesafe.ai".into(),
+            timeout_s: 60,
+            max_beats: 24,
+            max_quote_chars: 600,
+        }
+    }
+}
+
+impl JevConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.model.trim().is_empty() {
+            return Err("jev.model cannot be empty".into());
+        }
+        if !self.base_url.starts_with("http") {
+            return Err(format!("jev.base_url must be an http(s) URL, got '{}'", self.base_url));
+        }
+        if self.timeout_s == 0 {
+            return Err("jev.timeout_s must be greater than 0".into());
+        }
+        Ok(())
+    }
+}
+
 impl Default for ScriptConfig {
     fn default() -> Self {
         Self {
@@ -470,6 +529,9 @@ pub struct Config {
     /// The script generator's timing and research settings.
     #[serde(default)]
     pub script: ScriptConfig,
+    /// The optional editorial judge. Off, and inert, unless a key is put in front of it.
+    #[serde(default)]
+    pub jev: JevConfig,
 }
 
 impl Config {
@@ -552,6 +614,20 @@ impl Config {
             }
             return Ok(());
         }
+        if section == "jev" {
+            let f = &mut self.jev;
+            match field {
+                "enabled" => f.enabled = flag(value),
+                "api_key" => f.api_key = value.to_string(),
+                "model" => f.model = value.to_string(),
+                "base_url" => f.base_url = value.to_string(),
+                "timeout_s" => f.timeout_s = num(key, value)?,
+                "max_beats" => f.max_beats = num(key, value)?,
+                "max_quote_chars" => f.max_quote_chars = num(key, value)?,
+                other => return Err(format!("unknown config key 'jev.{other}'")),
+            }
+            return self.jev.validate();
+        }
         if section == "script" {
             let f = &mut self.script;
             match field {
@@ -620,6 +696,7 @@ impl Config {
         self.vision.validate("vision")?;
         self.chat_model().validate("chat_model")?;
         self.script.validate()?;
+        self.jev.validate()?;
         self.frames.validate()
     }
 

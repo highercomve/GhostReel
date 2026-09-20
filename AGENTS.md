@@ -80,6 +80,29 @@ A draft then goes through repair passes, in this order, and the order matters:
 - **The conversation is re-sent every round**, so the loop keeps three quarters of the window and
   forgets the oldest tool results (`make_room`) rather than dying on the server's context error.
 
+## The editorial judge (`chat/judge.rs`, `jev.rs`)
+
+`chat/metrics.rs` counts craft faults and every one has a pass that drives it to zero. It cannot
+see whether the shot on screen shows what the voice is talking about, whether the opening earns
+attention, or whether the ending lands — the three things the editor actually complained about.
+Jev (TypeSafe's System One model) answers those as probabilities; the weights that turn them into
+one number live in `compose`, in code, so they can be changed without asking anything again.
+
+- **Off unless told otherwise.** It is the only part of GhostReel that leaves the machine, so it
+  needs both `jev.enabled` and a key (`TYPESAFE_API_KEY` beats `jev.api_key`). Settings has both.
+- **One request, every question.** Jev reads the state once and answers all of them in parallel.
+  Splitting them costs ~12x more for the same answers.
+- **The state is what is heard and seen**, never timecodes or video ids: transcript text for each
+  clip and bed, the vision model's frame descriptions, and whether the cut closes on a held image.
+  Jev reads text only, and a judgement it cannot ground is a judgement of nothing.
+- **A beat with no frame descriptions is not asked about.** Asking anyway returned a flat "no" and
+  scored good footage as filler; `unjudged_beats` reports the gap instead of averaging it away.
+- **What it finds goes back to the model** on the assistant message, beside the repair note — a
+  repair pass cannot make a shot of a road illustrate a sentence about a dog, so only the brain
+  that picked the shot can fix it.
+- `ghostreel script judge <id> --brief "…"`; `tests/eval_judge.rs` (`--ignored`) re-runs the four
+  recorded drafts when the questions change, since a reworded question is a different measurement.
+
 ## Timeline export
 
 `.otio` (`otio.rs`) and Final Cut Pro 7 XML (`fcpxml.rs`) are both written here — there is no

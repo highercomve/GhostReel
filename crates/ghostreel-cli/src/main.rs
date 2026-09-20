@@ -179,6 +179,16 @@ enum ScriptAction {
         #[arg(long)]
         json: bool,
     },
+    /// Ask Jev what is wrong with a saved script editorially: do the pictures show what is being
+    /// said, does the opening earn attention, does the ending land. Needs `jev.enabled` and a key.
+    Judge {
+        id: i64,
+        /// What the cut was asked for. Judged against it when given.
+        #[arg(long)]
+        brief: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
     /// Display a script draft.
     Show {
         id: i64,
@@ -811,6 +821,39 @@ async fn script_cmd(paths: &Paths, action: ScriptAction) -> anyhow::Result<ExitC
                 }
             }
         }
+        ScriptAction::Judge { id, brief, json } => {
+            let stored = ghostreel_core::script::load(&db, id)?;
+            let Some(j) =
+                ghostreel_core::chat::judge::judge(&db, &stored.script, brief.as_deref(), &Config::load(&paths.config_file).unwrap_or_default().jev).await?
+            else {
+                eprintln!(
+                    "the editorial judge is off. Turn it on with:\n  \
+                     ghostreel config set jev.enabled true\n  \
+                     ghostreel config set jev.api_key <key>   (or set TYPESAFE_API_KEY)"
+                );
+                std::process::exit(1);
+            };
+            if json {
+                println!("{}", serde_json::to_string(&j)?);
+            } else {
+                println!("#{id} \"{}\"  editorial {:.0}/100  ({})", stored.script.title, j.total, j.model);
+                for p in &j.parts {
+                    println!("  {:>5.1}/{:<4.0}  {:<26} {:.2}", p.earned, p.possible, p.name, p.value);
+                }
+                if j.unjudged_beats > 0 {
+                    println!(
+                        "  {} beat(s) not judged: nothing describes what is on screen there — index their frames",
+                        j.unjudged_beats
+                    );
+                }
+                for m in &j.mismatched {
+                    println!("  pictures do not match the voice in '{}' (p={:.2}): \"{}\"", m.beat_id, m.match_p, m.heard);
+                }
+                for n in j.notes() {
+                    println!("  → {n}");
+                }
+            }
+        }
         ScriptAction::Show { id, json } => {
             let stored = ghostreel_core::script::load(&db, id)?;
             if json {
@@ -927,6 +970,7 @@ async fn script_cmd(paths: &Paths, action: ScriptAction) -> anyhow::Result<ExitC
                 system_prompt: Some(config.chat.system_prompt.clone()),
                 max_tool_rounds: config.chat_model().max_tool_rounds,
                 script: config.script.clone(),
+                jev: config.jev.clone(),
                 cancel: None,
             };
 

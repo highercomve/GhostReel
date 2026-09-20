@@ -518,6 +518,7 @@ async fn run_chat(
         system_prompt: Some(config.chat.system_prompt.clone()),
         max_tool_rounds: config.chat_model().max_tool_rounds,
         script: config.script.clone(),
+        jev: config.jev.clone(),
         cancel: Some(cancel.clone()),
     };
 

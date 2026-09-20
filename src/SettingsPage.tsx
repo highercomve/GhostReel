@@ -106,6 +106,77 @@ export default function SettingsPage() {
         </>
       )}
 
+      <h2>Script chat · editorial judge</h2>
+      <section className="card">
+        <p className="muted small">
+          GhostReel can already tell when a cut runs long or stops someone mid-sentence, and it fixes those itself.
+          What it cannot tell is whether the shot on screen shows what the voice is talking about, whether the opening
+          is worth watching, or whether the ending lands. Jev — a hosted model that answers in numbers rather than
+          words — reads each finished cut and says. What it finds goes back to the editor before it redrafts.
+        </p>
+        <p className="muted small">
+          Off by default, and it is the one part of GhostReel that leaves this computer: judging sends the cut's
+          spoken words and the descriptions of what is on screen to <code>api.typesafe.ai</code>. Nothing is sent
+          while it is off. A judgement costs a fraction of a cent.
+        </p>
+        <div className="settings-fields">
+          <div className="settings-field">
+            <label>Judge each cut</label>
+            <input
+              type="checkbox"
+              checked={ai?.jev.enabled ?? false}
+              disabled={!ai}
+              onChange={async (e) => {
+                const on = e.currentTarget.checked;
+                try {
+                  setAi(await setAiSettings({ jev: { enabled: on } }));
+                  setError(null);
+                } catch (err) {
+                  setError(String(err));
+                }
+              }}
+            />
+            <span className="muted small">
+              {ai?.jev.enabled ? "on — every finished script is judged" : "off — nothing is sent anywhere"}
+            </span>
+          </div>
+          <div className="settings-field">
+            <label>API key</label>
+            {ai?.jev.key_from_env ? (
+              <span className="muted small">
+                taken from <code>TYPESAFE_API_KEY</code> in the environment, which wins over anything typed here
+              </span>
+            ) : (
+              <>
+                <input
+                  type="password"
+                  style={{ width: "22em" }}
+                  placeholder={ai?.jev.has_key ? "•••••••• saved — type to replace" : "apikey_…"}
+                  onKeyDown={async (e) => {
+                    if (e.key !== "Enter") return;
+                    const value = e.currentTarget.value;
+                    e.currentTarget.value = "";
+                    try {
+                      setAi(await setAiSettings({ jev: { api_key: value } }));
+                      setError(null);
+                    } catch (err) {
+                      setError(String(err));
+                    }
+                  }}
+                />
+                <span className="muted small">
+                  {ai?.jev.has_key ? "saved in config.toml · Enter to replace" : "press Enter to save"}
+                  {" · "}
+                  <a href="https://console.typesafe.ai/keys" target="_blank" rel="noreferrer">
+                    get one
+                  </a>
+                </span>
+              </>
+            )}
+          </div>
+        </div>
+      </section>
+
       <h2>Script chat · editor instructions</h2>
       <section className="card">
         <p className="muted small">

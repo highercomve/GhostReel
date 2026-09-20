@@ -428,6 +428,26 @@ struct AiSettingsView {
     stt: SttSettingsView,
     embed: EmbedSettingsView,
     frames: FrameSettingsView,
+    jev: JevSettingsView,
+}
+
+/// The editorial judge. `has_key` rather than the key itself: a secret that has been typed in
+/// does not need to travel back to the window that typed it, and the settings page only has to
+/// show whether there is one.
+#[derive(Serialize, Deserialize)]
+struct JevSettingsView {
+    enabled: bool,
+    has_key: bool,
+    /// The key is in the environment rather than the config file, so the field is not editable.
+    key_from_env: bool,
+    model: String,
+}
+
+#[derive(Deserialize, Default)]
+struct JevSettingsPatch {
+    enabled: Option<bool>,
+    api_key: Option<String>,
+    model: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -474,6 +494,7 @@ struct AiSettingsPatch {
     stt: Option<SttSettingsPatch>,
     embed: Option<EmbedSettingsPatch>,
     frames: Option<FrameSettingsPatch>,
+    jev: Option<JevSettingsPatch>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -581,6 +602,16 @@ fn apply_llm_patch(
     cfg.validate(section)
 }
 
+fn jev_view(cfg: &ghostreel_core::config::JevConfig) -> JevSettingsView {
+    let env_key = std::env::var("TYPESAFE_API_KEY").ok().filter(|k| !k.trim().is_empty());
+    JevSettingsView {
+        enabled: cfg.enabled,
+        has_key: env_key.is_some() || !cfg.api_key.trim().is_empty(),
+        key_from_env: env_key.is_some(),
+        model: cfg.model.clone(),
+    }
+}
+
 #[tauri::command]
 fn get_ai_settings() -> CmdResult<AiSettingsView> {
     let p = paths()?;
@@ -595,6 +626,7 @@ fn get_ai_settings() -> CmdResult<AiSettingsView> {
             model: config.embed.model,
         },
         frames: FrameSettingsView { max_interval_s: config.frames.max_interval_s },
+        jev: jev_view(&config.jev),
     })
 }
 
@@ -689,9 +721,30 @@ async fn set_ai_settings(patch: AiSettingsPatch, search_state: State<'_, SearchS
         config.frames.max_interval_s = v;
     }
 
+    if let Some(j) = patch.jev {
+        if let Some(on) = j.enabled {
+            config.jev.enabled = on;
+        }
+        if let Some(key) = j.api_key {
+            // An empty string is how the page clears a stored key, so it is not ignored.
+            config.jev.api_key = key.trim().to_string();
+        }
+        if let Some(m) = j.model {
+            config.jev.model = m;
+        }
+        config.jev.validate()?;
+        if config.jev.enabled
+            && config.jev.api_key.trim().is_empty()
+            && std::env::var("TYPESAFE_API_KEY").ok().filter(|k| !k.trim().is_empty()).is_none()
+        {
+            return Err("turning the judge on needs an API key: paste one, or set TYPESAFE_API_KEY".into());
+        }
+    }
+
     config.save(&p.config_file).map_err(err)?;
 
     Ok(AiSettingsView {
+        jev: jev_view(&config.jev),
         vision: llm_view(&config.vision),
         chat_model: llm_view(&config.chat_model()),
         stt: SttSettingsView { backend: config.stt.backend.to_string(), url: config.stt.url, model: config.stt.model },

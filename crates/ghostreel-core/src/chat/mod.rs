@@ -11,10 +11,12 @@ use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+pub mod judge;
 pub mod metrics;
 pub mod repair;
 pub use enforce_grounding_and_pacing as repair_draft;
 pub mod tools;
+pub use judge::Judgement;
 pub use metrics::{ScriptMetrics, ScriptScore, measure, score};
 pub use tools::{Detail, tools_definition};
 
@@ -22,7 +24,7 @@ use crate::Error;
 use crate::db::Db;
 use crate::embed::Embedder;
 use crate::projects::{Project, now};
-use crate::script::{Issue, IssueSeverity, Script, ScriptClip, save_version, snap_to_segments, validate};
+use crate::script::{Issue, IssueSeverity, Script, ScriptClip, save_version, snap_to_segments};
 use crate::search::{SearchOptions, query_vector, search_with_vector};
 
 /// Events emitted during agent execution.
@@ -74,6 +76,8 @@ pub struct TurnResult {
     pub script: Option<Script>,
     pub issues: Vec<Issue>,
     pub tool_calls: Vec<ToolCallRecord>,
+    /// The editorial read, when `[jev]` is on. `None` means nothing was asked, not a good cut.
+    pub judgement: Option<judge::Judgement>,
 }
 
 /// Backends for script chat.
@@ -174,6 +178,8 @@ pub struct ChatContext {
     pub max_tool_rounds: u32,
     /// The `[script]` settings: clip lengths, target tolerances, narration pace, research budget.
     pub script: crate::config::ScriptConfig,
+    /// The optional editorial judge. Default — disabled — asks nothing and sends nothing.
+    pub jev: crate::config::JevConfig,
     /// Set by Stop. Checked between tool rounds and before every model call, so a turn ends
     /// within a round instead of after the whole draft.
     pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
@@ -2217,7 +2223,7 @@ fn snap_range(
 ) -> (f64, f64) {
     let overlapping: Vec<usize> =
         (0..segs.len()).filter(|&i| segs[i].1 > in_s + 0.05 && segs[i].0 < out_s - 0.05).collect();
-    let (Some(&first), Some(&last)) = (overlapping.first(), overlapping.last()) else { return (in_s, out_s) };
+    let (Some(&first), Some(&_last)) = (overlapping.first(), overlapping.last()) else { return (in_s, out_s) };
     let (mut in_s, mut out_s) = (in_s, out_s);
     let ceiling = cap_out.unwrap_or(f64::MAX).min(duration);
 
@@ -3222,6 +3228,30 @@ pub async fn run_turn(
     // pipeline undoes it again. Recording it in the reply puts it in what the next turn replays.
     let repair_note = repair_note(&issues);
 
+    // The editorial read, when one is configured. A repair pass can move a cut onto a sentence;
+    // it cannot make a shot of a road illustrate a sentence about a dog, so what Jev finds goes
+    // where the mechanical repairs go — onto the assistant message, which every backend replays —
+    // and the only thing that can choose a different shot reads it next turn.
+    //
+    // A judgement that fails is not a failed turn: the script is already saved and the cut is
+    // already good or bad on its own terms.
+    // Read the cut first, ask second: the database is not `Sync`, and a future still holding it
+    // at an await point cannot be spawned by the app's queue worker.
+    let planned = parsed_script.as_ref().and_then(|s| judge::plan(&ctx.db, s, Some(message), &ctx.jev));
+    let judgement = match planned {
+        Some(p) => match p.ask().await {
+            Ok(j) => Some(j),
+            Err(e) => {
+                tracing::warn!("editorial judge: {e}");
+                None
+            }
+        },
+        None => None,
+    };
+    let judge_note = judgement.as_ref().map(Judgement::notes).filter(|n| !n.is_empty()).map(|notes| {
+        format!("[editorial read of the saved cut, fix these next time: {}]", notes.join("; "))
+    });
+
     let reply = if !raw_reply.trim().is_empty() {
         raw_reply
     } else if let Some(s) = &parsed_script {
@@ -3260,10 +3290,11 @@ pub async fn run_turn(
     // replays next turn, so it is the one place a note reaches the server, local and CLI brains
     // alike.
     let assistant_tc_json = script_id.map(|sid| json!({ "script_id": sid }).to_string());
-    let stored_reply = match &repair_note {
-        Some(note) => format!("{reply}\n\n{note}"),
-        None => reply.clone(),
-    };
+    let mut stored_reply = reply.clone();
+    for note in [repair_note.as_ref(), judge_note.as_ref()].into_iter().flatten() {
+        stored_reply.push_str("\n\n");
+        stored_reply.push_str(note);
+    }
     ctx.db.conn.execute(
         "INSERT INTO chat_messages(session_id, role, content, tool_calls_json, created_at)
          VALUES (?1, 'assistant', ?2, ?3, ?4)",
@@ -3273,7 +3304,7 @@ pub async fn run_turn(
     // Update chat_sessions updated_at
     ctx.db.conn.execute("UPDATE chat_sessions SET updated_at = ?1 WHERE id = ?2", params![now_ts, session_id])?;
 
-    Ok(TurnResult { session_id, reply, script_id, script: parsed_script, issues, tool_calls: tool_records })
+    Ok(TurnResult { session_id, reply, script_id, script: parsed_script, issues, tool_calls: tool_records, judgement })
 }
 
 /// What the pipeline changed after the draft was written — beds laid, clips moved off shaky
@@ -3736,6 +3767,7 @@ mod tests {
             system_prompt: None,
             max_tool_rounds: 0,
             script: sc(),
+            jev: Default::default(),
             cancel: None,
         };
 
@@ -4854,6 +4886,7 @@ mod tests {
             system_prompt: None,
             max_tool_rounds: 0,
             script: sc(),
+            jev: Default::default(),
             cancel: None,
         };
 
@@ -5012,6 +5045,7 @@ mod tests {
             system_prompt: None,
             max_tool_rounds: 0,
             script: sc(),
+            jev: Default::default(),
             cancel: None,
         };
 
@@ -5133,6 +5167,7 @@ mod tests {
             system_prompt: None,
             max_tool_rounds: 0,
             script: sc(),
+            jev: Default::default(),
             cancel: None,
         };
 

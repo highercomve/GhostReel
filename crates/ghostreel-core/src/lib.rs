@@ -15,6 +15,7 @@ pub mod export;
 pub mod fcpxml;
 pub mod frames;
 pub mod index;
+pub mod jev;
 pub mod media;
 pub mod models;
 pub mod otio;
@@ -58,6 +59,8 @@ pub enum Error {
     Embed(String),
     #[error("vision: {0}")]
     Vision(String),
+    #[error("jev: {0}")]
+    Jev(String),
     #[error("frames: {0}")]
     Frames(String),
     #[error("transcription: {0}")]

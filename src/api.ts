@@ -606,6 +606,22 @@ export interface FrameSettings {
   max_interval_s: number;
 }
 
+export interface JevSettings {
+  enabled: boolean;
+  /** Whether a key exists at all. The key itself never comes back. */
+  has_key: boolean;
+  /** The key is in TYPESAFE_API_KEY, so the field is not editable here. */
+  key_from_env: boolean;
+  model: string;
+}
+
+export interface JevSettingsPatch {
+  enabled?: boolean;
+  /** "" clears a stored key. */
+  api_key?: string;
+  model?: string;
+}
+
 export interface AiSettings {
   /** Frame descriptions (indexing). */
   vision: VisionSettings;
@@ -614,6 +630,7 @@ export interface AiSettings {
   stt: SttSettings;
   embed: EmbedSettings;
   frames: FrameSettings;
+  jev: JevSettings;
 }
 
 export interface BackendsResolution {
@@ -665,6 +682,7 @@ export interface AiSettingsPatch {
   stt?: SttSettingsPatch;
   embed?: EmbedSettingsPatch;
   frames?: FrameSettingsPatch;
+  jev?: JevSettingsPatch;
 }
 
 export const getAiSettings = () => invoke<AiSettings>("get_ai_settings");
