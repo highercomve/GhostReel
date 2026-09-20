@@ -94,7 +94,7 @@ const BASELINE: &[(&str, f64, f64)] = &[
     ("bonsai27b", 20.0, 10.0),
     ("qwen35", 33.0, 2.5),
     ("agy", 84.0, 2.5),
-    ("bonsai2", 33.0, 2.5),
+    ("bonsai2", 50.0, 2.5),
 ];
 
 /// B-roll left hanging after the voice stops reads as a pause between interviews. Where a beat

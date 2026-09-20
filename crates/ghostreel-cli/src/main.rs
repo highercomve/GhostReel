@@ -179,6 +179,18 @@ enum ScriptAction {
         #[arg(long)]
         json: bool,
     },
+    /// Build a cut by choosing rather than writing: Jev picks the quotes and the shots out of the
+    /// index, and nothing is generated, so no clip can refer to footage that does not exist.
+    /// Fast, and limited to what the interviews already say. Needs `jev.enabled` and a key.
+    Build {
+        #[arg(long, short)]
+        project: String,
+        /// What the piece is for. Every choice is made against this.
+        #[arg(long, short)]
+        brief: String,
+        #[arg(long, short = 't', default_value_t = 40.0)]
+        target_s: f64,
+    },
     /// Ask Jev what is wrong with a saved script editorially: do the pictures show what is being
     /// said, does the opening earn attention, does the ending land. Needs `jev.enabled` and a key.
     Judge {
@@ -820,6 +832,35 @@ async fn script_cmd(paths: &Paths, action: ScriptAction) -> anyhow::Result<ExitC
                     println!("  -{cost:>5.1}  {part}");
                 }
             }
+        }
+        ScriptAction::Build { project, brief, target_s } => {
+            let project = db.require_project(&project)?;
+            let config = Config::load(&paths.config_file).unwrap_or_default();
+
+            // Read the index, then ask: the database must not be held open across the requests.
+            let footage = ghostreel_core::chat::build::survey(&db, project.id)?;
+            println!(
+                "{} quotable line(s) and {} described shot(s) in the index",
+                footage.quotes.len(),
+                footage.shots.len()
+            );
+            let script =
+                ghostreel_core::chat::build::build(&footage, &project, &brief, target_s, &config.jev).await?;
+            println!("chose {} line(s):", script.beats.len());
+            for beat in &script.beats {
+                println!("  {}", beat.purpose);
+            }
+
+            let mut s = script;
+            let mut issues =
+                ghostreel_core::chat::repair::finish_script(&db, project.id, &mut s, true, &config.script)?
+                    .unwrap_or_default();
+            issues.retain(|i| !i.message.is_empty());
+            for i in &issues {
+                println!("  [{:?}] {}", i.severity, i.message);
+            }
+            let id = ghostreel_core::script::save_version(&db, project.id, &s, None)?;
+            println!("saved script #{id} \"{}\" ({:.1} s)", s.title, s.total_duration_s());
         }
         ScriptAction::Judge { id, brief, json } => {
             let stored = ghostreel_core::script::load(&db, id)?;

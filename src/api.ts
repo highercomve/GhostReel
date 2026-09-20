@@ -509,6 +509,13 @@ export interface ChatProgress {
 export const chatTurn = (projectId: number, sessionId: number | null, message: string) =>
   invoke<ChatTurnView>("chat_turn", { projectId, sessionId, message });
 
+/**
+ * Build a cut by choosing instead of writing: Jev picks the quotes and the shots out of the index
+ * and code assembles them. Returns the saved script id. Needs a Jev key (Settings).
+ */
+export const buildScriptWithJev = (projectId: number, brief: string, targetS: number) =>
+  invoke<number>("build_script_with_jev", { projectId, brief, targetS });
+
 export const chatSessions = (projectId: number) =>
   invoke<ChatSession[]>("chat_sessions", { projectId });
 

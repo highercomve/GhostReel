@@ -11,6 +11,7 @@ use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+pub mod build;
 pub mod judge;
 pub mod metrics;
 pub mod repair;
@@ -1547,16 +1548,44 @@ pub fn hold_the_last_picture(db: &Db, script: &mut Script, cfg: &crate::config::
 /// left at its old length then outlives them: it plays on over the next beat's pictures, and the
 /// export puts overlapping clips on A1. Whatever moved the clips, this puts the sound back inside
 /// its beat.
-fn clamp_beds_to_beats(script: &mut Script) {
+fn clamp_beds_to_beats(db: &Db, script: &mut Script, cfg: &crate::config::ScriptConfig) {
     for beat in &mut script.beats {
         let beat_len: f64 = beat.clips.iter().map(|c| (c.out_s - c.in_s).max(0.0)).sum();
-        match &mut beat.bed {
-            Some(bed) if beat_len <= 0.0 => {
-                let _ = bed;
-                beat.bed = None;
+        let Some(bed) = &beat.bed else { continue };
+        if beat_len <= 0.0 {
+            beat.bed = None;
+            continue;
+        }
+        if bed.duration_s() <= beat_len {
+            continue;
+        }
+
+        // This is the last thing that touches a bed, and it is where a speaker gets cut off:
+        // `end_on_sentences` puts the voice on a sentence, then `trim_pictures_to_bed` and the
+        // closing hold move the pictures, and trimming the bed to fit them lands mid-word.
+        //
+        // The pictures give way to the voice, so when cutting the bed here would land inside a
+        // sentence, the beat's last shot is held for the seconds the voice still needs instead.
+        // Bounded by the budget a clip gets for the same job; past that, the trim stands and the
+        // score reports the cut.
+        let wanted = bed.duration_s();
+        let short_by = wanted - beat_len;
+        let segs = sentence_edges(db, bed.video_id);
+        if short_by <= cfg.max_speech_extend_s && cuts_into_a_sentence(&segs, bed.in_s + beat_len) {
+            if let Some(last) = beat.clips.last_mut() {
+                let room = (video_duration(db, last.video_id).unwrap_or(f64::MAX) - last.out_s).max(0.0);
+                last.out_s += short_by.min(room);
             }
-            Some(bed) if bed.duration_s() > beat_len => bed.out_s = bed.in_s + beat_len,
-            _ => {}
+            let beat_len: f64 = beat.clips.iter().map(|c| (c.out_s - c.in_s).max(0.0)).sum();
+            if let Some(bed) = &mut beat.bed
+                && bed.duration_s() > beat_len
+            {
+                bed.out_s = bed.in_s + beat_len;
+            }
+            continue;
+        }
+        if let Some(bed) = &mut beat.bed {
+            bed.out_s = bed.in_s + beat_len;
         }
     }
 }
@@ -1581,7 +1610,7 @@ fn fit_to_target(db: &Db, script: &mut Script, cfg: &crate::config::ScriptConfig
     }
     if total < target {
         let grew = grow_to_target(db, script, cfg);
-        clamp_beds_to_beats(script);
+        clamp_beds_to_beats(db, script, cfg);
         return grew;
     }
 
@@ -1624,7 +1653,7 @@ fn fit_to_target(db: &Db, script: &mut Script, cfg: &crate::config::ScriptConfig
             }
         }
     }
-    clamp_beds_to_beats(script);
+    clamp_beds_to_beats(db, script, cfg);
     changed
 }
 
@@ -2193,6 +2222,12 @@ pub fn end_on_sentences(db: &Db, script: &mut Script, cfg: &crate::config::Scrip
     fixed
 }
 
+/// Whether a range ending at `out_s` stops inside a sentence rather than at the end of one.
+/// The same rule `metrics::ends_mid_sentence` measures, asked of the edges already in hand.
+fn cuts_into_a_sentence(segs: &[(f64, f64)], out_s: f64) -> bool {
+    segs.iter().any(|&(start, end)| end > out_s + 0.25 && start < out_s - CUT_INTO_SENTENCE_S)
+}
+
 /// How much of a sentence a range has to play before stopping in it counts as cutting into it.
 /// Below this it is the deliberate overrun past the last word, not an interruption.
 const CUT_INTO_SENTENCE_S: f64 = 0.6;
@@ -2282,6 +2317,13 @@ fn snap_range(
 fn pad_speech(db: &Db, script: &mut Script, cfg: &crate::config::ScriptConfig) -> usize {
     let mut changed = 0;
     for c in script.beats.iter_mut().flat_map(|b| b.clips.iter_mut()) {
+        // A muted clip has no voice to protect. Padding one to finish a sentence nobody can hear
+        // is not a repair, it is a two-second cutaway turning into twenty: b-roll taken from a
+        // video that happens to contain speech was held until that speech finished, and a 40 s
+        // cut came out at 77 s. `end_on_sentences` always skipped these; this did not.
+        if c.audio != crate::script::Audio::Source {
+            continue;
+        }
         let Ok(mut st) = db
             .conn
             .prepare_cached("SELECT start_s, end_s FROM transcript_segments WHERE video_id = ?1 ORDER BY start_s")
@@ -3810,6 +3852,8 @@ mod tests {
     #[test]
     fn a_bed_is_cut_back_when_its_pictures_are() {
         use crate::script::{Audio, AudioBed, Beat, ScriptClip};
+        // No transcript: nothing to cut into, so the bed is simply trimmed to its pictures.
+        let db = Db::open_in_memory().unwrap();
         let mut script = Script {
             title: "t".into(),
             target_duration_s: None,
@@ -3826,7 +3870,7 @@ mod tests {
                 bed: Some(AudioBed { video_id: 1, in_s: 10.0, out_s: 30.0, why: None, inferred: true }),
             }],
         };
-        clamp_beds_to_beats(&mut script);
+        clamp_beds_to_beats(&db, &mut script, &sc());
         let bed = script.beats[0].bed.clone().unwrap();
         assert!((bed.duration_s() - 6.0).abs() < 1e-9, "bed matches its pictures: {}", bed.duration_s());
     }
@@ -4707,7 +4751,7 @@ mod tests {
         let bed = script.beats[0].bed.clone().unwrap();
         assert!((bed.out_s - 31.35).abs() < 0.01, "the bed runs to the end of her sentence: {}", bed.out_s);
         // And it still fits the pictures, so clamp_beds_to_beats will not cut it back again.
-        clamp_beds_to_beats(&mut script);
+        clamp_beds_to_beats(&db, &mut script, &sc());
         assert!((script.beats[0].bed.as_ref().unwrap().out_s - 31.35).abs() < 0.01, "clamped away again");
     }
 

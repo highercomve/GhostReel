@@ -5,6 +5,7 @@ import {
   chatSessions,
   deleteChatSession,
   chatTurn,
+  buildScriptWithJev,
   listScripts,
   type ChatEvent,
   type ChatMessage,
@@ -56,6 +57,8 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
   const [liveEvents, setLiveEvents] = useState<ChatEvent[]>([]);
   const [optimisticUser, setOptimisticUser] = useState<string | null>(null);
   const [turnError, setTurnError] = useState<string | null>(null);
+  /** Jev is building a cut by choosing. One shot, no conversation, ~15 s. */
+  const [building, setBuilding] = useState(false);
   const [latestIssues, setLatestIssues] = useState<Issue[] | undefined>(undefined);
 
   const messagesRef = useRef<HTMLDivElement>(null);
@@ -458,6 +461,34 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
             onClick={handleSend}
           >
             Send
+          </button>
+          {/*
+            Jev does not write, so it cannot hold a conversation — this is one shot, not a turn.
+            It chooses the quotes and the shots out of the index and code assembles them, which
+            takes about as long as a preview and cannot refer to footage that does not exist.
+          */}
+          <button
+            type="button"
+            className="ghost"
+            title="Build a cut by choosing rather than writing: Jev picks the quotes and the shots out of the index. Fast, grounded, and limited to what the interviews already say. Needs a Jev key in Settings."
+            disabled={turnRunning || building || !inputMessage.trim()}
+            onClick={async () => {
+              const brief = inputMessage.trim();
+              setBuilding(true);
+              setTurnError(null);
+              try {
+                const id = await buildScriptWithJev(projectId, brief, 40);
+                setInputMessage("");
+                setScripts(await listScripts(projectId));
+                setSelectedScriptId(id);
+              } catch (e) {
+                setTurnError(String(e));
+              } finally {
+                setBuilding(false);
+              }
+            }}
+          >
+            {building ? "Choosing…" : "Build with Jev"}
           </button>
         </div>
       </section>

@@ -63,7 +63,7 @@ pub fn finish_script(
     if held > 0.0 {
         note(&mut issues, format!("held the closing picture for {held:.1} s of quiet"));
     }
-    super::clamp_beds_to_beats(s);
+    super::clamp_beds_to_beats(db, s, cfg);
 
     issues.extend(super::content_issues(db, s, cfg));
     issues.extend(validate(db, project_id, s)?);

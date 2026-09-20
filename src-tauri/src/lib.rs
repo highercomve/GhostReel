@@ -612,6 +612,45 @@ fn jev_view(cfg: &ghostreel_core::config::JevConfig) -> JevSettingsView {
     }
 }
 
+/// Build a cut by choosing rather than writing: Jev picks the quotes and the shots out of the
+/// index and code assembles them. Not a chat turn — there is no conversation to have with a model
+/// that answers in probabilities — so it runs here rather than through the queue: it takes about
+/// as long as a preview, and there is nothing to stream.
+#[tauri::command]
+async fn build_script_with_jev(project_id: i64, brief: String, target_s: f64) -> CmdResult<i64> {
+    let p = paths()?;
+    let config = Config::load(&p.config_file).unwrap_or_default();
+    if config.jev.api_key.trim().is_empty() && std::env::var("TYPESAFE_API_KEY").is_err() {
+        return Err("building this way needs a Jev API key — add one in Settings".into());
+    }
+
+    // Read the index and then ask: the database is not `Sync`, so it must not be held open
+    // across the requests. Both halves run off the UI thread.
+    let db_path = p.db_file();
+    let (footage, project) = tokio::task::spawn_blocking(move || -> CmdResult<_> {
+        let db = Db::open(&db_path).map_err(err)?;
+        let project = db.project(project_id).map_err(err)?;
+        let footage = ghostreel_core::chat::build::survey(&db, project_id).map_err(err)?;
+        Ok((footage, project))
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+
+    let script =
+        ghostreel_core::chat::build::build(&footage, &project, &brief, target_s, &config.jev).await.map_err(err)?;
+
+    let db_path = p.db_file();
+    let script_cfg = config.script.clone();
+    tokio::task::spawn_blocking(move || -> CmdResult<i64> {
+        let db = Db::open(&db_path).map_err(err)?;
+        let mut s = script;
+        ghostreel_core::chat::repair::finish_script(&db, project_id, &mut s, true, &script_cfg).map_err(err)?;
+        ghostreel_core::script::save_version(&db, project_id, &s, None).map_err(err)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 #[tauri::command]
 fn get_ai_settings() -> CmdResult<AiSettingsView> {
     let p = paths()?;
@@ -1110,6 +1149,7 @@ pub fn run() {
             remove_model,
             set_whisper_model,
             open_models_dir,
+            build_script_with_jev,
             get_ai_settings,
             set_ai_settings,
             server_models,
