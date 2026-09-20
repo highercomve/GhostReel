@@ -5,7 +5,7 @@ members = ["crates/ghostreel-core", "crates/ghostreel-cli", "src-tauri", "crates
 exclude = ["spikes"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 license = "MIT"
 

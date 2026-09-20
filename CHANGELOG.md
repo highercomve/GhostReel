@@ -5,6 +5,90 @@ versions follow [SemVer](https://semver.org/) while the project is 0.x (minor = 
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-09-20
+
+The release where a cut stopped being judged only by counting, and where standalone learned to
+draft again. Measured on the same 40-second brief over 96 videos throughout: **agy 98/100
+mechanically and 76/100 editorially, with no beat where the picture ignores the voice** — the
+first cut all project to manage that.
+
+### Added
+
+- **An editorial judge** (`chat/judge.rs`, `jev.rs`). The score GhostReel keeps counts craft
+  faults, and every one has a pass that drives it to zero. None of it reaches whether the shot on
+  screen shows what the voice is talking about, whether the opening earns attention, or whether
+  the ending lands — the three complaints that actually came back from watching previews. Jev
+  answers those as probabilities in one request; the weights live in code. Off unless `jev.enabled`
+  and a key are both set: it is the only part of GhostReel that leaves the machine. What it finds
+  rides back to the model on the assistant message, because no repair pass can make a shot of a
+  road illustrate a sentence about a dog. `ghostreel script judge <id>`.
+- **Building a cut by choosing, with nothing generating anything** (`chat/build.rs`,
+  `ghostreel script build`, *Build with Jev*). Code enumerates every quotable sentence and every
+  described shot; Jev picks; code assembles. An invented timecode is not a bug that got fixed, it
+  is a thing that cannot be expressed. 40.7 s against a 40 s target in **14 seconds**, against
+  minutes for a model that writes.
+- **Finding the interviewer by what they say** (`interviewer.rs`). `off_mic` was acoustic only, so
+  an interviewer sitting near the mic read as the subject and a finished cut opened with "Okay,
+  cool. So just tell me your name and the line of business that you're in." One Noul per line
+  instead, batched per video. It also catches slates, mic checks and countdowns. Records how each
+  flag was set (`off_mic_source`, `off_mic_p`, schema v9) so it can be reviewed, re-judged or
+  undone — `--dry-run` and `--undo`.
+- **Keyframes sampled where the picture changes** (`frames.change_budget`). A moving camera never
+  trips a cut threshold, so a drive through a neighbourhood was sampled by the interval clock
+  alone: every keyframe a different street, everything between them unindexed. The scores below
+  the threshold were already being read and thrown away; accumulating them is the cumulative half
+  of the twin-comparison algorithm (Zhang, Kankanhalli & Smoliar, 1993), at no extra decode.
+- **Describing several frames at once** (`vision.describe_concurrency`). Generating a token means
+  reading every weight out of VRAM, so the GPU spends decode waiting on memory; a batch reads them
+  once. Measured 2.9× in isolation, 1.75× over a real re-index — 32 minutes to 18.
+- **Server capability probing** (`Probe::caps`). GhostReel talks to anything OpenAI-compatible but
+  only llama.cpp describes its own shape. Slots, per-slot context and router mode are detected, and
+  the settings page offers a control only when the server can honour it. `doctor` now warns when
+  the chat's context exceeds what a slot actually has.
+- **Script metrics and a replay eval** (`chat/metrics.rs`, `tests/eval_replay.rs`). Four recorded
+  drafts replayed against the footage they refer to, so a change to the repair passes is measured
+  rather than discovered in a preview weeks later.
+- **Rich tool descriptions** (`chat/tools.rs`) and a **tool memo**, so a model that asks the same
+  question twice gets the answer back with a note instead of running it again.
+- **A model catalog entry for `qwen3.5-9b`** — the only local model here that can write a script.
+
+### Changed
+
+- **Standalone drafts again.** A local model is grammar-constrained to one action per round and
+  `reply` is the cheapest branch; two different models declined a project outright. Four things
+  were wrong, each hiding the next: the prompt described every word anybody said and nothing about
+  what is on screen (`picture_digest`), a reply before any tool call ended the turn, `ToolMemo` was
+  not wired into this path so the same question was asked forever, and the final call still offered
+  `reply` — one run did the whole job then handed it over as markdown prose.
+- **A cut made of speech is fitted by losing a beat, not by cutting a sentence.** Speech is never
+  scaled, so such a cut could not be fitted at all: 179.6 s against a 40 s target produced a
+  warning and nothing else. Whole beats go instead, planned up front and never below half the clips
+  the model chose. A recorded draft replays at 81 rather than 55.
+- **The length is spelled out as arithmetic.** "40 seconds" and "a clip may run to 30 s" is a
+  contradiction a model resolves by ignoring the first.
+- **The last word finishes**, even when the transcript says it already has: Whisper quantises
+  timestamps, so a cut exactly on a boundary takes the word's tail.
+- **Pictures give way to the voice**, so b-roll is no longer a pause between interviews, and the
+  piece **holds its last picture** for two seconds of quiet instead of stopping on a word.
+- **`--redo describe` actually redoes it.** It reset the job rows and left the descriptions, so the
+  stage found nothing to do and reported "96 jobs ok" in eighteen seconds.
+- **A run of failures is a broken backend, not bad frames.** Storing each error as a frame's
+  description turned 576 good descriptions into errors that read as finished work.
+- **`GHOSTREEL_DEBUG_CHAT` dumps every local round**, not only the final draft — which a turn
+  ending in `reply` never reaches.
+
+### Fixed
+
+- **`pad_speech` padded muted clips**, holding b-roll until speech nobody can hear had finished: a
+  two-second cutaway became twenty.
+- **`clamp_beds_to_beats` cut speakers off.** It is the last thing to touch a bed; it now holds the
+  beat's last shot for the seconds the voice needs.
+- **A capped option pool was truncated, not spread.** Jev saw shots from 25 of 96 videos, and
+  re-indexing made it worse.
+- **Narration is a voice.** A beat carried by a written line was described to the judge as playing
+  silent, and the advice that came back was about a quote that did not exist.
+
+
 ### Added
 - **`scripts/install-local.sh`** — build from source and install for the current user, the way
   GhostPen does it: `ghostreel-app` and `ghostreel` into `~/.local/bin` with a desktop entry and
