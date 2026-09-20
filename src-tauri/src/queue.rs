@@ -414,6 +414,7 @@ async fn run_preview(
         burn_narration,
         normalize_audio,
         audio_fade_s: config.script.audio_fade_s,
+        speech_overrun_s: config.script.speech_overrun_s,
         out: out.map(std::path::PathBuf::from),
         cancel: Some(cancel),
     };

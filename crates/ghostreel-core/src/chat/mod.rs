@@ -2226,6 +2226,18 @@ fn snap_range(
     // sentence" makes every pass swallow one more: a cut grew 126 s to 154 s being repaired twice.
     let cut_into = overlapping.iter().rev().find(|&&i| segs[i].0 < out_s - CUT_INTO_SENTENCE_S).copied();
     let sentence_end = cut_into.map(|i| segs[i].1).unwrap_or(out_s);
+
+    // A range that stops exactly on a boundary still clips the last word. Whisper's times are
+    // approximate and often quantised — Adrienne's segments land on whole seconds — so "the
+    // sentence ends at 79.00" means the speech ends somewhere near it, and cutting at 79.00 takes
+    // the tail of "running around too" with it. Give every speaking range the overrun; the render
+    // fades across it, so the word decays instead of stopping.
+    if let Some(last_end) = overlapping.iter().rev().map(|&i| segs[i].1).find(|&e| e <= out_s + 0.05)
+        && out_s < last_end + cfg.speech_overrun_s - 0.02
+    {
+        out_s = (last_end + cfg.speech_overrun_s).min(ceiling).min(duration);
+    }
+
     if sentence_end > out_s + 0.05 {
         let wanted = (sentence_end + cfg.speech_overrun_s).min(duration);
         if wanted - out_s <= cfg.max_speech_extend_s && wanted <= ceiling {
@@ -3591,9 +3603,16 @@ mod tests {
         assert_eq!(end_on_sentences(&db, &mut s, &cfg), 1);
         assert!((s.beats[0].clips[0].out_s - 20.35).abs() < 0.01, "{}", s.beats[0].clips[0].out_s);
 
-        // A clip already on a boundary is left alone.
+        // A clip sitting exactly on a boundary gains the overrun and nothing else: whisper's
+        // times are approximate, so cutting on the number clips the last word — it is how
+        // "…the deer running around too" and "Genuine, real neighborhood." lost their endings.
         let mut s = script_of(beat(10.0, 31.0));
-        assert_eq!(end_on_sentences(&db, &mut s, &sc()), 0);
+        assert_eq!(end_on_sentences(&db, &mut s, &sc()), 1);
+        assert!(
+            (s.beats[0].clips[0].out_s - 31.35).abs() < 0.01,
+            "the last word keeps its decay: {}",
+            s.beats[0].clips[0].out_s
+        );
 
         // And b-roll is not speech: nothing to keep whole.
         let mut s = script_of(beat(10.0, 28.4));

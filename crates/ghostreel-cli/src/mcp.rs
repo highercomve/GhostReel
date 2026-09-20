@@ -533,6 +533,10 @@ async fn call_tool(paths: &Paths, name: &str, args: &Value) -> anyhow::Result<Va
                     .unwrap_or_default()
                     .script
                     .audio_fade_s,
+                speech_overrun_s: ghostreel_core::config::Config::load(&paths.config_file)
+                    .unwrap_or_default()
+                    .script
+                    .speech_overrun_s,
                 out: args.get("out").and_then(|v| v.as_str()).map(PathBuf::from),
                 cancel: None,
             };

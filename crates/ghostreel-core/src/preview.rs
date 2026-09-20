@@ -100,6 +100,9 @@ pub struct PreviewOptions {
     pub normalize_audio: bool,
     /// Seconds of fade at each join; `script.audio_fade_s`.
     pub audio_fade_s: f64,
+    /// How far a cut runs past the last word so its decay survives; `script.speech_overrun_s`.
+    /// The fade out spends this, rather than starting on the word's final sample.
+    pub speech_overrun_s: f64,
     pub out: Option<PathBuf>,
     pub cancel: Option<Arc<AtomicBool>>,
 }
@@ -459,6 +462,7 @@ pub fn render_preview(
             // overrun reaches into the next sentence — audible as a stray "And" after the point
             // has been made. Fading from the sentence end keeps the decay and loses the word.
             let fade = opts.audio_fade_s.max(0.0).min(seg_dur / 3.0);
+            let cfg_overrun = opts.speech_overrun_s.max(0.0);
             let speech_end_rel: Option<f64> = db
                 .conn
                 .query_row(
@@ -469,13 +473,20 @@ pub fn render_preview(
                 .ok()
                 .flatten()
                 .map(|e| (e - seg.in_s).max(0.0));
-            let fade_out_at = match speech_end_rel {
-                // Start at the last word's end, but never so early that the fade outlasts the clip.
-                Some(end) if end < seg_dur => end.min((seg_dur - fade).max(0.0)),
-                _ => (seg_dur - fade).max(0.0),
+            // The fade runs *across* the decay of the last word rather than starting on it.
+            // Whisper's segment times are approximate and often quantised to whole seconds, so
+            // "the sentence ends here" is only nearly true; fading from that instant clipped
+            // "…running around too" and "Genuine, real neighborhood." The clip carries an overrun
+            // for exactly this, and the fade now spends it.
+            let (fade_out_at, fade_len) = match speech_end_rel {
+                Some(end) if end < seg_dur => {
+                    let room = (seg_dur - end).max(0.0);
+                    (end.min((seg_dur - fade).max(0.0)), fade.max(room.min(cfg_overrun)))
+                }
+                _ => ((seg_dur - fade).max(0.0), fade),
             };
             let fades = if fade > 0.005 {
-                format!("afade=t=in:st=0:d={fade:.3},afade=t=out:st={fade_out_at:.3}:d={fade:.3},")
+                format!("afade=t=in:st=0:d={fade:.3},afade=t=out:st={fade_out_at:.3}:d={fade_len:.3},")
             } else {
                 String::new()
             };
@@ -586,6 +597,7 @@ pub fn render_preview(
             let dur = (bed.out_s - bed.in_s).max(0.01);
             let wav = previews_dir.join(format!("bed_{}_{i}_{}.wav", stored.id, std::process::id()));
             let fade = opts.audio_fade_s.max(0.0).min(dur / 3.0);
+            let cfg_overrun = opts.speech_overrun_s.max(0.0);
             // As for a clip, the fade out starts where the speaking stops, not where the bed does.
             let speech_end_rel: Option<f64> = db
                 .conn
@@ -597,13 +609,16 @@ pub fn render_preview(
                 .ok()
                 .flatten()
                 .map(|e| (e - bed.in_s).max(0.0));
-            let fade_out_at = match speech_end_rel {
-                Some(end) if end < dur => end.min((dur - fade).max(0.0)),
-                _ => (dur - fade).max(0.0),
+            let (fade_out_at, fade_len) = match speech_end_rel {
+                Some(end) if end < dur => {
+                    let room = (dur - end).max(0.0);
+                    (end.min((dur - fade).max(0.0)), fade.max(room.min(cfg_overrun)))
+                }
+                _ => ((dur - fade).max(0.0), fade),
             };
             let mut af = String::new();
             if fade > 0.005 {
-                af.push_str(&format!("afade=t=in:st=0:d={fade:.3},afade=t=out:st={fade_out_at:.3}:d={fade:.3},"));
+                af.push_str(&format!("afade=t=in:st=0:d={fade:.3},afade=t=out:st={fade_out_at:.3}:d={fade_len:.3},"));
             }
             if opts.normalize_audio {
                 af.push_str("loudnorm=I=-16:TP=-1.5:LRA=11,");
@@ -1128,6 +1143,7 @@ mod tests {
                 burn_narration: true,
                 normalize_audio: false,
                 audio_fade_s: 0.12,
+                speech_overrun_s: 0.35,
                 out: Some(burned_out.clone()),
                 cancel: None,
             },
