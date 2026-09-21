@@ -5,6 +5,31 @@ versions follow [SemVer](https://semver.org/) while the project is 0.x (minor = 
 
 ## [Unreleased]
 
+## [0.4.2] — 2026-09-21
+
+### Added
+
+- **Switch chat brain directly in the composer.** A dedicated brain bar in the script chat composer
+  allows switching between **Auto**, **Local** (this computer), **Server**, and **CLI** without
+  navigating to Settings or Models. Depending on the selected backend, it exposes the local model
+  picker and think toggle, CLI tool and model selector with availability check, or server endpoint
+  configuration directly within the chat workflow.
+- **Image and screenshot attachments in script chat.** Paste screenshots directly from the clipboard,
+  drag and drop images, or pick files into the composer. Thumbnails can be previewed in a lightbox modal
+  and removed before drafting.
+
+### Fixed
+
+- **Chat progress and tool execution chips are preserved across navigation.** Navigating away from
+  the chat panel (e.g. to Activity, Models, or Settings) during a live turn no longer loses the
+  running state or tool chips. The session cache and task queue synchronize live progress, keep the
+  composer locked during execution, and automatically reload messages and scripts upon completion.
+- **Immediate session update on turn start.** Chat sessions update their timestamp and order
+  immediately when a new prompt is sent, ensuring active sessions remain prioritized in the sidebar.
+- **File export save dialog allowed by ACL.** Added missing `dialog:allow-save` permission to Tauri
+  capabilities, resolving `Command plugin:dialog|save not allowed by ACL` when exporting MP4,
+  Premiere (FCP XML), or OpenTimelineIO (.otio).
+
 ## [0.4.1] — 2026-09-21
 
 ### Changed
