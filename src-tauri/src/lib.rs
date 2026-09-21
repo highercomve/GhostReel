@@ -652,7 +652,7 @@ fn jev_view(cfg: &ghostreel_core::config::JevConfig) -> JevSettingsView {
 /// that answers in probabilities — so it runs here rather than through the queue: it takes about
 /// as long as a preview, and there is nothing to stream.
 #[tauri::command]
-async fn build_script_with_jev(project_id: i64, brief: String, target_s: f64) -> CmdResult<i64> {
+async fn build_script_with_jev(project_id: i64, brief: String, target_s: f64) -> CmdResult<BuiltCut> {
     let p = paths()?;
     let config = Config::load(&p.config_file).unwrap_or_default();
     if config.jev.api_key.trim().is_empty() && std::env::var("TYPESAFE_API_KEY").is_err() {
@@ -674,16 +674,60 @@ async fn build_script_with_jev(project_id: i64, brief: String, target_s: f64) ->
     let script =
         ghostreel_core::chat::build::build(&footage, &project, &brief, target_s, &config.jev).await.map_err(err)?;
 
+    let brief_for_judge = brief.clone();
     let db_path = p.db_file();
     let script_cfg = config.script.clone();
-    tokio::task::spawn_blocking(move || -> CmdResult<i64> {
+    let (script_id, script) =
+        tokio::task::spawn_blocking(move || -> CmdResult<(i64, ghostreel_core::script::Script)> {
+            let db = Db::open(&db_path).map_err(err)?;
+            let mut s = script;
+            ghostreel_core::chat::repair::finish_script(&db, project_id, &mut s, true, &script_cfg).map_err(err)?;
+            let id = ghostreel_core::script::save_version(&db, project_id, &s, None).map_err(err)?;
+            Ok((id, s))
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+
+    // Judge it and open it as a conversation, the same handoff `ghostreel script build` does.
+    // The builder picks pictures well and structures poorly and a chat brain is the other way
+    // round, so the useful thing is not the cut but the cut plus a critique, in a session the
+    // next turn can carry on from. Without this the button is a dead end: the best pipeline
+    // measured here (build, then refine) was reachable only from the CLI.
+    //
+    // `plan` reads the database and `ask` does not, which is the whole reason the judge is split
+    // in two — a `Db` is not `Sync` and must not be held across the request.
+    let db_path = p.db_file();
+    let jev_cfg = config.jev.clone();
+    let (planned, script) = tokio::task::spawn_blocking(move || -> CmdResult<_> {
         let db = Db::open(&db_path).map_err(err)?;
-        let mut s = script;
-        ghostreel_core::chat::repair::finish_script(&db, project_id, &mut s, true, &script_cfg).map_err(err)?;
-        ghostreel_core::script::save_version(&db, project_id, &s, None).map_err(err)
+        let planned = ghostreel_core::chat::judge::plan(&db, &script, Some(&brief_for_judge), &jev_cfg);
+        Ok((planned, script))
     })
     .await
-    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())??;
+    // A judgement is a nicety; the handoff is the point. Losing the notes must not lose the
+    // session, so a judge that is off, unkeyed or unreachable is not an error here.
+    let notes = match planned {
+        Some(p) => p.ask().await.map(|j| j.notes()).unwrap_or_default(),
+        None => Vec::new(),
+    };
+
+    let db_path = p.db_file();
+    let session_id = tokio::task::spawn_blocking(move || -> CmdResult<i64> {
+        let db = Db::open(&db_path).map_err(err)?;
+        ghostreel_core::chat::build::save_as_session(&db, project_id, &brief, script_id, &script, &notes).map_err(err)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+
+    Ok(BuiltCut { script_id, session_id })
+}
+
+/// What the build hands back: the cut, and the conversation to refine it in.
+#[derive(serde::Serialize)]
+struct BuiltCut {
+    script_id: i64,
+    session_id: i64,
 }
 
 #[tauri::command]

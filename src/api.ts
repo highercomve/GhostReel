@@ -513,8 +513,11 @@ export const chatTurn = (projectId: number, sessionId: number | null, message: s
  * Build a cut by choosing instead of writing: Jev picks the quotes and the shots out of the index
  * and code assembles them. Returns the saved script id. Needs a Jev key (Settings).
  */
+/** A cut Jev chose, and the conversation opened to refine it in. */
+export type BuiltCut = { script_id: number; session_id: number };
+
 export const buildScriptWithJev = (projectId: number, brief: string, targetS: number) =>
-  invoke<number>("build_script_with_jev", { projectId, brief, targetS });
+  invoke<BuiltCut>("build_script_with_jev", { projectId, brief, targetS });
 
 export const chatSessions = (projectId: number) =>
   invoke<ChatSession[]>("chat_sessions", { projectId });

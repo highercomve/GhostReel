@@ -59,6 +59,16 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
   const [turnError, setTurnError] = useState<string | null>(null);
   /** Jev is building a cut by choosing. One shot, no conversation, ~15 s. */
   const [building, setBuilding] = useState(false);
+  /**
+   * Draft with Jev before handing the brief to the chat brain.
+   *
+   * The two are good at opposite things: Jev picks pictures well and structures poorly, a model
+   * is the other way round. Starting the model from a real cut and a critique of it, rather than
+   * from nothing, measured 76 editorial in 2m45s against 65 for Jev alone and 76 for agy alone
+   * in 9m23s — and it is the local models, which are worst at the research, that stand to gain
+   * the most from not having to do it.
+   */
+  const [jevFirst, setJevFirst] = useState(false);
   const [latestIssues, setLatestIssues] = useState<Issue[] | undefined>(undefined);
 
   const messagesRef = useRef<HTMLDivElement>(null);
@@ -186,7 +196,23 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
     setOptimisticUser(text);
 
     try {
-      const res = await chatTurn(projectId, selectedSessionId, text);
+      // When Jev drafts first, the model's turn happens in the session the build opened — which
+      // already holds the brief, the cut and the editorial notes, so the instruction here is to
+      // improve it rather than to write one.
+      let session = selectedSessionId;
+      let message = text;
+      if (jevFirst) {
+        setBuilding(true);
+        const built = await buildScriptWithJev(projectId, text, 40).finally(() => setBuilding(false));
+        session = built.session_id;
+        setSelectedSessionId(built.session_id);
+        setSelectedScriptId(built.script_id);
+        setScripts(await listScripts(projectId).catch(() => [] as ScriptSummary[]));
+        message =
+          "Improve this cut. Keep it to the brief, fix the editorial notes above, and keep every " +
+          "quote a whole sentence. Reply with the full script JSON.";
+      }
+      const res = await chatTurn(projectId, session, message);
       setSelectedSessionId(res.session_id);
 
       // Refresh sessions, messages, and scripts
@@ -457,11 +483,23 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
           />
           <button
             type="button"
-            disabled={turnRunning || !inputMessage.trim()}
+            disabled={turnRunning || building || !inputMessage.trim()}
             onClick={handleSend}
           >
-            Send
+            {building ? "Choosing…" : jevFirst ? "Build, then refine" : "Send"}
           </button>
+          {/*
+            Two brains in a row. Jev cannot write, so it can only choose — but choosing is the
+            part a model spends fifteen tool rounds on, and it gets the pictures right more often.
+            The model then does what it is good at: making four chosen quotes into a story.
+          */}
+          <label
+            className="chat-toggle"
+            title="Have Jev choose a first cut out of the index, judge it, and hand that to the chat brain to refine — instead of the model researching the whole project itself. Needs a Jev key in Settings."
+          >
+            <input type="checkbox" checked={jevFirst} onChange={(e) => setJevFirst(e.target.checked)} />
+            Jev drafts first
+          </label>
           {/*
             Jev does not write, so it cannot hold a conversation — this is one shot, not a turn.
             It chooses the quotes and the shots out of the index and code assembles them, which
@@ -477,10 +515,18 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
               setBuilding(true);
               setTurnError(null);
               try {
-                const id = await buildScriptWithJev(projectId, brief, 40);
+                const built = await buildScriptWithJev(projectId, brief, 40);
                 setInputMessage("");
                 setScripts(await listScripts(projectId));
-                setSelectedScriptId(id);
+                setSessions(
+                  [...(await chatSessions(projectId).catch(() => [] as ChatSession[]))].sort(
+                    (a, b) => (b.updated_at || b.created_at) - (a.updated_at || a.created_at),
+                  ),
+                );
+                // Select the session the build opened, so the next thing typed refines this cut
+                // with whichever brain Settings names rather than starting a new conversation.
+                setSelectedSessionId(built.session_id);
+                setSelectedScriptId(built.script_id);
               } catch (e) {
                 setTurnError(String(e));
               } finally {
