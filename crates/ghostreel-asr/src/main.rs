@@ -71,7 +71,7 @@ fn run() -> Result<(), String> {
     if raw.len() % 4 != 0 {
         return Err("stdin is not f32le PCM (length not a multiple of 4)".into());
     }
-    let samples: Vec<f32> = raw.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+    let samples: Vec<f32> = raw.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect();
     let audio_s = samples.len() as f64 / 16_000.0;
 
     // whisper.cpp/ggml logs go to stderr as-is: GhostReel keeps the last lines to explain failures

@@ -165,6 +165,7 @@ fn format_prompt_with_template(model: &LlamaModel, user_message: &str) -> String
 }
 
 impl Vision<'_> {
+    #[allow(clippy::too_many_arguments)]
     fn sample(
         &mut self,
         prompt_tokens: usize,
