@@ -249,6 +249,20 @@ enum ScriptAction {
         session: Option<i64>,
         message: String,
     },
+    /// Keep asking the chat brain to improve a cut, and keep the best one the judge sees.
+    ///
+    /// One turn moves a cut about as far as one instruction goes. This runs several and climbs
+    /// the editorial score, which needs `jev.enabled` and a key — without one there is no
+    /// fitness to climb and the last round is simply kept.
+    Refine {
+        #[arg(long, short)]
+        project: String,
+        /// The session holding the cut and its critique — `script build` prints one.
+        #[arg(long)]
+        session: i64,
+        #[arg(long, default_value_t = 3)]
+        rounds: usize,
+    },
     /// List chat sessions in a project.
     Sessions {
         #[arg(long, short)]
@@ -764,7 +778,12 @@ async fn script_cmd(paths: &Paths, action: ScriptAction) -> anyhow::Result<ExitC
             for issue in ghostreel_core::chat::lay_audio_beds(&db, &mut script, &script_cfg) {
                 println!("  [info] {}", issue.message);
             }
-            // And the same guarantee a drafted script gets: nothing stops mid-sentence.
+            // And the same guarantee a drafted script gets: a range stops where the speaker
+            // stopped, and then on a whole sentence.
+            let turns = ghostreel_core::chat::end_on_turns(&db, &mut script, &script_cfg);
+            if turns > 0 {
+                println!("  [info] ended {turns} range(s) where the speaker stopped, before the reply over the top");
+            }
             let mended = ghostreel_core::chat::end_on_sentences(&db, &mut script, &script_cfg);
             if mended > 0 {
                 println!("  [info] put {mended} range(s) back on whole sentences");
@@ -773,10 +792,13 @@ async fn script_cmd(paths: &Paths, action: ScriptAction) -> anyhow::Result<ExitC
             if shortened > 0 {
                 println!("  [info] cut the pictures back to the voice in {shortened} beat(s)");
             }
-            let held = ghostreel_core::chat::hold_the_last_picture(&db, &mut script, &script_cfg);
+            let held = ghostreel_core::chat::hold_the_last_picture(&db, p.id, &mut script, &script_cfg);
             if held > 0.0 {
                 println!("  [info] held the closing picture for {held:.1} s of quiet");
             }
+            // A bed may not outlast the pictures it plays under, and everything above moves them.
+            // `finish_script` has always ended this way; this copy of the sequence never did.
+            ghostreel_core::chat::clamp_beds_to_beats(&db, &mut script, &script_cfg);
             let issues = ghostreel_core::script::validate(&db, p.id, &script)?;
             for issue in &issues {
                 let tag = match issue.severity {
@@ -1052,6 +1074,53 @@ async fn script_cmd(paths: &Paths, action: ScriptAction) -> anyhow::Result<ExitC
                 res.encoder,
                 t0.elapsed().as_secs_f64()
             );
+        }
+        ScriptAction::Refine { project, session, rounds } => {
+            let p = db.require_project(&project)?;
+            let config = Config::load(&paths.config_file)?;
+            let vision_setup = runtime::resolve_chat(paths, &config).await;
+            eprintln!("Chat model: {}", vision_setup.describe());
+            let backend =
+                ghostreel_core::chat::ChatBackend::from_vision_setup(&vision_setup, config.script.server_timeout_s)
+                    .await?
+                    .with_window(config.chat_model().ctx_tokens);
+            let mut embedder = None;
+            let embed_setup = runtime::resolve_embed(paths, &config).await;
+            match runtime::start_embedder(&embed_setup, |_, _| {}).await {
+                Ok(e) => embedder = Some(e),
+                Err(why) => eprintln!("(meaning search unavailable: {why}; using keywords only)"),
+            }
+            let mut ctx = ghostreel_core::chat::ChatContext {
+                db,
+                data_dir: paths.data_dir.clone(),
+                backend,
+                embedder,
+                system_prompt: Some(config.chat.system_prompt.clone()),
+                max_tool_rounds: config.chat_model().max_tool_rounds,
+                script: config.script.clone(),
+                jev: config.jev.clone(),
+                cancel: None,
+            };
+
+            let t0 = std::time::Instant::now();
+            let mut on_event = |_: ghostreel_core::chat::ChatEvent| {};
+            let named = |id: Option<i64>| id.map(|i| format!("#{i}")).unwrap_or_else(|| "(no script)".into());
+            let mut on_round = |r: &ghostreel_core::chat::refine::Round| match r.total {
+                Some(t) => println!("  round {}: script {} — editorial {t:.0}/100", r.n, named(r.script_id)),
+                None => println!("  round {}: script {} — not judged", r.n, named(r.script_id)),
+            };
+            let out = ghostreel_core::chat::refine::run(&mut ctx, p.id, session, rounds, &mut on_event, &mut on_round)
+                .await?;
+            match &out.best {
+                Some(b) => println!(
+                    "best of {} round(s): script {}{} in {:.0}s",
+                    out.rounds.len(),
+                    named(b.script_id),
+                    b.total.map(|t| format!(" at {t:.0}/100")).unwrap_or_default(),
+                    t0.elapsed().as_secs_f64()
+                ),
+                None => println!("no round produced a script"),
+            }
         }
         ScriptAction::Chat { project, session, message } => {
             let p = db.require_project(&project)?;

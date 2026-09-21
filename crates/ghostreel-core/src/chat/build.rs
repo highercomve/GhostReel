@@ -360,7 +360,7 @@ const STOPWORDS: &[&str] = &[
 ];
 
 /// The content words of a line or a description, lowercased, long enough to mean something.
-fn content_words(text: &str) -> std::collections::HashSet<String> {
+pub(crate) fn content_words(text: &str) -> std::collections::HashSet<String> {
     text.split(|c: char| !c.is_alphanumeric() && c != '\'')
         .map(|w| w.trim_matches('\'').to_lowercase())
         .filter(|w| w.len() >= 4 && !STOPWORDS.contains(&w.as_str()))
@@ -373,7 +373,7 @@ fn content_words(text: &str) -> std::collections::HashSet<String> {
 /// and pulling the search subsystem in here would widen what a change to this file can break. The
 /// descriptions are keyword-rich — "deer", "fence", "patio", "hillside" — so overlap is enough to
 /// shortlist, and Jev still does the choosing.
-fn relevance(line: &std::collections::HashSet<String>, shot: &str) -> usize {
+pub(crate) fn relevance(line: &std::collections::HashSet<String>, shot: &str) -> usize {
     let words = content_words(shot);
     line.iter().filter(|w| words.contains(*w)).count()
 }
@@ -579,6 +579,10 @@ pub fn save_as_session(
         params![session_id, content, serde_json::json!({ "script_id": script_id }).to_string(), t],
     )?;
     db.conn.execute("UPDATE chat_sessions SET updated_at = ?1 WHERE id = ?2", params![t, session_id])?;
+    // The cut belongs to the conversation about it. Saved before the session existed, it was
+    // left with no session at all, which puts it in the panel's orphan list instead of under the
+    // session that is about to refine it.
+    db.conn.execute("UPDATE scripts SET session_id = ?1 WHERE id = ?2", params![session_id, script_id])?;
     Ok(session_id)
 }
 

@@ -109,7 +109,44 @@ impl Judgement {
                 );
             }
         }
+        out.extend(self.weakest(2));
         out
+    }
+
+    /// The `n` dimensions losing the most points, as something to do about each.
+    ///
+    /// The notes above only fire below 0.4, which is a fault. Most cuts are not faulty, they are
+    /// *mediocre*: the Greet Mag build scored ending 0.49, opening 0.56 and brief 0.68 and was
+    /// told about none of them, so the only instruction reaching the model was one mismatched
+    /// beat — and it changed one beat. A model asked to make a cut better and given nothing to
+    /// aim at returns what it was given. Ranked by points lost rather than by value, because a
+    /// dimension worth 30 at 0.68 is a bigger prize than one worth 5 at 0.41.
+    fn weakest(&self, n: usize) -> Vec<String> {
+        let mut ranked: Vec<&Part> = self
+            .parts
+            .iter()
+            // Room to be worth naming, and not already said above.
+            .filter(|p| p.value < 0.7 && !(p.value < 0.4 && matches!(p.name.as_str(), "ending" | "opening")))
+            .collect();
+        ranked.sort_by(|a, b| (b.possible - b.earned).total_cmp(&(a.possible - a.earned)));
+        ranked
+            .into_iter()
+            .take(n)
+            .map(|p| {
+                // The names `compose` gives the parts, which are what the editor reads.
+                let what = match p.name.as_str() {
+                    "pictures match the voice" => "the shots mostly do not show what is being said over them — for each beat, find footage of the thing the voice names",
+                    "flow" => "the beats do not follow one another — reorder them so each line answers the one before, or cut the one that does not belong",
+                    "opening" => "the opening does not earn attention — open on the strongest sentence anybody says, not the earliest one",
+                    "ending" => "the ending does not land — close on a line that answers what the opening set up",
+                    "says what was asked" => "the cut drifts from the brief — re-read it and drop whatever does not serve it",
+                    "says each thing once" => "the same point is made more than once — keep the best version of it and cut the rest",
+                    "easy to follow" => "the voices cut against each other — group what belongs together",
+                    other => other,
+                };
+                format!("{what} (scored {:.2}, worth {:.0} points of which it lost {:.0})", p.value, p.possible, p.possible - p.earned)
+            })
+            .collect()
     }
 }
 
@@ -605,6 +642,37 @@ mod tests {
 
     fn answers(json: &str) -> Answers {
         serde_json::from_str(json).unwrap()
+    }
+
+    /// The Greet Mag build scored ending 0.49, opening 0.56 and brief 0.68 and was told about
+    /// none of them, because `notes` only spoke below 0.4. The model fixed the one mismatched
+    /// beat it *was* told about and handed the rest back unchanged: 62 → 64.
+    #[test]
+    fn a_merely_mediocre_cut_is_still_told_what_to_work_on() {
+        let db = db_with_footage();
+        let s = state(&db, &bedded_script(), None, &JevConfig::default());
+        // Nothing here is a fault — every dimension is mid, which is the ordinary case.
+        let mid = compose(
+            &s,
+            &answers(
+                r#"{"model":"jev-1.13.0","answers":{
+                "beat_0_pictures_match":{"type":"noul","noul":0.67},
+                "opening":{"type":"score","score":1.1,"legend":{"0":"a","1":"b","2":"c"},"confidence":0.9},
+                "flow":{"type":"score","score":1.5,"legend":{"0":"a","1":"b","2":"c"},"confidence":0.9},
+                "ending":{"type":"score","score":1.0,"legend":{"0":"a","1":"b","2":"c"},"confidence":0.9},
+                "repeats_itself":{"type":"noul","noul":0.5},
+                "voice_whiplash":{"type":"noul","noul":0.3}}}"#,
+            ),
+        );
+        let notes = mid.notes();
+        assert!(!notes.is_empty(), "a mediocre cut needs something to aim at");
+        // Ranked by points lost, so the 30-point dimension outranks the 5-point ones.
+        assert!(
+            notes.iter().any(|n| n.contains("do not show what is being said")),
+            "pictures lose the most here: {notes:?}"
+        );
+        assert!(notes.len() <= 3, "two dimensions plus any real fault, not a wall: {notes:?}");
+        assert!(notes.iter().all(|n| n.contains("scored") || n.contains("beat '")), "each says how bad: {notes:?}");
     }
 
     #[test]

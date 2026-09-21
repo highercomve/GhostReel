@@ -14,6 +14,7 @@ use serde_json::{Value, json};
 pub mod build;
 pub mod judge;
 pub mod metrics;
+pub mod refine;
 pub mod repair;
 pub use enforce_grounding_and_pacing as repair_draft;
 pub mod tools;
@@ -1638,7 +1639,24 @@ pub fn trim_pictures_to_bed(script: &mut Script, cfg: &crate::config::ScriptConf
 /// and lets it go quiet — it is what tells a viewer the thing is over. The hold comes out of
 /// footage already chosen and already grounded: the last shot simply plays a little longer, and
 /// the bed is deliberately not extended with it, because the silence is the point.
-pub fn hold_the_last_picture(db: &Db, script: &mut Script, cfg: &crate::config::ScriptConfig) -> f64 {
+/// What `hold_the_last_picture` writes in a cutaway's `why`, and what `drop_closing_picture`
+/// finds it by. A repair must be able to tell the pictures it added from the ones the model
+/// chose: `drop_beats_to_target` will not cut below half the clips the model wrote, and an extra
+/// picture in that count let it drop one more beat on the second repair than on the first — a
+/// draft walked 84.5 s → 43.1 s on a pass that should have found nothing to do.
+pub(crate) const CLOSING_PICTURE: &str = "the image the piece closes on";
+
+/// Take back the closing picture a previous repair added, so the fit sees the model's own cut.
+pub fn drop_closing_picture(script: &mut Script) -> bool {
+    let Some(beat) = script.beats.last_mut() else { return false };
+    if beat.clips.last().and_then(|c| c.why.as_deref()) == Some(CLOSING_PICTURE) {
+        beat.clips.pop();
+        return true;
+    }
+    false
+}
+
+pub fn hold_the_last_picture(db: &Db, project_id: i64, script: &mut Script, cfg: &crate::config::ScriptConfig) -> f64 {
     if cfg.closing_hold_s <= 0.0 {
         return 0.0;
     }
@@ -1657,9 +1675,37 @@ pub fn hold_the_last_picture(db: &Db, script: &mut Script, cfg: &crate::config::
         _ => {}
     }
 
-    let Some(last) = beat.clips.last_mut() else { return 0.0 };
+    let Some(last) = beat.clips.last() else { return 0.0 };
+    let (last_video, last_out) = (last.video_id, last.out_s);
+
+    // Closing on the speaker means closing on a talking head with the sound already finished —
+    // two seconds of somebody moving their hands in silence, which the editor described as the
+    // cut ending "without an image that represents what we were talking about". When the last
+    // picture is a face we have been listening to, the hold becomes a cutaway instead.
+    //
+    // Only under a bed. Without one the closing voice is that picture's own audio, and the hold
+    // below mutes the clip it extends — so cutting away there would be swapping the sound out as
+    // well as the image, and it changes what the fit is allowed to trim: a draft whose last beat
+    // has no bed walked 84.5 s → 52.5 s across two repairs on the strength of that one difference.
+    let bedded = beat_has_bed(script);
+    if bedded && voices(script).contains(&last_video) {
+        let heard = closing_words(db, script);
+        if let Some(shot) = closing_shot(db, project_id, script, &heard, cfg.closing_hold_s) {
+            let beat = script.beats.last_mut().expect("checked above");
+            beat.clips.push(ScriptClip {
+                video_id: shot.video_id,
+                in_s: shot.t_s,
+                out_s: shot.t_s + cfg.closing_hold_s,
+                audio: crate::script::Audio::Mute,
+                why: Some(CLOSING_PICTURE.into()),
+            });
+            return cfg.closing_hold_s;
+        }
+    }
+
+    let Some(last) = script.beats.last_mut().and_then(|b| b.clips.last_mut()) else { return 0.0 };
     let duration = video_duration(db, last.video_id).unwrap_or(f64::MAX);
-    let room = (duration - last.out_s).max(0.0);
+    let room = (duration - last_out).max(0.0);
     let held = cfg.closing_hold_s.min(room);
     if held < 0.2 {
         return 0.0;
@@ -1672,13 +1718,105 @@ pub fn hold_the_last_picture(db: &Db, script: &mut Script, cfg: &crate::config::
     held
 }
 
+/// Whether the last beat carries its sound on a bed rather than in the pictures themselves.
+fn beat_has_bed(script: &Script) -> bool {
+    script.beats.last().is_some_and(|b| b.bed.is_some())
+}
+
+/// Every video whose voice is heard anywhere in the cut.
+fn voices(script: &Script) -> std::collections::HashSet<i64> {
+    let mut v = std::collections::HashSet::new();
+    for beat in &script.beats {
+        if let Some(bed) = &beat.bed {
+            v.insert(bed.video_id);
+        }
+        for c in &beat.clips {
+            if c.audio == crate::script::Audio::Source {
+                v.insert(c.video_id);
+            }
+        }
+    }
+    v
+}
+
+/// The last thing said in the cut, which is what the closing image should be about.
+fn closing_words(db: &Db, script: &Script) -> String {
+    let Some(beat) = script.beats.last() else { return String::new() };
+    if let Some(bed) = &beat.bed {
+        return clip_speech(db, bed.video_id, bed.in_s, bed.out_s);
+    }
+    match beat.clips.iter().rev().find(|c| c.audio == crate::script::Audio::Source) {
+        Some(c) => clip_speech(db, c.video_id, c.in_s, c.out_s),
+        None => String::new(),
+    }
+}
+
+/// A described shot to close on: nobody talking in it, nothing already used, and of everything
+/// left, whatever shares the most with the closing line.
+///
+/// "Nobody talking" is the part that matters and it is stricter than the rule `chat/build.rs`
+/// picks cutaways by. Excluding only the voices *heard in this cut* still closed one on a frame
+/// of a different interviewee, lav mic on his collar, mid-sentence — a talking head is a talking
+/// head whether or not this piece happens to use his voice. A shot with any speech under it is
+/// somebody being interviewed; the closing image wants the place, not a person answering a
+/// question. Word overlap and not embeddings, deliberately: this is a tie-break over a handful of
+/// eligible shots, not a search.
+fn closing_shot(
+    db: &Db,
+    project_id: i64,
+    script: &Script,
+    heard: &str,
+    need_s: f64,
+) -> Option<crate::chat::build::Shot> {
+    let voices = voices(script);
+    let used: std::collections::HashSet<i64> =
+        script.beats.iter().flat_map(|b| b.clips.iter().map(|c| c.video_id)).collect();
+    let wanted = crate::chat::build::content_words(heard);
+
+    let rows: Vec<(i64, f64, String)> = db
+        .conn
+        .prepare_cached(
+            "SELECT f.video_id, f.t_s, f.description_json, v.duration_s
+               FROM frames f
+               JOIN videos v ON v.id = f.video_id
+               JOIN video_files vf ON vf.video_id = f.video_id
+               JOIN folders fo ON fo.id = vf.folder_id
+               JOIN project_folders pf ON pf.folder_id = fo.id
+              WHERE pf.project_id = ?1 AND f.description_json IS NOT NULL
+              GROUP BY f.video_id, f.t_s",
+        )
+        .ok()?
+        .query_map(params![project_id], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?, r.get::<_, String>(2)?, r.get::<_, f64>(3)?))
+        })
+        .ok()?
+        .flatten()
+        // Room to play the whole hold, not a voice we have been listening to, and not somebody
+        // talking on camera.
+        .filter(|(vid, t_s, _, dur)| {
+            !voices.contains(vid)
+                && !used.contains(vid)
+                && dur - t_s >= need_s
+                && !clip_has_speech(db, *vid, *t_s, t_s + need_s)
+        })
+        .filter_map(|(vid, t_s, json, _)| {
+            let text = serde_json::from_str::<Value>(&json).ok()?["description"].as_str()?.to_string();
+            Some((vid, t_s, text))
+        })
+        .collect();
+
+    rows.into_iter()
+        .max_by_key(|(_, _, text)| crate::chat::build::relevance(&wanted, text))
+        .map(|(video_id, t_s, text)| crate::chat::build::Shot { video_id, t_s, text })
+}
+
 /// Keep every bed inside the beat it plays under.
 ///
 /// Beds are laid before the cut is fitted to its target, and fitting trims the pictures. A bed
 /// left at its old length then outlives them: it plays on over the next beat's pictures, and the
 /// export puts overlapping clips on A1. Whatever moved the clips, this puts the sound back inside
 /// its beat.
-fn clamp_beds_to_beats(db: &Db, script: &mut Script, cfg: &crate::config::ScriptConfig) {
+pub fn clamp_beds_to_beats(db: &Db, script: &mut Script, cfg: &crate::config::ScriptConfig) {
     for beat in &mut script.beats {
         let beat_len: f64 = beat.clips.iter().map(|c| (c.out_s - c.in_s).max(0.0)).sum();
         let Some(bed) = &beat.bed else { continue };
@@ -2432,6 +2570,132 @@ fn clip_has_described_frame(db: &Db, video_id: i64, in_s: f64, out_s: f64) -> bo
         .unwrap_or(false)
 }
 
+/// Acknowledgements in a row, which is where one person stops talking and another starts.
+///
+/// Nothing in the index says who is speaking. Diarisation would, and `interviewer.rs` catches the
+/// lines that give the interviewer away by their words, but neither reaches the ordinary case: a
+/// subject finishes a thought, both people say "Yeah", and the interviewer starts a story of their
+/// own. Measured on the Greet Mag tape, the beat meant to end on
+///
+/// > "And we love the deer running around too." … "So, yeah, it's beautiful."
+///
+/// ran three segments further, through "Yeah." "Yeah." into "I used to live up on like Spicewood
+/// Springs road." — the interviewer, indistinguishable from the subject as text (Jev scores it
+/// 0.20) and impossible to catch by word count, since it is a full ten-word sentence. What gives
+/// it away is the pair of acknowledgements in front of it.
+const TURN_BREAK_ACKS: usize = 2;
+
+/// How close to the end of a range the handover has to be to count as one.
+///
+/// Without this the pass is not idempotent, which the replay eval caught: having trimmed at one
+/// run of acknowledgements it finds an earlier one on the next pass and trims again, and a
+/// recorded draft walked from 52.5 s to 43.4 s on a repair that should have found nothing to do.
+/// Anchoring the handover to the end of the range fixes that by construction — once the range
+/// stops where the speaker stopped, the acknowledgements are outside it and there is nothing left
+/// to find.
+const TURN_TAIL_S: f64 = 4.0;
+
+/// Whether a transcript line is an acknowledgement rather than something said.
+fn is_acknowledgement(text: &str) -> bool {
+    let n = text.split_whitespace().count();
+    n > 0 && n < MIN_CLIP_WORDS
+}
+
+/// End a speech range before somebody else takes over.
+///
+/// A run of `TURN_BREAK_ACKS` acknowledgements splits the range, and the range keeps the longer
+/// side. That last part is what makes this safe: two "Yeah"s in the middle of somebody's own
+/// answer are them thinking, and the answer continues for longer than its opening — trimming
+/// there would throw the answer away to keep its first sentence. When the acknowledgements are a
+/// handover instead, what follows them is a scrap: Adrienne speaks for eight seconds, both say
+/// "Yeah", and one second of the interviewer follows.
+///
+/// This runs before `end_on_sentences`, which puts the new edge back on a sentence boundary, and
+/// like every pass that moves a clip it must be followed by `clamp_beds_to_beats`.
+pub fn end_on_turns(db: &Db, script: &mut Script, cfg: &crate::config::ScriptConfig) -> usize {
+    let mut fixed = 0usize;
+    for beat in &mut script.beats {
+        let trim = |video_id: i64, in_s: f64, out_s: &mut f64| {
+            let Some(end) = turn_end(db, video_id, in_s, *out_s, cfg) else { return false };
+            if end < *out_s - 0.05 {
+                *out_s = end;
+                return true;
+            }
+            false
+        };
+        for c in beat.clips.iter_mut() {
+            if c.audio == crate::script::Audio::Source && trim(c.video_id, c.in_s, &mut c.out_s) {
+                fixed += 1;
+            }
+        }
+        if let Some(bed) = &mut beat.bed {
+            let (v, i) = (bed.video_id, bed.in_s);
+            if trim(v, i, &mut bed.out_s) {
+                fixed += 1;
+            }
+        }
+    }
+    fixed
+}
+
+/// Where the turn inside `[in_s, out_s]` ends, if somebody else takes over before `out_s`.
+fn turn_end(db: &Db, video_id: i64, in_s: f64, out_s: f64, cfg: &crate::config::ScriptConfig) -> Option<f64> {
+    let segs: Vec<(f64, f64, String)> = db
+        .conn
+        .prepare_cached(
+            "SELECT start_s, end_s, text FROM transcript_segments
+             WHERE video_id = ?1 AND end_s > ?2 + 0.05 AND start_s < ?3 - 0.05 ORDER BY start_s",
+        )
+        .ok()?
+        .query_map(params![video_id, in_s, out_s], |r| {
+            Ok((r.get::<_, f64>(0)?, r.get::<_, f64>(1)?, r.get::<_, String>(2)?))
+        })
+        .ok()?
+        .flatten()
+        .collect();
+    if segs.len() < TURN_BREAK_ACKS + 2 {
+        return None;
+    }
+    // Walk back from the end looking for the last run of acknowledgements, and keep whatever was
+    // said before it. Starting from the end rather than the start is what makes this the *tail*:
+    // the first such run in a long answer is a pause, the last one is the handover.
+    let mut i = segs.len();
+    while i > 0 {
+        i -= 1;
+        if !is_acknowledgement(&segs[i].2) {
+            continue;
+        }
+        let run_end = i + 1;
+        while i > 0 && is_acknowledgement(&segs[i - 1].2) {
+            i -= 1;
+        }
+        if run_end - i < TURN_BREAK_ACKS || i == 0 {
+            continue;
+        }
+        // The handover is at the end of the range or it is not a handover.
+        if out_s - segs[i].0 > TURN_TAIL_S {
+            return None;
+        }
+        // Something is said after the run, or the run is simply trailing filler that
+        // `end_on_sentences` will tidy on its own.
+        if !segs[run_end..].iter().any(|s| !is_acknowledgement(&s.2)) {
+            continue;
+        }
+        let end = segs[i - 1].1;
+        // Keep the longer side. Everything after the acknowledgements has to be the scrap for
+        // this to be a handover rather than a pause the speaker took in their own answer.
+        if out_s - segs[run_end].0 >= end - in_s {
+            continue;
+        }
+        // Never trim a speech range below what a clip is allowed to be.
+        if end - in_s < cfg.min_clip_s {
+            return None;
+        }
+        return Some(end);
+    }
+    None
+}
+
 /// Make every clip that carries someone's voice begin and end on a whole sentence.
 ///
 /// Snapping only reaches 0.75 s and the fit that runs last can trim far more than that, so a clip
@@ -2755,6 +3019,19 @@ pub fn messages(db: &Db, session_id: i64) -> Result<Vec<ChatMessage>, Error> {
 }
 
 /// Run one turn of the script chat agent.
+/// The first thing the editor asked for in this session, which is what every later cut is still
+/// meant to serve.
+fn session_brief(db: &Db, session_id: i64) -> Option<String> {
+    db.conn
+        .query_row(
+            "SELECT content FROM chat_messages WHERE session_id = ?1 AND role = 'user' ORDER BY id LIMIT 1",
+            params![session_id],
+            |r| r.get::<_, String>(0),
+        )
+        .ok()
+        .filter(|b| !b.trim().is_empty())
+}
+
 pub async fn run_turn(
     ctx: &mut ChatContext,
     project_id: i64,
@@ -3616,7 +3893,13 @@ pub async fn run_turn(
     // already good or bad on its own terms.
     // Read the cut first, ask second: the database is not `Sync`, and a future still holding it
     // at an await point cannot be spawned by the app's queue worker.
-    let planned = parsed_script.as_ref().and_then(|s| judge::plan(&ctx.db, s, Some(message), &ctx.jev));
+    // Judged against the *brief*, which is the first thing asked in this session — not `message`,
+    // which on any turn after the first is an instruction about the cut rather than a description
+    // of it. Refining scored "says what was asked" against "Improve this cut. The editorial read
+    // above says exactly where it is losing points…", and the same script read 67 in the turn and
+    // 76 when judged against what was actually asked for.
+    let brief = session_brief(&ctx.db, session_id).unwrap_or_else(|| message.to_string());
+    let planned = parsed_script.as_ref().and_then(|s| judge::plan(&ctx.db, s, Some(&brief), &ctx.jev));
     let judgement = match planned {
         Some(p) => match p.ask().await {
             Ok(j) => Some(j),
@@ -4122,6 +4405,186 @@ mod tests {
             script.beats[0].clips.iter().all(|c| (c.out_s - c.in_s - 25.0).abs() < 1e-9),
             "every clip is the length its sentences are"
         );
+    }
+
+    /// The cut used to end on two seconds of the speaker still moving his hands with the sound
+    /// already finished. The editor: it closes "without an image that represents what we were
+    /// talking about".
+    #[test]
+    fn the_cut_closes_on_a_picture_rather_than_a_talking_head() {
+        use crate::script::{Audio, AudioBed, Beat, ScriptClip};
+        let mut db = Db::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let project = db.create_project(&NewProject::named("P")).unwrap();
+        let folder = db.add_folder(project.id, tmp.path(), true).unwrap();
+        for (id, hash) in [(1, 'h'), (2, 'i'), (3, 'j')] {
+            db.conn
+                .execute(
+                    "INSERT INTO videos(id, content_hash, size, duration_s) VALUES (?1, ?2, 1, 300.0)",
+                    params![id, hash.to_string()],
+                )
+                .unwrap();
+            db.conn
+                .execute(
+                    "INSERT INTO video_files(video_id, folder_id, path, size, mtime, last_seen) VALUES (?1, ?2, ?3, 1, 0, 0)",
+                    params![id, folder.id, format!("{id}.mp4")],
+                )
+                .unwrap();
+        }
+        db.conn
+            .execute("INSERT INTO transcript_segments(video_id, start_s, end_s, text) VALUES (1, 10.0, 20.0, 'everyone here is on each other side in this community')", [])
+            .unwrap();
+        // #3 is somebody else being interviewed: described, but a talking head all the same.
+        db.conn
+            .execute("INSERT INTO transcript_segments(video_id, start_s, end_s, text) VALUES (3, 0.0, 9.0, 'and then I started the business')", [])
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO frames(video_id, t_s, description_json) VALUES
+                 (2, 5.0, '{\"description\":\"a wide shot of the community gathered in the lobby\"}'),
+                 (3, 1.0, '{\"description\":\"a man with a lav mic on his collar, mid sentence\"}')",
+                [],
+            )
+            .unwrap();
+        let mut script = Script {
+            title: "t".into(),
+            target_duration_s: None,
+            fps: Default::default(),
+            width: None,
+            height: None,
+            beats: vec![Beat {
+                id: "b1".into(),
+                purpose: "p".into(),
+                narration: None,
+                on_screen_text: None,
+                notes: None,
+                clips: vec![ScriptClip { video_id: 1, in_s: 10.0, out_s: 20.0, audio: Audio::Mute, why: None }],
+                bed: Some(AudioBed { video_id: 1, in_s: 10.0, out_s: 20.0, why: None, inferred: true }),
+            }],
+        };
+        let held = hold_the_last_picture(&db, project.id, &mut script, &sc());
+        assert!(held > 0.0, "there is a hold to add");
+        let clips = &script.beats[0].clips;
+        assert_eq!(clips.len(), 2, "the hold is a new picture, not more of the same one");
+        assert_eq!(clips[1].video_id, 2, "not #3 — a lav mic mid-sentence is another talking head");
+        assert_eq!(clips[1].audio, Audio::Mute);
+        assert_eq!(clips[0].out_s, 20.0, "the speaker's own picture is left where it was");
+
+        // And a second repair neither adds another nor leaves the first behind.
+        assert_eq!(hold_the_last_picture(&db, project.id, &mut script, &sc()), 0.0, "held twice");
+        assert!(drop_closing_picture(&mut script), "the repair can take back what it added");
+        assert_eq!(script.beats[0].clips.len(), 1);
+    }
+
+    /// The Greet Mag tape, verbatim: she finishes, both say "Yeah", and the interviewer starts a
+    /// story of their own. That last line is ten words of plain English — no word count and no
+    /// off-mic flag reaches it (Jev scores it 0.20). The pair of "Yeah"s in front of it does.
+    /// Refining judged "says what was asked" against the refine instruction rather than the
+    /// brief, so the same script read 67 in the turn and 76 against what was actually asked for —
+    /// and the loop that climbs that score was climbing the wrong number.
+    #[test]
+    fn a_cut_is_judged_against_the_brief_not_against_the_last_thing_typed() {
+        let db = Db::open_in_memory().unwrap();
+        let project = db.create_project(&NewProject::named("P")).unwrap();
+        let session = create_session(&db, project.id, "s").unwrap();
+        let t = now();
+        for (role, content) in [
+            ("user", "Make a 40 second piece about the Northwest Hills neighbourhood."),
+            ("assistant", "Drafted it."),
+            ("user", "Improve this cut. Change something substantial this time."),
+        ] {
+            db.conn
+                .execute(
+                    "INSERT INTO chat_messages(session_id, role, content, tool_calls_json, created_at)
+                     VALUES (?1, ?2, ?3, NULL, ?4)",
+                    params![session, role, content, t],
+                )
+                .unwrap();
+        }
+        let brief = session_brief(&db, session).expect("the session opens with the brief");
+        assert!(brief.contains("Northwest Hills"), "got {brief:?}");
+        assert!(!brief.contains("Improve this cut"), "the instruction is not the brief: {brief:?}");
+        // A session with nothing in it yet falls back to the caller's message.
+        assert_eq!(session_brief(&db, 999_999), None);
+    }
+
+    #[test]
+    fn a_beat_ends_where_the_turn_does_not_where_the_reply_starts() {
+        use crate::script::{AudioBed, Beat};
+        let db = Db::open_in_memory().unwrap();
+        db.conn.execute("INSERT INTO videos(id, content_hash, size, duration_s) VALUES (100,'h',1,200.0)", []).unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO transcript_segments(video_id, start_s, end_s, text) VALUES
+                 (100, 72.0, 77.0, 'And it feels like you are in more of a small town neighborhood and we just love it.'),
+                 (100, 77.0, 79.0, 'And we love the deer running around too.'),
+                 (100, 79.0, 80.0, 'So, yeah, it is beautiful.'),
+                 (100, 80.0, 80.0, 'Yeah.'),
+                 (100, 80.0, 81.0, 'Yeah.'),
+                 (100, 81.0, 82.0, 'I used to live up on like Spicewood Springs road.')",
+                [],
+            )
+            .unwrap();
+        let mut script = Script {
+            title: "t".into(),
+            target_duration_s: None,
+            fps: Default::default(),
+            width: None,
+            height: None,
+            beats: vec![Beat {
+                id: "b1".into(),
+                purpose: "p".into(),
+                narration: None,
+                on_screen_text: None,
+                notes: None,
+                clips: vec![],
+                bed: Some(AudioBed { video_id: 100, in_s: 72.0, out_s: 82.0, why: None, inferred: true }),
+            }],
+        };
+        assert_eq!(end_on_turns(&db, &mut script, &sc()), 1, "the handover is there to be found");
+        let bed = script.beats[0].bed.clone().unwrap();
+        assert!(
+            (bed.out_s - 80.0).abs() < 0.05,
+            "keeps what she said and drops the reply over the top, got {:.1}",
+            bed.out_s
+        );
+    }
+
+    /// Two "Yeah"s in the middle of somebody's own answer are them thinking. Trimming there would
+    /// throw away the answer to keep its opening.
+    #[test]
+    fn a_pause_inside_an_answer_is_not_a_handover() {
+        use crate::script::{Audio, Beat, ScriptClip};
+        let db = Db::open_in_memory().unwrap();
+        db.conn.execute("INSERT INTO videos(id, content_hash, size, duration_s) VALUES (7,'h7',1,200.0)", []).unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO transcript_segments(video_id, start_s, end_s, text) VALUES
+                 (7, 0.0, 4.0, 'We moved here in 2021 and we have loved every minute of it.'),
+                 (7, 4.0, 4.5, 'Yeah.'),
+                 (7, 4.5, 5.0, 'Yeah.'),
+                 (7, 5.0, 9.0, 'And the thing that keeps us here is how easily people talk to each other.'),
+                 (7, 9.0, 13.0, 'That is rarer than it sounds, and it is why we are staying put.')",
+                [],
+            )
+            .unwrap();
+        let mut script = Script {
+            title: "t".into(),
+            target_duration_s: None,
+            fps: Default::default(),
+            width: None,
+            height: None,
+            beats: vec![Beat {
+                id: "b1".into(),
+                purpose: "p".into(),
+                narration: None,
+                on_screen_text: None,
+                notes: None,
+                clips: vec![ScriptClip { video_id: 7, in_s: 0.0, out_s: 13.0, audio: Audio::Source, why: None }],
+                bed: None,
+            }],
+        };
+        assert_eq!(end_on_turns(&db, &mut script, &sc()), 0, "kept: {:?}", script.beats[0].clips[0]);
     }
 
     /// The fit that runs last can trim a speech clip far past what snapping reaches, leaving a
@@ -5033,7 +5496,7 @@ mod tests {
             }],
         };
 
-        let held = hold_the_last_picture(&db, &mut script, &sc());
+        let held = hold_the_last_picture(&db, 1, &mut script, &sc());
         assert!((held - 2.0).abs() < 0.01, "held {held}");
         let clip = &script.beats[0].clips[0];
         assert!((clip.out_s - 22.0).abs() < 0.01, "the picture runs on: {}", clip.out_s);
@@ -5069,18 +5532,18 @@ mod tests {
 
         // Only 0.6 s of the file is left: hold that and no more.
         let mut s = script_of(beat_of(None, 20.0));
-        let held = hold_the_last_picture(&db, &mut s, &sc());
+        let held = hold_the_last_picture(&db, 1, &mut s, &sc());
         assert!((held - 0.6).abs() < 0.01, "held {held}");
 
         // Narration runs to the end: the piece already has an ending.
         let mut s = script_of(beat_of(Some("a closing line"), 15.0));
-        assert_eq!(hold_the_last_picture(&db, &mut s, &sc()), 0.0);
+        assert_eq!(hold_the_last_picture(&db, 1, &mut s, &sc()), 0.0);
 
         // Turned off.
         let mut cfg = sc();
         cfg.closing_hold_s = 0.0;
         let mut s = script_of(beat_of(None, 15.0));
-        assert_eq!(hold_the_last_picture(&db, &mut s, &cfg), 0.0);
+        assert_eq!(hold_the_last_picture(&db, 1, &mut s, &cfg), 0.0);
     }
 
     /// A cutaway that outlasts the voice under it is a pause between interviews, which is the

@@ -28,6 +28,10 @@ pub fn finish_script(
         issues.push(Issue { severity: IssueSeverity::Info, beat_id: None, clip_index: None, message });
     };
 
+    // Anything a previous repair added comes off first: the fit below counts clips, and a
+    // picture this pass put there is not one the model chose.
+    super::drop_closing_picture(s);
+
     let _ = super::snap_to_segments(db, s)?;
     super::pad_speech(db, s, cfg);
     super::clamp_to_duration(db, s);
@@ -51,6 +55,15 @@ pub fn finish_script(
     // These finish the cut rather than fit it, so they run whether or not the fit moved anything.
     // They used to sit inside that `if`, which meant a script already close to its target — the
     // good ones — was the only kind that never got them.
+    // Before the sentences, because this moves an edge and `end_on_sentences` puts it back on a
+    // boundary. It cannot run earlier: `pad_speech` grows a clip into the pauses either side, so a
+    // trim made before padding is simply undone, and the two passes then take turns — the replay
+    // eval caught exactly that, a draft walking from 52.5 s to 43.4 s on a second repair that
+    // should have found nothing to do.
+    let turns = super::end_on_turns(db, s, cfg);
+    if turns > 0 {
+        note(&mut issues, format!("ended {turns} range(s) where the speaker stopped, before the reply over the top"));
+    }
     let mended = super::end_on_sentences(db, s, cfg);
     if mended > 0 {
         note(&mut issues, format!("put {mended} range(s) back on whole sentences"));
@@ -59,7 +72,7 @@ pub fn finish_script(
     if shortened > 0 {
         note(&mut issues, format!("cut the pictures back to the voice in {shortened} beat(s)"));
     }
-    let held = super::hold_the_last_picture(db, s, cfg);
+    let held = super::hold_the_last_picture(db, project_id, s, cfg);
     if held > 0.0 {
         note(&mut issues, format!("held the closing picture for {held:.1} s of quiet"));
     }

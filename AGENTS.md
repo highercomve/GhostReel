@@ -69,7 +69,7 @@ reads two tapes and builds the teaser out of whoever it found there. Tools are f
 A draft then goes through repair passes, in this order, and the order matters:
 `tidy_beat_ids` → shaky stretches moved → off-mic openings retimed → clips without speech muted →
 `lay_audio_beds` → grounding → `snap_to_segments` / `pad_speech` → `fit_to_target` →
-`end_on_sentences` → `clamp_beds_to_beats`. Invariants worth not breaking:
+`end_on_turns` → `end_on_sentences` → `clamp_beds_to_beats`. Invariants worth not breaking:
 
 - **Speech is never scaled and never ends mid-sentence.** Length is a target; a sentence is not.
   Anything that trims clips must be followed by `end_on_sentences`. A cut made mostly of speech
@@ -104,8 +104,17 @@ A draft then goes through repair passes, in this order, and the order matters:
   describing a frame (seconds) and writing a script (minutes: agy needs about nine on a 96-video
   project), and at the 180 s default every chat turn was killed. The chat takes the larger of the
   agent's own timeout and `script.server_timeout_s`.
+- **A range stops where the speaker stopped** (`end_on_turns`): a run of two acknowledgements is a
+  handover, and the range keeps the longer side of it. Nothing else reaches this — the interviewer
+  chatting "I used to live up on like Spicewood Springs road" is ten words of plain English, which
+  no word count catches and Jev scores 0.20. It has to run *after* `pad_speech`, which grows a clip
+  back into the pauses either side, or the two take turns and a cut walks 52.5 s → 43.4 s on a
+  repair that should find nothing.
 - **Repairs are reported back to the model** on the assistant message (`repair_note`), because the
   repair runs after the last redraft and the model otherwise repeats the same mistake.
+- **`script import` has its own copy of this sequence** (`ghostreel-cli/src/main.rs`) rather than
+  calling `repair::finish_script`. A pass added to one and not the other silently does nothing on
+  import — which is how `clamp_beds_to_beats` came to be missing there.
 - **The conversation is re-sent every round**, so the loop keeps three quarters of the window and
   forgets the oldest tool results (`make_room`) rather than dying on the server's context error.
 
@@ -143,6 +152,14 @@ one number live in `compose`, in code, so they can be changed without asking any
   needs both `jev.enabled` and a key (`TYPESAFE_API_KEY` beats `jev.api_key`). Settings has both.
 - **One request, every question.** Jev reads the state once and answers all of them in parallel.
   Splitting them costs ~12x more for the same answers.
+- **The state's keys are read in alphabetical order**, because `serde_json::Map` is a `BTreeMap` —
+  not the order they were written in the `json!`. Where the framing sits relative to the data
+  changes the answers: `interviewer.rs` called its framing key `what_this_is`, so twenty lines of
+  dialogue arrived before the sentence explaining what they were, and the subject's own words
+  scored 0.89 as the interviewer (0.46 with the framing first). Name a framing key so it sorts
+  *before* what it frames, and assert it in a test. `judge.rs` still sorts to
+  `actual_seconds, beats, brief, …` — its brief is read after its beats, and its weights were
+  tuned that way, so changing it means re-running `eval_judge`.
 - **The state is what is heard and seen**, never timecodes or video ids: transcript text for each
   clip and bed, the vision model's frame descriptions, and whether the cut closes on a held image.
   Jev reads text only, and a judgement it cannot ground is a judgement of nothing.
@@ -221,9 +238,10 @@ line. It only ever *adds* flags — the acoustic test is evidence too — and re
 set (`off_mic_source` 'level' or 'speech', with `off_mic_p`), because one bit cannot be reviewed,
 re-judged at a different threshold, or undone without re-measuring every video.
 
-- **Batch per video, never across the project.** "The surrounding lines are context" is only true
-  if they are the same conversation: batched project-wide that line scored 0.53 and survived; among
-  its own interview it is 0.97.
+- **Twenty lines per request, as state and as questions.** Accuracy falls off with the *length of
+  the state*, not the number of questions: the same unmistakable line reads 0.56 against 63 lines,
+  0.53 against 63 lines with only 20 questions asked, and 0.96 against 20. Batching per video was
+  not the fix it looked like — it helped only on the short tapes.
 - **`jev.interviewer_threshold` is 0.78**, which is the gap the footage showed: unmistakable lines
   (a question, a mic check, a countdown) sit at 0.84–0.97 and real answers wrongly caught at
   0.70–0.76. Change it with evidence, not taste.
@@ -281,10 +299,30 @@ on that session starts from real timecodes and a critique instead of fifteen rou
     ghostreel script build -p P -b "…"            # ~10 s, prints the session id
     ghostreel script chat  -p P --session N "…"   # refine
 
+In the app the same chain is the **"Jev drafts first"** toggle beside the chat box: Send then
+builds, judges and refines in one go, against whichever brain Settings names. `build_script_with_jev`
+returns `{script_id, session_id}` and the panel selects both — before that it returned only a
+script id and saved it with no session, so the button produced a cut with nothing to hand it to
+and the best pipeline here was reachable only from the CLI. The judge is split (`plan` reads the
+database, `ask` does not) because a `Db` is not `Sync` and must not be held across the request.
+
 Measured on the same brief: **76 editorial in 2m45s**, against 65 for the builder alone and 76 for
 agy alone at 9m23s. Flow 0.59 → 0.73, ending 0.37 → 0.86, opening 0.59 → 0.71 — the last two the
 best recorded. Attempts to fix the builder's structure *in the builder*, by rewording how middles
 are chosen, made it worse twice; handing the problem to something that can hold a story did not.
+
+It works with a weak brain too, which is the point: the local Qwen 9B took a build from 62 to 64
+and flow 0.57 → 0.74 — the same structural lift agy gives — where writing from scratch it scored
+56 and 38 mechanically. It is no longer doing the research it is bad at.
+
+**One turn is one instruction's worth of change.** That first local run moved almost nothing
+because `judge::notes` only spoke below 0.4: ending 0.49, opening 0.56 and brief 0.68 went
+unmentioned, so the only thing said was one mismatched beat, and one beat is what changed.
+`judge::weakest` now always names the two dimensions losing the most points — ranked by points
+lost, not by value, since 30 points at 0.68 is a bigger prize than 5 at 0.41 — and
+`chat/refine.rs` runs the turn several times and **keeps the best one the judge saw, never the
+last**: a round can make a cut worse, and a loop that keeps the last answer is a random walk.
+`ghostreel script refine -p P --session N --rounds 3`.
 
 ## Timeline export
 
