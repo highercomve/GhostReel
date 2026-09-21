@@ -5,6 +5,57 @@ versions follow [SemVer](https://semver.org/) while the project is 0.x (minor = 
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-09-21
+
+### Added
+
+- **Refining, as something that repeats and keeps the best.** `ghostreel script refine -p P
+  --session N --rounds 3` asks the chat brain to improve a cut several times and keeps the best
+  round the judge saw, never the last — a round can make a cut worse, and one did. On the Greet
+  Mag brief: Jev's build at 61, then 66 / 67 / 63 across three rounds, with flow going 0.57 → 0.93
+  and the ending 0.49 → 0.84. With Jev off there is no fitness to climb, so it degrades to plain
+  repeated turns.
+- **"Jev drafts first" in the app.** A toggle beside the chat box turns Send into the whole chain:
+  Jev chooses a cut out of the index, the judge reads it, and whichever brain Settings names
+  refines it from there. This is what makes the chain worth having for a local model — writing
+  from scratch the local Qwen scored 38 mechanically and 56 editorially; handed a built cut it
+  scored 98 and 64, the same structural lift agy gives, because it is no longer doing the research
+  it is bad at.
+- **The cut closes on a picture rather than a talking head.** `hold_the_last_picture` used to
+  extend whatever clip was last, which on a speaker gave two seconds of somebody moving their
+  hands with the sound already finished. It now cuts away to a described shot with nobody talking
+  in it, chosen by what it shares with the closing line. Only under a bed: without one the closing
+  voice is that picture's own audio.
+
+### Fixed
+
+- **The interviewer pass was asking Jev the wrong way, twice.** Accuracy falls off with the length
+  of the state rather than the number of questions — an unmistakable interviewer line reads 0.56
+  against 63 lines and 0.96 against 20 — and `serde_json::Map` is a `BTreeMap`, so the framing key
+  `what_this_is` sorted *after* `lines` and twenty lines of dialogue arrived before the sentence
+  explaining what they were. That cost four of fourteen subject lines to false positives on a
+  labelled set: the speaker's own words scoring 0.89 as the interviewer, 0.46 with the framing
+  first. Windows are 20 lines now and the key is named to sort first, with a test that says so.
+  `GHOSTREEL_DEBUG_JEV` dumps each request.
+- **A beat ran on into the reply over the top.** One ended three segments past the speaker's last
+  line, through "Yeah." "Yeah." into the interviewer starting a story of his own — ten words of
+  ordinary English that no word count reaches and Jev scores 0.20. `end_on_turns` reads a run of
+  two acknowledgements as a handover and keeps the longer side, so a pause inside somebody's own
+  answer is left alone.
+- **Refining barely changed anything, because it was barely told anything.** `judge::notes` only
+  spoke below 0.4, so a cut scoring ending 0.49, opening 0.56 and brief 0.68 heard about none of
+  them and changed only the one beat it was told about. The judge now always names the two
+  dimensions losing the most points, ranked by points lost rather than by score.
+- **Every refine turn was judged against the wrong text.** The turn passed its own message as the
+  brief, so "says what was asked" scored the cut against "Improve this cut…" rather than against
+  what was asked for. The same script read 67 in the turn and 76 against the real brief, four
+  times running. It reads the session's first message now.
+- **"Build with Jev" in the app was a dead end.** It saved the cut with no session and never
+  judged it, so `save_as_session` had one caller in the repo — the CLI — and the built script was
+  filed under the panel's orphans rather than under the conversation about to refine it.
+- **`script import` had drifted from the repair sequence** it is meant to mirror, missing
+  `clamp_beds_to_beats` entirely.
+
 ## [0.3.2] — 2026-09-21
 
 ### Fixed
