@@ -268,6 +268,24 @@ that questions only *suggest* are enforced in code, because "mostly" is not a ru
 - **The cutaway falls on a transcript boundary**, never inside a sentence. Cutting anywhere else
   is undone by `end_on_sentences` and the first real build came out 84% over its target.
 
+## Jev builds, a chat brain refines
+
+The two ways of getting a cut are good at opposite things. The builder picks pictures well —
+0.84 picture-to-voice against agy's 0.77 — and structures poorly, because it chooses four quotes
+independently and nothing ever asks whether they make a story (flow 0.59). agy is the reverse.
+
+`script build` therefore judges its own cut and writes it into a chat session as turn one: the
+brief as the user message, the script JSON and the judge's notes as the assistant's. A chat turn
+on that session starts from real timecodes and a critique instead of fifteen rounds of looking.
+
+    ghostreel script build -p P -b "…"            # ~10 s, prints the session id
+    ghostreel script chat  -p P --session N "…"   # refine
+
+Measured on the same brief: **76 editorial in 2m45s**, against 65 for the builder alone and 76 for
+agy alone at 9m23s. Flow 0.59 → 0.73, ending 0.37 → 0.86, opening 0.59 → 0.71 — the last two the
+best recorded. Attempts to fix the builder's structure *in the builder*, by rewording how middles
+are chosen, made it worse twice; handing the problem to something that can hold a story did not.
+
 ## Timeline export
 
 `.otio` (`otio.rs`) and Final Cut Pro 7 XML (`fcpxml.rs`) are both written here — there is no

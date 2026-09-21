@@ -531,6 +531,57 @@ pub fn lay_out(project: &Project, lines: &[Quote], shots: &[Option<Shot>], targe
     }
 }
 
+/// Write a built cut into a chat session, as though a turn had produced it.
+///
+/// The builder is fast and picks pictures well — 0.84 on picture-to-voice against agy's 0.77 —
+/// and it structures poorly, because it chooses four quotes independently and nothing ever asks
+/// whether they make a story. agy is the other way round. Handing the built cut to agy as the
+/// conversation so far lets each do what it is good at, and saves agy the research: it starts
+/// from real timecodes and a critique instead of fifteen tool rounds of looking.
+///
+/// `notes` is what the judge said, when it was asked. The chat already replays the assistant
+/// message and already treats a `[...]` note on it as instructions for the next turn, so the
+/// critique arrives the same way a repair note does.
+pub fn save_as_session(
+    db: &Db,
+    project_id: i64,
+    brief: &str,
+    script_id: i64,
+    script: &Script,
+    notes: &[String],
+) -> Result<i64, Error> {
+    let title: String = brief.chars().take(60).collect();
+    let session_id = super::create_session(db, project_id, &title)?;
+    let t = super::now();
+
+    db.conn.execute(
+        "INSERT INTO chat_messages(session_id, role, content, tool_calls_json, created_at)
+         VALUES (?1, 'user', ?2, NULL, ?3)",
+        params![session_id, brief, t],
+    )?;
+
+    // The script itself, in the form the chat replays: the next turn parses it back out as the
+    // version to improve rather than starting from nothing.
+    let mut content = format!(
+        "Drafted '{}': {} beats, {} clips, {:.1} s\n\n```json\n{}\n```",
+        script.title,
+        script.beats.len(),
+        script.clip_count(),
+        script.total_duration_s(),
+        serde_json::to_string_pretty(script).unwrap_or_default()
+    );
+    if !notes.is_empty() {
+        content.push_str(&format!("\n\n[editorial read of this cut, fix these: {}]", notes.join("; ")));
+    }
+    db.conn.execute(
+        "INSERT INTO chat_messages(session_id, role, content, tool_calls_json, created_at)
+         VALUES (?1, 'assistant', ?2, ?3, ?4)",
+        params![session_id, content, serde_json::json!({ "script_id": script_id }).to_string(), t],
+    )?;
+    db.conn.execute("UPDATE chat_sessions SET updated_at = ?1 WHERE id = ?2", params![t, session_id])?;
+    Ok(session_id)
+}
+
 /// Build a cut out of the footage by choosing, start to finish.
 ///
 /// The result still goes through the ordinary repair passes — it is a draft like any other, and

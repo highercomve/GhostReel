@@ -896,6 +896,27 @@ async fn script_cmd(paths: &Paths, action: ScriptAction) -> anyhow::Result<ExitC
             }
             let id = ghostreel_core::script::save_version(&db, project.id, &s, None)?;
             println!("saved script #{id} \"{}\" ({:.1} s)", s.title, s.total_duration_s());
+
+            // Judge it while we are here, and open it as a conversation. The builder picks
+            // pictures well and structures poorly; a chat brain is the other way round, and
+            // handing it a real cut plus a critique saves it the research it would otherwise
+            // spend fifteen tool rounds on.
+            let notes = match ghostreel_core::chat::judge::judge(&db, &s, Some(&brief), &config.jev).await {
+                Ok(Some(j)) => {
+                    println!("  editorial {:.0}/100 ({})", j.total, j.model);
+                    j.notes()
+                }
+                Ok(None) => Vec::new(),
+                Err(e) => {
+                    eprintln!("  (not judged: {e})");
+                    Vec::new()
+                }
+            };
+            let session = ghostreel_core::chat::build::save_as_session(&db, project.id, &brief, id, &s, &notes)?;
+            println!(
+                "  refine it with: ghostreel script chat -p {:?} --session {session} \"<what to change>\"",
+                project.name
+            );
         }
         ScriptAction::Judge { id, brief, json } => {
             let stored = ghostreel_core::script::load(&db, id)?;
