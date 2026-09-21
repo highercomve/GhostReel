@@ -629,6 +629,8 @@ export interface ServerCaps {
 
 export interface JevSettings {
   enabled: boolean;
+  /** Whether every finished cut is read editorially. Separate from `enabled`, which also gates choosing. */
+  judge: boolean;
   /** Whether a key exists at all. The key itself never comes back. */
   has_key: boolean;
   /** The key is in TYPESAFE_API_KEY, so the field is not editable here. */
@@ -638,6 +640,7 @@ export interface JevSettings {
 
 export interface JevSettingsPatch {
   enabled?: boolean;
+  judge?: boolean;
   /** "" clears a stored key. */
   api_key?: string;
   model?: string;

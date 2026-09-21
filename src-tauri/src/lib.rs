@@ -455,6 +455,9 @@ struct ServerCapsView {
 #[derive(Serialize, Deserialize)]
 struct JevSettingsView {
     enabled: bool,
+    /// Whether every finished cut is read editorially. Separate from `enabled`, which also gates
+    /// choosing — building a cut with Jev and having it score every draft are different wants.
+    judge: bool,
     has_key: bool,
     /// The key is in the environment rather than the config file, so the field is not editable.
     key_from_env: bool,
@@ -464,6 +467,7 @@ struct JevSettingsView {
 #[derive(Deserialize, Default)]
 struct JevSettingsPatch {
     enabled: Option<bool>,
+    judge: Option<bool>,
     api_key: Option<String>,
     model: Option<String>,
 }
@@ -641,6 +645,7 @@ fn jev_view(cfg: &ghostreel_core::config::JevConfig) -> JevSettingsView {
     let env_key = std::env::var("TYPESAFE_API_KEY").ok().filter(|k| !k.trim().is_empty());
     JevSettingsView {
         enabled: cfg.enabled,
+        judge: cfg.judge,
         has_key: env_key.is_some() || !cfg.api_key.trim().is_empty(),
         key_from_env: env_key.is_some(),
         model: cfg.model.clone(),
@@ -844,6 +849,9 @@ async fn set_ai_settings(patch: AiSettingsPatch, search_state: State<'_, SearchS
     if let Some(j) = patch.jev {
         if let Some(on) = j.enabled {
             config.jev.enabled = on;
+        }
+        if let Some(on) = j.judge {
+            config.jev.judge = on;
         }
         if let Some(key) = j.api_key {
             // An empty string is how the page clears a stored key, so it is not ignored.

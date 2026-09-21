@@ -426,6 +426,9 @@ pub struct Planned {
 
 /// Read the cut, or `None` when Jev is off, unkeyed, or there is nothing to judge.
 pub fn plan(db: &Db, script: &Script, brief: Option<&str>, cfg: &JevConfig) -> Option<Planned> {
+    if !cfg.judge {
+        return None;
+    }
     let client = Jev::from_config(cfg)?;
     if script.beats.is_empty() {
         return None;
@@ -647,6 +650,26 @@ mod tests {
     /// The Greet Mag build scored ending 0.49, opening 0.56 and brief 0.68 and was told about
     /// none of them, because `notes` only spoke below 0.4. The model fixed the one mismatched
     /// beat it *was* told about and handed the rest back unchanged: 62 → 64.
+    /// Choosing and judging are separate wants. `enabled` gates everything that leaves the
+    /// machine, including `script build` and `script interviewer`; somebody who wants Jev to
+    /// assemble a cut but not to score every draft had to turn the builder off to get it.
+    #[test]
+    fn the_judge_can_be_off_while_jev_is_on() {
+        let db = db_with_footage();
+        let script = bedded_script();
+        let mut cfg = JevConfig { enabled: true, api_key: "k".into(), ..Default::default() };
+        assert!(cfg.judge, "judging is on once Jev is, since that switch is the one that decides");
+        assert!(plan(&db, &script, None, &cfg).is_some(), "on means a cut is read");
+
+        cfg.judge = false;
+        assert!(plan(&db, &script, None, &cfg).is_none(), "off means nothing is asked");
+
+        // And the master switch still wins over it.
+        cfg.judge = true;
+        cfg.enabled = false;
+        assert!(plan(&db, &script, None, &cfg).is_none(), "off is off, whatever else is set");
+    }
+
     #[test]
     fn a_merely_mediocre_cut_is_still_told_what_to_work_on() {
         let db = db_with_footage();

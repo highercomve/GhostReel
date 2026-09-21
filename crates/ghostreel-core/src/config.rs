@@ -309,6 +309,14 @@ pub struct ScriptConfig {
 pub struct JevConfig {
     /// Ask Jev at all. Without this nothing here is reached, whatever else is set.
     pub enabled: bool,
+    /// Read every finished cut editorially.
+    ///
+    /// Separate from `enabled` because they are separate choices. `enabled` is the master switch
+    /// — off means nothing leaves the machine — and it also gates *choosing* (`script build`,
+    /// `script interviewer`), which is not judging. Somebody who wants Jev to assemble a cut but
+    /// does not want every draft read and scored had no way to say so: turning the judge off
+    /// meant turning the builder off with it.
+    pub judge: bool,
     /// The API key. `TYPESAFE_API_KEY` in the environment wins over this, because a config file
     /// is committed by accident far more often than an environment is.
     pub api_key: String,
@@ -340,6 +348,9 @@ impl Default for JevConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            // On, because it only ever runs once `enabled` is: the switch above is the one that
+            // decides whether anything is sent anywhere.
+            judge: true,
             api_key: String::new(),
             model: "jev-latest".into(),
             base_url: "https://api.typesafe.ai".into(),

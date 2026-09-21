@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import {
+  getAiSettings,
+  setAiSettings,
   chatMessages,
   chatSessions,
   deleteChatSession,
@@ -46,6 +48,30 @@ function formatToolCall(tc: ToolCallRecord): string {
   return `${tc.tool}${argSnippet ? ` ${argSnippet}` : ""}${summaryPart}`;
 }
 
+/** The three ways a brief becomes a cut, in the order they cost wall-clock time. */
+type Mode = "chat" | "jev" | "both";
+
+const MODES: { id: Mode; label: string; action: string; hint: string }[] = [
+  {
+    id: "chat",
+    label: "Model",
+    action: "Send",
+    hint: "The model researches the footage and writes the cut. Slowest, strongest at structure.",
+  },
+  {
+    id: "jev",
+    label: "Jev",
+    action: "Build",
+    hint: "Jev picks quotes and shots out of the index. ~15 s, and it can only use what was actually said.",
+  },
+  {
+    id: "both",
+    label: "Jev → model",
+    action: "Build & refine",
+    hint: "Jev chooses a first cut, the model improves it. Best result measured, and a few minutes.",
+  },
+];
+
 export default function ScriptsPanel({ projectId }: { projectId: number }) {
   const [sessions, setSessions] = useState<ChatSession[]>([]);
   const [selectedSessionId, setSelectedSessionId] = useState<number | null>(null);
@@ -60,15 +86,20 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
   /** Jev is building a cut by choosing. One shot, no conversation, ~15 s. */
   const [building, setBuilding] = useState(false);
   /**
-   * Draft with Jev before handing the brief to the chat brain.
+   * How this brief becomes a cut.
    *
-   * The two are good at opposite things: Jev picks pictures well and structures poorly, a model
-   * is the other way round. Starting the model from a real cut and a critique of it, rather than
-   * from nothing, measured 76 editorial in 2m45s against 65 for Jev alone and 76 for agy alone
-   * in 9m23s — and it is the local models, which are worst at the research, that stand to gain
-   * the most from not having to do it.
+   * One decision, not two buttons and a checkbox. The three ways differ by which brain chooses
+   * and which writes: a model researches the project and writes (slow, good structure); Jev only
+   * chooses out of the index (~15 s, grounded, cannot write narration); or Jev chooses and the
+   * model improves what it chose, which measured best — 76 editorial against 65 for Jev alone
+   * and 76 for agy alone at three times the wall clock. The local models, worst at the research,
+   * gain the most from not having to do it.
    */
-  const [jevFirst, setJevFirst] = useState(false);
+  const [mode, setMode] = useState<Mode>("chat");
+  /** Whether the Jev modes can run at all, so they are disabled with a reason, not failed with one. */
+  const [jevReady, setJevReady] = useState<boolean | null>(null);
+  /** Whether every finished cut is read editorially. `null` until settings have been read. */
+  const [judging, setJudging] = useState<boolean | null>(null);
   const [latestIssues, setLatestIssues] = useState<Issue[] | undefined>(undefined);
 
   const messagesRef = useRef<HTMLDivElement>(null);
@@ -88,6 +119,26 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
       setMessages([]);
     }
   };
+
+  // Whether the Jev modes are offerable at all. Asked once: a mode that cannot run should say so
+  // before it is chosen, not fail after.
+  useEffect(() => {
+    let cancelled = false;
+    getAiSettings()
+      .then((ai) => {
+        if (cancelled) return;
+        setJevReady(ai.jev.enabled && (ai.jev.has_key || ai.jev.key_from_env));
+        setJudging(ai.jev.judge);
+      })
+      .catch(() => {
+        // Unknown, not unavailable: leave the modes enabled rather than hiding them over a
+        // settings read that happened to fail.
+        if (!cancelled) setJevReady(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // Load sessions and scripts on mount / projectId change
   useEffect(() => {
@@ -196,18 +247,29 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
     setOptimisticUser(text);
 
     try {
-      // When Jev drafts first, the model's turn happens in the session the build opened — which
-      // already holds the brief, the cut and the editorial notes, so the instruction here is to
+      // Jev first, when asked. The model's turn then happens in the session the build opened,
+      // which already holds the brief, the cut and the editorial notes — so the instruction is to
       // improve it rather than to write one.
       let session = selectedSessionId;
       let message = text;
-      if (jevFirst) {
+      if (mode !== "chat") {
         setBuilding(true);
         const built = await buildScriptWithJev(projectId, text, 40).finally(() => setBuilding(false));
         session = built.session_id;
         setSelectedSessionId(built.session_id);
         setSelectedScriptId(built.script_id);
         setScripts(await listScripts(projectId).catch(() => [] as ScriptSummary[]));
+        setSessions(
+          [...(await chatSessions(projectId).catch(() => [] as ChatSession[]))].sort(
+            (a, b) => (b.updated_at || b.created_at) - (a.updated_at || a.created_at),
+          ),
+        );
+        // Jev does not write, so it cannot hold a conversation: this mode ends here, with the
+        // session left selected so anything typed next refines the cut rather than starting over.
+        if (mode === "jev") {
+          setMessages(await chatMessages(built.session_id).catch(() => [] as ChatMessage[]));
+          return;
+        }
         message =
           "Improve this cut. Keep it to the brief, fix the editorial notes above, and keep every " +
           "quote a whole sentence. Reply with the full script JSON.";
@@ -467,75 +529,90 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
           {turnError && <div className="banner bad small">{turnError}</div>}
         </div>
 
-        {/* Chat Input */}
-        <div className="chat-input-row">
+        {/* Composer: what to make, then how to make it. */}
+        <div className="chat-composer">
           <textarea
-            rows={2}
+            rows={3}
             placeholder={
-              turnRunning
-                ? "Waiting for response..."
-                : "Ask GhostReel to draft or revise a script (Enter to send, Shift+Enter for newline)..."
+              turnRunning ? "Working…" : "Describe the cut you want. Enter to send, Shift+Enter for a new line."
             }
             value={inputMessage}
             disabled={turnRunning}
             onChange={(e) => setInputMessage(e.target.value)}
             onKeyDown={handleKeyDown}
           />
+
+          {/*
+            One decision rather than two buttons and a checkbox: every one of these turns the
+            same brief into a cut, and they differ only in which brain chooses and which writes.
+          */}
+          <div className="composer-modes" role="radiogroup" aria-label="How to build this cut">
+            {MODES.map((m) => {
+              const needsJev = m.id !== "chat";
+              const blocked = needsJev && jevReady === false;
+              return (
+                <button
+                  key={m.id}
+                  type="button"
+                  role="radio"
+                  aria-checked={mode === m.id}
+                  className={`composer-mode${mode === m.id ? " on" : ""}`}
+                  disabled={turnRunning || blocked}
+                  title={blocked ? "Needs Jev turned on with an API key — see Settings" : m.hint}
+                  onClick={() => setMode(m.id)}
+                >
+                  {m.label}
+                </button>
+              );
+            })}
+          </div>
+
+          {/*
+            The judge is a separate want from the builder: somebody may have Jev assemble a cut
+            and not want every draft scored. `jev.enabled` gates both, so this writes its own flag.
+          */}
           <button
             type="button"
-            disabled={turnRunning || building || !inputMessage.trim()}
-            onClick={handleSend}
-          >
-            {building ? "Choosing…" : jevFirst ? "Build, then refine" : "Send"}
-          </button>
-          {/*
-            Two brains in a row. Jev cannot write, so it can only choose — but choosing is the
-            part a model spends fifteen tool rounds on, and it gets the pictures right more often.
-            The model then does what it is good at: making four chosen quotes into a story.
-          */}
-          <label
-            className="chat-toggle"
-            title="Have Jev choose a first cut out of the index, judge it, and hand that to the chat brain to refine — instead of the model researching the whole project itself. Needs a Jev key in Settings."
-          >
-            <input type="checkbox" checked={jevFirst} onChange={(e) => setJevFirst(e.target.checked)} />
-            Jev drafts first
-          </label>
-          {/*
-            Jev does not write, so it cannot hold a conversation — this is one shot, not a turn.
-            It chooses the quotes and the shots out of the index and code assembles them, which
-            takes about as long as a preview and cannot refer to footage that does not exist.
-          */}
-          <button
-            type="button"
-            className="ghost"
-            title="Build a cut by choosing rather than writing: Jev picks the quotes and the shots out of the index. Fast, grounded, and limited to what the interviews already say. Needs a Jev key in Settings."
-            disabled={turnRunning || building || !inputMessage.trim()}
+            className={`composer-judge${judging ? " on" : ""}`}
+            disabled={jevReady === false || judging === null}
+            aria-pressed={!!judging}
+            title={
+              jevReady === false
+                ? "Needs Jev turned on with an API key — see Settings"
+                : judging
+                  ? "Every finished cut is read editorially — the shots against the voice, the opening, the ending. Click to stop."
+                  : "Finished cuts are not read editorially. Click to have Jev score them."
+            }
             onClick={async () => {
-              const brief = inputMessage.trim();
-              setBuilding(true);
-              setTurnError(null);
+              const next = !judging;
+              setJudging(next);
               try {
-                const built = await buildScriptWithJev(projectId, brief, 40);
-                setInputMessage("");
-                setScripts(await listScripts(projectId));
-                setSessions(
-                  [...(await chatSessions(projectId).catch(() => [] as ChatSession[]))].sort(
-                    (a, b) => (b.updated_at || b.created_at) - (a.updated_at || a.created_at),
-                  ),
-                );
-                // Select the session the build opened, so the next thing typed refines this cut
-                // with whichever brain Settings names rather than starting a new conversation.
-                setSelectedSessionId(built.session_id);
-                setSelectedScriptId(built.script_id);
+                const ai = await setAiSettings({ jev: { judge: next } });
+                setJudging(ai.jev.judge);
               } catch (e) {
+                setJudging(!next);
                 setTurnError(String(e));
-              } finally {
-                setBuilding(false);
               }
             }}
           >
-            {building ? "Choosing…" : "Build with Jev"}
+            {judging ? "Judging on" : "Judging off"}
           </button>
+
+          <div className="composer-go">
+            <p className="composer-hint small muted">
+              {jevReady === false && mode !== "chat"
+                ? "Needs Jev turned on with an API key — see Settings."
+                : MODES.find((m) => m.id === mode)?.hint}
+            </p>
+            <button
+              type="button"
+              className="primary"
+              disabled={turnRunning || building || !inputMessage.trim()}
+              onClick={handleSend}
+            >
+              {building ? "Choosing…" : turnRunning ? "Working…" : MODES.find((m) => m.id === mode)?.action}
+            </button>
+          </div>
         </div>
       </section>
 
