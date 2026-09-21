@@ -302,13 +302,14 @@ impl Vision<'_> {
         think: bool,
         seed: u32,
         temperature: f32,
+        image: Option<&str>,
     ) -> Result<Value, String> {
         let t0 = Instant::now();
         self.ctx.clear_kv_cache();
         // Thinking opens the block and leaves it to the model to close; otherwise the block is
         // pre-closed, which is what tells a Qwen-style model to answer straight away.
         let head = if think { "<think>\n" } else { "<think>\n\n</think>\n\n" };
-        let text = if prompt.starts_with("<|im_start|>") {
+        let mut text = if prompt.starts_with("<|im_start|>") {
             if prompt.ends_with("<think>\n\n</think>\n\n") {
                 if think {
                     // Caller wants reasoning: reopen the block this prompt already closed.
@@ -326,9 +327,24 @@ impl Vision<'_> {
         } else {
             format_prompt_with_template(self.model, prompt)
         };
+
+        let bitmap = if let Some(img_path) = image {
+            let bm = MtmdBitmap::from_file(&self.mtmd, img_path, false).map_err(|e| format!("image {img_path}: {e:?}"))?;
+            let marker = llama_cpp_2::mtmd::mtmd_default_marker();
+            if let Some(pos) = text.rfind("<|im_start|>user\n") {
+                text.insert_str(pos + "<|im_start|>user\n".len(), &marker);
+            } else {
+                text = format!("{marker}{text}");
+            }
+            Some(bm)
+        } else {
+            None
+        };
+
+        let bitmaps: Vec<&MtmdBitmap> = bitmap.as_ref().into_iter().collect();
         let chunks = self
             .mtmd
-            .tokenize(MtmdInputText { text, add_special: true, parse_special: true }, &[])
+            .tokenize(MtmdInputText { text, add_special: true, parse_special: true }, &bitmaps)
             .map_err(|e| format!("tokenize: {e:?}"))?;
         let prompt_tokens = chunks.total_tokens();
         let n_past = chunks
@@ -503,6 +519,7 @@ fn run() -> Result<(), String> {
                         req.think.unwrap_or(false),
                         req.seed.unwrap_or(42),
                         req.temperature.unwrap_or(0.2),
+                        req.image.as_deref(),
                     )
                 }
                 (None, _) => Err("vision/llm model not loaded".into()),

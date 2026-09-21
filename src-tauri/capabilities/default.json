@@ -3,5 +3,5 @@
   "identifier": "default",
   "description": "Capabilities for the GhostReel main window",
   "windows": ["main"],
-  "permissions": ["core:default", "dialog:allow-open", "dialog:allow-ask", "dialog:allow-message", "opener:default", "updater:default", "process:allow-restart"]
+  "permissions": ["core:default", "dialog:default", "opener:default", "updater:default", "process:allow-restart"]
 }

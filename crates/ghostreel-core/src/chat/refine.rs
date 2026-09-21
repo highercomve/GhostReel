@@ -83,7 +83,7 @@ pub async fn run(
     let mut since_best = 0usize;
 
     for n in 1..=rounds.max(1) {
-        let res = run_turn(ctx, project_id, Some(session_id), &instruction(n), on_event).await?;
+        let res = run_turn(ctx, project_id, Some(session_id), &instruction(n), &[], on_event).await?;
         let round = Round { n, script_id: res.script_id, total: res.judgement.as_ref().map(|j| j.total) };
         on_round(&round);
         all.push(round.clone());

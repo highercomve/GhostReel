@@ -865,7 +865,7 @@ async fn set_ai_settings(patch: AiSettingsPatch, search_state: State<'_, SearchS
             && config.jev.api_key.trim().is_empty()
             && std::env::var("TYPESAFE_API_KEY").ok().filter(|k| !k.trim().is_empty()).is_none()
         {
-            return Err("turning the judge on needs an API key: paste one, or set TYPESAFE_API_KEY".into());
+            return Err("turning Jev on needs an API key: paste one, or set TYPESAFE_API_KEY".into());
         }
     }
 
@@ -1082,6 +1082,7 @@ async fn chat_turn(
     project_id: i64,
     session_id: Option<i64>,
     message: String,
+    images: Option<Vec<String>>,
 ) -> CmdResult<queue::ChatTurnView> {
     let session_id = match session_id {
         Some(id) => id,
@@ -1093,7 +1094,7 @@ async fn chat_turn(
     };
     let label = format!("Script chat: {}", message.chars().take(40).collect::<String>());
     let (tx, rx) = tokio::sync::oneshot::channel();
-    queue.enqueue_chat(&app, project_id, session_id, message, label, tx).await;
+    queue.enqueue_chat(&app, project_id, session_id, message, images.unwrap_or_default(), label, tx).await;
     match rx.await {
         Ok(res) => res,
         Err(_) => Err("chat task cancelled or failed".into()),
@@ -1189,6 +1190,9 @@ pub fn run() {
                 let proxies_dir = p.data_dir.join("proxies");
                 let _ = std::fs::create_dir_all(&proxies_dir);
                 let _ = app.asset_protocol_scope().allow_directory(&proxies_dir, true);
+                let chat_images_dir = p.data_dir.join("chat_images");
+                let _ = std::fs::create_dir_all(&chat_images_dir);
+                let _ = app.asset_protocol_scope().allow_directory(&chat_images_dir, true);
                 // Watched folders, so the player can load the videos.
                 if let Ok(db) = Db::open(&p.db_file()) {
                     for f in db.folders(None).unwrap_or_default() {

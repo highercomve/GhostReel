@@ -264,6 +264,10 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE transcript_segments ADD COLUMN off_mic_source TEXT;
     ALTER TABLE transcript_segments ADD COLUMN off_mic_p REAL;
     "#,
+    // v10 — attached images on chat messages (pasted screenshots or reference frames)
+    r#"
+    ALTER TABLE chat_messages ADD COLUMN images_json TEXT;
+    "#,
 ];
 
 static REGISTER_VEC: Once = Once::new();

@@ -247,6 +247,8 @@ enum ScriptAction {
         project: String,
         #[arg(long)]
         session: Option<i64>,
+        #[arg(long = "image", short = 'i')]
+        images: Vec<String>,
         message: String,
     },
     /// Keep asking the chat brain to improve a cut, and keep the best one the judge sees.
@@ -1122,7 +1124,7 @@ async fn script_cmd(paths: &Paths, action: ScriptAction) -> anyhow::Result<ExitC
                 None => println!("no round produced a script"),
             }
         }
-        ScriptAction::Chat { project, session, message } => {
+        ScriptAction::Chat { project, session, images, message } => {
             let p = db.require_project(&project)?;
             let config = Config::load(&paths.config_file)?;
             let vision_setup = runtime::resolve_chat(paths, &config).await;
@@ -1133,10 +1135,9 @@ async fn script_cmd(paths: &Paths, action: ScriptAction) -> anyhow::Result<ExitC
                     .with_window(config.chat_model().ctx_tokens);
 
             let mut embedder = None;
-            let embed_setup = runtime::resolve_embed(paths, &config).await;
-            match runtime::start_embedder(&embed_setup, |_, _| {}).await {
-                Ok(e) => embedder = Some(e),
-                Err(why) => eprintln!("(meaning search unavailable: {why}; using keywords only)"),
+            if config.chat_model().max_tool_rounds != 0 {
+                let setup = runtime::resolve_embed(paths, &config).await;
+                embedder = runtime::start_embedder(&setup, |_, _| {}).await.ok();
             }
 
             let mut ctx = ghostreel_core::chat::ChatContext {
@@ -1167,7 +1168,7 @@ async fn script_cmd(paths: &Paths, action: ScriptAction) -> anyhow::Result<ExitC
                 }
             };
 
-            let res = ghostreel_core::chat::run_turn(&mut ctx, p.id, session, &message, &mut on_event).await?;
+            let res = ghostreel_core::chat::run_turn(&mut ctx, p.id, session, &message, &images, &mut on_event).await?;
 
             println!("\n{}\n", res.reply);
             println!("Session: #{}", res.session_id);

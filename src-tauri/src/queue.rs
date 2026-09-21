@@ -76,12 +76,14 @@ pub struct Task {
     pub error: Option<String>,
     pub created_at: i64,
     pub finished_at: Option<i64>,
+    #[serde(default)]
+    pub chat_events: Vec<ghostreel_core::chat::ChatEvent>,
     #[serde(skip)]
     cancel: Arc<AtomicBool>,
 }
 
 type ChatSender = oneshot::Sender<Result<ChatTurnView, String>>;
-type ChatRequest = (String, ChatSender);
+type ChatRequest = (String, Vec<String>, ChatSender);
 
 #[derive(Default)]
 pub struct Queue {
@@ -120,6 +122,7 @@ impl Queue {
             error: None,
             created_at: ghostreel_core::projects::now(),
             finished_at: None,
+            chat_events: Vec::new(),
             cancel: Arc::new(AtomicBool::new(false)),
         });
         drop(tasks);
@@ -134,11 +137,12 @@ impl Queue {
         project_id: i64,
         session_id: i64,
         message: String,
+        images: Vec<String>,
         label: String,
         tx: oneshot::Sender<Result<ChatTurnView, String>>,
     ) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst) + 1;
-        self.chat_requests.lock().await.insert(id, (message, tx));
+        self.chat_requests.lock().await.insert(id, (message, images, tx));
         let mut tasks = self.tasks.lock().await;
         tasks.push_back(Task {
             id,
@@ -152,6 +156,7 @@ impl Queue {
             error: None,
             created_at: ghostreel_core::projects::now(),
             finished_at: None,
+            chat_events: Vec::new(),
             cancel: Arc::new(AtomicBool::new(false)),
         });
         drop(tasks);
@@ -167,7 +172,7 @@ impl Queue {
             TaskState::Queued => {
                 t.state = TaskState::Cancelled;
                 t.finished_at = Some(ghostreel_core::projects::now());
-                if let Some((_, tx)) = self.chat_requests.lock().await.remove(&id) {
+                if let Some((_, _, tx)) = self.chat_requests.lock().await.remove(&id) {
                     let _ = tx.send(Err("task cancelled".into()));
                 }
             }
@@ -254,8 +259,8 @@ pub async fn worker(app: AppHandle) {
             TaskKind::Chat { project_id, session_id } => {
                 let req = queue.chat_requests.lock().await.remove(&id);
                 match req {
-                    Some((message, tx)) => {
-                        let res = run_chat(&app, id, project_id, session_id, message, cancel.clone()).await;
+                    Some((message, images, tx)) => {
+                        let res = run_chat(&app, id, project_id, session_id, message, images, cancel.clone()).await;
                         let outcome = match &res {
                             Ok(_) => Ok(TaskOutcome::Chat),
                             // Stop is not a failure: report it as the cancellation it is.
@@ -501,6 +506,7 @@ async fn run_chat(
     project_id: i64,
     session_id: i64,
     message: String,
+    images: Vec<String>,
     cancel: Arc<AtomicBool>,
 ) -> Result<ChatTurnView, String> {
     let p = Paths::resolve().map_err(|e| e.to_string())?;
@@ -539,6 +545,8 @@ async fn run_chat(
     .max(1) as f64;
     let mut rounds = 0u64;
     let started = std::time::Instant::now();
+    let events_log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let events_log_cb = events_log.clone();
     let mut on_event = move |event: ghostreel_core::chat::ChatEvent| {
         let progress = {
             if matches!(event, ghostreel_core::chat::ChatEvent::ToolStarted { .. }) {
@@ -578,6 +586,9 @@ async fn run_chat(
             ghostreel_core::chat::ChatEvent::Validating => "Validating script".to_string(),
         };
 
+        events_log_cb.lock().unwrap().push(event.clone());
+        let all_events = events_log_cb.lock().unwrap().clone();
+
         let _ = app_handle.emit(
             "chat-progress",
             serde_json::json!({
@@ -593,6 +604,7 @@ async fn run_chat(
                 .update(&app_clone, task_id, |t| {
                     t.note = Some(note);
                     t.progress = Some(progress);
+                    t.chat_events = all_events;
                 })
                 .await;
         });
@@ -602,7 +614,7 @@ async fn run_chat(
         return Err("task cancelled".into());
     }
 
-    let turn_res = ghostreel_core::chat::run_turn(&mut ctx, project_id, Some(session_id), &message, &mut on_event)
+    let turn_res = ghostreel_core::chat::run_turn(&mut ctx, project_id, Some(session_id), &message, &images, &mut on_event)
         .await
         .map_err(|e| e.to_string())?;
 

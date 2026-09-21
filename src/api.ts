@@ -278,6 +278,7 @@ export interface Task {
   error: string | null;
   created_at: number;
   finished_at: number | null;
+  chat_events?: ChatEvent[];
 }
 
 export interface PlannedSegment {
@@ -473,6 +474,7 @@ export interface ChatMessage {
   session_id: number;
   role: "user" | "assistant" | "tool";
   content: string;
+  images?: string[];
   tool_calls: ToolCallRecord[] | null;
   script_id: number | null;
   created_at: number;
@@ -506,8 +508,8 @@ export interface ChatProgress {
   event: ChatEvent;
 }
 
-export const chatTurn = (projectId: number, sessionId: number | null, message: string) =>
-  invoke<ChatTurnView>("chat_turn", { projectId, sessionId, message });
+export const chatTurn = (projectId: number, sessionId: number | null, message: string, images?: string[]) =>
+  invoke<ChatTurnView>("chat_turn", { projectId, sessionId, message, images: images ?? [] });
 
 /**
  * Build a cut by choosing instead of writing: Jev picks the quotes and the shots out of the index

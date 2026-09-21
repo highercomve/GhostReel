@@ -156,6 +156,27 @@ fn read_the_prompt(file: &Path) -> String {
     )
 }
 
+/// Parse any `[User attached image: <path>]` references inside the prompt.
+fn extract_attached_image_paths(prompt: &str) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let marker = "[User attached image: ";
+    let mut rest = prompt;
+    while let Some(idx) = rest.find(marker) {
+        let after = &rest[idx + marker.len()..];
+        if let Some(end) = after.find(']') {
+            let path_str = &after[..end];
+            let p = PathBuf::from(path_str.trim());
+            if p.is_file() && !out.contains(&p) {
+                out.push(p);
+            }
+            rest = &after[end + 1..];
+        } else {
+            break;
+        }
+    }
+    out
+}
+
 impl CliAgent {
     pub fn new(cfg: CliAgentConfig) -> Self {
         Self { cfg }
@@ -295,25 +316,38 @@ impl CliAgent {
         // agents all read files; what they cannot do is take 75 KB through argv on Windows.
         let spilled = spill_prompt(prompt);
         let owned;
-        let prompt: &str = match &spilled {
+        let effective_prompt: &str = match &spilled {
             Some((file, _)) => {
                 owned = read_the_prompt(file);
                 &owned
             }
             None => prompt,
         };
-        let grant = spilled.as_ref().map(|(_, dir)| dir.clone());
+        let mut grant_dirs: Vec<PathBuf> = Vec::new();
+        if let Some((_, dir)) = &spilled {
+            grant_dirs.push(dir.clone());
+        }
+        // Extract any user-attached images mentioned in prompt so CLI agents can read them
+        let attached_imgs = extract_attached_image_paths(prompt);
+        for img in &attached_imgs {
+            if let Some(parent) = img.parent() {
+                if !grant_dirs.contains(&parent.to_path_buf()) {
+                    grant_dirs.push(parent.to_path_buf());
+                }
+            }
+        }
+
         match self.cfg.tool.as_str() {
             "claude" => {
                 args.push(bin.as_os_str().to_owned());
                 args.push("-p".into());
-                args.push(prompt.into());
+                args.push(effective_prompt.into());
                 args.push("--output-format".into());
                 args.push("json".into());
                 args.push("--allowedTools".into());
-                // Reading the spilled prompt is the one tool it needs.
-                args.push(if grant.is_some() { "Read".into() } else { std::ffi::OsString::from("none") });
-                if let Some(dir) = &grant {
+                // Reading the spilled prompt or attached images is the tool it needs.
+                args.push(if !grant_dirs.is_empty() { "Read".into() } else { std::ffi::OsString::from("none") });
+                for dir in &grant_dirs {
                     args.push("--add-dir".into());
                     args.push(dir.as_os_str().to_owned());
                 }
@@ -328,7 +362,7 @@ impl CliAgent {
             "agy" => {
                 args.push(bin.as_os_str().to_owned());
                 args.push("--dangerously-skip-permissions".into());
-                if let Some(dir) = &grant {
+                for dir in &grant_dirs {
                     args.push("--add-dir".into());
                     args.push(dir.as_os_str().to_owned());
                 }
@@ -339,7 +373,7 @@ impl CliAgent {
                     args.push(self.cfg.model.clone().into());
                 }
                 args.push("-p".into());
-                args.push(prompt.into());
+                args.push(effective_prompt.into());
             }
             "opencode" => {
                 args.push(bin.as_os_str().to_owned());
@@ -348,16 +382,20 @@ impl CliAgent {
                     args.push("-m".into());
                     args.push(self.cfg.model.clone().into());
                 }
-                args.push(as_plain_brief(prompt).into());
+                args.push(as_plain_brief(effective_prompt).into());
             }
             "codex" => {
                 args.extend(codex_exec_prefix(bin));
                 args.push("--dangerously-bypass-approvals-and-sandbox".into());
+                for img in &attached_imgs {
+                    args.push("-i".into());
+                    args.push(img.as_os_str().to_owned());
+                }
                 if !self.cfg.model.is_empty() {
                     args.push("-m".into());
                     args.push(self.cfg.model.clone().into());
                 }
-                args.push(prompt.into());
+                args.push(effective_prompt.into());
             }
             other => {
                 tracing_warn(other);

@@ -165,28 +165,30 @@ export default function SettingsPage() {
         </>
       )}
 
-      <h2>Script chat · editorial judge</h2>
+      <h2>Script chat · Jev (builder & judge)</h2>
       <section className="card">
         <p className="muted small">
-          GhostReel can already tell when a cut runs long or stops someone mid-sentence, and it fixes those itself.
-          What it cannot tell is whether the shot on screen shows what the voice is talking about, whether the opening
-          is worth watching, or whether the ending lands. Jev — a hosted model that answers in numbers rather than
-          words — reads each finished cut and says. What it finds goes back to the editor before it redrafts.
+          Jev is TypeSafe&apos;s hosted System One model. It can assemble a first-pass cut out of the index in ~15 s
+          (by choosing quotes and b-roll directly from indexed footage, used in &ldquo;Jev&rdquo; and &ldquo;Jev → model&rdquo;
+          modes), detect off-mic interviewers, and score finished drafts editorially (opening, ending, and shot-to-voice match).
         </p>
         <p className="muted small">
-          Off by default, and it is the one part of GhostReel that leaves this computer: judging sends the cut's
-          spoken words and the descriptions of what is on screen to <code>api.typesafe.ai</code>. Nothing is sent
-          while it is off. A judgement costs a fraction of a cent.
+          Off by default, and it is the one part of GhostReel that leaves this computer: when enabled, transcripts
+          and frame descriptions are sent to <code>api.typesafe.ai</code>. Nothing is sent while it is off.
         </p>
         <div className="settings-fields">
           <div className="settings-field">
-            <label>Judge each cut</label>
+            <label>Enable Jev</label>
             <input
               type="checkbox"
               checked={ai?.jev.enabled ?? false}
               disabled={!ai}
               onChange={async (e) => {
                 const on = e.currentTarget.checked;
+                if (on && !ai?.jev.has_key && !ai?.jev.key_from_env) {
+                  setError("Turning Jev on needs an API key: enter one below first");
+                  return;
+                }
                 try {
                   setAi(await setAiSettings({ jev: { enabled: on } }));
                   setError(null);
@@ -196,7 +198,31 @@ export default function SettingsPage() {
               }}
             />
             <span className="muted small">
-              {ai?.jev.enabled ? "on — every finished script is judged" : "off — nothing is sent anywhere"}
+              {ai?.jev.enabled ? "on — Jev can build cuts, detect interviewers, and judge" : "off — nothing is sent anywhere"}
+            </span>
+          </div>
+          <div className="settings-field">
+            <label>Enable Jev to be use in the Script generation</label>
+            <input
+              type="checkbox"
+              checked={ai?.jev.judge ?? true}
+              disabled={!ai || !ai?.jev.enabled}
+              onChange={async (e) => {
+                const on = e.currentTarget.checked;
+                try {
+                  setAi(await setAiSettings({ jev: { judge: on } }));
+                  setError(null);
+                } catch (err) {
+                  setError(String(err));
+                }
+              }}
+            />
+            <span className="muted small">
+              {!ai?.jev.enabled
+                ? "disabled — enable Jev above"
+                : ai?.jev.judge
+                  ? "on — every finished script is scored editorially"
+                  : "off — scripts are not scored automatically"}
             </span>
           </div>
           <div className="settings-field">
@@ -213,10 +239,15 @@ export default function SettingsPage() {
                   placeholder={ai?.jev.has_key ? "•••••••• saved — type to replace" : "apikey_…"}
                   onKeyDown={async (e) => {
                     if (e.key !== "Enter") return;
-                    const value = e.currentTarget.value;
+                    const value = e.currentTarget.value.trim();
                     e.currentTarget.value = "";
                     try {
-                      setAi(await setAiSettings({ jev: { api_key: value } }));
+                      // If saving a non-empty key, also enable Jev so it's ready to use right away.
+                      // If saving an empty key (clearing it), disable Jev.
+                      const patch = value
+                        ? { api_key: value, enabled: true }
+                        : { api_key: "", enabled: false };
+                      setAi(await setAiSettings({ jev: patch }));
                       setError(null);
                     } catch (err) {
                       setError(String(err));

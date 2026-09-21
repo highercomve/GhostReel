@@ -7,6 +7,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use base64::Engine;
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -64,6 +65,7 @@ pub struct ChatMessage {
     pub session_id: i64,
     pub role: String,
     pub content: String,
+    pub images: Option<Vec<String>>,
     pub tool_calls: Option<Vec<ToolCallRecord>>,
     pub script_id: Option<i64>,
     pub created_at: i64,
@@ -708,8 +710,36 @@ pub fn local_final_action_schema(allow_reply: bool) -> Value {
 }
 
 /// Roughly how much of a context window a conversation takes, at four characters a token.
+/// Images in multimodal messages are estimated at ~1000 tokens each rather than raw base64 char length.
 fn approx_tokens(messages: &[Value]) -> usize {
-    messages.iter().map(|m| m.to_string().len()).sum::<usize>() / 4
+    let mut chars = 0usize;
+    let mut image_count = 0usize;
+    for m in messages {
+        if let Some(content) = m.get("content") {
+            if let Some(s) = content.as_str() {
+                chars += s.len();
+            } else if let Some(arr) = content.as_array() {
+                for part in arr {
+                    if part.get("type").and_then(|t| t.as_str()) == Some("image_url") {
+                        image_count += 1;
+                    } else if let Some(txt) = part.get("text").and_then(|t| t.as_str()) {
+                        chars += txt.len();
+                    } else {
+                        chars += part.to_string().len();
+                    }
+                }
+            } else {
+                chars += content.to_string().len();
+            }
+        }
+        if let Some(role) = m.get("role").and_then(|r| r.as_str()) {
+            chars += role.len();
+        }
+        if let Some(tools) = m.get("tool_calls") {
+            chars += tools.to_string().len();
+        }
+    }
+    (chars / 4) + (image_count * 1000)
 }
 
 /// Make room for another round by forgetting the oldest tool results.
@@ -2224,6 +2254,7 @@ HOW TO EDIT
 15a. A line marked [applied after drafting] in an earlier reply is a change already made to the saved script - a bed laid, a clip moved off a shaky stretch, a range dropped. It is done: build on it rather than undoing it, and do not make the same mistake again in this session.
 15. The user's feedback overrides these defaults. When revising, change what they asked for (slower, longer, different shots, more narration) and keep what they didn't mention; never return the previous draft unchanged.
 16. Always reply in the user's language.
+17. The user may attach images (such as screenshots of the timeline, preview video player, or specific frames) to their messages. Carefully inspect any attached images to understand visual feedback, timeline misalignments, mute/unmute issues, or footage references they are pointing out, and address them directly in your revised script.
 ";
 
 /// Construct the system prompt for the editor agent: the editing instructions (`custom` or the
@@ -2985,7 +3016,7 @@ pub fn sessions_with_counts(db: &Db, project_id: i64) -> Result<Vec<SessionSumma
 /// Retrieve all messages for a session.
 pub fn messages(db: &Db, session_id: i64) -> Result<Vec<ChatMessage>, Error> {
     let mut st = db.conn.prepare(
-        "SELECT id, session_id, role, content, tool_calls_json, created_at
+        "SELECT id, session_id, role, content, tool_calls_json, created_at, images_json
          FROM chat_messages WHERE session_id = ?1 ORDER BY id ASC",
     )?;
     let rows = st.query_map([session_id], |r| {
@@ -2995,6 +3026,7 @@ pub fn messages(db: &Db, session_id: i64) -> Result<Vec<ChatMessage>, Error> {
         let content: String = r.get(3)?;
         let tool_calls_json: Option<String> = r.get(4)?;
         let created_at: i64 = r.get(5)?;
+        let images_json: Option<String> = r.get(6)?;
 
         let mut tool_calls = None;
         let mut script_id = None;
@@ -3012,7 +3044,12 @@ pub fn messages(db: &Db, session_id: i64) -> Result<Vec<ChatMessage>, Error> {
             }
         }
 
-        Ok(ChatMessage { id, session_id: sid, role, content, tool_calls, script_id, created_at })
+        let images = images_json
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+            .filter(|imgs| !imgs.is_empty());
+
+        Ok(ChatMessage { id, session_id: sid, role, content, images, tool_calls, script_id, created_at })
     })?;
 
     Ok(rows.filter_map(Result::ok).collect())
@@ -3032,11 +3069,55 @@ fn session_brief(db: &Db, session_id: i64) -> Option<String> {
         .filter(|b| !b.trim().is_empty())
 }
 
+/// Save any data URLs (from pasted images) into `<data_dir>/chat_images`, and keep any valid
+/// existing file paths. Returns the absolute paths on disk.
+fn persist_chat_images(data_dir: &Path, session_id: i64, images: &[String]) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if images.is_empty() {
+        return out;
+    }
+    let chat_images_dir = data_dir.join("chat_images");
+    let _ = std::fs::create_dir_all(&chat_images_dir);
+    let now_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+
+    for (idx, img_str) in images.iter().enumerate() {
+        let trimmed = img_str.trim();
+        if trimmed.starts_with("data:image/") {
+            if let Some((header, b64)) = trimmed.split_once(',') {
+                let ext = if header.contains("jpeg") || header.contains("jpg") {
+                    "jpg"
+                } else if header.contains("webp") {
+                    "webp"
+                } else {
+                    "png"
+                };
+                if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64.trim()) {
+                    let filename = format!("chat_{}_{}_{}.{}", session_id, now_ts, idx, ext);
+                    let target = chat_images_dir.join(filename);
+                    if std::fs::write(&target, bytes).is_ok() {
+                        out.push(target);
+                        continue;
+                    }
+                }
+            }
+        }
+        let p = PathBuf::from(trimmed);
+        if p.is_file() {
+            out.push(p);
+        }
+    }
+    out
+}
+
 pub async fn run_turn(
     ctx: &mut ChatContext,
     project_id: i64,
     session_id: Option<i64>,
     message: &str,
+    images: &[String],
     on_event: &mut (dyn FnMut(ChatEvent) + Send),
 ) -> Result<TurnResult, Error> {
     let project = ctx.db.project(project_id)?;
@@ -3057,6 +3138,14 @@ pub async fn run_turn(
             let sid = create_session(&ctx.db, project_id, &title)?;
             (sid, true)
         }
+    };
+
+    let saved_image_paths = persist_chat_images(&ctx.data_dir, session_id, images);
+    let image_strings: Vec<String> = saved_image_paths.iter().map(|p| p.to_string_lossy().to_string()).collect();
+    let images_json = if !image_strings.is_empty() {
+        serde_json::to_string(&image_strings).ok()
+    } else {
+        None
     };
 
     let mut grounding = Grounding::default();
@@ -3101,10 +3190,11 @@ pub async fn run_turn(
     // message lived only in the window's own state — and closing the app mid-turn lost it
     // altogether. After `prior_messages` is read, so it is not replayed twice.
     ctx.db.conn.execute(
-        "INSERT INTO chat_messages(session_id, role, content, tool_calls_json, created_at)
-         VALUES (?1, 'user', ?2, NULL, ?3)",
-        params![session_id, message, now()],
+        "INSERT INTO chat_messages(session_id, role, content, tool_calls_json, created_at, images_json)
+         VALUES (?1, 'user', ?2, NULL, ?3, ?4)",
+        params![session_id, message, now(), images_json],
     )?;
+    ctx.db.conn.execute("UPDATE chat_sessions SET updated_at = ?1 WHERE id = ?2", params![now(), session_id])?;
 
     // A roomy brain gets the whole of every tool description; a small local model, whose window
     // is already half transcripts, gets the summary, the parameters and the costliest warning.
@@ -3184,10 +3274,37 @@ pub async fn run_turn(
             req_messages.push(json!({ "role": "system", "content": sys_prompt }));
             for pm in &prior_messages {
                 if pm.role == "user" || pm.role == "assistant" {
-                    req_messages.push(json!({ "role": &pm.role, "content": &pm.content }));
+                    if pm.role == "user" && pm.images.as_ref().is_some_and(|imgs| !imgs.is_empty()) {
+                        let mut parts = vec![json!({ "type": "text", "text": &pm.content })];
+                        for img_str in pm.images.as_ref().unwrap() {
+                            let p = PathBuf::from(img_str);
+                            if let Ok(bytes) = std::fs::read(&p) {
+                                let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("jpeg");
+                                let mime = if ext == "png" { "image/png" } else if ext == "webp" { "image/webp" } else { "image/jpeg" };
+                                let data_url = format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(bytes));
+                                parts.push(json!({ "type": "image_url", "image_url": { "url": data_url } }));
+                            }
+                        }
+                        req_messages.push(json!({ "role": "user", "content": parts }));
+                    } else {
+                        req_messages.push(json!({ "role": &pm.role, "content": &pm.content }));
+                    }
                 }
             }
-            req_messages.push(json!({ "role": "user", "content": message }));
+            if !saved_image_paths.is_empty() {
+                let mut parts = vec![json!({ "type": "text", "text": message })];
+                for p in &saved_image_paths {
+                    if let Ok(bytes) = std::fs::read(p) {
+                        let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("jpeg");
+                        let mime = if ext == "png" { "image/png" } else if ext == "webp" { "image/webp" } else { "image/jpeg" };
+                        let data_url = format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(bytes));
+                        parts.push(json!({ "type": "image_url", "image_url": { "url": data_url } }));
+                    }
+                }
+                req_messages.push(json!({ "role": "user", "content": parts }));
+            } else {
+                req_messages.push(json!({ "role": "user", "content": message }));
+            }
 
             let mut tool_rounds = 0;
             let mut empty_searches = 0usize;
@@ -3461,10 +3578,21 @@ pub async fn run_turn(
             let mut transcript = format!("<|im_start|>system\n{sys_prompt}<|im_end|>\n");
             for pm in &prior_messages {
                 if pm.role == "user" || pm.role == "assistant" {
-                    transcript.push_str(&format!("<|im_start|>{}\n{}<|im_end|>\n", pm.role, pm.content));
+                    if pm.role == "user" && pm.images.as_ref().is_some_and(|imgs| !imgs.is_empty()) {
+                        let notes = pm.images.as_ref().unwrap().iter().map(|p| format!("[User attached image: {p}]")).collect::<Vec<_>>().join("\n");
+                        transcript.push_str(&format!("<|im_start|>{}\n{}\n{}\n<|im_end|>\n", pm.role, pm.content, notes));
+                    } else {
+                        transcript.push_str(&format!("<|im_start|>{}\n{}<|im_end|>\n", pm.role, pm.content));
+                    }
                 }
             }
-            transcript.push_str(&format!("<|im_start|>user\n{message}<|im_end|>\n"));
+            let user_turn_text = if !saved_image_paths.is_empty() {
+                let notes = saved_image_paths.iter().map(|p| format!("[User attached image: {}]", p.display())).collect::<Vec<_>>().join("\n");
+                format!("{message}\n\nPlease examine the attached image(s) as part of this request:\n{notes}")
+            } else {
+                message.to_string()
+            };
+            transcript.push_str(&format!("<|im_start|>user\n{user_turn_text}<|im_end|>\n"));
 
             // A full script's JSON is far longer than a tool action, so the draft call gets its
             // own budget out of the configured context rather than the default.
@@ -3488,8 +3616,15 @@ pub async fn run_turn(
                 tool_rounds += 1;
                 // A tool action is short, but a model that reasons first spends the same budget on
                 // the thought — at the default 2048 it ran out mid-round and the turn died.
-                let out_str =
-                    helper.complete_full(&transcript, Some(local_action_schema()), script_token_budget, *think).await?;
+                let out_str = helper
+                    .complete_full_with_image(
+                        &transcript,
+                        saved_image_paths.first().map(|p| p.as_path()),
+                        Some(local_action_schema()),
+                        script_token_budget,
+                        *think,
+                    )
+                    .await?;
                 // Every round, not just the final draft: a turn that ends in `Reply` never
                 // reaches the draft call, so the one dump that existed showed nothing at all
                 // about why a local model talked instead of editing.
@@ -3673,7 +3808,13 @@ pub async fn run_turn(
                         allowed_clips_text(&grounding)
                     ));
                     if let Ok(retry_str) = helper
-                        .complete_full(&transcript, Some(local_final_action_schema(false)), script_token_budget, *think)
+                        .complete_full_with_image(
+                            &transcript,
+                            saved_image_paths.first().map(|p| p.as_path()),
+                            Some(local_final_action_schema(false)),
+                            script_token_budget,
+                            *think,
+                        )
                         .await
                         && let Ok(LocalAction::Final { mut script }) = serde_json::from_str::<LocalAction>(&retry_str)
                     {
@@ -3708,10 +3849,21 @@ pub async fn run_turn(
             let mut transcript = format!("<|im_start|>system\n{sys_prompt}<|im_end|>\n");
             for pm in &prior_messages {
                 if pm.role == "user" || pm.role == "assistant" {
-                    transcript.push_str(&format!("<|im_start|>{}\n{}<|im_end|>\n", pm.role, pm.content));
+                    if pm.role == "user" && pm.images.as_ref().is_some_and(|imgs| !imgs.is_empty()) {
+                        let notes = pm.images.as_ref().unwrap().iter().map(|p| format!("[User attached image: {p}]")).collect::<Vec<_>>().join("\n");
+                        transcript.push_str(&format!("<|im_start|>{}\n{}\n{}\n<|im_end|>\n", pm.role, pm.content, notes));
+                    } else {
+                        transcript.push_str(&format!("<|im_start|>{}\n{}<|im_end|>\n", pm.role, pm.content));
+                    }
                 }
             }
-            transcript.push_str(&format!("<|im_start|>user\n{message}<|im_end|>\n"));
+            let user_turn_text = if !saved_image_paths.is_empty() {
+                let notes = saved_image_paths.iter().map(|p| format!("[User attached image: {}]", p.display())).collect::<Vec<_>>().join("\n");
+                format!("{message}\n\nPlease examine the attached image(s) as part of this request:\n{notes}")
+            } else {
+                message.to_string()
+            };
+            transcript.push_str(&format!("<|im_start|>user\n{user_turn_text}<|im_end|>\n"));
 
             let schema_json = serde_json::to_string(&local_action_schema()).unwrap_or_default();
             let final_schema_json = serde_json::to_string(&local_final_action_schema(true)).unwrap_or_default();
@@ -4772,7 +4924,7 @@ mod tests {
             cancel: None,
         };
 
-        let res = run_turn(&mut ctx, p.id, None, "a 40 second teaser", &mut |_| {}).await;
+        let res = run_turn(&mut ctx, p.id, None, "a 40 second teaser", &[], &mut |_| {}).await;
         assert!(res.is_err(), "the turn fails without a server");
 
         let asked: String = ctx
@@ -5897,7 +6049,7 @@ mod tests {
             cancel: None,
         };
 
-        let res = run_turn(&mut ctx, p.id, None, "a 5 second teaser", &mut |_| {}).await.unwrap();
+        let res = run_turn(&mut ctx, p.id, None, "a 5 second teaser", &[], &mut |_| {}).await.unwrap();
         let script = res.script.expect("a script");
         assert_eq!(script.title, "first", "the worse redraft was kept");
         assert!(
@@ -6057,7 +6209,7 @@ mod tests {
         };
 
         let res =
-            run_turn(&mut ctx, p.id, None, "Create a 5s teaser about unboxing", &mut |e| events.push(e)).await.unwrap();
+            run_turn(&mut ctx, p.id, None, "Create a 5s teaser about unboxing", &[], &mut |e| events.push(e)).await.unwrap();
 
         assert!(res.script_id.is_some());
         let script = res.script.unwrap();
@@ -6178,7 +6330,7 @@ mod tests {
             cancel: None,
         };
 
-        let res = run_turn(&mut ctx, p.id, None, "Make video", &mut |_| {}).await.unwrap();
+        let res = run_turn(&mut ctx, p.id, None, "Make video", &[], &mut |_| {}).await.unwrap();
 
         // The clip was not grounded in tool results -> dropped -> no beats left -> script_id None
         assert_eq!(res.script_id, None);
@@ -6189,7 +6341,35 @@ mod tests {
     fn run_turn_future_is_send() {
         fn assert_send<T: Send>(_: T) {}
         let _ = |ctx: &mut ChatContext, mut cb: Box<dyn FnMut(ChatEvent) + Send>| {
-            assert_send(run_turn(ctx, 1, None, "test", &mut *cb));
+            assert_send(run_turn(ctx, 1, None, "test", &[], &mut *cb));
         };
+    }
+
+    #[test]
+    fn test_persist_chat_images_and_messages_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open_in_memory().unwrap();
+        let p = db.create_project(&NewProject::named("ImgProj")).unwrap();
+        let sid = create_session(&db, p.id, "Session with image").unwrap();
+
+        // 1x1 PNG in base64
+        let b64_png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+        let saved = persist_chat_images(tmp.path(), sid, &[b64_png.to_string()]);
+        assert_eq!(saved.len(), 1);
+        assert!(saved[0].is_file());
+
+        let imgs_json = serde_json::to_string(&vec![saved[0].to_string_lossy().to_string()]).ok();
+        db.conn.execute(
+            "INSERT INTO chat_messages(session_id, role, content, tool_calls_json, created_at, images_json)
+             VALUES (?1, 'user', 'look at this image', NULL, ?2, ?3)",
+            params![sid, now(), imgs_json],
+        ).unwrap();
+
+        let msgs = messages(&db, sid).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "look at this image");
+        let loaded_imgs = msgs[0].images.as_ref().unwrap();
+        assert_eq!(loaded_imgs.len(), 1);
+        assert_eq!(loaded_imgs[0], saved[0].to_str().unwrap());
     }
 }

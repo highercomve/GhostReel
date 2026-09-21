@@ -365,7 +365,38 @@ impl LocalLlm {
         max_tokens: usize,
         think: bool,
     ) -> Result<String, Error> {
-        self.complete_draw(prompt, schema, max_tokens, think, None).await
+        self.complete_full_with_image(prompt, None, schema, max_tokens, think).await
+    }
+
+    /// `complete_full`, optionally providing an image file for vision-enabled models to inspect.
+    pub async fn complete_full_with_image(
+        &mut self,
+        prompt: &str,
+        image: Option<&Path>,
+        schema: Option<Value>,
+        max_tokens: usize,
+        think: bool,
+    ) -> Result<String, Error> {
+        let mut req = json!({
+            "cmd": "complete",
+            "prompt": prompt,
+            "max_tokens": max_tokens,
+            "think": think,
+        });
+        if let Some(img) = image {
+            req["image"] = json!(img.to_string_lossy());
+        }
+        if let Some(s) = schema {
+            req["schema"] = s;
+        }
+        let v = self.request(req).await?;
+        if v["truncated"].as_bool().unwrap_or(false) {
+            return Err(Error::Vision(format!(
+                "the local model hit its {max_tokens}-token output limit and the answer is cut off; \
+                 raise chat_model.ctx_tokens or ask for a shorter script"
+            )));
+        }
+        Ok(v["content"].as_str().unwrap_or_default().to_string())
     }
 
     /// One draw of an answer. `draw` picks the sampling seed, so the same prompt asked twice with

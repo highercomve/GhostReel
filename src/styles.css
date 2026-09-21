@@ -870,6 +870,159 @@ main.wide {
   width: 100%;
 }
 
+/* Attached images in chat bubbles */
+.chat-attached-images {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+
+.chat-attached-image {
+  max-width: 160px;
+  max-height: 110px;
+  border-radius: 6px;
+  object-fit: cover;
+  cursor: pointer;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  transition: transform 0.15s, border-color 0.15s;
+}
+
+.chat-attached-image:hover {
+  transform: scale(1.02);
+  border-color: var(--accent);
+}
+
+/* Lightbox modal for previewing attached images */
+.chat-image-modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.85);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 9999;
+  backdrop-filter: blur(3px);
+}
+
+.chat-image-modal-content {
+  position: relative;
+  max-width: 92vw;
+  max-height: 92vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.chat-image-modal-content img {
+  max-width: 92vw;
+  max-height: 92vh;
+  object-fit: contain;
+  border-radius: 8px;
+  box-shadow: 0 6px 30px rgba(0, 0, 0, 0.85);
+}
+
+.chat-image-modal-close {
+  position: absolute;
+  top: -14px;
+  right: -14px;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  color: var(--text);
+  font-size: 20px;
+  font-weight: bold;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.5);
+  transition: background 0.15s, color 0.15s;
+}
+
+.chat-image-modal-close:hover {
+  background: var(--bad);
+  color: #fff;
+  border-color: var(--bad);
+}
+
+/* Composer thumbnail attachments strip */
+.chat-composer-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 4px 0;
+}
+
+.chat-composer-attachment-thumb {
+  position: relative;
+  width: 68px;
+  height: 50px;
+  border-radius: 6px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  background: var(--bg);
+}
+
+.chat-composer-attachment-thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  cursor: pointer;
+  display: block;
+}
+
+.chat-composer-attachment-remove {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.75);
+  color: #fff;
+  border: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+  cursor: pointer;
+  padding: 0;
+  line-height: 1;
+  transition: background 0.15s;
+}
+
+.chat-composer-attachment-remove:hover {
+  background: var(--bad);
+}
+
+.composer-attach-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 8px;
+  font-size: 11px;
+  color: var(--muted);
+  cursor: pointer;
+  background: transparent;
+  border: 1px dashed var(--border);
+  border-radius: 6px;
+  transition: border-color 0.15s, color 0.15s;
+}
+
+.composer-attach-btn:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--text);
+}
+
+.composer-attach-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
 /*
   Composer: what to make on one line of its own, then how to make it.
 
@@ -931,6 +1084,114 @@ main.wide {
 .composer-mode:disabled {
   opacity: 0.4;
   cursor: not-allowed;
+}
+
+.composer-mode.blocked:not(.on) {
+  opacity: 0.45;
+}
+
+/* Model / Brain selector in composer */
+.composer-model-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 4px 8px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 11px;
+}
+
+.composer-model-label {
+  font-weight: 600;
+  color: var(--muted);
+  text-transform: uppercase;
+  font-size: 10px;
+  letter-spacing: 0.5px;
+  user-select: none;
+}
+
+.composer-backend-pills {
+  display: flex;
+  gap: 2px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 1px;
+}
+
+.backend-pill {
+  padding: 2px 7px;
+  font-size: 11px;
+  background: transparent;
+  border: 0;
+  border-radius: 4px;
+  color: var(--muted);
+  cursor: pointer;
+  line-height: 1.3;
+}
+
+.backend-pill:hover:not(:disabled) {
+  color: var(--text);
+}
+
+.backend-pill.active {
+  background: var(--bg);
+  color: var(--text);
+  box-shadow: inset 0 0 0 1px var(--accent);
+  font-weight: 500;
+}
+
+.backend-pill:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.composer-model-controls {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  flex: 1;
+}
+
+.composer-model-select {
+  padding: 2px 6px;
+  font-size: 11px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  max-width: 170px;
+}
+
+.composer-model-input {
+  padding: 2px 6px;
+  font-size: 11px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  max-width: 140px;
+}
+
+.composer-think-label {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--muted);
+  font-size: 11px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.composer-think-label input {
+  margin: 0;
+}
+
+.composer-think-label:hover {
+  color: var(--text);
 }
 
 /* Reads as state, not as a verb: it says what is happening, and clicking changes it. */

@@ -494,7 +494,11 @@ async fn call_tool(paths: &Paths, name: &str, args: &Value) -> anyhow::Result<Va
                 jev: config.jev.clone(),
                 cancel: None,
             };
-            let turn = ghostreel_core::chat::run_turn(&mut ctx, p.id, session_id, &message, &mut |_| {}).await?;
+            let images: Vec<String> = args
+                .get("images")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .unwrap_or_default();
+            let turn = ghostreel_core::chat::run_turn(&mut ctx, p.id, session_id, &message, &images, &mut |_| {}).await?;
             Ok(serde_json::to_value(turn)?)
         }
         "save_script" => {
