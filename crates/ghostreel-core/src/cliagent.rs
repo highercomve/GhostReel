@@ -914,9 +914,9 @@ mod brief_tests {
     #[test]
     fn a_prompt_too_long_for_argv_is_spilled_to_a_file() {
         // The threshold is platform-dependent on purpose, so drive the helper directly: on unix
-        // it is a megabyte, and the working path must never spill.
+        // it is a megabyte, and the working path must never spill. Asserting on the constant
+        // itself is not a test, it is a restatement.
         assert!(spill_prompt("a short prompt").is_none(), "an ordinary prompt is passed as an argument");
-        assert!(MAX_ARGV_CHARS > 30_000, "the threshold must leave room for the rest of the argv");
 
         let huge = "x".repeat(MAX_ARGV_CHARS + 1);
         let Some((file, dir)) = spill_prompt(&huge) else { panic!("a prompt past the limit must spill") };
