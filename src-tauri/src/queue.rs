@@ -507,7 +507,7 @@ async fn run_chat(
     let config = Config::load(&p.config_file).map_err(|e| e.to_string())?;
     // The chat has its own model settings (bigger context); the describe stage keeps [vision].
     let chat_setup = ghostreel_core::runtime::resolve_chat(&p, &config).await;
-    let backend = ghostreel_core::chat::ChatBackend::from_vision_setup(&chat_setup)
+    let backend = ghostreel_core::chat::ChatBackend::from_vision_setup(&chat_setup, config.script.server_timeout_s)
         .await
         .map_err(|e| e.to_string())?
         .with_window(config.chat_model().ctx_tokens);

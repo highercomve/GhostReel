@@ -103,8 +103,8 @@ pub enum ChatBackend {
 }
 
 impl ChatBackend {
-    pub async fn from_runtime(rt: &crate::runtime::Runtime) -> Result<Self, Error> {
-        Self::from_vision_setup(&rt.vision).await
+    pub async fn from_runtime(rt: &crate::runtime::Runtime, script_timeout_s: u64) -> Result<Self, Error> {
+        Self::from_vision_setup(&rt.vision, script_timeout_s).await
     }
 
     /// The window this backend is talking to, for deciding when a conversation has grown too
@@ -127,7 +127,12 @@ impl ChatBackend {
 
     /// Chat uses the vision model (Bonsai): the vision server, or the local helper with the model
     /// and mmproj (downloaded once when missing, like the describe stage).
-    pub async fn from_vision_setup(setup: &crate::runtime::VisionSetup) -> Result<Self, Error> {
+    /// `script_timeout_s` is the floor for a CLI agent's own timeout here. `CliAgentConfig`
+    /// serves two jobs with one number: describing a frame, which takes seconds, and writing a
+    /// whole script, which takes minutes — agy needs about nine of them on a 96-video project.
+    /// At the 180 s default the second was killed every time, reported as "agy timed out after
+    /// 180s". The server path already has `script.server_timeout_s` for exactly this reason.
+    pub async fn from_vision_setup(setup: &crate::runtime::VisionSetup, script_timeout_s: u64) -> Result<Self, Error> {
         match setup {
             crate::runtime::VisionSetup::Server(s) => {
                 // The caller sets the window with `with_window`: a VisionSetup does not carry it.
@@ -138,7 +143,12 @@ impl ChatBackend {
                     ctx_tokens: 32768,
                 })
             }
-            crate::runtime::VisionSetup::Cli(cfg) => Ok(ChatBackend::Cli(crate::cliagent::CliAgent::new(cfg.clone()))),
+            crate::runtime::VisionSetup::Cli(cfg) => {
+                Ok(ChatBackend::Cli(crate::cliagent::CliAgent::new(crate::config::CliAgentConfig {
+                    timeout_secs: cfg.timeout_secs.max(script_timeout_s),
+                    ..cfg.clone()
+                })))
+            }
             crate::runtime::VisionSetup::Local { helper, models_dir, model, mmproj, found, runtime } => {
                 let mut paths = Vec::with_capacity(2);
                 for spec in [model, mmproj] {
@@ -2053,7 +2063,7 @@ The whole project is in front of you before you call anything: WHAT PEOPLE SAY h
  c. Lay the beat out: the speaker's face first, then cut to the picture and give the beat a \"bed\" so their voice keeps running under it.
  d. Add up the clip lengths and fix the total yourself before you answer.
  e. Answer with one JSON object and nothing else.
-Before you answer, check: every range came from WHAT PEOPLE SAY or from a tool; every clip with \"source\" audio starts and ends where a sentence does; no clip is under 4 s; the total is within 10% of the target; every beat has a purpose that moves the story on.
+Before you answer, check: every range came from WHAT PEOPLE SAY or from a tool; every clip with \"source\" audio starts and ends where a sentence does and carries a whole thought, never just \"Okay\" or \"Thank you\"; no clip is under 4 s; the total is within 10% of the target; every beat has a purpose that moves the story on.
 
 HOW TO EDIT
 1. Understand the material first: list the videos, look at the keyframes of the promising ones, and read the transcripts of the videos where people talk.
@@ -2247,7 +2257,7 @@ async fn fill_missing_narration(
 /// Editorial problems the model can fix in a redraft: narration too short for its beat, and clips
 /// over footage the tools know nothing about (no speech and no described keyframe nearby).
 pub fn content_issues(db: &Db, script: &Script, cfg: &crate::config::ScriptConfig) -> Vec<Issue> {
-    let mut issues = Vec::new();
+    let mut issues = empty_speech_issues(db, script);
     let mut seen_narration: Vec<String> = Vec::new();
     for beat in &script.beats {
         let Some(n) = beat.narration.as_deref().map(str::trim).filter(|n| !n.is_empty()) else { continue };
@@ -2298,6 +2308,68 @@ pub fn content_issues(db: &Db, script: &Script, cfg: &crate::config::ScriptConfi
                     ),
                 });
             }
+        }
+    }
+    issues
+}
+
+/// The on-mic words a clip actually carries, as one line.
+fn clip_speech(db: &Db, video_id: i64, in_s: f64, out_s: f64) -> String {
+    let Ok(mut st) = db.conn.prepare(
+        "SELECT text FROM transcript_segments
+          WHERE video_id = ?1 AND end_s > ?2 AND start_s < ?3 AND COALESCE(off_mic, 0) = 0
+          ORDER BY start_s",
+    ) else {
+        return String::new();
+    };
+    st.query_map(params![video_id, in_s, out_s], |r| r.get::<_, String>(0))
+        .map(|rows| rows.flatten().collect::<Vec<_>>().join(" "))
+        .unwrap_or_default()
+}
+
+/// Words below which a clip's speech is an acknowledgement rather than something said.
+///
+/// The repair passes check length, sentence boundaries and grounding; none of them ever asked
+/// whether the words were worth hearing. A cut came back at 39.9 s against a 40 s target — a
+/// perfect duration score — with three of its eight clips being five seconds each of "Thank you."
+/// and "Okay.", a third of the piece. `chat/build.rs` has held this rule since it was written;
+/// a model writing the script was never told it.
+const MIN_CLIP_WORDS: usize = 4;
+
+/// Clips whose audible speech says nothing: "Okay.", "Thank you.", "Yeah."
+///
+/// Reported rather than dropped. The words may be the point — somebody thanking a neighbour is a
+/// moment — and the model is the only thing that knows; what it must not do is spend five seconds
+/// on one by accident.
+fn empty_speech_issues(db: &Db, script: &Script) -> Vec<Issue> {
+    let mut issues = Vec::new();
+    for beat in &script.beats {
+        // A bed carries the beat's sound, so its clips are not meant to be heard.
+        if beat.bed.is_some() {
+            continue;
+        }
+        for (i, c) in beat.clips.iter().enumerate() {
+            if c.audio != crate::script::Audio::Source {
+                continue;
+            }
+            let said = clip_speech(db, c.video_id, c.in_s, c.out_s);
+            let said = said.trim();
+            if said.is_empty() || said.split_whitespace().count() >= MIN_CLIP_WORDS {
+                continue;
+            }
+            issues.push(Issue {
+                severity: IssueSeverity::Warning,
+                beat_id: Some(beat.id.clone()),
+                clip_index: Some(i),
+                message: format!(
+                    "clip plays {:.1} s of \"{said}\" (video #{} {:.1}–{:.1}) — that is an acknowledgement, not \
+                     something said; quote a whole thought or mute the clip and let another voice carry it",
+                    (c.out_s - c.in_s).max(0.0),
+                    c.video_id,
+                    c.in_s,
+                    c.out_s
+                ),
+            });
         }
     }
     issues
@@ -3830,6 +3902,98 @@ pub fn lay_audio_beds(db: &Db, s: &mut Script, cfg: &crate::config::ScriptConfig
 mod tests {
     use super::*;
 
+    /// Five seconds of "Thank you." is a third of a forty-second piece, and every existing check
+    /// passed it: the clip is long enough, it ends on a sentence, the footage is real, and the
+    /// total came to 39.9 s against 40. Nothing asked whether the words were worth hearing.
+    #[test]
+    fn a_clip_that_only_says_thank_you_is_reported() {
+        use crate::script::{Audio, Beat, ScriptClip};
+        let db = Db::open_in_memory().unwrap();
+        db.conn.execute("INSERT INTO videos(id, content_hash, size, duration_s) VALUES (1,'a',1,60)", []).unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO transcript_segments(video_id, start_s, end_s, text, off_mic) VALUES
+                 (1, 1.0, 6.0, 'Thank you.', 0),
+                 (1, 10.0, 18.0, 'We moved here in 2021 and we have loved every minute of it.', 0)",
+                [],
+            )
+            .unwrap();
+
+        let beat = |id: &str, in_s: f64, out_s: f64| Beat {
+            id: id.into(),
+            purpose: "p".into(),
+            narration: None,
+            on_screen_text: None,
+            clips: vec![ScriptClip { video_id: 1, in_s, out_s, audio: Audio::Source, why: None }],
+            bed: None,
+            notes: None,
+        };
+        let script = Script {
+            title: "t".into(),
+            target_duration_s: Some(40.0),
+            fps: None,
+            width: None,
+            height: None,
+            beats: vec![beat("thanks", 1.0, 6.0), beat("real", 10.0, 18.0)],
+        };
+
+        let issues = empty_speech_issues(&db, &script);
+        assert_eq!(issues.len(), 1, "only the acknowledgement: {issues:?}");
+        assert_eq!(issues[0].beat_id.as_deref(), Some("thanks"));
+        assert!(issues[0].message.contains("Thank you."), "{}", issues[0].message);
+        assert!(issues[0].message.contains("acknowledgement"));
+    }
+
+    #[test]
+    fn a_clip_under_a_bed_is_not_judged_on_words_nobody_hears() {
+        use crate::script::{Audio, AudioBed, Beat, ScriptClip};
+        let db = Db::open_in_memory().unwrap();
+        db.conn.execute("INSERT INTO videos(id, content_hash, size, duration_s) VALUES (1,'a',1,60)", []).unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO transcript_segments(video_id, start_s, end_s, text, off_mic) VALUES (1, 1.0, 6.0, 'Okay.', 0)",
+                [],
+            )
+            .unwrap();
+        let script = Script {
+            title: "t".into(),
+            target_duration_s: Some(40.0),
+            fps: None,
+            width: None,
+            height: None,
+            beats: vec![Beat {
+                id: "bedded".into(),
+                purpose: "p".into(),
+                narration: None,
+                on_screen_text: None,
+                // Muted pictures under somebody else's voice: what they say is irrelevant.
+                clips: vec![ScriptClip { video_id: 1, in_s: 1.0, out_s: 6.0, audio: Audio::Mute, why: None }],
+                bed: Some(AudioBed { video_id: 1, in_s: 10.0, out_s: 18.0, why: None, inferred: true }),
+                notes: None,
+            }],
+        };
+        assert!(empty_speech_issues(&db, &script).is_empty());
+    }
+
+    /// One `CliAgentConfig` serves two jobs with very different clocks: describing a frame takes
+    /// seconds, writing a script takes minutes — agy needs about nine on a 96-video project. At
+    /// the 180 s default every chat turn was killed and reported as "agy timed out after 180s".
+    #[tokio::test]
+    async fn a_cli_brain_writing_a_script_gets_a_script_length_clock() {
+        let cli = crate::config::CliAgentConfig { tool: "agy".into(), timeout_secs: 180, ..Default::default() };
+        let setup = crate::runtime::VisionSetup::Cli(cli);
+
+        let backend = ChatBackend::from_vision_setup(&setup, 1800).await.unwrap();
+        let ChatBackend::Cli(agent) = backend else { panic!("expected a CLI backend") };
+        assert_eq!(agent.timeout_secs(), 1800, "the frame clock must not govern a script");
+
+        // A setting longer than the script default is the operator's choice and is kept.
+        let patient = crate::config::CliAgentConfig { tool: "agy".into(), timeout_secs: 3600, ..Default::default() };
+        let backend = ChatBackend::from_vision_setup(&crate::runtime::VisionSetup::Cli(patient), 1800).await.unwrap();
+        let ChatBackend::Cli(agent) = backend else { panic!("expected a CLI backend") };
+        assert_eq!(agent.timeout_secs(), 3600);
+    }
+
     /// A speech-heavy cut far over target loses whole quotes, not seconds off each one.
     ///
     /// Picture scaling cannot touch it — `speech_factor` is 1.0 on purpose — so before this a
@@ -4683,7 +4847,8 @@ mod tests {
             .unwrap();
         db.conn
             .execute(
-                "INSERT INTO transcript_segments(video_id, start_s, end_s, text) VALUES (1, 100.0, 110.0, 'hi')",
+                "INSERT INTO transcript_segments(video_id, start_s, end_s, text)
+                 VALUES (1, 100.0, 110.0, 'We moved here in 2021 and have loved it since.')",
                 [],
             )
             .unwrap();

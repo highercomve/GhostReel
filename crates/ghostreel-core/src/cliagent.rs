@@ -369,6 +369,12 @@ impl CliAgent {
         args
     }
 
+    /// How long this agent is allowed to take. Read by the chat, which gives a script-writing
+    /// agent a longer clock than a frame-describing one.
+    pub fn timeout_secs(&self) -> u64 {
+        self.cfg.timeout_secs
+    }
+
     /// Run a CLI and return stdout.
     async fn run_cli(&self, bin: &Path, args: &[std::ffi::OsString]) -> Result<String, Error> {
         if args.is_empty() {

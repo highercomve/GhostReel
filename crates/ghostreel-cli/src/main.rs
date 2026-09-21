@@ -1037,9 +1037,10 @@ async fn script_cmd(paths: &Paths, action: ScriptAction) -> anyhow::Result<ExitC
             let config = Config::load(&paths.config_file)?;
             let vision_setup = runtime::resolve_chat(paths, &config).await;
             eprintln!("Chat model: {}", vision_setup.describe());
-            let backend = ghostreel_core::chat::ChatBackend::from_vision_setup(&vision_setup)
-                .await?
-                .with_window(config.chat_model().ctx_tokens);
+            let backend =
+                ghostreel_core::chat::ChatBackend::from_vision_setup(&vision_setup, config.script.server_timeout_s)
+                    .await?
+                    .with_window(config.chat_model().ctx_tokens);
 
             let mut embedder = None;
             let embed_setup = runtime::resolve_embed(paths, &config).await;

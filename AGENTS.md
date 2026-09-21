@@ -94,6 +94,16 @@ A draft then goes through repair passes, in this order, and the order matters:
   pictures give way to the voice, never the other way round.
 - **A muted clip has no voice to protect**, so `pad_speech` and `end_on_sentences` both skip it.
   Padding b-roll to finish speech nobody can hear turned a two-second cutaway into twenty.
+- **A clip must carry a whole thought.** Length, sentence boundaries and grounding were all
+  checked; nothing asked whether the words were worth hearing. A cut came back at 39.9 s against
+  a 40 s target — a perfect duration score — with three of eight clips being five seconds each of
+  "Thank you." and "Okay.", a third of the piece. `empty_speech_issues` reports them and the
+  prompt's checklist says it; `chat/build.rs` had held the rule since it was written, but only
+  for the cut it builds itself.
+- **A CLI brain writing a script gets a script-length clock.** One `CliAgentConfig` serves
+  describing a frame (seconds) and writing a script (minutes: agy needs about nine on a 96-video
+  project), and at the 180 s default every chat turn was killed. The chat takes the larger of the
+  agent's own timeout and `script.server_timeout_s`.
 - **Repairs are reported back to the model** on the assistant message (`repair_note`), because the
   repair runs after the last redraft and the model otherwise repeats the same mistake.
 - **The conversation is re-sent every round**, so the loop keeps three quarters of the window and
