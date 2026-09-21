@@ -116,6 +116,46 @@ pub struct CliAgent {
     pub cfg: CliAgentConfig,
 }
 
+/// The most a whole command line may be before the prompt is spilled to a file instead.
+///
+/// Windows caps a command line at 32767 characters and `CreateProcess` fails with os error 206,
+/// "The filename or extension is too long" — a message that points at the binary and not at the
+/// argument that is actually too big. The script chat's prompt is the whole project's speech:
+/// 75 KB on a 96-video project, so every CLI turn failed there before it started.
+///
+/// Unix allows megabytes, so the threshold is set so high that the working path never spills and
+/// behaves exactly as it did.
+const MAX_ARGV_CHARS: usize = if cfg!(windows) { 30_000 } else { 1_000_000 };
+
+/// Write a prompt too long to pass as an argument, and return the file and the directory to
+/// grant. `None` when it fits, which is the ordinary case.
+fn spill_prompt(prompt: &str) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+    if prompt.len() <= MAX_ARGV_CHARS {
+        return None;
+    }
+    let dir = std::env::temp_dir().join("ghostreel-prompts");
+    std::fs::create_dir_all(&dir).ok()?;
+    // One file per call, cleaned by the OS: two turns must not read each other's prompt.
+    let name = format!(
+        "prompt-{}-{}.md",
+        std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)
+    );
+    let file = dir.join(name);
+    std::fs::write(&file, prompt).ok()?;
+    Some((file, dir))
+}
+
+/// What to say instead of the prompt when it had to be written to a file.
+fn read_the_prompt(file: &Path) -> String {
+    format!(
+        "Read the file {} — it contains your full instructions, including the footage you may use \
+         and the format of your answer — and then do exactly what it says. Do not reply about the \
+         file itself.",
+        file.display()
+    )
+}
+
 impl CliAgent {
     pub fn new(cfg: CliAgentConfig) -> Self {
         Self { cfg }
@@ -251,6 +291,18 @@ impl CliAgent {
 
     fn build_argv_complete(&self, bin: &Path, prompt: &str) -> Vec<std::ffi::OsString> {
         let mut args: Vec<std::ffi::OsString> = Vec::new();
+        // Too long to pass as an argument on this platform: write it down and point at it. The
+        // agents all read files; what they cannot do is take 75 KB through argv on Windows.
+        let spilled = spill_prompt(prompt);
+        let owned;
+        let prompt: &str = match &spilled {
+            Some((file, _)) => {
+                owned = read_the_prompt(file);
+                &owned
+            }
+            None => prompt,
+        };
+        let grant = spilled.as_ref().map(|(_, dir)| dir.clone());
         match self.cfg.tool.as_str() {
             "claude" => {
                 args.push(bin.as_os_str().to_owned());
@@ -259,7 +311,12 @@ impl CliAgent {
                 args.push("--output-format".into());
                 args.push("json".into());
                 args.push("--allowedTools".into());
-                args.push("none".into());
+                // Reading the spilled prompt is the one tool it needs.
+                args.push(if grant.is_some() { "Read".into() } else { std::ffi::OsString::from("none") });
+                if let Some(dir) = &grant {
+                    args.push("--add-dir".into());
+                    args.push(dir.as_os_str().to_owned());
+                }
                 // Nothing here edits anything: the agent is asked for JSON, and a prompt it
                 // cannot answer is a turn that hangs until the timeout.
                 args.push("--dangerously-skip-permissions".into());
@@ -271,6 +328,10 @@ impl CliAgent {
             "agy" => {
                 args.push(bin.as_os_str().to_owned());
                 args.push("--dangerously-skip-permissions".into());
+                if let Some(dir) = &grant {
+                    args.push("--add-dir".into());
+                    args.push(dir.as_os_str().to_owned());
+                }
                 args.push("--output-format".into());
                 args.push("json".into());
                 if !self.cfg.model.is_empty() {
@@ -826,7 +887,9 @@ mod model_list_tests {
 
 #[cfg(test)]
 mod brief_tests {
-    use super::as_plain_brief;
+    use super::{CliAgent, MAX_ARGV_CHARS, as_plain_brief, read_the_prompt, spill_prompt};
+    use crate::config::CliAgentConfig;
+    use std::path::Path;
 
     /// opencode read the ChatML transcript as someone else's conversation and refused to play:
     /// "I'm opencode, not your tool runtime." The same content, framed as its own brief, is a job.
@@ -843,5 +906,48 @@ mod brief_tests {
         assert!(brief.contains("You are an editor. Reply with JSON."));
         assert!(brief.contains("WHAT YOU WERE ASKED\nMake a 40 second teaser."));
         assert!(brief.contains("WHAT YOU ANSWERED LAST"));
+    }
+
+    /// A prompt too long for the platform's command line is written down and pointed at, rather
+    /// than failing on spawn with "The filename or extension is too long" — a Windows message
+    /// that blames the binary for an argument's size.
+    #[test]
+    fn a_prompt_too_long_for_argv_is_spilled_to_a_file() {
+        // The threshold is platform-dependent on purpose, so drive the helper directly: on unix
+        // it is a megabyte, and the working path must never spill.
+        assert!(spill_prompt("a short prompt").is_none(), "an ordinary prompt is passed as an argument");
+        assert!(MAX_ARGV_CHARS > 30_000, "the threshold must leave room for the rest of the argv");
+
+        let huge = "x".repeat(MAX_ARGV_CHARS + 1);
+        let Some((file, dir)) = spill_prompt(&huge) else { panic!("a prompt past the limit must spill") };
+        assert_eq!(std::fs::read_to_string(&file).unwrap().len(), huge.len(), "written whole");
+        assert!(file.starts_with(&dir));
+
+        // What the agent is told instead names the file and nothing else.
+        let told = read_the_prompt(&file);
+        assert!(told.contains(&file.display().to_string()));
+        assert!(told.contains("do exactly what it says"));
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn spilling_grants_the_agent_the_directory_it_must_read() {
+        let dir = std::env::temp_dir().join("ghostreel-prompts");
+        for tool in ["claude", "agy"] {
+            let agent = CliAgent::new(CliAgentConfig { tool: tool.into(), ..Default::default() });
+            let argv = agent.build_argv_complete(Path::new("/bin/true"), &"x".repeat(MAX_ARGV_CHARS + 1));
+            let flat: Vec<String> = argv.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+
+            assert!(flat.iter().any(|a| a == "--add-dir"), "{tool}: {flat:?}");
+            assert!(flat.iter().any(|a| a == &dir.display().to_string()), "{tool}: {flat:?}");
+            // And the prompt itself is a short instruction, not the payload.
+            assert!(flat.iter().all(|a| a.len() < 1000), "{tool} still passes the payload in argv");
+        }
+        // claude cannot read a file with tools switched off.
+        let claude = CliAgent::new(CliAgentConfig { tool: "claude".into(), ..Default::default() });
+        let argv = claude.build_argv_complete(Path::new("/bin/true"), &"x".repeat(MAX_ARGV_CHARS + 1));
+        let flat: Vec<String> = argv.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert!(flat.contains(&"Read".to_string()), "{flat:?}");
+        assert!(!flat.contains(&"none".to_string()));
     }
 }

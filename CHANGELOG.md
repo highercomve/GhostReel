@@ -5,6 +5,19 @@ versions follow [SemVer](https://semver.org/) while the project is 0.x (minor = 
 
 ## [Unreleased]
 
+## [0.3.1] — 2026-09-21
+
+### Fixed
+
+- **A CLI agent could not run at all on Windows.** `CreateProcess` caps a command line at 32767
+  characters and fails with os error 206, "The filename or extension is too long" — a message that
+  names the binary rather than the argument that is actually too big. The script chat passes the
+  whole project's speech in its prompt, 75 KB on a 96-video project, so every turn failed before
+  the agent started. A prompt past the platform's limit is now written to a file and the agent is
+  pointed at it; `claude` is granted `Read` and `agy` the directory. Unix allows megabytes, so the
+  threshold is set high enough there that nothing spills and the path behaves exactly as it did.
+
+
 ## [0.3.0] — 2026-09-20
 
 The release where a cut stopped being judged only by counting, and where standalone learned to
