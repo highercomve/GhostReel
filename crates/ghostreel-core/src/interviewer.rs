@@ -14,7 +14,8 @@
 //!
 //! What gives an interviewer away is the words. "Tell me your name", "so first off", "what do you
 //! think about today's event" — that is a judgement about meaning, one segment at a time, which
-//! is what a System One model is for. One request carries a hundred of them.
+//! is what a System One model is for. One request carries a short window of them, and the window
+//! is short on purpose: see `BATCH`.
 //!
 //! This only ever *adds* off-mic flags. The acoustic test is evidence too, and a segment it
 //! already caught is not re-litigated.
@@ -29,14 +30,26 @@ use crate::config::JevConfig;
 use crate::db::Db;
 use crate::jev::{Jev, Question};
 
-/// Segments asked about in one request, within a single video. The state is short — a line of
-/// dialogue each — so this is bounded by the number of questions rather than the context.
+/// Lines carried in one request, as state *and* as questions. Small, and that is the whole point.
 ///
-/// Never spanning two videos, which the first run made expensive: batched across the project, the
-/// line "So just tell me your name and the line of business that you're in" came back at 0.53 and
-/// survived. Asked among its own interview it is 0.97. "The surrounding lines are given for
-/// context" is only true if the surrounding lines are the same conversation.
-const BATCH: usize = 100;
+/// An answer's accuracy falls off with the length of the state it is read against, not with the
+/// number of questions asked about it. Measured on the Greet Mag tape that still opened with
+/// cross-talk, "Tell me about this event right here." — a line nobody could mistake:
+///
+/// | state | questions | p    |
+/// |-------|-----------|------|
+/// | 63    | 63        | 0.56 |
+/// | 63    | 20        | 0.53 |
+/// | 20    | 20        | 0.96 |
+///
+/// Asking fewer questions about the same long state changes nothing; shortening the state moves
+/// the answer by 0.4 and across the threshold. Batching per video was not the fix it looked like
+/// — it helped only on the short tapes, and the long ones kept their interviewer.
+///
+/// Neighbours still matter ("Okay." is the subject agreeing or the interviewer moving on, and only
+/// the surrounding lines say which), so this is a window rather than one line at a time. Twenty is
+/// the measured size; raising it costs accuracy, not money.
+const BATCH: usize = 20;
 
 /// One segment considered, and what came back.
 #[derive(Debug, Clone, PartialEq)]
@@ -78,6 +91,21 @@ fn candidates(db: &Db, project_id: i64) -> Result<Vec<(i64, i64, f64, String)>, 
 
 /// The question asked of every line. Written once, here, so a change is a change to the whole
 /// measurement rather than to one call site.
+/// The window Jev reads, with the framing ahead of the dialogue.
+///
+/// The key is `about_these_lines` and not `what_this_is` so that it sorts *before* `lines`:
+/// serde_json writes object keys alphabetically and Jev reads the state in that order. Under the
+/// old name the twenty lines arrived first and the sentence explaining them last, which cost
+/// four of fourteen subject lines to false positives. See `Jev::ask`, and
+/// `the_framing_is_read_before_the_dialogue` below.
+fn state(lines: &[&str]) -> serde_json::Value {
+    json!({
+        "about_these_lines": "A transcript of one recorded interview, in order. Two people speak: \
+                              an interviewer running the interview, and the subject answering.",
+        "lines": lines,
+    })
+}
+
 fn question(i: usize) -> Question {
     Question::Noul {
         instructions: json!({
@@ -109,7 +137,7 @@ pub async fn find(db: &Db, project_id: i64, cfg: &JevConfig) -> Result<Vec<Verdi
     let rows = candidates(db, project_id)?;
     let mut out = Vec::with_capacity(rows.len());
 
-    // One conversation at a time.
+    // A short window at a time, never spanning two interviews.
     let mut by_video: Vec<Vec<&(i64, i64, f64, String)>> = Vec::new();
     for row in &rows {
         match by_video.last_mut() {
@@ -122,11 +150,7 @@ pub async fn find(db: &Db, project_id: i64, cfg: &JevConfig) -> Result<Vec<Verdi
         // Every line of the batch is in the state, so each question can be judged against what
         // was said either side of it — "Okay." is the subject agreeing or the interviewer moving
         // on, and only the neighbours say which.
-        let state = json!({
-            "what_this_is": "A transcript of one recorded interview, in order. Two people speak: an \
-                             interviewer running the interview, and the subject answering.",
-            "lines": batch.iter().map(|(_, _, _, t)| t.trim()).collect::<Vec<_>>(),
-        });
+        let state = state(&batch.iter().map(|(_, _, _, t)| t.trim()).collect::<Vec<_>>());
         let questions: BTreeMap<String, Question> =
             (0..batch.len()).map(|i| (format!("line_{i}"), question(i))).collect();
 
@@ -264,6 +288,16 @@ mod tests {
         // …and the unmistakable ones 0.84 and up.
         assert!(v(0.84).is_interviewer(&cfg), "a mic check is not interview content");
         assert!(v(0.97).is_interviewer(&cfg), "\"so just tell me your name\" certainly is not");
+    }
+
+    #[test]
+    fn the_framing_is_read_before_the_dialogue() {
+        // serde_json writes objects alphabetically, so the key name decides what Jev reads first.
+        // Framing last scored a subject's own line 0.89 as the interviewer; framing first, 0.46.
+        let s = serde_json::to_string(&state(&["So tell me your name.", "I am Adrienne."])).unwrap();
+        let framing = s.find("A transcript of one recorded interview").expect("framing is in the state");
+        let dialogue = s.find("I am Adrienne").expect("dialogue is in the state");
+        assert!(framing < dialogue, "the sentence saying what these lines are must come first:\n{s}");
     }
 
     #[test]

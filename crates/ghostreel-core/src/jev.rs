@@ -168,6 +168,14 @@ impl Jev {
 
     /// Ask every question about one state, in a single request.
     ///
+    /// **The state's keys are read in the order `serde_json` writes them, which is alphabetical,
+    /// not the order they were inserted.** Jev reads the state as text, and where the framing sits
+    /// relative to the data changes the answers: `interviewer.rs` called its framing key
+    /// `what_this_is`, so twenty lines of dialogue arrived before the sentence explaining what
+    /// they were, and a line of the subject's own answer scored 0.89 as the interviewer. The same
+    /// window with the framing first scored it 0.46. Name a framing key so it sorts *before* the
+    /// data it frames, and assert that in a test — nothing else will notice.
+    ///
     /// 429 and 529 are the two the docs say to back off on rather than give up on; a judge that
     /// dies on a rate limit would make the eval flaky for no reason.
     pub async fn ask(&self, state: &Value, questions: &BTreeMap<String, Question>) -> Result<Answers, Error> {
@@ -177,6 +185,17 @@ impl Jev {
         let client = reqwest::Client::builder().timeout(self.timeout).build().map_err(|e| Error::Jev(e.to_string()))?;
         let url = format!("{}/v1/systemone", self.base_url);
         let body = Request { state, model: &self.model, questions };
+
+        // The same affordance as GHOSTREEL_DEBUG_CHAT: the way to see what was actually asked
+        // rather than what the code reads as if it asks. A question that scores a line 0.88 in
+        // here and 0.47 from a hand-written probe differs somewhere, and reading both is the
+        // only way to find out where.
+        if let (Ok(path), Ok(pretty)) = (std::env::var("GHOSTREEL_DEBUG_JEV"), serde_json::to_string_pretty(&body)) {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+                let _ = writeln!(f, "{pretty}\n---");
+            }
+        }
 
         let mut backoff = std::time::Duration::from_millis(500);
         let mut last = String::new();
