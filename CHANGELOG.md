@@ -5,6 +5,25 @@ versions follow [SemVer](https://semver.org/) while the project is 0.x (minor = 
 
 ## [Unreleased]
 
+## [0.4.1] — 2026-09-21
+
+### Changed
+
+- **The script composer is one decision.** The chat box used to share a row with a Send button, a
+  "Jev drafts first" checkbox and a "Build with Jev" button, which left the input about 130 px wide
+  in the narrow chat column with its placeholder clipped mid-word. The textarea now takes the full
+  width; beneath it a three-way control — **Model**, **Jev**, **Jev → model** — picks how the brief
+  becomes a cut, with one action button whose label follows it and a one-line hint saying what each
+  costs. The Jev modes are disabled with a reason when no key is set, instead of failing after
+  being chosen.
+
+### Added
+
+- **The editorial judge can be switched off on its own** (`jev.judge`, and a pill in the composer).
+  `jev.enabled` is still the master switch — off means nothing leaves the machine — but it also
+  gates building with Jev, so turning the judge off used to take the Jev modes with it. Defaults
+  on; existing config files are unaffected.
+
 ## [0.4.0] — 2026-09-21
 
 ### Added
