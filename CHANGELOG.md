@@ -5,6 +5,25 @@ versions follow [SemVer](https://semver.org/) while the project is 0.x (minor = 
 
 ## [Unreleased]
 
+## [0.3.2] — 2026-09-21
+
+### Fixed
+
+- **A clip could play five seconds of "Thank you."** A cut came back at 39.9 s against a 40 s
+  target — a perfect duration score — with three of its eight clips being acknowledgements, a
+  third of the piece. Every existing check passed it: the clips were long enough, they ended on
+  sentences, the footage was real. Nothing asked whether the words were worth hearing.
+  `empty_speech_issues` now reports a source-audio clip whose speech is under four words, and the
+  prompt's checklist says it before the model drafts. Reported rather than dropped, because
+  somebody thanking a neighbour may be the moment and only the model knows; clips under a bed are
+  exempt, since nobody hears them.
+- **A CLI brain was killed mid-script after 180 seconds.** One `CliAgentConfig` serves two jobs
+  with very different clocks — describing a frame takes seconds, writing a script takes minutes,
+  and agy needs about nine of them on a 96-video project. The chat now takes the larger of the
+  agent's own timeout and `script.server_timeout_s`, which exists on the server path for exactly
+  this reason. A longer setting is the operator's and is kept.
+
+
 ## [0.3.1] — 2026-09-21
 
 ### Fixed
