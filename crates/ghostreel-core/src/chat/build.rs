@@ -346,6 +346,57 @@ async fn choose_quotes(client: &Jev, footage: &Footage, brief: &str, target_s: f
 ///
 /// Only footage nobody in the cut speaks in is on offer. A talking head under somebody else's
 /// voice is the exact failure this is meant to prevent, so it is not on the menu at all.
+/// Shots offered for one line. Forty is what a Choice can weigh without the distribution going
+/// flat, and forty relevant ones beat two hundred arbitrary ones.
+const SHORTLIST: usize = 40;
+
+/// Words that appear in every sentence and so distinguish nothing.
+const STOPWORDS: &[&str] = &[
+    "the", "and", "that", "this", "with", "you", "your", "for", "are", "was", "were", "have", "has", "had", "but",
+    "not", "they", "them", "their", "there", "here", "what", "when", "where", "who", "how", "just", "like", "really",
+    "kind", "sort", "very", "much", "more", "most", "some", "any", "all", "our", "out", "about", "from", "into",
+    "than", "then", "been", "would", "could", "should", "will", "can", "get", "got", "know", "think", "going", "one",
+    "its", "it's", "i'm", "we're", "that's", "yeah", "okay", "thing", "things", "stuff", "because", "well",
+];
+
+/// The content words of a line or a description, lowercased, long enough to mean something.
+fn content_words(text: &str) -> std::collections::HashSet<String> {
+    text.split(|c: char| !c.is_alphanumeric() && c != '\'')
+        .map(|w| w.trim_matches('\'').to_lowercase())
+        .filter(|w| w.len() >= 4 && !STOPWORDS.contains(&w.as_str()))
+        .collect()
+}
+
+/// How well a shot's description answers a line, as shared content words.
+///
+/// Deliberately not embeddings: the builder's whole shape is that code enumerates and Jev judges,
+/// and pulling the search subsystem in here would widen what a change to this file can break. The
+/// descriptions are keyword-rich — "deer", "fence", "patio", "hillside" — so overlap is enough to
+/// shortlist, and Jev still does the choosing.
+fn relevance(line: &std::collections::HashSet<String>, shot: &str) -> usize {
+    let words = content_words(shot);
+    line.iter().filter(|w| words.contains(*w)).count()
+}
+
+/// The shots worth offering for one line: the most relevant, and a spread when nothing matches.
+///
+/// A Choice takes at most 255 options and the state shares that budget, so 639 described shots
+/// have to become a few dozen. Spending them on a round-robin sample offers the model whatever
+/// happened to be sampled; spending them on relevance offers it the shots that might actually
+/// illustrate the line, and no shot in the project is unreachable for want of a turn.
+fn shortlist_for<'a>(line: &Quote, eligible: &'a [Shot]) -> Vec<&'a Shot> {
+    let words = content_words(&line.text);
+    let mut scored: Vec<(usize, &Shot)> = eligible.iter().map(|s| (relevance(&words, &s.text), s)).collect();
+    if scored.iter().all(|(n, _)| *n == 0) {
+        // Nothing in the line names anything visible — "we just love it". A spread is the honest
+        // answer there: no shot is more relevant than another.
+        return spread(eligible, SHORTLIST, |s| s.video_id);
+    }
+    // Most relevant first; ties by video so one tape cannot monopolise the list.
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.video_id.cmp(&b.1.video_id)));
+    scored.into_iter().filter(|(n, _)| *n > 0).take(SHORTLIST).map(|(_, s)| s).collect()
+}
+
 async fn choose_shots(
     client: &Jev,
     footage: &Footage,
@@ -354,35 +405,53 @@ async fn choose_shots(
 ) -> Result<Vec<Option<Shot>>, Error> {
     let speakers: std::collections::HashSet<i64> = lines.iter().map(|q| q.video_id).collect();
     let eligible: Vec<Shot> = footage.shots.iter().filter(|s| !speakers.contains(&s.video_id)).cloned().collect();
-    let pool: Vec<&Shot> = spread(&eligible, MAX_OPTIONS, |s| s.video_id);
-    if pool.is_empty() {
+    if eligible.is_empty() {
         return Ok(vec![None; lines.len()]);
     }
-    let keyed: Vec<(String, &Shot)> = pool.iter().enumerate().map(|(i, s)| (format!("s{i}"), *s)).collect();
-    let criteria: std::collections::BTreeMap<String, Value> =
-        keyed.iter().map(|(k, s)| (k.clone(), json!(shorten(&s.text, 200)))).collect();
+
+    // One shortlist per line rather than one pool for all of them. Every shot keeps a stable key
+    // so the state names each one once however many lines it is offered to.
+    let mut key_of: std::collections::HashMap<(i64, u64), String> = std::collections::HashMap::new();
+    let mut shots_json = serde_json::Map::new();
+    let mut per_line: Vec<Vec<(String, &Shot)>> = Vec::with_capacity(lines.len());
+    for line in lines {
+        let mut keyed = Vec::new();
+        for shot in shortlist_for(line, &eligible) {
+            let id = (shot.video_id, (shot.t_s * 1000.0) as u64);
+            let key = key_of.entry(id).or_insert_with(|| format!("s{}", shots_json.len())).clone();
+            shots_json.entry(key.clone()).or_insert_with(|| json!(shorten(&shot.text, 260)));
+            keyed.push((key, shot));
+        }
+        per_line.push(keyed);
+    }
+    if per_line.iter().all(Vec::is_empty) {
+        return Ok(vec![None; lines.len()]);
+    }
 
     let state = json!({
         "brief": brief,
-        "shots": keyed.iter().map(|(k, s)| (k.clone(), json!(shorten(&s.text, 260)))).collect::<serde_json::Map<_, _>>(),
+        "shots": shots_json,
         "lines": lines.iter().enumerate().map(|(i, q)| (format!("l{i}"), json!(q.text))).collect::<serde_json::Map<_, _>>(),
     });
 
     // Every line in one request: they are independent, and Jev reads the shot list once.
     let mut qs = std::collections::BTreeMap::new();
     for (i, q) in lines.iter().enumerate() {
+        if per_line[i].is_empty() {
+            continue;
+        }
         qs.insert(
             format!("shot_for_l{i}"),
             Question::Choice {
                 instructions: json!({
                     "line": shorten(&q.text, 300),
                     "question": format!(
-                        "The voice in `lines.l{i}` plays over the picture. Which shot in `shots` best \
-                         shows what that voice is talking about? Choose a shot a viewer would read as \
-                         an illustration of the line."
+                        "The voice in `lines.l{i}` plays over the picture. Which of these shots best \
+                         shows what that voice is talking about? Choose one a viewer would read as an \
+                         illustration of the line."
                     ),
                 }),
-                criteria: criteria.clone(),
+                criteria: per_line[i].iter().map(|(k, s)| (k.clone(), json!(shorten(&s.text, 200)))).collect(),
             },
         );
     }
@@ -391,9 +460,11 @@ async fn choose_shots(
     Ok(lines
         .iter()
         .enumerate()
+        // Each line is resolved against its own shortlist: the keys are shared across the state,
+        // but a line can only be answered with a shot it was actually offered.
         .map(|(i, _)| match answers.answers.get(&format!("shot_for_l{i}")) {
             Some(crate::jev::Answer::Choice { choice, .. }) => {
-                keyed.iter().find(|(k, _)| k == choice).map(|(_, s)| (*s).clone())
+                per_line[i].iter().find(|(k, _)| k == choice).map(|(_, s)| (*s).clone())
             }
             _ => None,
         })
@@ -670,5 +741,56 @@ mod tests {
         let picked = spread(&shots, 200, |s| s.video_id);
         assert_eq!(picked.len(), 5);
         assert_eq!(picked.iter().map(|s| s.t_s).collect::<Vec<_>>(), vec![0.0, 1.0, 2.0, 3.0, 4.0]);
+    }
+
+    /// 639 described shots have to become a few dozen, and spending that budget on relevance
+    /// rather than on a round-robin sample is the difference between offering the model the shot
+    /// that illustrates the line and offering it whatever happened to be sampled.
+    #[test]
+    fn a_line_is_offered_the_shots_that_match_its_words() {
+        let shot = |vid: i64, t: f64, text: &str| Shot { video_id: vid, t_s: t, text: text.into() };
+        let eligible = vec![
+            shot(1, 0.0, "A hotel lobby with a reception desk and marble floor."),
+            shot(2, 0.0, "Two deer standing at a wooden fence at dawn."),
+            shot(3, 0.0, "A conference room with a projector screen."),
+            shot(4, 0.0, "A quiet residential street lined with oak trees."),
+        ];
+        let line = Quote {
+            video_id: 9,
+            in_s: 0.0,
+            out_s: 8.0,
+            text: "We love the deer running around the fence every morning.".into(),
+            breaks: vec![],
+        };
+
+        let picked = shortlist_for(&line, &eligible);
+        assert_eq!(
+            picked[0].video_id,
+            2,
+            "the deer shot comes first: {:?}",
+            picked.iter().map(|s| s.video_id).collect::<Vec<_>>()
+        );
+        // The lobby and the conference room share no content word with the line at all.
+        assert!(!picked.iter().any(|s| s.video_id == 1));
+        assert!(!picked.iter().any(|s| s.video_id == 3));
+    }
+
+    #[test]
+    fn a_line_naming_nothing_visible_still_gets_a_spread() {
+        let shot = |vid: i64, text: &str| Shot { video_id: vid, t_s: 0.0, text: text.into() };
+        let eligible = vec![shot(1, "A hotel lobby."), shot(2, "A wooden fence."), shot(3, "A conference room.")];
+        // Nothing here names anything you could photograph.
+        let line = Quote { video_id: 9, in_s: 0.0, out_s: 8.0, text: "And we just love it.".into(), breaks: vec![] };
+
+        let picked = shortlist_for(&line, &eligible);
+        assert_eq!(picked.len(), 3, "no shot is more relevant than another, so offer them all");
+    }
+
+    #[test]
+    fn stopwords_and_short_words_do_not_count_as_a_match() {
+        // "that", "with", "have" appear in every sentence and distinguish nothing.
+        let words = content_words("And that is the thing that we have here with you, because well.");
+        assert!(words.is_empty(), "nothing here names anything: {words:?}");
+        assert_eq!(relevance(&content_words("deer at the fence"), "A wooden fence at dawn."), 1);
     }
 }

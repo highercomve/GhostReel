@@ -253,6 +253,14 @@ that questions only *suggest* are enforced in code, because "mostly" is not a ru
   question gave a four-line cut drawn from two people out of fifty-six.
 - **Shots come only from footage nobody in the cut speaks in**, so a talking head can never be the
   b-roll under somebody else's voice.
+- **The option budget is spent on relevance, not on a sample.** A Choice takes at most 255
+  options and the state shares that budget, so 639 described shots must become a few dozen. Each
+  line now gets its own shortlist, ranked by content words shared with what is said over it, and
+  a line that names nothing visible ("and we just love it") falls back to a spread. Picture-match
+  went 0.70 → 0.84 with no mismatched beats, on the same four quotes: the deer shot finally
+  reached the deer line. Deliberately word overlap and not embeddings — the builder's shape is
+  that code enumerates and Jev judges, and pulling the search subsystem in here would widen what
+  a change to this file can break.
 - **A capped pool is spread, never truncated.** `.take(200)` in video order showed Jev shots from
   25 of 96 videos, and re-indexing made it *worse*: more frames per video pushed more videos out
   of the window, so half again as much footage produced the identical cut. `spread` takes a turn
