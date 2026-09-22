@@ -330,10 +330,10 @@ impl CliAgent {
         // Extract any user-attached images mentioned in prompt so CLI agents can read them
         let attached_imgs = extract_attached_image_paths(prompt);
         for img in &attached_imgs {
-            if let Some(parent) = img.parent() {
-                if !grant_dirs.contains(&parent.to_path_buf()) {
-                    grant_dirs.push(parent.to_path_buf());
-                }
+            if let Some(parent) = img.parent()
+                && !grant_dirs.contains(&parent.to_path_buf())
+            {
+                grant_dirs.push(parent.to_path_buf());
             }
         }
 

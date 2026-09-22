@@ -841,6 +841,12 @@ main.wide {
   border-color: var(--accent-2);
 }
 
+.bubble-script-link button.active-script {
+  background: color-mix(in srgb, var(--accent-2) 20%, transparent);
+  font-weight: 600;
+  box-shadow: 0 0 0 1px var(--accent-2);
+}
+
 .tool-chips-row {
   display: flex;
   flex-wrap: wrap;

@@ -936,7 +936,7 @@ async fn script_cmd(paths: &Paths, action: ScriptAction) -> anyhow::Result<ExitC
                     Vec::new()
                 }
             };
-            let session = ghostreel_core::chat::build::save_as_session(&db, project.id, &brief, id, &s, &notes)?;
+            let session = ghostreel_core::chat::build::save_as_session(&db, project.id, None, &brief, id, &s, &notes)?;
             println!(
                 "  refine it with: ghostreel script chat -p {:?} --session {session} \"<what to change>\"",
                 project.name

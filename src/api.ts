@@ -304,6 +304,8 @@ export const enqueuePreview = (
 export const enqueueExport = (scriptId: number, format: string, path: string) =>
   invoke<number>("enqueue_export", { scriptId, format, path });
 export const previewPlan = (scriptId: number) => invoke<PlannedSegment[]>("preview_plan", { scriptId });
+export const getScriptPreview = (scriptId: number) =>
+  invoke<string | null>("get_script_preview", { scriptId });
 export const queueList = () => invoke<Task[]>("queue_list");
 export const cancelTask = (id: number) => invoke<boolean>("cancel_task", { id });
 export const clearFinishedTasks = () => invoke<void>("clear_finished_tasks");
@@ -518,8 +520,12 @@ export const chatTurn = (projectId: number, sessionId: number | null, message: s
 /** A cut Jev chose, and the conversation opened to refine it in. */
 export type BuiltCut = { script_id: number; session_id: number };
 
-export const buildScriptWithJev = (projectId: number, brief: string, targetS: number) =>
-  invoke<BuiltCut>("build_script_with_jev", { projectId, brief, targetS });
+export const buildScriptWithJev = (
+  projectId: number,
+  sessionId: number | null,
+  brief: string,
+  targetS: number,
+) => invoke<BuiltCut>("build_script_with_jev", { projectId, sessionId, brief, targetS });
 
 export const chatSessions = (projectId: number) =>
   invoke<ChatSession[]>("chat_sessions", { projectId });

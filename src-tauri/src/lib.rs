@@ -345,6 +345,14 @@ fn preview_plan(script_id: i64) -> CmdResult<Vec<ghostreel_core::preview::Planne
 }
 
 #[tauri::command]
+fn get_script_preview(script_id: i64) -> CmdResult<Option<String>> {
+    let db = open_db()?;
+    let p = Paths::resolve().map_err(err)?;
+    let found = ghostreel_core::preview::find_preview(&db, &p.data_dir, script_id).map_err(err)?;
+    Ok(found.map(|p| p.to_string_lossy().to_string()))
+}
+
+#[tauri::command]
 async fn queue_list(queue: State<'_, queue::Queue>) -> CmdResult<Vec<queue::Task>> {
     Ok(queue.snapshot().await)
 }
@@ -657,7 +665,12 @@ fn jev_view(cfg: &ghostreel_core::config::JevConfig) -> JevSettingsView {
 /// that answers in probabilities — so it runs here rather than through the queue: it takes about
 /// as long as a preview, and there is nothing to stream.
 #[tauri::command]
-async fn build_script_with_jev(project_id: i64, brief: String, target_s: f64) -> CmdResult<BuiltCut> {
+async fn build_script_with_jev(
+    project_id: i64,
+    session_id: Option<i64>,
+    brief: String,
+    target_s: f64,
+) -> CmdResult<BuiltCut> {
     let p = paths()?;
     let config = Config::load(&p.config_file).unwrap_or_default();
     if config.jev.api_key.trim().is_empty() && std::env::var("TYPESAFE_API_KEY").is_err() {
@@ -718,14 +731,15 @@ async fn build_script_with_jev(project_id: i64, brief: String, target_s: f64) ->
     };
 
     let db_path = p.db_file();
-    let session_id = tokio::task::spawn_blocking(move || -> CmdResult<i64> {
+    let final_session_id = tokio::task::spawn_blocking(move || -> CmdResult<i64> {
         let db = Db::open(&db_path).map_err(err)?;
-        ghostreel_core::chat::build::save_as_session(&db, project_id, &brief, script_id, &script, &notes).map_err(err)
+        ghostreel_core::chat::build::save_as_session(&db, project_id, session_id, &brief, script_id, &script, &notes)
+            .map_err(err)
     })
     .await
     .map_err(|e| e.to_string())??;
 
-    Ok(BuiltCut { script_id, session_id })
+    Ok(BuiltCut { script_id, session_id: final_session_id })
 }
 
 /// What the build hands back: the cut, and the conversation to refine it in.
@@ -1219,6 +1233,7 @@ pub fn run() {
             enqueue_preview,
             enqueue_export,
             preview_plan,
+            get_script_preview,
             queue_list,
             cancel_task,
             clear_finished_tasks,

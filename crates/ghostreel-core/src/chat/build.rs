@@ -545,13 +545,19 @@ pub fn lay_out(project: &Project, lines: &[Quote], shots: &[Option<Shot>], targe
 pub fn save_as_session(
     db: &Db,
     project_id: i64,
+    existing_session_id: Option<i64>,
     brief: &str,
     script_id: i64,
     script: &Script,
     notes: &[String],
 ) -> Result<i64, Error> {
-    let title: String = brief.chars().take(60).collect();
-    let session_id = super::create_session(db, project_id, &title)?;
+    let session_id = match existing_session_id {
+        Some(sid) => sid,
+        None => {
+            let title: String = brief.chars().take(60).collect();
+            super::create_session(db, project_id, &title)?
+        }
+    };
     let t = super::now();
 
     db.conn.execute(

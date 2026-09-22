@@ -25,6 +25,7 @@ interface ScriptEditorProps {
   projectId: number;
   scriptId: number;
   sessionId: number | null;
+  sessionTitle?: string;
   latestIssues?: Issue[];
   onScriptSaved: (newScriptId: number, issues: Issue[]) => void;
 }
@@ -33,11 +34,13 @@ export default function ScriptEditor({
   projectId,
   scriptId,
   sessionId,
+  sessionTitle,
   latestIssues,
   onScriptSaved,
 }: ScriptEditorProps) {
   const [script, setScript] = useState<Script | null>(null);
   const [initialJson, setInitialJson] = useState<string | null>(null);
+  const [loadedSessionId, setLoadedSessionId] = useState<number | null>(null);
   const [version, setVersion] = useState<number | null>(null);
   const [issues, setIssues] = useState<Issue[]>([]);
   const [loading, setLoading] = useState(false);
@@ -93,6 +96,7 @@ export default function ScriptEditor({
         if (cancelled) return;
         setScript(view.stored.script);
         setInitialJson(JSON.stringify(view.stored.script));
+        setLoadedSessionId(view.stored.session_id);
         setVersion(view.stored.version);
         setIssues(latestIssues ?? view.issues);
         setLoading(false);
@@ -149,7 +153,7 @@ export default function ScriptEditor({
     setSaving(true);
     setError(null);
     try {
-      const res = await saveScript(projectId, script, sessionId);
+      const res = await saveScript(projectId, script, sessionId ?? loadedSessionId);
       setInitialJson(JSON.stringify(script));
       setIssues(res.issues);
       onScriptSaved(res.script_id, res.issues);
@@ -316,6 +320,11 @@ export default function ScriptEditor({
             <span className="label">
               Script {version != null ? `v${version}` : ""}
             </span>
+            {sessionTitle && (
+              <span className="pill small" style={{ marginLeft: "8px", fontWeight: "normal", opacity: 0.8 }} title="Chat session this script belongs to">
+                Chat: {sessionTitle}
+              </span>
+            )}
             {isDirty && <span className="tag warn">Unsaved changes</span>}
           </div>
           <div className="inline">

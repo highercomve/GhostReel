@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use rusqlite::params;
+use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 use crate::Error;
@@ -364,6 +364,34 @@ pub fn preview_plan(db: &Db, script_id: i64) -> Result<Vec<PlannedSegment>, Erro
     let project_fps = stored.script.fps.unwrap_or_else(|| Fps::new(project.fps_num, project.fps_den));
     let media = otio::resolve_media_for_script(db, stored.project_id, &stored.script, project_fps)?;
     plan_segments(&stored.script, &media)
+}
+
+/// Check if an existing preview MP4 render exists on disk for this script.
+pub fn find_preview(db: &Db, data_dir: &Path, script_id: i64) -> Result<Option<PathBuf>, Error> {
+    let path: Option<String> = db
+        .conn
+        .query_row(
+            "SELECT path FROM exports WHERE script_id = ?1 AND format = 'preview_mp4' ORDER BY created_at DESC LIMIT 1",
+            params![script_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+
+    if let Some(p_str) = path {
+        let p = PathBuf::from(p_str);
+        if p.is_file() {
+            return Ok(Some(p));
+        }
+    }
+
+    if let Ok(stored) = script::load(db, script_id) {
+        let candidate = data_dir.join("previews").join(format!("script_{}_v{}.mp4", stored.id, stored.version));
+        if candidate.is_file() {
+            return Ok(Some(candidate));
+        }
+    }
+
+    Ok(None)
 }
 
 /// Render a preview MP4 for a script draft.

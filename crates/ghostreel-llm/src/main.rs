@@ -329,7 +329,8 @@ impl Vision<'_> {
         };
 
         let bitmap = if let Some(img_path) = image {
-            let bm = MtmdBitmap::from_file(&self.mtmd, img_path, false).map_err(|e| format!("image {img_path}: {e:?}"))?;
+            let bm =
+                MtmdBitmap::from_file(&self.mtmd, img_path, false).map_err(|e| format!("image {img_path}: {e:?}"))?;
             let marker = llama_cpp_2::mtmd::mtmd_default_marker();
             if let Some(pos) = text.rfind("<|im_start|>user\n") {
                 text.insert_str(pos + "<|im_start|>user\n".len(), &marker);

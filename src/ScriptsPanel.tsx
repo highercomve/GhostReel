@@ -27,6 +27,13 @@ import ScriptEditor from "./ScriptEditor";
 import TaskCard from "./TaskCard";
 import { useQueue } from "./useQueue";
 
+function cleanTitle(title: string | null | undefined): string {
+  if (!title) return "Untitled chat";
+  const firstLine = title.split("\n")[0].trim();
+  const cleaned = firstLine.replace(/^```[a-z]*\s*/i, "").replace(/[`"{}[\]]/g, "").trim();
+  return cleaned.length > 55 ? cleaned.slice(0, 55) + "…" : cleaned || "Untitled chat";
+}
+
 function formatRelativeTime(timestamp: number): string {
   const ms = timestamp < 1e11 ? timestamp * 1000 : timestamp;
   const diffSecs = Math.max(0, Math.floor((Date.now() - ms) / 1000));
@@ -215,6 +222,7 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
     setSessions((prev) => prev.filter((s) => s.id !== id));
     if (selectedSessionId === id) {
       setSelectedSessionId(null);
+      setSelectedScriptId(null);
       setMessages([]);
     }
   };
@@ -297,13 +305,10 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
 
         // Find latest script for this session
         const sessScripts = scriptList.filter((s) => s.session_id === targetSessionId);
-        if (sessScripts.length > 0) {
-          setSelectedScriptId(Math.max(...sessScripts.map((s) => s.id)));
-        } else if (scriptList.length > 0) {
-          setSelectedScriptId(Math.max(...scriptList.map((s) => s.id)));
-        }
-      } else if (scriptList.length > 0) {
-        setSelectedScriptId(Math.max(...scriptList.map((s) => s.id)));
+        setSelectedScriptId(sessScripts.length > 0 ? Math.max(...sessScripts.map((s) => s.id)) : null);
+      } else {
+        setSelectedSessionId(null);
+        setSelectedScriptId(null);
       }
     });
 
@@ -457,16 +462,15 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
     setSelectedSessionId(sessId);
     setTurnError(null);
     setLiveEvents(sessionEventsCache.get(sessId) ?? []);
-    // Auto-select latest script belonging to this session if any
+    // Auto-select latest script belonging to this session if any, otherwise null
     const sessScripts = scripts.filter((s) => s.session_id === sessId);
-    if (sessScripts.length > 0) {
-      setSelectedScriptId(Math.max(...sessScripts.map((s) => s.id)));
-    }
+    setSelectedScriptId(sessScripts.length > 0 ? Math.max(...sessScripts.map((s) => s.id)) : null);
   };
 
   const handleNewChat = () => {
     userSelectedRef.current = true;
     setSelectedSessionId(null);
+    setSelectedScriptId(null);
     setMessages([]);
     setTurnError(null);
     setLiveEvents([]);
@@ -476,7 +480,7 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
     const text = inputMessage.trim();
     const imagesToSend = [...attachedImages];
     if ((!text && imagesToSend.length === 0) || isTurnRunning) return;
-    userSelectedRef.current = false;
+    userSelectedRef.current = true;
     const promptText = text || (imagesToSend.length > 0 ? "Review the attached image(s)." : "");
     setInputMessage("");
     setAttachedImages([]);
@@ -486,14 +490,16 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
     setOptimisticUser({ text: promptText, images: imagesToSend });
 
     try {
-      // Jev first, when asked. The model's turn then happens in the session the build opened,
-      // which already holds the brief, the cut and the editorial notes — so the instruction is to
-      // improve it rather than to write one.
+      // Jev first, when asked. The build lands in the open chat (or opens one), so the model's
+      // turn that follows already holds the brief, the cut and the editorial notes — and a build
+      // asked for mid-conversation continues that conversation rather than starting another.
       let session = selectedSessionId;
       let message = promptText;
       if (mode !== "chat") {
         setBuilding(true);
-        const built = await buildScriptWithJev(projectId, promptText, 40).finally(() => setBuilding(false));
+        const built = await buildScriptWithJev(projectId, session, promptText, 40).finally(() =>
+          setBuilding(false),
+        );
         session = built.session_id;
         setSelectedSessionId(built.session_id);
         setSelectedScriptId(built.script_id);
@@ -515,6 +521,7 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
       }
       const res = await chatTurn(projectId, session, message, imagesToSend);
       setSelectedSessionId(res.session_id);
+      userSelectedRef.current = true;
       sessionEventsCache.delete(res.session_id);
 
       // Refresh sessions, messages, and scripts
@@ -600,7 +607,7 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
                   className={`session-item ${isSelected ? "active" : ""}`}
                   onClick={() => handleSelectSession(sess.id)}
                 >
-                  <span className="session-title">{sess.title || "Untitled chat"}</span>
+                  <span className="session-title">{cleanTitle(sess.title)}</span>
                   {liveSessionId === sess.id && <span className="pill local small">Running</span>}
                   <span className="session-time muted small">
                     {formatRelativeTime(sess.updated_at || sess.created_at)}
@@ -628,6 +635,8 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
                           className={`script-version-item ${isScriptSelected ? "active" : ""}`}
                           onClick={(e) => {
                             e.stopPropagation();
+                            userSelectedRef.current = true;
+                            setSelectedSessionId(sess.id);
                             setSelectedScriptId(s.id);
                           }}
                         >
@@ -656,7 +665,17 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
                   <div
                     key={s.id}
                     className={`script-version-item ${isScriptSelected ? "active" : ""}`}
-                    onClick={() => setSelectedScriptId(s.id)}
+                    onClick={() => {
+                      userSelectedRef.current = true;
+                      setSelectedScriptId(s.id);
+                      if (s.session_id != null && sessions.some((sess) => sess.id === s.session_id)) {
+                        setSelectedSessionId(s.session_id);
+                        chatMessages(s.session_id).then(setMessages).catch(() => setMessages([]));
+                      } else {
+                        setSelectedSessionId(null);
+                        setMessages([]);
+                      }
+                    }}
                   >
                     <span className="version-tag">v{s.version}</span>
                     <span className="version-info muted small">
@@ -675,7 +694,7 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
         <div className="chat-header">
           <span className="label">
             {selectedSessionId != null
-              ? sessions.find((s) => s.id === selectedSessionId)?.title || "Script Chat"
+              ? cleanTitle(sessions.find((s) => s.id === selectedSessionId)?.title)
               : "New Script Chat"}
           </span>
           {isTurnRunning && <span className="pill local small">Running</span>}
@@ -729,10 +748,12 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
                     <div className="bubble-script-link">
                       <button
                         type="button"
-                        className="ghost small link-button"
+                        className={`ghost small link-button${selectedScriptId === msg.script_id ? " active-script" : ""}`}
                         onClick={() => setSelectedScriptId(msg.script_id!)}
                       >
-                        Open v{findScriptVersion(msg.script_id)}
+                        {selectedScriptId === msg.script_id
+                          ? `✓ Viewing v${findScriptVersion(msg.script_id)}`
+                          : `Open v${findScriptVersion(msg.script_id)}`}
                       </button>
                     </div>
                   )}
@@ -1087,7 +1108,11 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
               }
               onClick={handleSend}
             >
-              {building ? "Choosing…" : isTurnRunning ? "Working…" : MODES.find((m) => m.id === mode)?.action}
+              {building
+                ? "Choosing…"
+                : isTurnRunning
+                  ? "Working…"
+                  : MODES.find((m) => m.id === mode)?.action}
             </button>
           </div>
         </div>
@@ -1100,6 +1125,11 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
             projectId={projectId}
             scriptId={selectedScriptId}
             sessionId={selectedSessionId}
+            sessionTitle={
+              selectedSessionId != null
+                ? cleanTitle(sessions.find((s) => s.id === selectedSessionId)?.title)
+                : undefined
+            }
             latestIssues={latestIssues}
             onScriptSaved={handleScriptSaved}
           />

@@ -4,6 +4,7 @@ import {
   clock,
   enqueueExport,
   enqueuePreview,
+  getScriptPreview,
   mediaUrl,
   previewPlan,
   type PlannedSegment,
@@ -43,19 +44,62 @@ export default function PreviewPlayer({
   const videoRef = useRef<HTMLVideoElement>(null);
 
   const tasks = useQueue();
-  const previewTask = previewTaskId != null ? tasks.find((t) => t.id === previewTaskId) : null;
-  const exportTask = exportTaskId != null ? tasks.find((t) => t.id === exportTaskId) : null;
+  const previewTask =
+    previewTaskId != null
+      ? tasks.find((t) => t.id === previewTaskId)
+      : tasks.find(
+          (t) =>
+            t.kind.type === "render_preview" &&
+            t.kind.script_id === scriptId &&
+            (t.state === "running" || t.state === "queued"),
+        ) ??
+        tasks
+          .filter(
+            (t) =>
+              t.kind.type === "render_preview" &&
+              t.kind.script_id === scriptId &&
+              t.state === "done" &&
+              t.output,
+          )
+          .sort((a, b) => (b.finished_at || 0) - (a.finished_at || 0))[0] ??
+        null;
 
-  // Load plan when script changes
+  const exportTask =
+    exportTaskId != null
+      ? tasks.find((t) => t.id === exportTaskId)
+      : tasks.find(
+          (t) =>
+            t.kind.type === "export" &&
+            t.kind.script_id === scriptId &&
+            (t.state === "running" || t.state === "queued"),
+        ) ??
+        tasks
+          .filter(
+            (t) =>
+              t.kind.type === "export" &&
+              t.kind.script_id === scriptId &&
+              t.state === "done" &&
+              t.output,
+          )
+          .sort((a, b) => (b.finished_at || 0) - (a.finished_at || 0))[0] ??
+        null;
+
+  // Load plan and check for existing preview render on disk when script changes
   useEffect(() => {
     setPlan(null);
     setPreviewVideoSrc(null);
     setError(null);
     previewPlan(scriptId)
       .then(setPlan)
-      .catch(() => {
-        // M8b backend commands may not exist yet; catch and ignore silently for plan
-      });
+      .catch(() => {});
+
+    getScriptPreview(scriptId)
+      .then((path) => {
+        if (path) {
+          mediaUrl(path).then(setPreviewVideoSrc).catch(() => {});
+        }
+      })
+      .catch(() => {});
   }, [scriptId]);
 
   // When preview task finishes, load video

@@ -3078,29 +3078,26 @@ fn persist_chat_images(data_dir: &Path, session_id: i64, images: &[String]) -> V
     }
     let chat_images_dir = data_dir.join("chat_images");
     let _ = std::fs::create_dir_all(&chat_images_dir);
-    let now_ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
+    let now_ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
 
     for (idx, img_str) in images.iter().enumerate() {
         let trimmed = img_str.trim();
-        if trimmed.starts_with("data:image/") {
-            if let Some((header, b64)) = trimmed.split_once(',') {
-                let ext = if header.contains("jpeg") || header.contains("jpg") {
-                    "jpg"
-                } else if header.contains("webp") {
-                    "webp"
-                } else {
-                    "png"
-                };
-                if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64.trim()) {
-                    let filename = format!("chat_{}_{}_{}.{}", session_id, now_ts, idx, ext);
-                    let target = chat_images_dir.join(filename);
-                    if std::fs::write(&target, bytes).is_ok() {
-                        out.push(target);
-                        continue;
-                    }
+        if trimmed.starts_with("data:image/")
+            && let Some((header, b64)) = trimmed.split_once(',')
+        {
+            let ext = if header.contains("jpeg") || header.contains("jpg") {
+                "jpg"
+            } else if header.contains("webp") {
+                "webp"
+            } else {
+                "png"
+            };
+            if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64.trim()) {
+                let filename = format!("chat_{}_{}_{}.{}", session_id, now_ts, idx, ext);
+                let target = chat_images_dir.join(filename);
+                if std::fs::write(&target, bytes).is_ok() {
+                    out.push(target);
+                    continue;
                 }
             }
         }
@@ -3142,11 +3139,7 @@ pub async fn run_turn(
 
     let saved_image_paths = persist_chat_images(&ctx.data_dir, session_id, images);
     let image_strings: Vec<String> = saved_image_paths.iter().map(|p| p.to_string_lossy().to_string()).collect();
-    let images_json = if !image_strings.is_empty() {
-        serde_json::to_string(&image_strings).ok()
-    } else {
-        None
-    };
+    let images_json = if !image_strings.is_empty() { serde_json::to_string(&image_strings).ok() } else { None };
 
     let mut grounding = Grounding::default();
     // What this turn has already fetched, so asking twice costs nothing and asking a third time
@@ -3280,8 +3273,17 @@ pub async fn run_turn(
                             let p = PathBuf::from(img_str);
                             if let Ok(bytes) = std::fs::read(&p) {
                                 let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("jpeg");
-                                let mime = if ext == "png" { "image/png" } else if ext == "webp" { "image/webp" } else { "image/jpeg" };
-                                let data_url = format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(bytes));
+                                let mime = if ext == "png" {
+                                    "image/png"
+                                } else if ext == "webp" {
+                                    "image/webp"
+                                } else {
+                                    "image/jpeg"
+                                };
+                                let data_url = format!(
+                                    "data:{mime};base64,{}",
+                                    base64::engine::general_purpose::STANDARD.encode(bytes)
+                                );
                                 parts.push(json!({ "type": "image_url", "image_url": { "url": data_url } }));
                             }
                         }
@@ -3296,8 +3298,15 @@ pub async fn run_turn(
                 for p in &saved_image_paths {
                     if let Ok(bytes) = std::fs::read(p) {
                         let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("jpeg");
-                        let mime = if ext == "png" { "image/png" } else if ext == "webp" { "image/webp" } else { "image/jpeg" };
-                        let data_url = format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(bytes));
+                        let mime = if ext == "png" {
+                            "image/png"
+                        } else if ext == "webp" {
+                            "image/webp"
+                        } else {
+                            "image/jpeg"
+                        };
+                        let data_url =
+                            format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(bytes));
                         parts.push(json!({ "type": "image_url", "image_url": { "url": data_url } }));
                     }
                 }
@@ -3579,15 +3588,27 @@ pub async fn run_turn(
             for pm in &prior_messages {
                 if pm.role == "user" || pm.role == "assistant" {
                     if pm.role == "user" && pm.images.as_ref().is_some_and(|imgs| !imgs.is_empty()) {
-                        let notes = pm.images.as_ref().unwrap().iter().map(|p| format!("[User attached image: {p}]")).collect::<Vec<_>>().join("\n");
-                        transcript.push_str(&format!("<|im_start|>{}\n{}\n{}\n<|im_end|>\n", pm.role, pm.content, notes));
+                        let notes = pm
+                            .images
+                            .as_ref()
+                            .unwrap()
+                            .iter()
+                            .map(|p| format!("[User attached image: {p}]"))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        transcript
+                            .push_str(&format!("<|im_start|>{}\n{}\n{}\n<|im_end|>\n", pm.role, pm.content, notes));
                     } else {
                         transcript.push_str(&format!("<|im_start|>{}\n{}<|im_end|>\n", pm.role, pm.content));
                     }
                 }
             }
             let user_turn_text = if !saved_image_paths.is_empty() {
-                let notes = saved_image_paths.iter().map(|p| format!("[User attached image: {}]", p.display())).collect::<Vec<_>>().join("\n");
+                let notes = saved_image_paths
+                    .iter()
+                    .map(|p| format!("[User attached image: {}]", p.display()))
+                    .collect::<Vec<_>>()
+                    .join("\n");
                 format!("{message}\n\nPlease examine the attached image(s) as part of this request:\n{notes}")
             } else {
                 message.to_string()
@@ -3850,15 +3871,27 @@ pub async fn run_turn(
             for pm in &prior_messages {
                 if pm.role == "user" || pm.role == "assistant" {
                     if pm.role == "user" && pm.images.as_ref().is_some_and(|imgs| !imgs.is_empty()) {
-                        let notes = pm.images.as_ref().unwrap().iter().map(|p| format!("[User attached image: {p}]")).collect::<Vec<_>>().join("\n");
-                        transcript.push_str(&format!("<|im_start|>{}\n{}\n{}\n<|im_end|>\n", pm.role, pm.content, notes));
+                        let notes = pm
+                            .images
+                            .as_ref()
+                            .unwrap()
+                            .iter()
+                            .map(|p| format!("[User attached image: {p}]"))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        transcript
+                            .push_str(&format!("<|im_start|>{}\n{}\n{}\n<|im_end|>\n", pm.role, pm.content, notes));
                     } else {
                         transcript.push_str(&format!("<|im_start|>{}\n{}<|im_end|>\n", pm.role, pm.content));
                     }
                 }
             }
             let user_turn_text = if !saved_image_paths.is_empty() {
-                let notes = saved_image_paths.iter().map(|p| format!("[User attached image: {}]", p.display())).collect::<Vec<_>>().join("\n");
+                let notes = saved_image_paths
+                    .iter()
+                    .map(|p| format!("[User attached image: {}]", p.display()))
+                    .collect::<Vec<_>>()
+                    .join("\n");
                 format!("{message}\n\nPlease examine the attached image(s) as part of this request:\n{notes}")
             } else {
                 message.to_string()
@@ -6208,8 +6241,9 @@ mod tests {
             cancel: None,
         };
 
-        let res =
-            run_turn(&mut ctx, p.id, None, "Create a 5s teaser about unboxing", &[], &mut |e| events.push(e)).await.unwrap();
+        let res = run_turn(&mut ctx, p.id, None, "Create a 5s teaser about unboxing", &[], &mut |e| events.push(e))
+            .await
+            .unwrap();
 
         assert!(res.script_id.is_some());
         let script = res.script.unwrap();
@@ -6359,11 +6393,13 @@ mod tests {
         assert!(saved[0].is_file());
 
         let imgs_json = serde_json::to_string(&vec![saved[0].to_string_lossy().to_string()]).ok();
-        db.conn.execute(
-            "INSERT INTO chat_messages(session_id, role, content, tool_calls_json, created_at, images_json)
+        db.conn
+            .execute(
+                "INSERT INTO chat_messages(session_id, role, content, tool_calls_json, created_at, images_json)
              VALUES (?1, 'user', 'look at this image', NULL, ?2, ?3)",
-            params![sid, now(), imgs_json],
-        ).unwrap();
+                params![sid, now(), imgs_json],
+            )
+            .unwrap();
 
         let msgs = messages(&db, sid).unwrap();
         assert_eq!(msgs.len(), 1);

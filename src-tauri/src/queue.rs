@@ -131,6 +131,7 @@ impl Queue {
         id
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn enqueue_chat(
         &self,
         app: &AppHandle,
@@ -614,9 +615,10 @@ async fn run_chat(
         return Err("task cancelled".into());
     }
 
-    let turn_res = ghostreel_core::chat::run_turn(&mut ctx, project_id, Some(session_id), &message, &images, &mut on_event)
-        .await
-        .map_err(|e| e.to_string())?;
+    let turn_res =
+        ghostreel_core::chat::run_turn(&mut ctx, project_id, Some(session_id), &message, &images, &mut on_event)
+            .await
+            .map_err(|e| e.to_string())?;
 
     Ok(ChatTurnView {
         session_id: turn_res.session_id,
