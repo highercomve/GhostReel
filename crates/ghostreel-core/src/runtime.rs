@@ -120,6 +120,7 @@ pub async fn start_embedder(
                 embed: Some(path),
                 cpu: true,
                 runtime: crate::vision::HelperRuntime { kv_cache: "f16".into(), ..Default::default() },
+                concurrency: 1,
             };
             Embedder::local(&models).await.map_err(|e| e.to_string())
         }
@@ -135,8 +136,8 @@ pub struct Runtime {
     pub data_dir: PathBuf,
     /// Keyframe extraction settings; `None` disables the frames stage (tests).
     pub frames: Option<crate::frames::FrameOptions>,
-    /// Frames described at once against a server (`vision.describe_concurrency`). Describing is
-    /// memory-bandwidth bound, so a batch amortises one read of the weights over several answers.
+    /// Frames described at once against a server or local helper (`vision.describe_concurrency`).
+    /// Memory-bandwidth bound, so a batch amortises reading the weights over several answers.
     pub describe_concurrency: usize,
     pub vision: VisionSetup,
     pub embed: EmbedSetup,
@@ -195,15 +196,23 @@ pub async fn resolve(paths: &Paths, config: &Config) -> Result<Runtime, crate::E
         locate("ffmpeg").ok_or_else(|| crate::Error::Invalid("ffmpeg not found (see `ghostreel doctor`)".into()))?;
     let ffprobe =
         locate("ffprobe").ok_or_else(|| crate::Error::Invalid("ffprobe not found (see `ghostreel doctor`)".into()))?;
-    let (stt, vision, embed) =
-        tokio::join!(resolve_stt(paths, config), resolve_vision(paths, config), resolve_embed(paths, config));
+    let (stt, vision, embed, gpus) = tokio::join!(
+        resolve_stt(paths, config),
+        resolve_vision(paths, config),
+        resolve_embed(paths, config),
+        crate::doctor::nvidia_gpus()
+    );
+    let total_vram = gpus.first().map(|g| g.vram_total_mib);
+    let model_mb = crate::models::find_entry(&config.vision.local_model).and_then(|e| e.vram_mb);
+    let describe_concurrency =
+        crate::doctor::calculate_describe_concurrency(config.vision.describe_concurrency, total_vram, model_mb);
     Ok(Runtime {
         ffmpeg,
         ffprobe,
         stt,
         data_dir: paths.data_dir.clone(),
         frames: Some(crate::frames::FrameOptions::from_config(&config.frames)),
-        describe_concurrency: config.vision.describe_concurrency.max(1) as usize,
+        describe_concurrency,
         vision,
         embed,
         steadiness: (&config.script).into(),

@@ -187,6 +187,7 @@ pub struct LocalModels {
     /// Context window, KV cache precision and flash attention for this helper. Frame descriptions
     /// and the script chat run the same binary with different values (see `config::VisionConfig`).
     pub runtime: HelperRuntime,
+    pub concurrency: usize,
 }
 
 /// How much room the helper gets, and how it spends VRAM on it.
@@ -233,8 +234,11 @@ impl LocalLlm {
         if m.cpu {
             cmd.arg("--cpu");
         }
+        let concurrency = m.concurrency.max(1);
+        cmd.arg("--concurrency").arg(concurrency.to_string());
+        let needed_ctx = m.runtime.ctx_tokens.max((concurrency as u32) * 2048);
         cmd.arg("--ctx")
-            .arg(m.runtime.ctx_tokens.to_string())
+            .arg(needed_ctx.to_string())
             .arg("--kv-type")
             .arg(&m.runtime.kv_cache)
             .arg("--flash-attn")
@@ -324,6 +328,48 @@ impl LocalLlm {
             }))
             .await?;
         parse_description(v["content"].as_str().unwrap_or_default())
+    }
+
+    pub async fn batch_describe(
+        &mut self,
+        items: &[(&Path, Option<&str>)],
+    ) -> Result<Vec<Result<FrameDescription, Error>>, Error> {
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+        let batch_items: Vec<Value> = items
+            .iter()
+            .map(|(image, speech)| {
+                json!({
+                    "image": image.to_string_lossy(),
+                    "prompt": prompt(*speech),
+                    "schema": schema(),
+                    "max_tokens": 1200,
+                })
+            })
+            .collect();
+
+        let v = self
+            .request(json!({
+                "cmd": "batch_describe",
+                "items": batch_items,
+            }))
+            .await?;
+
+        let results =
+            v["results"].as_array().ok_or_else(|| Error::Vision("helper response missing results array".into()))?;
+
+        let mut out = Vec::with_capacity(results.len());
+        for res in results {
+            if res["ok"].as_bool().unwrap_or(false) {
+                let content = res["content"].as_str().unwrap_or_default();
+                out.push(parse_description(content));
+            } else {
+                let err = res["error"].as_str().unwrap_or("helper batch item error");
+                out.push(Err(Error::Vision(err.to_string())));
+            }
+        }
+        Ok(out)
     }
 
     pub async fn embed(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>, Error> {
@@ -563,6 +609,7 @@ echo '{"ready":true,"vision":true,"embed_dim":3}'
 while IFS= read -r line; do
   id=$(printf '%s' "$line" | sed 's/.*"id":\([0-9]*\).*/\1/')
   case "$line" in
+    *'"cmd":"batch_describe"'*) printf '{"id":%s,"ok":true,"results":[{"ok":true,"content":"{\\"description\\":\\"a cat\\",\\"visible_text\\":[],\\"objects\\":[\\"cat\\"],\\"setting\\":\\"sofa\\",\\"shot\\":\\"medium\\",\\"tags\\":[]}"}]}\n' "$id" ;;
     *'"cmd":"describe"'*) printf '{"id":%s,"ok":true,"content":"{\\"description\\":\\"a cat\\",\\"visible_text\\":[],\\"objects\\":[\\"cat\\"],\\"setting\\":\\"sofa\\",\\"shot\\":\\"medium\\",\\"tags\\":[]}"}\n' "$id" ;;
     *'"cmd":"embed"'*) printf '{"id":%s,"ok":true,"embeddings":[[1,0,0],[0,1,0]]}\n' "$id" ;;
   esac
@@ -577,11 +624,15 @@ done
             embed: None,
             cpu: false,
             runtime: Default::default(),
+            concurrency: 1,
         };
         let mut llm = LocalLlm::start(&models).await.unwrap();
         assert_eq!(llm.embed_dim, Some(3));
         let d = llm.describe(Path::new("/x.jpg"), None).await.unwrap();
         assert_eq!(d.objects, vec!["cat"]);
+        let batch = llm.batch_describe(&[(Path::new("/x.jpg"), None)]).await.unwrap();
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].as_ref().unwrap().objects, vec!["cat"]);
         let e = llm.embed(&["a".into(), "b".into()]).await.unwrap();
         assert_eq!(e, vec![vec![1.0, 0.0, 0.0], vec![0.0, 1.0, 0.0]]);
     }
@@ -619,6 +670,7 @@ done
             embed: None,
             cpu: false,
             runtime: Default::default(),
+            concurrency: 1,
         };
         let mut llm = LocalLlm::start(&models).await.unwrap();
 
@@ -648,6 +700,7 @@ done
             embed: None,
             cpu: false,
             runtime: Default::default(),
+            concurrency: 1,
         };
         let err = LocalLlm::start(&models).await.err().unwrap();
         assert!(err.to_string().contains("out of memory"), "{err}");

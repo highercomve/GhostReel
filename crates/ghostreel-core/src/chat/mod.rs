@@ -169,6 +169,7 @@ impl ChatBackend {
                     embed: None,
                     cpu: false,
                     runtime: runtime.clone(),
+                    concurrency: 1,
                 };
                 let llm = crate::vision::LocalLlm::start(&models).await?;
                 Ok(ChatBackend::Local { helper: Box::new(llm), ctx_tokens: runtime.ctx_tokens, think: runtime.think })

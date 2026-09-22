@@ -5,6 +5,7 @@ import {
   addFolder,
   clock,
   enqueueIndex,
+  enqueueSteadiness,
   fileName,
   fileUrl,
   fpsLabel,
@@ -14,6 +15,7 @@ import {
   removeFolder,
   redoProjectStage,
   getAiSettings,
+  setAiSettings,
   removeProject,
   excludeVideo,
   includeVideo,
@@ -65,8 +67,29 @@ export default function ProjectPage({ projectId, onChanged }: { projectId: numbe
   const [searchNote, setSearchNote] = useState<string | null>(null);
   const [searching, setSearching] = useState(false);
   const [editName, setEditName] = useState<string | null>(null);
+  const [samplingSize, setSamplingSize] = useState<number>(768);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const menuRef = useRef<HTMLDivElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
   const tasks = useQueue();
+
+  useEffect(() => {
+    if (!menuOpen) return;
+    const onClickOutside = (e: MouseEvent) => {
+      if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
+        setMenuOpen(false);
+      }
+    };
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setMenuOpen(false);
+    };
+    document.addEventListener("mousedown", onClickOutside);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("mousedown", onClickOutside);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [menuOpen]);
 
   const refresh = useCallback(async () => {
     try {
@@ -74,6 +97,12 @@ export default function ProjectPage({ projectId, onChanged }: { projectId: numbe
       setError(null);
     } catch (e) {
       setError(String(e));
+    }
+    try {
+      const s = await getAiSettings();
+      setSamplingSize(s.frames.long_side ?? 768);
+    } catch {
+      /* ignore */
     }
   }, [projectId]);
 
@@ -123,13 +152,16 @@ export default function ProjectPage({ projectId, onChanged }: { projectId: numbe
 
   const onRebuildFrames = async () => {
     let interval = "the current";
+    let size = samplingSize;
     try {
-      interval = `${(await getAiSettings()).frames.max_interval_s} s`;
+      const s = await getAiSettings();
+      interval = `${s.frames.max_interval_s} s`;
+      size = s.frames.long_side ?? samplingSize;
     } catch {
       /* keep generic wording */
     }
     const ok = await ask(
-      `Re-extract and re-describe all keyframes of this project with ${interval} interval? Transcripts are kept. This re-runs frame descriptions and search embeddings, which can take a while.`,
+      `Re-extract and re-describe all keyframes of this project with ${interval} interval at ${size}px sampling size? Transcripts are kept. This re-runs frame descriptions and search embeddings, which can take a while.`,
       { title: "Rebuild keyframes", kind: "warning" },
     );
     if (ok) run(() => redoProjectStage(projectId, "frames"));
@@ -225,14 +257,120 @@ export default function ProjectPage({ projectId, onChanged }: { projectId: numbe
           </p>
         </div>
         <div className="header-actions">
-          <button
-            className="ghost"
-            onClick={onRebuildFrames}
-            disabled={!!running || !!queued || view.videos.length === 0}
-            title="Re-extract keyframes with the interval set on the Models page"
-          >
-            Rebuild keyframes
-          </button>
+          <div className="project-menu-container" ref={menuRef}>
+            <button
+              type="button"
+              className="ghost"
+              onClick={() => setMenuOpen(!menuOpen)}
+              aria-expanded={menuOpen}
+              title="Project settings, video analysis & management"
+            >
+              ⚙ Project ▾
+            </button>
+            {menuOpen && (
+              <div className="project-menu">
+                <div className="project-menu-section-title">Video Analysis</div>
+
+                <div className="project-menu-field">
+                  <span className="project-menu-label">Vision sampling</span>
+                  <select
+                    className="project-menu-select"
+                    value={samplingSize}
+                    onChange={async (e) => {
+                      const v = Number(e.target.value);
+                      setSamplingSize(v);
+                      try {
+                        await setAiSettings({ frames: { long_side: v } });
+                      } catch {
+                        /* ignore */
+                      }
+                    }}
+                    disabled={!!running || !!queued}
+                  >
+                    <option value={512}>512 px (fastest)</option>
+                    <option value={640}>640 px (fast)</option>
+                    <option value={768}>768 px (default)</option>
+                    <option value={1024}>1024 px (high detail)</option>
+                    <option value={1280}>1280 px (full detail)</option>
+                  </select>
+                </div>
+
+                <button
+                  type="button"
+                  className="project-menu-item"
+                  onClick={() => {
+                    setMenuOpen(false);
+                    onRebuildFrames();
+                  }}
+                  disabled={!!running || !!queued || view.videos.length === 0}
+                  title="Re-extract and re-describe keyframes with current interval and sampling size"
+                >
+                  <span>Rebuild keyframes…</span>
+                </button>
+
+                {view.videos.some((v) => !v.steadiness_measured) ? (
+                  <button
+                    type="button"
+                    className="project-menu-item"
+                    onClick={() => {
+                      setMenuOpen(false);
+                      run(() => enqueueSteadiness(projectId, false));
+                    }}
+                    disabled={!!running || !!queued}
+                    title="Analyze camera steadiness/shake for unmeasured videos in this project"
+                  >
+                    <span>Analyze camera shake</span>
+                    <span className="tag warn small">pending</span>
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    className="project-menu-item"
+                    onClick={async () => {
+                      setMenuOpen(false);
+                      const ok = await ask("Re-measure camera steadiness for all videos in this project?", {
+                        title: "Re-analyze camera shake",
+                      });
+                      if (ok) run(() => enqueueSteadiness(projectId, true));
+                    }}
+                    disabled={!!running || !!queued || view.videos.length === 0}
+                    title="Re-measure camera steadiness for all videos in this project"
+                  >
+                    <span>Re-analyze camera shake…</span>
+                  </button>
+                )}
+
+                <div className="project-menu-divider" />
+
+                <div className="project-menu-section-title">Project</div>
+
+                <button
+                  type="button"
+                  className="project-menu-item"
+                  onClick={() => {
+                    setMenuOpen(false);
+                    setEditName(p.name);
+                  }}
+                  title="Rename this project"
+                >
+                  <span>Rename project</span>
+                </button>
+
+                <button
+                  type="button"
+                  className="project-menu-item danger"
+                  onClick={() => {
+                    setMenuOpen(false);
+                    onDelete();
+                  }}
+                  title="Delete this project"
+                >
+                  <span>Delete project…</span>
+                </button>
+              </div>
+            )}
+          </div>
+
           <button onClick={() => run(() => enqueueIndex(projectId))} disabled={!!queued || view.folders.length === 0}>
             {running ? "Index again" : queued ? "Queued…" : "Index now"}
           </button>

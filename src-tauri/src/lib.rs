@@ -254,6 +254,23 @@ async fn enqueue_index(app: AppHandle, queue: State<'_, queue::Queue>, project_i
     Ok(queue.enqueue(&app, queue::TaskKind::Index { project_id }, format!("Index “{name}”")).await)
 }
 
+#[tauri::command]
+async fn enqueue_steadiness(
+    app: AppHandle,
+    queue: State<'_, queue::Queue>,
+    project_id: i64,
+    force: Option<bool>,
+) -> CmdResult<u64> {
+    let name = open_db()?.project(project_id).map_err(err)?.name;
+    let force = force.unwrap_or(false);
+    let label = if force {
+        format!("Re-analyze camera shake “{name}”")
+    } else {
+        format!("Analyze camera shake “{name}”")
+    };
+    Ok(queue.enqueue(&app, queue::TaskKind::Steadiness { project_id, force }, label).await)
+}
+
 /// Reset a stage (and later stages) back to pending for a project's videos, then enqueue an index run.
 /// `stage` must be one of: frames, transcribe, describe, embed.
 #[tauri::command]
@@ -531,11 +548,13 @@ struct AiSettingsPatch {
 #[derive(Serialize, Deserialize)]
 struct FrameSettingsView {
     max_interval_s: f64,
+    long_side: u32,
 }
 
 #[derive(Deserialize, Default)]
 struct FrameSettingsPatch {
     max_interval_s: Option<f64>,
+    long_side: Option<u32>,
 }
 
 #[derive(Serialize)]
@@ -764,7 +783,7 @@ async fn get_ai_settings() -> CmdResult<AiSettingsView> {
             url: config.embed.url,
             model: config.embed.model,
         },
-        frames: FrameSettingsView { max_interval_s: config.frames.max_interval_s },
+        frames: FrameSettingsView { max_interval_s: config.frames.max_interval_s, long_side: config.frames.long_side },
         jev: jev_view(&config.jev),
     })
 }
@@ -851,13 +870,19 @@ async fn set_ai_settings(patch: AiSettingsPatch, search_state: State<'_, SearchS
         *search_state.0.lock().await = None;
     }
 
-    if let Some(f) = patch.frames
-        && let Some(v) = f.max_interval_s
-    {
-        if v < 1.0 || v > 60.0 {
-            return Err(format!("frames.max_interval_s must be between 1 and 60, got {v}"));
+    if let Some(f) = patch.frames {
+        if let Some(v) = f.max_interval_s {
+            if v < 1.0 || v > 60.0 {
+                return Err(format!("frames.max_interval_s must be between 1 and 60, got {v}"));
+            }
+            config.frames.max_interval_s = v;
         }
-        config.frames.max_interval_s = v;
+        if let Some(s) = f.long_side {
+            if !(256..=3840).contains(&s) {
+                return Err(format!("frames.long_side must be between 256 and 3840, got {s}"));
+            }
+            config.frames.long_side = s;
+        }
     }
 
     if let Some(j) = patch.jev {
@@ -888,7 +913,6 @@ async fn set_ai_settings(patch: AiSettingsPatch, search_state: State<'_, SearchS
     let vision_caps = vision_caps_view(&config).await;
     Ok(AiSettingsView {
         vision_caps,
-        jev: jev_view(&config.jev),
         vision: llm_view(&config.vision),
         chat_model: llm_view(&config.chat_model()),
         stt: SttSettingsView { backend: config.stt.backend.to_string(), url: config.stt.url, model: config.stt.model },
@@ -897,7 +921,8 @@ async fn set_ai_settings(patch: AiSettingsPatch, search_state: State<'_, SearchS
             url: config.embed.url,
             model: config.embed.model,
         },
-        frames: FrameSettingsView { max_interval_s: config.frames.max_interval_s },
+        frames: FrameSettingsView { max_interval_s: config.frames.max_interval_s, long_side: config.frames.long_side },
+        jev: jev_view(&config.jev),
     })
 }
 
@@ -1230,6 +1255,7 @@ pub fn run() {
             add_folder,
             remove_folder,
             enqueue_index,
+            enqueue_steadiness,
             enqueue_preview,
             enqueue_export,
             preview_plan,

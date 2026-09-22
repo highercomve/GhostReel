@@ -45,12 +45,14 @@ main {
 header {
   display: flex;
   align-items: center;
+  justify-content: space-between;
   gap: 12px;
   margin-bottom: 16px;
 }
 
-header > div {
+header > div:first-child {
   flex: 1;
+  min-width: 0;
 }
 
 h1 {
@@ -1890,7 +1892,114 @@ form.rename input { font-size: 1.6rem; font-weight: 700; padding: 2px 8px; min-w
 .vision-table .col-radio { width: 44px; text-align: center; }
 
 
-.header-actions { display: flex; gap: 8px; align-items: center; }
+.header-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  justify-content: flex-end;
+  margin-left: auto;
+  flex-shrink: 0;
+}
+
+/* Project header actions & dropdown menu */
+.project-menu-container {
+  position: relative;
+}
+
+.project-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  min-width: 260px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 6px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.55);
+  z-index: 100;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.project-menu-section-title {
+  padding: 6px 10px 2px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+}
+
+.project-menu-field {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 10px;
+}
+
+.project-menu-label {
+  font-size: 13px;
+  color: var(--text);
+  white-space: nowrap;
+}
+
+.project-menu-select {
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 8px;
+  font-size: 12px;
+  outline: none;
+  cursor: pointer;
+}
+
+.project-menu-select:focus {
+  border-color: var(--accent);
+}
+
+.project-menu-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  padding: 8px 10px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text);
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  text-align: left;
+  cursor: pointer;
+  box-sizing: border-box;
+  transition: background 0.1s ease;
+}
+
+.project-menu-item:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--border) 50%, transparent);
+}
+
+.project-menu-item:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.project-menu-item.danger {
+  color: var(--bad);
+}
+
+.project-menu-item.danger:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--bad) 15%, transparent);
+}
+
+.project-menu-divider {
+  height: 1px;
+  background: var(--border);
+  margin: 4px 0;
+}
 
 .prompt-editor { width: 100%; min-height: 460px; font-family: ui-monospace, monospace; font-size: 0.85rem; line-height: 1.45; resize: vertical; box-sizing: border-box; }
 .prompt-actions { justify-content: space-between; margin-top: 8px; }

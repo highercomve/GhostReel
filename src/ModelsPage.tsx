@@ -699,6 +699,25 @@ export default function ModelsPage() {
             </span>
           </div>
 
+          <div className="settings-field">
+            <label>Sampling size</label>
+            <input
+              type="number"
+              min={256}
+              max={3840}
+              step={64}
+              style={{ width: "6em" }}
+              defaultValue={ai.frames.long_side ?? 768}
+              onChange={(e) => {
+                const v = Number(e.currentTarget.value);
+                if (v >= 256 && v <= 3840) debouncedUrlPatch("frames.long_side", { frames: { long_side: v } });
+              }}
+            />
+            <span className="muted small">
+              px on long side (default 768) · lower (512–768) = fewer tokens, faster AI description and lower VRAM; higher = finer visual detail.
+            </span>
+          </div>
+
           {(visionBackend === "server" || visionBackend === "auto") && (
             <div className="settings-fields">
               <div className="settings-field">

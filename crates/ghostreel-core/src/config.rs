@@ -542,11 +542,15 @@ pub struct FramesConfig {
     /// changes five times faster gets five times the frames, with no notion of what a car is —
     /// and this is what stops that from becoming an overnight describe job.
     pub min_interval_s: f64,
+    /// Maximum resolution (pixels on the long side) for extracted keyframes and vision model description.
+    /// Default is 768 px. Lower values (e.g. 512, 640) reduce visual tokens, speeding up prompt
+    /// evaluation and lowering VRAM requirements; higher values (e.g. 1024, 1280) capture finer details.
+    pub long_side: u32,
 }
 
 impl Default for FramesConfig {
     fn default() -> Self {
-        Self { max_interval_s: 8.0, change_budget: 1.0, min_interval_s: 2.0 }
+        Self { max_interval_s: 8.0, change_budget: 1.0, min_interval_s: 2.0, long_side: 768 }
     }
 }
 
@@ -562,10 +566,17 @@ impl FramesConfig {
         self.max_interval_s.clamp(1.0, 60.0)
     }
 
-    /// Validate that `max_interval_s` is within the 1–60 range, returning an error message if not.
+    /// Clamp `long_side` to the valid range (256–3840 px) without erroring.
+    pub fn clamped_long_side(&self) -> u32 {
+        self.long_side.clamp(256, 3840)
+    }
+
+    /// Validate that `max_interval_s` and `long_side` are within valid ranges.
     pub fn validate(&self) -> Result<(), String> {
         if self.max_interval_s < 1.0 || self.max_interval_s > 60.0 {
             Err(format!("frames.max_interval_s must be between 1 and 60, got {}", self.max_interval_s))
+        } else if self.long_side < 256 || self.long_side > 3840 {
+            Err(format!("frames.long_side must be between 256 and 3840, got {}", self.long_side))
         } else {
             Ok(())
         }
@@ -754,13 +765,20 @@ impl Config {
                 }
                 self.frames.min_interval_s = v;
             }
+            "frames.long_side" | "frames.sampling_size" => {
+                let v: u32 = num(key, value)?;
+                if !(256..=3840).contains(&v) {
+                    return Err(format!("frames.long_side must be between 256 and 3840, got {v}"));
+                }
+                self.frames.long_side = v;
+            }
             other => {
                 return Err(format!(
                     "unknown or unsupported config key '{other}'; supported keys: \
                      vision.* and chat_model.* (backend, url, model, local_model, ctx_tokens, kv_cache, \
                      flash_attn, think), vision.cli.* and chat_model.cli.* (tool, command, model, \
                      timeout_secs, concurrency), stt.backend, stt.url, embed.backend, embed.url, \
-                     frames.max_interval_s"
+                     frames.max_interval_s, frames.long_side"
                 ));
             }
         }

@@ -293,6 +293,8 @@ export interface PlannedSegment {
 }
 
 export const enqueueIndex = (projectId: number) => invoke<number>("enqueue_index", { projectId });
+export const enqueueSteadiness = (projectId: number, force = false) =>
+  invoke<number>("enqueue_steadiness", { projectId, force });
 /** `out`: save the rendered MP4 there (demo export) instead of the previews folder. */
 export const enqueuePreview = (
   scriptId: number,
@@ -624,6 +626,7 @@ export interface EmbedSettings {
 
 export interface FrameSettings {
   max_interval_s: number;
+  long_side: number;
 }
 
 /** What a server admits it can do; drives whether a control is offered at all. */
@@ -709,6 +712,7 @@ export interface EmbedSettingsPatch {
 
 export interface FrameSettingsPatch {
   max_interval_s?: number;
+  long_side?: number;
 }
 
 export interface AiSettingsPatch {

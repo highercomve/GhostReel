@@ -50,6 +50,11 @@ pub enum TaskKind {
     DownloadModel {
         model_id: String,
     },
+    Steadiness {
+        project_id: i64,
+        #[serde(default)]
+        force: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -230,6 +235,7 @@ impl Queue {
 
 enum TaskOutcome {
     Index(index::Summary),
+    Steadiness { measured: usize, total: usize },
     Preview { path: String },
     Export { path: String },
     Chat,
@@ -248,7 +254,48 @@ pub async fn worker(app: AppHandle) {
         queue.emit(&app).await;
         let result = match kind {
             TaskKind::Index { project_id } => {
-                run_index(&app, id, project_id, cancel.clone()).await.map(TaskOutcome::Index)
+                let outcome = run_index(&app, id, project_id, cancel.clone()).await.map(TaskOutcome::Index);
+                if let Ok(TaskOutcome::Index(ref summary)) = outcome
+                    && !summary.cancelled
+                {
+                    let p = Paths::resolve().ok();
+                    let config = p.as_ref().and_then(|p| Config::load(&p.config_file).ok());
+                    if config.as_ref().is_some_and(|c| c.script.max_shake_jerk > 0.0)
+                        && let Ok(db) = p.as_ref().map(|p| Db::open(&p.db_file())).transpose()
+                        && let Some(db) = db
+                    {
+                        let unmeasured: i64 = db
+                            .conn
+                            .query_row(
+                                "SELECT COUNT(DISTINCT v.id) FROM videos v
+                                 JOIN video_files vf ON vf.video_id = v.id
+                                 JOIN project_folders pf ON pf.folder_id = vf.folder_id AND pf.project_id = ?1
+                                 WHERE v.duration_s > 0
+                                   AND NOT EXISTS (SELECT 1 FROM motion_windows mw WHERE mw.video_id = v.id)",
+                                [project_id],
+                                |r| r.get(0),
+                            )
+                            .unwrap_or(0);
+                        if unmeasured > 0 {
+                            let name = db
+                                .project(project_id)
+                                .ok()
+                                .map(|pr| pr.name)
+                                .unwrap_or_else(|| format!("{project_id}"));
+                            let q = app.state::<Queue>();
+                            q.enqueue(
+                                &app,
+                                TaskKind::Steadiness { project_id, force: false },
+                                format!("Analyze camera shake “{name}”"),
+                            )
+                            .await;
+                        }
+                    }
+                }
+                outcome
+            }
+            TaskKind::Steadiness { project_id, force } => {
+                run_steadiness(&app, id, project_id, force, cancel.clone()).await
             }
             TaskKind::RenderPreview { script_id, burn_titles, burn_narration, normalize_audio, out } => {
                 run_preview(&app, id, script_id, burn_titles, burn_narration, normalize_audio, out, cancel.clone())
@@ -284,6 +331,16 @@ pub async fn worker(app: AppHandle) {
                     Ok(TaskOutcome::Index(summary)) => {
                         t.state = if summary.cancelled { TaskState::Cancelled } else { TaskState::Done };
                         t.summary = Some(summary);
+                    }
+                    Ok(TaskOutcome::Steadiness { measured, total }) => {
+                        t.state = TaskState::Done;
+                        t.output = Some(if measured == 0 {
+                            format!("All {total} videos already measured (up to date)")
+                        } else if measured == total {
+                            format!("Measured camera steadiness on all {measured} videos")
+                        } else {
+                            format!("Measured camera steadiness on {measured} of {total} videos")
+                        });
                     }
                     Ok(TaskOutcome::Preview { path }) => {
                         t.state = TaskState::Done;
@@ -391,12 +448,78 @@ async fn run_index(
     result.map_err(|e| e.to_string())
 }
 
+async fn run_steadiness(
+    app: &AppHandle,
+    task_id: u64,
+    project_id: i64,
+    force: bool,
+    cancel: Arc<AtomicBool>,
+) -> Result<TaskOutcome, String> {
+    let p = Paths::resolve().map_err(|e| e.to_string())?;
+    let config = Config::load(&p.config_file).map_err(|e| e.to_string())?;
+    let lock = loop {
+        match IndexLock::acquire(&p.data_dir) {
+            Ok(l) => break l,
+            Err(ghostreel_core::Error::Busy(_)) => {
+                app.state::<Queue>()
+                    .update(app, task_id, |t| t.note = Some("Waiting for another process to finish indexing…".into()))
+                    .await;
+                if cancel.load(Ordering::SeqCst) {
+                    return Ok(TaskOutcome::Cancelled);
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            }
+            Err(e) => return Err(e.to_string()),
+        }
+    };
+    let mut db = Db::open(&p.db_file()).map_err(|e| e.to_string())?;
+    let rt = runtime::resolve(&p, &config).await.map_err(|e| e.to_string())?;
+    let opts = index::Options { project_id: Some(project_id), cancel: Some(cancel), ..Default::default() };
+    let mut tracker = ghostreel_core::progress::Tracker::new(&[("steadiness", 1.0)]);
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<index::Event>();
+    let forward = {
+        let app = app.clone();
+        tauri::async_runtime::spawn(async move {
+            while let Some(e) = rx.recv().await {
+                let _ = app.emit("index-event", (task_id, &e));
+                let queue = app.state::<Queue>();
+                match e {
+                    index::Event::Progress(p) => queue.update(&app, task_id, |t| t.progress = Some(p)).await,
+                    index::Event::JobStarted { path, .. } => {
+                        queue
+                            .update(&app, task_id, |t| {
+                                t.note = Some(format!(
+                                    "Measuring camera shake: {}",
+                                    path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()
+                                ))
+                            })
+                            .await
+                    }
+                    _ => {}
+                }
+            }
+        })
+    };
+
+    let summary = index::run_steadiness_jobs(&mut db, &rt, &opts, force, &mut tracker, &mut |e| {
+        let _ = tx.send(e);
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    drop(tx);
+    let _ = forward.await;
+    drop(lock);
+    Ok(TaskOutcome::Steadiness { measured: summary.measured, total: summary.total })
+}
+
 fn stage_name(stage: &str) -> &str {
     match stage {
         "transcribe" => "Transcription",
         "describe" => "Frame descriptions",
         "embed" => "Search index",
         "frames" => "Keyframes",
+        "steadiness" => "Camera steadiness",
         other => other,
     }
 }

@@ -51,7 +51,7 @@ impl Default for FrameOptions {
             change_budget: 1.0,
             max_interval_s: 20.0,
             min_interval_s: 2.0,
-            long_side: 1280,
+            long_side: 768,
             dup_distance: 5,
             max_dup_gap_s: 60.0,
             max_frames: 600,
@@ -67,6 +67,7 @@ impl FrameOptions {
     ///   so static sections still collapse to one frame even with short intervals.
     /// - `max_frames` raised to `max(600, duration/interval)` via the caller; here we use a safe
     ///   global cap of 5000 so very long videos aren't silently truncated.
+    /// - `long_side` clamped to 256–3840 px (default 768).
     pub fn from_config(cfg: &crate::config::FramesConfig) -> Self {
         let interval = cfg.clamped_interval();
         Self {
@@ -75,6 +76,7 @@ impl FrameOptions {
             max_frames: 5000,
             change_budget: cfg.change_budget,
             min_interval_s: cfg.clamped_min_interval(),
+            long_side: cfg.clamped_long_side(),
             ..Self::default()
         }
     }
@@ -113,11 +115,32 @@ pub async fn scene_scan(
     opts: &FrameOptions,
     mut on_progress: impl FnMut(f64),
 ) -> Result<SceneScan, Error> {
+    match scene_scan_run(ffmpeg, video, opts, true, &mut on_progress).await {
+        Ok(scan) => Ok(scan),
+        Err(e) => {
+            // Hardware acceleration failed (e.g. out of GPU memory, no CUDA device, or unsupported codec):
+            // retry with software decode.
+            tracing::warn!("hwaccel scene scan failed ({e}), falling back to software decode");
+            scene_scan_run(ffmpeg, video, opts, false, &mut on_progress).await
+        }
+    }
+}
+
+async fn scene_scan_run(
+    ffmpeg: &Path,
+    video: &Path,
+    opts: &FrameOptions,
+    use_hwaccel: bool,
+    on_progress: &mut impl FnMut(f64),
+) -> Result<SceneScan, Error> {
     let threshold = opts.scene_threshold;
     let filter = "fps=4,scale=256:-2,select='gte(scene\\,0)',metadata=print:key=lavfi.scene_score";
-    let mut child = crate::proc::command(ffmpeg)
-        .args(["-nostdin", "-hide_banner", "-nostats"])
-        .args(hwaccel_args())
+    let mut cmd = crate::proc::command(ffmpeg);
+    cmd.args(["-nostdin", "-hide_banner", "-nostats"]);
+    if use_hwaccel {
+        cmd.args(hwaccel_args());
+    }
+    let mut child = cmd
         .arg("-i")
         .arg(video)
         .args(["-an", "-sn", "-dn", "-vf", filter, "-f", "null", "-"])
@@ -131,9 +154,6 @@ pub async fn scene_scan(
     let mut scan = SceneScan::default();
     let mut last_error = String::new();
     let mut pts = 0.0f64;
-    // The running sum since the last frame this pass asked for, and when that was. A cut resets
-    // both: a new shot starts its own drift, and carrying the old one over would ask for a frame
-    // moments after the cut already got one.
     let mut accumulated = 0.0f64;
     let mut last_pick = f64::NEG_INFINITY;
     let budget = opts.change_budget;

@@ -47,6 +47,7 @@ struct Args {
     kv_type: String,
     /// `auto`, `on` or `off`.
     flash_attn: String,
+    concurrency: u32,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -58,6 +59,7 @@ fn parse_args() -> Result<Args, String> {
         ngl: 999,
         kv_type: "q8_0".into(),
         flash_attn: "auto".into(),
+        concurrency: 4,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -67,6 +69,7 @@ fn parse_args() -> Result<Args, String> {
             "--mmproj" => a.mmproj = Some(val()?),
             "--embed-model" => a.embed_model = Some(val()?),
             "--ctx" => a.ctx = val()?.parse().map_err(|_| "--ctx needs a number")?,
+            "--concurrency" => a.concurrency = val()?.parse().map_err(|_| "--concurrency needs a number")?,
             "--ngl" => a.ngl = val()?.parse().map_err(|_| "--ngl needs a number")?,
             "--cpu" => a.ngl = 0,
             "--kv-type" => {
@@ -88,7 +91,7 @@ fn parse_args() -> Result<Args, String> {
             "-h" | "--help" => {
                 println!(
                     "usage: ghostreel-llm [--model m.gguf --mmproj p.gguf] [--embed-model e.gguf] [--ctx N] \
-[--kv-type f16|q8_0|q4_0] [--flash-attn auto|on|off] [--ngl N|--cpu]"
+[--concurrency N] [--kv-type f16|q8_0|q4_0] [--flash-attn auto|on|off] [--ngl N|--cpu]"
                 );
                 std::process::exit(0);
             }
@@ -102,6 +105,17 @@ fn parse_args() -> Result<Args, String> {
         return Err("nothing to load: pass --model/--mmproj and/or --embed-model".into());
     }
     Ok(a)
+}
+
+#[derive(Clone, Deserialize)]
+struct BatchDescribeItem {
+    image: String,
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
+    schema: Option<Value>,
+    #[serde(default)]
+    max_tokens: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -118,6 +132,8 @@ struct Request {
     max_tokens: Option<usize>,
     #[serde(default)]
     texts: Option<Vec<String>>,
+    #[serde(default)]
+    items: Option<Vec<BatchDescribeItem>>,
     /// Let the model reason before answering. The grammar only binds after `</think>`, so the
     /// reasoning is free text; without this a schema forces JSON from the very first token.
     #[serde(default)]
@@ -146,6 +162,7 @@ struct Vision<'a> {
     mtmd: MtmdContext,
     ctx: LlamaContext<'a>,
     n_batch: u32,
+    concurrency: usize,
 }
 
 fn format_prompt_with_template(model: &LlamaModel, user_message: &str) -> String {
@@ -268,6 +285,281 @@ impl Vision<'_> {
         }))
     }
 
+    fn batch_describe(&mut self, items: &[BatchDescribeItem]) -> Result<Vec<Value>, String> {
+        let mut all_results = Vec::with_capacity(items.len());
+        let chunk_size = self.concurrency.max(1);
+
+        for chunk in items.chunks(chunk_size) {
+            let t0 = Instant::now();
+            self.ctx.clear_kv_cache();
+
+            struct SlotState {
+                original_idx: usize,
+                prompt_tokens: usize,
+                pos: i32,
+                seq_id: i32,
+                max_tokens: usize,
+                chain: LlamaSampler,
+                grammar: Option<LlamaSampler>,
+                decoder: encoding_rs::Decoder,
+                out: String,
+                gen_tokens: usize,
+                next_token: llama_cpp_2::token::LlamaToken,
+                active: bool,
+            }
+
+            let mut slots: Vec<SlotState> = Vec::with_capacity(chunk.len());
+            let mut chunk_results: Vec<Option<Value>> = vec![None; chunk.len()];
+
+            for (slot_idx, item) in chunk.iter().enumerate() {
+                let marker = llama_cpp_2::mtmd::mtmd_default_marker();
+                let prompt_str = item.prompt.as_deref().unwrap_or("Describe this image.");
+                let user_msg = format!("{marker}{prompt_str}");
+                let text = format_prompt_with_template(self.model, &user_msg);
+                let bitmap = match MtmdBitmap::from_file(&self.mtmd, &item.image, false) {
+                    Ok(bm) => bm,
+                    Err(e) => {
+                        chunk_results[slot_idx] = Some(json!({
+                            "ok": false,
+                            "error": format!("image {}: {e:?}", item.image),
+                        }));
+                        continue;
+                    }
+                };
+                let chunks = match self
+                    .mtmd
+                    .tokenize(MtmdInputText { text, add_special: true, parse_special: true }, &[&bitmap])
+                {
+                    Ok(c) => c,
+                    Err(e) => {
+                        chunk_results[slot_idx] = Some(json!({
+                            "ok": false,
+                            "error": format!("tokenize: {e:?}"),
+                        }));
+                        continue;
+                    }
+                };
+                let prompt_tokens = chunks.total_tokens();
+                let seq_id = slot_idx as i32;
+                let n_past = match chunks.eval_chunks(&self.mtmd, &self.ctx, 0, seq_id, self.n_batch as i32, true) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        chunk_results[slot_idx] = Some(json!({
+                            "ok": false,
+                            "error": format!("prompt eval: {e:?}"),
+                        }));
+                        continue;
+                    }
+                };
+
+                let mut grammar = match &item.schema {
+                    Some(s) if !s.is_null() => match llama_cpp_2::json_schema_to_grammar(&s.to_string()) {
+                        Ok(g) => match LlamaSampler::grammar(self.model, &g, "root") {
+                            Ok(samp) => Some(samp),
+                            Err(e) => {
+                                chunk_results[slot_idx] = Some(json!({
+                                    "ok": false,
+                                    "error": format!("grammar: {e:?}"),
+                                }));
+                                continue;
+                            }
+                        },
+                        Err(e) => {
+                            chunk_results[slot_idx] = Some(json!({
+                                "ok": false,
+                                "error": format!("schema: {e:?}"),
+                            }));
+                            continue;
+                        }
+                    },
+                    _ => None,
+                };
+
+                let mut chain = LlamaSampler::chain_simple([
+                    LlamaSampler::penalties(self.model.n_vocab(), 64, 1.1, 0.0, 0.0),
+                    LlamaSampler::top_k(40),
+                    LlamaSampler::temp(0.2),
+                    LlamaSampler::dist(42),
+                ]);
+
+                let mut cur = self.ctx.token_data_array();
+                cur.apply_sampler(&chain);
+                let Some(mut tok) = cur.selected_token() else {
+                    chunk_results[slot_idx] = Some(json!({
+                        "ok": false,
+                        "error": "sampler selected no token",
+                    }));
+                    continue;
+                };
+                if let Some(g) = grammar.as_ref() {
+                    let mut single = LlamaTokenDataArray::new(vec![LlamaTokenData::new(tok, 1.0, 0.0)], false);
+                    single.apply_sampler(g);
+                    if !single.data[0].logit().is_finite() {
+                        let mut full = self.ctx.token_data_array();
+                        full.apply_sampler(g);
+                        full.apply_sampler(&chain);
+                        if let Some(good_tok) = full.selected_token() {
+                            tok = good_tok;
+                        } else {
+                            chunk_results[slot_idx] = Some(json!({
+                                "ok": false,
+                                "error": "no grammatical token",
+                            }));
+                            continue;
+                        }
+                    }
+                }
+                if let Some(g) = grammar.as_mut() {
+                    g.accept(tok);
+                }
+                chain.accept(tok);
+
+                let mut decoder = encoding_rs::UTF_8.new_decoder();
+                let mut out = String::new();
+                let mut active = true;
+                let mut gen_tokens = 0;
+                let max_tok = item.max_tokens.unwrap_or(1024);
+                if self.model.is_eog_token(tok) {
+                    active = false;
+                } else {
+                    match self.model.token_to_piece(tok, &mut decoder, false, None) {
+                        Ok(piece) => {
+                            out.push_str(&piece);
+                            gen_tokens = 1;
+                        }
+                        Err(e) => {
+                            chunk_results[slot_idx] = Some(json!({
+                                "ok": false,
+                                "error": e.to_string(),
+                            }));
+                            continue;
+                        }
+                    }
+                }
+
+                slots.push(SlotState {
+                    original_idx: slot_idx,
+                    prompt_tokens,
+                    pos: n_past,
+                    seq_id,
+                    max_tokens: max_tok,
+                    chain,
+                    grammar,
+                    decoder,
+                    out,
+                    gen_tokens,
+                    next_token: tok,
+                    active,
+                });
+            }
+
+            let mut batch = LlamaBatch::new(slots.len().max(512), 1);
+            while slots.iter().any(|s| s.active) {
+                batch.clear();
+                let mut active_indices = Vec::new();
+                for (idx, slot) in slots.iter_mut().enumerate() {
+                    if slot.active {
+                        active_indices.push(idx);
+                        if let Err(e) = batch.add(slot.next_token, slot.pos, &[slot.seq_id], true) {
+                            slot.active = false;
+                            chunk_results[slot.original_idx] = Some(json!({
+                                "ok": false,
+                                "error": format!("batch add error: {e}"),
+                            }));
+                        } else {
+                            slot.pos += 1;
+                        }
+                    }
+                }
+                if active_indices.is_empty() {
+                    break;
+                }
+                if let Err(e) = self.ctx.decode(&mut batch) {
+                    for &idx in &active_indices {
+                        slots[idx].active = false;
+                        chunk_results[slots[idx].original_idx] = Some(json!({
+                            "ok": false,
+                            "error": format!("decode error: {e}"),
+                        }));
+                    }
+                    break;
+                }
+
+                for (batch_offset, &slot_idx) in active_indices.iter().enumerate() {
+                    let slot = &mut slots[slot_idx];
+                    if !slot.active {
+                        continue;
+                    }
+                    let mut cur = self.ctx.token_data_array_ith(batch_offset as i32);
+                    cur.apply_sampler(&slot.chain);
+                    let Some(mut tok) = cur.selected_token() else {
+                        slot.active = false;
+                        continue;
+                    };
+                    if let Some(g) = slot.grammar.as_ref() {
+                        let mut single = LlamaTokenDataArray::new(vec![LlamaTokenData::new(tok, 1.0, 0.0)], false);
+                        single.apply_sampler(g);
+                        if !single.data[0].logit().is_finite() {
+                            let mut full = self.ctx.token_data_array_ith(batch_offset as i32);
+                            full.apply_sampler(g);
+                            full.apply_sampler(&slot.chain);
+                            if let Some(good_tok) = full.selected_token() {
+                                tok = good_tok;
+                            } else {
+                                slot.active = false;
+                                continue;
+                            }
+                        }
+                    }
+                    if let Some(g) = slot.grammar.as_mut() {
+                        g.accept(tok);
+                    }
+                    slot.chain.accept(tok);
+
+                    if self.model.is_eog_token(tok) {
+                        slot.active = false;
+                        continue;
+                    }
+                    if let Ok(piece) = self.model.token_to_piece(tok, &mut slot.decoder, false, None) {
+                        slot.out.push_str(&piece);
+                    }
+                    slot.gen_tokens += 1;
+                    slot.next_token = tok;
+                    if slot.gen_tokens >= slot.max_tokens {
+                        slot.active = false;
+                    }
+                }
+            }
+
+            let chunk_secs = t0.elapsed().as_secs_f64();
+            for slot in slots {
+                if chunk_results[slot.original_idx].is_none() {
+                    let (thought, answer) = match slot.out.split_once(CLOSE_THINK) {
+                        Some((t, a)) => {
+                            (Some(t.trim_start_matches(OPEN_THINK).trim().to_string()), a.trim().to_string())
+                        }
+                        None => (None, slot.out.clone()),
+                    };
+                    chunk_results[slot.original_idx] = Some(json!({
+                        "ok": true,
+                        "content": answer,
+                        "thinking": thought,
+                        "prompt_tokens": slot.prompt_tokens,
+                        "gen_tokens": slot.gen_tokens,
+                        "truncated": slot.gen_tokens >= slot.max_tokens,
+                        "secs": chunk_secs,
+                    }));
+                }
+            }
+
+            for res in chunk_results {
+                all_results.push(res.unwrap_or_else(|| json!({ "ok": false, "error": "unknown slot error" })));
+            }
+        }
+
+        Ok(all_results)
+    }
+
     fn describe(
         &mut self,
         image: &str,
@@ -275,22 +567,22 @@ impl Vision<'_> {
         schema: Option<&Value>,
         max_tokens: usize,
     ) -> Result<Value, String> {
-        let t0 = Instant::now();
-        self.ctx.clear_kv_cache();
-        let marker = llama_cpp_2::mtmd::mtmd_default_marker();
-        let user_msg = format!("{marker}{prompt}");
-        let text = format_prompt_with_template(self.model, &user_msg);
-        let bitmap = MtmdBitmap::from_file(&self.mtmd, image, false).map_err(|e| format!("image {image}: {e:?}"))?;
-        let chunks = self
-            .mtmd
-            .tokenize(MtmdInputText { text, add_special: true, parse_special: true }, &[&bitmap])
-            .map_err(|e| format!("tokenize: {e:?}"))?;
-        let prompt_tokens = chunks.total_tokens();
-        let n_past = chunks
-            .eval_chunks(&self.mtmd, &self.ctx, 0, 0, self.n_batch as i32, true)
-            .map_err(|e| format!("prompt eval: {e:?}"))?;
-
-        self.sample(prompt_tokens, n_past, schema, max_tokens, t0, false, 42, 0.2)
+        let item = BatchDescribeItem {
+            image: image.to_string(),
+            prompt: Some(prompt.to_string()),
+            schema: schema.cloned(),
+            max_tokens: Some(max_tokens),
+        };
+        let mut results = self.batch_describe(&[item])?;
+        if let Some(res) = results.pop() {
+            if res["ok"].as_bool().unwrap_or(false) {
+                Ok(res)
+            } else {
+                Err(res["error"].as_str().unwrap_or("describe failed").to_string())
+            }
+        } else {
+            Err("no result returned".into())
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -333,7 +625,7 @@ impl Vision<'_> {
                 MtmdBitmap::from_file(&self.mtmd, img_path, false).map_err(|e| format!("image {img_path}: {e:?}"))?;
             let marker = llama_cpp_2::mtmd::mtmd_default_marker();
             if let Some(pos) = text.rfind("<|im_start|>user\n") {
-                text.insert_str(pos + "<|im_start|>user\n".len(), &marker);
+                text.insert_str(pos + "<|im_start|>user\n".len(), marker);
             } else {
                 text = format!("{marker}{text}");
             }
@@ -442,7 +734,7 @@ fn run() -> Result<(), String> {
                 }
             };
             effective_ctx = ctx_tokens;
-            Some(Vision { model, mtmd, ctx, n_batch })
+            Some(Vision { model, mtmd, ctx, n_batch, concurrency: args.concurrency.max(1) as usize })
         }
         _ => None,
     };
@@ -479,6 +771,7 @@ fn run() -> Result<(), String> {
         "vision": vision.is_some(),
         "embed_dim": dim,
         "ctx": effective_ctx,
+        "concurrency": args.concurrency,
         "kv_type": args.kv_type,
         "flash_attn": args.flash_attn,
         "ngl": args.ngl,
@@ -499,6 +792,20 @@ fn run() -> Result<(), String> {
             }
         };
         let result = match req.cmd.as_str() {
+            "batch_describe" => match (&mut vision, &req.items) {
+                (Some(v), Some(items)) => {
+                    let t0 = Instant::now();
+                    match v.batch_describe(items) {
+                        Ok(results) => Ok(json!({
+                            "results": results,
+                            "secs": t0.elapsed().as_secs_f64(),
+                        })),
+                        Err(e) => Err(e),
+                    }
+                }
+                (None, _) => Err("vision model not loaded".into()),
+                (_, None) => Err("batch_describe needs items".into()),
+            },
             "describe" => match (&mut vision, &req.image) {
                 (Some(v), Some(image)) => v.describe(
                     image,

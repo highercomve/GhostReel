@@ -39,7 +39,11 @@ the same core.
   click any line to jump there.
 - **Keyframes described by a vision model:** scene changes plus a frame at least every *N*
   seconds (configurable), each described (subject, setting, shot, on-screen text). Scene
-  detection decodes on the GPU.
+  detection decodes on the GPU. Frame descriptions run with configurable sampling resolution
+  (512px–1280px, defaulting to 768px) and concurrent multi-sequence batching in the local helper,
+  achieving sub-second describe times (~0.75s per frame).
+- **Camera steadiness & shake analysis:** measures camera movement and handheld tremor
+  asynchronously, identifying shaky stretches so the script generation and editor cut around them.
 - **Hybrid search:** keywords (SQLite FTS5) + meaning (embeddinggemma vectors, sqlite-vec),
   merged into *moments* you can play from the right second.
 - **Script chat:** ask for "a 60 second promo about the neighbourhood using the interviews" —

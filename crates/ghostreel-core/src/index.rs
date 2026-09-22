@@ -938,19 +938,7 @@ async fn run_frame_jobs(
         match result {
             Ok(frames) => {
                 store_frames(db, video_id, &rt.data_dir, &frames)?;
-                // Measure how steady the camera is while we are already on this file. A failure
-                // here is not worth failing the stage for: the footage is still usable, the
-                // editor simply will not be told to avoid it.
-                if let Some(opts) = rt.steadiness {
-                    match crate::steadiness::measure(&rt.ffmpeg, &path, duration, opts.window_s, opts.stride_s).await {
-                        Ok(windows) => {
-                            let _ = db.set_motion_windows(video_id, &windows);
-                        }
-                        Err(e) => {
-                            on_event(Event::JobFailed { video_id, stage: "steadiness".into(), error: e.to_string() });
-                        }
-                    }
-                }
+                set_job(db, video_id, STAGE, "done", None)?;
                 on_event(Event::JobDone { video_id, stage: STAGE.into() });
                 done += 1;
             }
@@ -967,6 +955,136 @@ async fn run_frame_jobs(
         on_event(Event::Progress(tracker.snapshot(Some(path))));
     }
     Ok((done, failed))
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct SteadinessSummary {
+    pub measured: usize,
+    pub failed: usize,
+    pub total: usize,
+}
+
+/// Measure camera steadiness for videos that haven't been measured yet (or all videos if `force` is true).
+/// Runs lazily as a post-indexing action or dedicated background task.
+pub async fn run_steadiness_jobs(
+    db: &mut Db,
+    rt: &Runtime,
+    opts: &Options,
+    force: bool,
+    tracker: &mut Tracker,
+    on_event: &mut impl FnMut(Event),
+) -> Result<SteadinessSummary, Error> {
+    const STAGE: &str = "steadiness";
+    let total_in_scope: usize = match opts.project_id {
+        Some(pid) => {
+            let mut st = db.conn.prepare(
+                "SELECT COUNT(DISTINCT v.id)
+                 FROM videos v
+                 JOIN video_files vf ON vf.video_id = v.id
+                 JOIN project_folders pf ON pf.folder_id = vf.folder_id AND pf.project_id = ?1
+                 WHERE v.duration_s > 0",
+            )?;
+            st.query_row([pid], |r| r.get::<_, i64>(0)).map(|v| v as usize).unwrap_or(0)
+        }
+        None => {
+            let mut st = db.conn.prepare("SELECT COUNT(DISTINCT id) FROM videos WHERE duration_s > 0")?;
+            st.query_row([], |r| r.get::<_, i64>(0)).map(|v| v as usize).unwrap_or(0)
+        }
+    };
+
+    let Some(steadiness_opts) = rt.steadiness else {
+        return Ok(SteadinessSummary { measured: 0, failed: 0, total: total_in_scope });
+    };
+
+    // Find videos for the project (or all) that have duration > 0.
+    let unmeasured: Vec<(i64, PathBuf, f64)> = match opts.project_id {
+        Some(pid) => {
+            let sql = if force {
+                "SELECT v.id, vf.path, COALESCE(v.duration_s, 0)
+                 FROM videos v
+                 JOIN video_files vf ON vf.video_id = v.id
+                 JOIN project_folders pf ON pf.folder_id = vf.folder_id AND pf.project_id = ?1
+                 WHERE v.duration_s > 0
+                 GROUP BY v.id
+                 ORDER BY v.id"
+            } else {
+                "SELECT v.id, vf.path, COALESCE(v.duration_s, 0)
+                 FROM videos v
+                 JOIN video_files vf ON vf.video_id = v.id
+                 JOIN project_folders pf ON pf.folder_id = vf.folder_id AND pf.project_id = ?1
+                 WHERE v.duration_s > 0
+                   AND NOT EXISTS (SELECT 1 FROM motion_windows mw WHERE mw.video_id = v.id)
+                 GROUP BY v.id
+                 ORDER BY v.id"
+            };
+            let mut st = db.conn.prepare(sql)?;
+            let rows = st.query_map([pid], |r| Ok((r.get(0)?, PathBuf::from(r.get::<_, String>(1)?), r.get(2)?)))?;
+            rows.collect::<Result<_, _>>()?
+        }
+        None => {
+            let sql = if force {
+                "SELECT v.id, vf.path, COALESCE(v.duration_s, 0)
+                 FROM videos v
+                 JOIN video_files vf ON vf.video_id = v.id
+                 WHERE v.duration_s > 0
+                 GROUP BY v.id
+                 ORDER BY v.id"
+            } else {
+                "SELECT v.id, vf.path, COALESCE(v.duration_s, 0)
+                 FROM videos v
+                 JOIN video_files vf ON vf.video_id = v.id
+                 WHERE v.duration_s > 0
+                   AND NOT EXISTS (SELECT 1 FROM motion_windows mw WHERE mw.video_id = v.id)
+                 GROUP BY v.id
+                 ORDER BY v.id"
+            };
+            let mut st = db.conn.prepare(sql)?;
+            let rows = st.query_map([], |r| Ok((r.get(0)?, PathBuf::from(r.get::<_, String>(1)?), r.get(2)?)))?;
+            rows.collect::<Result<_, _>>()?
+        }
+    };
+
+    if unmeasured.is_empty() {
+        tracker.set_total(STAGE, 0);
+        return Ok(SteadinessSummary { measured: 0, failed: 0, total: total_in_scope });
+    }
+
+    let total: f64 = unmeasured.iter().map(|(_, _, d)| *d).sum();
+    tracker.set_total(STAGE, total.ceil() as u64);
+    tracker.start(STAGE);
+    on_event(Event::Progress(tracker.snapshot(None)));
+
+    let (mut done, mut failed) = (0, 0);
+    for (video_id, path, duration) in unmeasured {
+        if opts.cancelled() {
+            break;
+        }
+        on_event(Event::JobStarted { video_id, stage: STAGE.into(), path: path.clone() });
+        match crate::steadiness::measure(
+            &rt.ffmpeg,
+            &path,
+            duration,
+            steadiness_opts.window_s,
+            steadiness_opts.stride_s,
+        )
+        .await
+        {
+            Ok(windows) => {
+                let _ = db.set_motion_windows(video_id, &windows);
+                on_event(Event::JobDone { video_id, stage: STAGE.into() });
+                done += 1;
+            }
+            Err(e) => {
+                on_event(Event::JobFailed { video_id, stage: STAGE.into(), error: e.to_string() });
+                failed += 1;
+            }
+        }
+        tracker.advance(STAGE, duration.ceil() as u64);
+        if tracker.should_emit() {
+            on_event(Event::Progress(tracker.snapshot(Some(path))));
+        }
+    }
+    Ok(SteadinessSummary { measured: done, failed, total: total_in_scope })
 }
 
 // ---- describe -----------------------------------------------------------------------------
@@ -1008,13 +1126,11 @@ fn undescribed_frames(db: &Db, data_dir: &Path, video_id: i64) -> Result<Vec<Pen
 /// chat template this build cannot apply fails on the very first one and every one after.
 const BROKEN_BACKEND_RUN: usize = 5;
 
-/// How many frames to describe at once against a server.
-///
-/// Only the server backend batches. A local model is one set of weights in this process, so a
-/// second concurrent call queues behind the same lock; a CLI agent has its own `concurrency`.
+/// How many frames to describe at once against a server or local helper.
 fn describe_concurrency(rt: &Runtime) -> usize {
     match &rt.vision {
         VisionSetup::Server(_) => rt.describe_concurrency.max(1),
+        VisionSetup::Local { .. } => rt.describe_concurrency.max(1),
         _ => 1,
     }
 }
@@ -1063,6 +1179,7 @@ async fn start_describer(
                 embed: None,
                 cpu: false,
                 runtime: runtime.clone(),
+                concurrency: describe_concurrency(rt),
             };
             LocalLlm::start(&models).await.map(|l| Describer::Local(Box::new(l))).map_err(|e| e.to_string())
         }
@@ -1311,10 +1428,110 @@ async fn run_describe_jobs(
                 done += 1;
             }
         }
+    } else if let (crate::vision::Describer::Local(local_llm), n @ 2..) = (&mut describer, describe_concurrency(rt)) {
+        // Local: batch decode multiple frames concurrently in one forward pass.
+        let mut recent_errors: Vec<i64> = Vec::new();
+        'videos: for (video_id, path, frames) in work {
+            if frames.is_empty() {
+                continue;
+            }
+            set_job(db, video_id, STAGE, "running", None)?;
+            on_event(Event::JobStarted { video_id, stage: STAGE.into(), path: path.clone() });
+
+            for chunk in frames.chunks(n) {
+                if opts.cancelled() {
+                    set_job(db, video_id, STAGE, "pending", None)?;
+                    break 'videos;
+                }
+                let mut prepared = Vec::with_capacity(chunk.len());
+                for (frame_id, t_s, image) in chunk {
+                    let speech = speech_near(db, video_id, *t_s)?;
+                    prepared.push((*frame_id, image, speech));
+                }
+
+                let batch_input: Vec<(&Path, Option<&str>)> = prepared
+                    .iter()
+                    .map(|(_, img, sp)| (img.as_path(), (!sp.is_empty()).then_some(sp.as_str())))
+                    .collect();
+
+                let results = match local_llm.batch_describe(&batch_input).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        set_job(db, video_id, STAGE, "pending", Some(&e.to_string()))?;
+                        on_event(Event::StageUnavailable { stage: STAGE.into(), reason: e.to_string() });
+                        break 'videos;
+                    }
+                };
+
+                for (idx, result) in results.into_iter().enumerate() {
+                    let (frame_id, _, _) = prepared[idx];
+                    match result {
+                        Ok(d) => {
+                            let json = serde_json::to_string(&d).unwrap_or_default();
+                            db.conn.execute(
+                                "UPDATE frames SET description_json = ?1, visible_text = ?2 WHERE id = ?3",
+                                params![json, d.visible_text.join("\n"), frame_id],
+                            )?;
+                            recent_errors.clear();
+                        }
+                        Err(e) => {
+                            let json = serde_json::json!({ "error": e.to_string() }).to_string();
+                            db.conn.execute(
+                                "UPDATE frames SET description_json = ?1 WHERE id = ?2",
+                                params![json, frame_id],
+                            )?;
+                            recent_errors.push(frame_id);
+
+                            if recent_errors.len() >= BROKEN_BACKEND_RUN {
+                                for id in &recent_errors {
+                                    db.conn.execute(
+                                        "UPDATE frames SET description_json = NULL, visible_text = NULL WHERE id = ?1",
+                                        [id],
+                                    )?;
+                                }
+                                let reason = format!(
+                                    "{BROKEN_BACKEND_RUN} frames in a row failed to describe ({e}); \
+                                     leaving the rest for a later run"
+                                );
+                                set_job(db, video_id, STAGE, "pending", Some(&reason))?;
+                                on_event(Event::StageUnavailable { stage: STAGE.into(), reason });
+                                break 'videos;
+                            }
+                        }
+                    }
+                    tracker.advance(phase, 1);
+                    if tracker.should_emit() {
+                        on_event(Event::Progress(tracker.snapshot(Some(path.clone()))));
+                    }
+                }
+            }
+
+            let ok: i64 = db.conn.query_row(
+                "SELECT COUNT(*) FROM frames WHERE video_id = ?1 AND description_json NOT LIKE '{\"error\"%'",
+                [video_id],
+                |r| r.get(0),
+            )?;
+            if ok == 0 {
+                set_job(db, video_id, STAGE, "failed", Some("no frame could be described"))?;
+                on_event(Event::JobFailed {
+                    video_id,
+                    stage: STAGE.into(),
+                    error: "no frame could be described".into(),
+                });
+                failed += 1;
+            } else {
+                set_job(db, video_id, STAGE, "done", None)?;
+                db.conn.execute(
+                    "UPDATE jobs SET state = 'pending', attempts = 0 WHERE video_id = ?1 AND stage = 'embed'",
+                    [video_id],
+                )?;
+                on_event(Event::JobDone { video_id, stage: STAGE.into() });
+                done += 1;
+            }
+        }
     } else {
-        // Local, or a server asked to describe one frame at a time: sequential single-describer
-        // path. A local model is one set of weights in this process — running two at once would
-        // not batch anything, it would just queue behind the same lock.
+        // Local with concurrency 1, or a server asked to describe one frame at a time: sequential single-describer
+        // path.
         //
         // Frames that errored and have not yet been vindicated by a success. Kept across videos:
         // a broken backend does not repair itself at a video boundary.

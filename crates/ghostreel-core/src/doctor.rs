@@ -289,6 +289,37 @@ fn parse_nvidia_smi(csv: &str) -> Vec<Gpu> {
         .collect()
 }
 
+/// Calculate optimal describe concurrency based on GPU VRAM.
+/// Returns 1 on CPU/no GPU or when VRAM is tight, up to 8 on high-VRAM cards.
+pub fn optimal_describe_concurrency(total_vram_mib: Option<u64>, model_vram_mib: Option<u64>) -> usize {
+    let Some(total) = total_vram_mib else {
+        return 1;
+    };
+    if total < 4000 {
+        return 1;
+    }
+    // Estimated model weight footprint (default ~4.5 GB for Bonsai-27B/Qwen2.5-VL-7B)
+    // plus 1000 MiB base system/driver reserve.
+    let reserve = model_vram_mib.unwrap_or(4500).saturating_add(1000);
+    if total <= reserve {
+        return 1;
+    }
+    let headroom = total - reserve;
+    // With 768px images, each concurrent sequence requires ~600-800 MiB KV + activation headroom.
+    let slots = (headroom / 800).clamp(1, 8);
+    slots as usize
+}
+
+/// Calculate effective describe concurrency taking configuration and GPU VRAM into account.
+pub fn calculate_describe_concurrency(
+    configured: u32,
+    total_vram_mib: Option<u64>,
+    model_vram_mib: Option<u64>,
+) -> usize {
+    let optimal = optimal_describe_concurrency(total_vram_mib, model_vram_mib);
+    if configured == 0 { optimal } else { (configured as usize).min(optimal).max(1) }
+}
+
 /// Breadth-limited search for `file_name` under `roots` (model dirs are shallow trees).
 fn find_file(roots: &[PathBuf], file_name: &str, max_depth: usize) -> Option<PathBuf> {
     fn walk(dir: &Path, name: &str, depth: usize) -> Option<PathBuf> {
@@ -348,5 +379,21 @@ mod tests {
         assert!(r.db.ok, "{:?}", r.db.error);
         assert_eq!(r.vision.target, Target::Local);
         assert!(r.blockers().iter().all(|b| !b.starts_with("vision") && !b.starts_with("stt")));
+    }
+
+    #[test]
+    fn test_optimal_describe_concurrency() {
+        assert_eq!(optimal_describe_concurrency(None, None), 1);
+        assert_eq!(optimal_describe_concurrency(Some(2048), None), 1);
+        assert_eq!(optimal_describe_concurrency(Some(6000), Some(4500)), 1);
+        assert_eq!(optimal_describe_concurrency(Some(8192), Some(4500)), 3);
+        assert_eq!(optimal_describe_concurrency(Some(12282), Some(4500)), 8);
+        assert_eq!(optimal_describe_concurrency(Some(24576), Some(4500)), 8);
+
+        // calculate_describe_concurrency caps or defaults:
+        assert_eq!(calculate_describe_concurrency(0, Some(12282), Some(4500)), 8);
+        assert_eq!(calculate_describe_concurrency(4, Some(12282), Some(4500)), 4);
+        assert_eq!(calculate_describe_concurrency(8, Some(6000), Some(4500)), 1);
+        assert_eq!(calculate_describe_concurrency(4, None, None), 1);
     }
 }
