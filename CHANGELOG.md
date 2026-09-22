@@ -5,6 +5,28 @@ versions follow [SemVer](https://semver.org/) while the project is 0.x (minor = 
 
 ## [Unreleased]
 
+## [0.4.5] — 2026-09-22
+
+### Added
+
+- **Configurable pipeline stages per project**: Projects now store pipeline stage configuration
+  (`probe`, `transcribe`, `frames`, `describe`, `embed`) persisted in SQLite (`projects.pipeline_json`,
+  migration 11).
+- **Index without transcription (b-roll / dialogue-free footage)**: Speech transcription can now be
+  disabled during project creation or dynamically toggled later. Disabled stages are skipped entirely
+  during index runs and excluded from progress estimation.
+- **Smart pipeline job synchronization**: When a stage is disabled across all projects watching a video,
+  pending and queued jobs are marked `skipped`. Re-enabling a stage automatically restores them to `pending`
+  for the next index run (while respecting zero-audio videos).
+- **CLI pipeline management**:
+  - `ghostreel project create <name> --no-transcribe` or `--stages <list>`
+  - `ghostreel project config -p <project> [--enable|--disable|--no-transcribe|--transcribe]`
+  - `ghostreel project show -p <project>` displays active and disabled stages
+  - `ghostreel index -p <project> [--stages|--skip|--no-transcribe]`
+- **Desktop UI pipeline controls**: Added a checkbox in the project creation modal to toggle
+  transcription, and a dedicated **Pipeline Stages** section inside the `[ ⚙ Project ▾ ]` header dropdown
+  to toggle stages interactively with clean vertical alignment.
+
 ## [0.4.4] — 2026-09-22
 
 ### Added
