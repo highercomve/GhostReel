@@ -13,6 +13,7 @@ function NewProject({ onCreated, onCancel }: { onCreated: (id: number) => void; 
   const [name, setName] = useState("");
   const [fps, setFps] = useState("25");
   const [res, setRes] = useState("1920x1080");
+  const [transcribe, setTranscribe] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
   const submit = async (e: React.FormEvent) => {
@@ -20,7 +21,7 @@ function NewProject({ onCreated, onCancel }: { onCreated: (id: number) => void; 
     const preset = FPS_PRESETS.find((p) => p.label === fps)!;
     const [w, h] = res.split("x").map(Number);
     try {
-      const p = await createProject(name, preset.num, preset.den, w, h);
+      const p = await createProject(name, preset.num, preset.den, w, h, { transcribe });
       onCreated(p.id);
     } catch (err) {
       setError(String(err));
@@ -43,6 +44,10 @@ function NewProject({ onCreated, onCancel }: { onCreated: (id: number) => void; 
           <option value="1080x1080">1:1</option>
         </select>
       </div>
+      <label className="checkbox-row" title="Uncheck if your footage is b-roll or has no speech to transcribe">
+        <input type="checkbox" checked={transcribe} onChange={(e) => setTranscribe(e.target.checked)} />
+        <span>Transcribe audio (speech-to-text)</span>
+      </label>
       {error && <div className="bad-text small">{error}</div>}
       <div className="inline">
         <button type="submit" disabled={!name.trim()}>

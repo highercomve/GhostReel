@@ -13,7 +13,7 @@ use ghostreel_core::index::{self, FrameRow, Status, TranscriptSegment, VideoRow}
 use ghostreel_core::models;
 use ghostreel_core::paths::Paths;
 use ghostreel_core::probe::{self, Resolution};
-use ghostreel_core::projects::{Folder, NewProject, Project};
+use ghostreel_core::projects::{Folder, NewProject, PipelineConfig, Project};
 use ghostreel_core::runtime;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, State};
@@ -63,10 +63,30 @@ fn list_projects() -> CmdResult<Vec<ProjectSummary>> {
 }
 
 #[tauri::command]
-fn create_project(name: String, fps_num: i64, fps_den: i64, width: i64, height: i64) -> CmdResult<Project> {
+fn create_project(
+    name: String,
+    fps_num: i64,
+    fps_den: i64,
+    width: i64,
+    height: i64,
+    pipeline: Option<PipelineConfig>,
+) -> CmdResult<Project> {
     open_db()?
-        .create_project(&NewProject { name, description: String::new(), fps_num, fps_den, width, height })
+        .create_project(&NewProject {
+            name,
+            description: String::new(),
+            fps_num,
+            fps_den,
+            width,
+            height,
+            pipeline,
+        })
         .map_err(err)
+}
+
+#[tauri::command]
+fn set_project_pipeline(project_id: i64, pipeline: PipelineConfig) -> CmdResult<Project> {
+    open_db()?.update_project_pipeline(project_id, &pipeline).map_err(err)
 }
 
 #[tauri::command]
@@ -1247,6 +1267,7 @@ pub fn run() {
             cli_models,
             list_projects,
             create_project,
+            set_project_pipeline,
             rename_project,
             exclude_video,
             include_video,

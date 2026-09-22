@@ -18,7 +18,7 @@ use ghostreel_core::index::{self, Event, IndexLock};
 use ghostreel_core::paths::Paths;
 use ghostreel_core::probe::{Resolution, Target};
 use ghostreel_core::progress::{Progress, eta_text};
-use ghostreel_core::projects::NewProject;
+use ghostreel_core::projects::{NewProject, PipelineConfig};
 use ghostreel_core::runtime;
 use ghostreel_core::script::{Audio, IssueSeverity, Script};
 use ghostreel_core::watch::FolderWatcher;
@@ -73,6 +73,15 @@ enum Command {
         /// When --redo frames is used, old keyframe files are deleted and re-extracted.
         #[arg(long, value_name = "STAGE")]
         redo: Option<String>,
+        /// Explicit stages to run (comma-separated: probe, transcribe, frames, describe, embed).
+        #[arg(long, value_delimiter = ',')]
+        stages: Option<Vec<String>>,
+        /// Skip these pipeline stages (comma-separated: probe, transcribe, frames, describe, embed).
+        #[arg(long, value_delimiter = ',')]
+        skip: Option<Vec<String>>,
+        /// Shorthand to skip speech-to-text transcription.
+        #[arg(long)]
+        no_transcribe: bool,
     },
     /// Print a video's transcript.
     Transcript {
@@ -286,6 +295,30 @@ enum ProjectAction {
         width: i64,
         #[arg(long, default_value_t = 1080)]
         height: i64,
+        /// Disable speech-to-text transcription for this project.
+        #[arg(long)]
+        no_transcribe: bool,
+        /// Enabled pipeline stages (comma-separated: probe, transcribe, frames, describe, embed).
+        #[arg(long, value_delimiter = ',')]
+        stages: Option<Vec<String>>,
+    },
+    /// Configure pipeline stages and settings for a project.
+    Config {
+        name: String,
+        /// Enable pipeline stages (comma-separated: probe, transcribe, frames, describe, embed).
+        #[arg(long, value_delimiter = ',')]
+        enable: Option<Vec<String>>,
+        /// Disable pipeline stages (comma-separated: probe, transcribe, frames, describe, embed).
+        #[arg(long, value_delimiter = ',')]
+        disable: Option<Vec<String>>,
+        /// Disable speech-to-text transcription for this project.
+        #[arg(long)]
+        no_transcribe: bool,
+        /// Enable speech-to-text transcription for this project.
+        #[arg(long)]
+        transcribe: bool,
+        #[arg(long)]
+        json: bool,
     },
     List {
         #[arg(long)]
@@ -390,8 +423,19 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         }
         Command::Project { action } => project_cmd(&paths, action),
         Command::Folder { action } => folder_cmd(&paths, action),
-        Command::Index { project, watch, retry_failed, json, redo } => {
-            index_cmd(&paths, project.as_deref(), watch, retry_failed, json, redo.as_deref()).await
+        Command::Index { project, watch, retry_failed, json, redo, stages, skip, no_transcribe } => {
+            index_cmd(
+                &paths,
+                project.as_deref(),
+                watch,
+                retry_failed,
+                json,
+                redo.as_deref(),
+                stages.as_deref(),
+                skip.as_deref(),
+                no_transcribe,
+            )
+            .await
         }
         Command::Status { project, videos, json } => status_cmd(&paths, project.as_deref(), videos, json),
         Command::Transcript { video_id, srt, json } => transcript_cmd(&paths, video_id, srt, json),
@@ -645,19 +689,82 @@ fn fps_label(num: i64, den: i64) -> String {
     if den == 1 { num.to_string() } else { format!("{:.3} ({num}/{den})", num as f64 / den as f64) }
 }
 
+fn format_pipeline(pipeline: &PipelineConfig) -> String {
+    let mut enabled = Vec::new();
+    let mut disabled = Vec::new();
+    for &stage in ghostreel_core::index::STAGES {
+        if pipeline.is_enabled(stage) {
+            enabled.push(stage);
+        } else {
+            disabled.push(stage);
+        }
+    }
+    if disabled.is_empty() {
+        "all stages enabled".into()
+    } else {
+        format!("{} (disabled: {})", enabled.join(", "), disabled.join(", "))
+    }
+}
+
 fn project_cmd(paths: &Paths, action: ProjectAction) -> anyhow::Result<ExitCode> {
     let mut db = open_db(paths)?;
     match action {
-        ProjectAction::Create { name, description, fps, width, height } => {
+        ProjectAction::Create { name, description, fps, width, height, no_transcribe, stages } => {
             let (fps_num, fps_den) = parse_fps(&fps)?;
-            let p = db.create_project(&NewProject { name, description, fps_num, fps_den, width, height })?;
+            let mut pipeline = PipelineConfig::default();
+            if let Some(stages) = stages {
+                pipeline.probe = stages.iter().any(|s| s == "probe");
+                pipeline.transcribe = stages.iter().any(|s| s == "transcribe");
+                pipeline.frames = stages.iter().any(|s| s == "frames");
+                pipeline.describe = stages.iter().any(|s| s == "describe");
+                pipeline.embed = stages.iter().any(|s| s == "embed");
+            }
+            if no_transcribe {
+                pipeline.transcribe = false;
+            }
+            let p = db.create_project(&NewProject {
+                name,
+                description,
+                fps_num,
+                fps_den,
+                width,
+                height,
+                pipeline: Some(pipeline),
+            })?;
             println!(
-                "created project '{}' ({}x{} @ {} fps)",
+                "created project '{}' ({}x{} @ {} fps, pipeline: {})",
                 p.name,
                 p.width,
                 p.height,
-                fps_label(p.fps_num, p.fps_den)
+                fps_label(p.fps_num, p.fps_den),
+                format_pipeline(&p.pipeline)
             );
+        }
+        ProjectAction::Config { name, enable, disable, no_transcribe, transcribe, json } => {
+            let p = db.require_project(&name)?;
+            let mut pipeline = p.pipeline.clone();
+            if let Some(stages) = enable {
+                for stage in stages {
+                    pipeline.set_enabled(&stage, true).map_err(|e| anyhow::anyhow!("{e}"))?;
+                }
+            }
+            if let Some(stages) = disable {
+                for stage in stages {
+                    pipeline.set_enabled(&stage, false).map_err(|e| anyhow::anyhow!("{e}"))?;
+                }
+            }
+            if no_transcribe {
+                pipeline.transcribe = false;
+            }
+            if transcribe {
+                pipeline.transcribe = true;
+            }
+            let updated = db.update_project_pipeline(p.id, &pipeline)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&updated)?);
+            } else {
+                println!("updated pipeline for project '{}': {}", updated.name, format_pipeline(&updated.pipeline));
+            }
         }
         ProjectAction::List { json } => {
             let projects = db.projects()?;
@@ -696,6 +803,7 @@ fn project_cmd(paths: &Paths, action: ProjectAction) -> anyhow::Result<ExitCode>
                 if !p.description.is_empty() {
                     println!("  {}", p.description);
                 }
+                println!("  pipeline: {}", format_pipeline(&p.pipeline));
                 for f in folders {
                     println!("  folder {}{}", f.path.display(), if f.recursive { "" } else { " (not recursive)" });
                 }
@@ -1239,6 +1347,7 @@ async fn script_cmd(paths: &Paths, action: ScriptAction) -> anyhow::Result<ExitC
     Ok(ExitCode::SUCCESS)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn index_cmd(
     paths: &Paths,
     project: Option<&str>,
@@ -1246,11 +1355,38 @@ async fn index_cmd(
     retry_failed: bool,
     json: bool,
     redo: Option<&str>,
+    stages: Option<&[String]>,
+    skip: Option<&[String]>,
+    no_transcribe: bool,
 ) -> anyhow::Result<ExitCode> {
     let mut db = open_db(paths)?;
     let pid = project_id(&db, project)?;
     let config = Config::load(&paths.config_file)?;
-    let opts = index::Options { project_id: pid, retry_failed, settle_secs: if watch { 10 } else { 0 }, cancel: None };
+
+    let mut resolved_stages: Option<Vec<String>> = stages.map(|s| s.to_vec());
+    let mut to_skip = skip.map(|s| s.to_vec()).unwrap_or_default();
+    if no_transcribe && !to_skip.iter().any(|s| s == "transcribe") {
+        to_skip.push("transcribe".into());
+    }
+    if !to_skip.is_empty() {
+        let base_stages = resolved_stages.unwrap_or_else(|| index::STAGES.iter().map(|&s| s.to_string()).collect());
+        resolved_stages = Some(base_stages.into_iter().filter(|s| !to_skip.contains(s)).collect());
+    }
+    if let Some(ref stages) = resolved_stages {
+        for s in stages {
+            if !index::STAGES.contains(&s.as_str()) {
+                anyhow::bail!("unknown stage '{s}'; valid values: {}", index::STAGES.join(", "));
+            }
+        }
+    }
+
+    let opts = index::Options {
+        project_id: pid,
+        retry_failed,
+        settle_secs: if watch { 10 } else { 0 },
+        cancel: None,
+        stages: resolved_stages,
+    };
 
     // --redo: reset the specified stage (and later stages) back to pending.
     if let Some(stage) = redo {

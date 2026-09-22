@@ -285,6 +285,24 @@ nav {
   gap: 6px;
 }
 
+.checkbox-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted);
+  cursor: pointer;
+  user-select: none;
+  margin-top: 2px;
+}
+
+.checkbox-row input {
+  cursor: pointer;
+  accent-color: var(--accent);
+  flex: 0 0 auto;
+  margin: 0;
+}
+
 input,
 select {
   background: var(--bg);
@@ -295,6 +313,21 @@ select {
   font: inherit;
   min-width: 0;
   flex: 1;
+}
+
+input[type="checkbox"],
+input[type="radio"] {
+  flex: 0 0 auto;
+  width: 15px;
+  height: 15px;
+  min-width: 15px;
+  padding: 0;
+  margin: 0;
+  border: none;
+  background: none;
+  border-radius: 3px;
+  cursor: pointer;
+  accent-color: var(--accent);
 }
 
 button.ghost {
@@ -1958,6 +1991,51 @@ form.rename input { font-size: 1.6rem; font-weight: 700; padding: 2px 8px; min-w
 
 .project-menu-select:focus {
   border-color: var(--accent);
+}
+
+.project-menu-checkbox {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 10px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text);
+  cursor: pointer;
+  border-radius: 6px;
+  box-sizing: border-box;
+  width: 100%;
+  transition: background 0.1s ease;
+  user-select: none;
+}
+
+.project-menu-checkbox:hover:not(:has(input:disabled)) {
+  background: color-mix(in srgb, var(--border) 50%, transparent);
+}
+
+.project-menu-checkbox:has(input:disabled) {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.project-menu-checkbox input[type="checkbox"] {
+  appearance: auto;
+  -webkit-appearance: checkbox;
+  flex: 0 0 auto;
+  width: 15px;
+  height: 15px;
+  min-width: 15px;
+  margin: 0;
+  padding: 0;
+  border: none;
+  background: none;
+  cursor: pointer;
+  accent-color: var(--accent);
+}
+
+.project-menu-checkbox span {
+  flex: 1;
+  text-align: left;
 }
 
 .project-menu-item {

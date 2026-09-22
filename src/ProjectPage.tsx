@@ -16,6 +16,7 @@ import {
   redoProjectStage,
   getAiSettings,
   setAiSettings,
+  setProjectPipeline,
   removeProject,
   excludeVideo,
   includeVideo,
@@ -30,17 +31,17 @@ import { useQueue } from "./useQueue";
 import VideoPanel from "./VideoPanel";
 import ScriptsPanel from "./ScriptsPanel";
 
-function SpeechCell({ v }: { v: VideoRow }) {
+function SpeechCell({ v, transcribeEnabled }: { v: VideoRow; transcribeEnabled?: boolean }) {
   if (v.segments > 0) return <span className="good-text">{v.language ? v.language.toUpperCase() : "✓"}</span>;
   switch (v.transcribe) {
     case "skipped":
-      return <span className="muted">no audio</span>;
+      return <span className="muted">{v.has_audio ? "skipped" : "no audio"}</span>;
     case "failed":
       return <span className="bad-text">failed</span>;
     case "done":
       return <span className="muted">no speech</span>;
     default:
-      return <span className="muted">waiting</span>;
+      return <span className="muted">{transcribeEnabled === false ? "disabled" : "waiting"}</span>;
   }
 }
 
@@ -342,6 +343,62 @@ export default function ProjectPage({ projectId, onChanged }: { projectId: numbe
 
                 <div className="project-menu-divider" />
 
+                <div className="project-menu-section-title">Pipeline Stages</div>
+
+                <label className="project-menu-checkbox" title="Transcribe speech with Whisper">
+                  <input
+                    type="checkbox"
+                    checked={p.pipeline.transcribe}
+                    disabled={!!running || !!queued}
+                    onChange={async (e) => {
+                      const next = { ...p.pipeline, transcribe: e.target.checked };
+                      await run(() => setProjectPipeline(projectId, next));
+                    }}
+                  />
+                  <span>Transcription</span>
+                </label>
+
+                <label className="project-menu-checkbox" title="Sample keyframes from video">
+                  <input
+                    type="checkbox"
+                    checked={p.pipeline.frames}
+                    disabled={!!running || !!queued}
+                    onChange={async (e) => {
+                      const next = { ...p.pipeline, frames: e.target.checked };
+                      await run(() => setProjectPipeline(projectId, next));
+                    }}
+                  />
+                  <span>Keyframes</span>
+                </label>
+
+                <label className="project-menu-checkbox" title="Describe keyframes with vision model">
+                  <input
+                    type="checkbox"
+                    checked={p.pipeline.describe}
+                    disabled={!!running || !!queued}
+                    onChange={async (e) => {
+                      const next = { ...p.pipeline, describe: e.target.checked };
+                      await run(() => setProjectPipeline(projectId, next));
+                    }}
+                  />
+                  <span>Frame descriptions</span>
+                </label>
+
+                <label className="project-menu-checkbox" title="Generate vector embeddings and search chunks">
+                  <input
+                    type="checkbox"
+                    checked={p.pipeline.embed}
+                    disabled={!!running || !!queued}
+                    onChange={async (e) => {
+                      const next = { ...p.pipeline, embed: e.target.checked };
+                      await run(() => setProjectPipeline(projectId, next));
+                    }}
+                  />
+                  <span>Search embeddings</span>
+                </label>
+
+                <div className="project-menu-divider" />
+
                 <div className="project-menu-section-title">Project</div>
 
                 <button
@@ -494,8 +551,10 @@ export default function ProjectPage({ projectId, onChanged }: { projectId: numbe
         Videos
         <span className="muted small normal">
           {" "}
-          · {stage("probe")?.done ?? 0} ready · {stage("transcribe")?.done ?? 0} transcribed ·{" "}
-          {stage("describe")?.done ?? 0} described · {stage("embed")?.done ?? 0} searchable
+          · {stage("probe")?.done ?? 0} ready ·{" "}
+          {p.pipeline?.transcribe ? `${stage("transcribe")?.done ?? 0} transcribed` : "transcription disabled"} ·{" "}
+          {p.pipeline?.describe ? `${stage("describe")?.done ?? 0} described` : "descriptions disabled"} ·{" "}
+          {p.pipeline?.embed ? `${stage("embed")?.done ?? 0} searchable` : "search indexing disabled"}
           {st.vfr_videos ? ` · ${st.vfr_videos} variable frame rate` : ""}
         </span>
       </h2>
@@ -542,7 +601,7 @@ export default function ProjectPage({ projectId, onChanged }: { projectId: numbe
                     {v.vcodec ? ` · ${v.vcodec}` : ""}
                   </td>
                   <td>
-                    <SpeechCell v={v} />
+                    <SpeechCell v={v} transcribeEnabled={p.pipeline?.transcribe} />
                   </td>
                   <td>
                     {v.steadiness_measured ? (

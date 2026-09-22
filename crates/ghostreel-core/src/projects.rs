@@ -7,12 +7,88 @@
 use std::path::{Path, PathBuf};
 
 use rusqlite::{OptionalExtension, params};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::Error;
 use crate::db::Db;
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+fn default_true() -> bool {
+    true
+}
+
+/// Which pipeline stages are enabled for a project.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PipelineConfig {
+    #[serde(default = "default_true")]
+    pub probe: bool,
+    #[serde(default = "default_true")]
+    pub transcribe: bool,
+    #[serde(default = "default_true")]
+    pub frames: bool,
+    #[serde(default = "default_true")]
+    pub describe: bool,
+    #[serde(default = "default_true")]
+    pub embed: bool,
+}
+
+impl Default for PipelineConfig {
+    fn default() -> Self {
+        Self {
+            probe: true,
+            transcribe: true,
+            frames: true,
+            describe: true,
+            embed: true,
+        }
+    }
+}
+
+impl PipelineConfig {
+    pub fn is_enabled(&self, stage: &str) -> bool {
+        match stage {
+            "probe" => self.probe,
+            "transcribe" => self.transcribe,
+            "frames" => self.frames,
+            "describe" => self.describe,
+            "embed" => self.embed,
+            _ => true,
+        }
+    }
+
+    pub fn set_enabled(&mut self, stage: &str, enabled: bool) -> Result<(), Error> {
+        match stage {
+            "probe" => self.probe = enabled,
+            "transcribe" => self.transcribe = enabled,
+            "frames" => self.frames = enabled,
+            "describe" => self.describe = enabled,
+            "embed" => self.embed = enabled,
+            _ => return Err(Error::Invalid(format!("unknown pipeline stage '{stage}'"))),
+        }
+        Ok(())
+    }
+
+    pub fn enabled_stages(&self) -> Vec<&'static str> {
+        let mut stages = Vec::new();
+        if self.probe {
+            stages.push("probe");
+        }
+        if self.transcribe {
+            stages.push("transcribe");
+        }
+        if self.frames {
+            stages.push("frames");
+        }
+        if self.describe {
+            stages.push("describe");
+        }
+        if self.embed {
+            stages.push("embed");
+        }
+        stages
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Project {
     pub id: i64,
     pub name: String,
@@ -22,6 +98,7 @@ pub struct Project {
     pub width: i64,
     pub height: i64,
     pub created_at: i64,
+    pub pipeline: PipelineConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -41,11 +118,25 @@ pub struct NewProject {
     pub fps_den: i64,
     pub width: i64,
     pub height: i64,
+    pub pipeline: Option<PipelineConfig>,
 }
 
 impl NewProject {
     pub fn named(name: impl Into<String>) -> Self {
-        Self { name: name.into(), description: String::new(), fps_num: 25, fps_den: 1, width: 1920, height: 1080 }
+        Self {
+            name: name.into(),
+            description: String::new(),
+            fps_num: 25,
+            fps_den: 1,
+            width: 1920,
+            height: 1080,
+            pipeline: None,
+        }
+    }
+
+    pub fn with_pipeline(mut self, pipeline: PipelineConfig) -> Self {
+        self.pipeline = Some(pipeline);
+        self
     }
 }
 
@@ -77,6 +168,8 @@ pub fn now() -> i64 {
 }
 
 fn row_to_project(r: &rusqlite::Row) -> rusqlite::Result<Project> {
+    let pipeline_json: String = r.get(8)?;
+    let pipeline = serde_json::from_str(&pipeline_json).unwrap_or_default();
     Ok(Project {
         id: r.get(0)?,
         name: r.get(1)?,
@@ -86,10 +179,12 @@ fn row_to_project(r: &rusqlite::Row) -> rusqlite::Result<Project> {
         width: r.get(5)?,
         height: r.get(6)?,
         created_at: r.get(7)?,
+        pipeline,
     })
 }
 
-const PROJECT_COLS: &str = "id, name, description, fps_num, fps_den, width, height, created_at";
+const PROJECT_COLS: &str =
+    "id, name, description, fps_num, fps_den, width, height, created_at, COALESCE(pipeline_json, '')";
 
 impl Db {
     pub fn create_project(&self, p: &NewProject) -> Result<Project, Error> {
@@ -103,12 +198,25 @@ impl Db {
         if self.project_by_name(name)?.is_some() {
             return Err(Error::Invalid(format!("project '{name}' already exists")));
         }
+        let pipeline_json = serde_json::to_string(&p.pipeline.clone().unwrap_or_default()).unwrap_or_default();
         self.conn.execute(
-            "INSERT INTO projects(name, description, fps_num, fps_den, width, height, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![name, p.description, p.fps_num, p.fps_den, p.width, p.height, now()],
+            "INSERT INTO projects(name, description, fps_num, fps_den, width, height, created_at, pipeline_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![name, p.description, p.fps_num, p.fps_den, p.width, p.height, now(), pipeline_json],
         )?;
-        self.project(self.conn.last_insert_rowid())
+        let project = self.project(self.conn.last_insert_rowid())?;
+        let _ = crate::index::sync_pipeline_jobs(self, Some(project.id));
+        Ok(project)
+    }
+
+    /// Update the pipeline stage configuration for a project.
+    pub fn update_project_pipeline(&mut self, id: i64, pipeline: &PipelineConfig) -> Result<Project, Error> {
+        let pipeline_json = serde_json::to_string(pipeline).map_err(|e| Error::Invalid(e.to_string()))?;
+        if self.conn.execute("UPDATE projects SET pipeline_json = ?1 WHERE id = ?2", params![pipeline_json, id])? == 0 {
+            return Err(Error::NotFound(format!("project #{id}")));
+        }
+        crate::index::sync_pipeline_jobs(self, Some(id))?;
+        self.project(id)
     }
 
     pub fn projects(&self) -> Result<Vec<Project>, Error> {
@@ -476,5 +584,39 @@ mod tests {
         assert_eq!(db.folders(None).unwrap().len(), 1, "still used by B");
         db.remove_project(b.id).unwrap();
         assert!(db.folders(None).unwrap().is_empty(), "orphan folder removed with last project");
+    }
+
+    #[test]
+    fn project_pipeline_configuration() {
+        let mut db = Db::open_in_memory().unwrap();
+        let default_proj = db.create_project(&NewProject::named("Default")).unwrap();
+        assert!(default_proj.pipeline.probe);
+        assert!(default_proj.pipeline.transcribe);
+        assert!(default_proj.pipeline.frames);
+        assert!(default_proj.pipeline.describe);
+        assert!(default_proj.pipeline.embed);
+        assert_eq!(default_proj.pipeline.enabled_stages(), vec!["probe", "transcribe", "frames", "describe", "embed"]);
+
+        let custom_pipeline = PipelineConfig {
+            probe: true,
+            transcribe: false,
+            frames: true,
+            describe: false,
+            embed: true,
+        };
+        let b_roll = db
+            .create_project(&NewProject::named("BRoll").with_pipeline(custom_pipeline))
+            .unwrap();
+        assert!(!b_roll.pipeline.transcribe);
+        assert!(!b_roll.pipeline.describe);
+        assert!(b_roll.pipeline.frames);
+        assert_eq!(b_roll.pipeline.enabled_stages(), vec!["probe", "frames", "embed"]);
+
+        // Update pipeline on existing project
+        let mut updated_pipeline = b_roll.pipeline.clone();
+        updated_pipeline.transcribe = true;
+        let updated = db.update_project_pipeline(b_roll.id, &updated_pipeline).unwrap();
+        assert!(updated.pipeline.transcribe);
+        assert!(db.project(b_roll.id).unwrap().pipeline.transcribe);
     }
 }

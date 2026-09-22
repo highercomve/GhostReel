@@ -268,6 +268,10 @@ const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE chat_messages ADD COLUMN images_json TEXT;
     "#,
+    // v11 — project pipeline configuration (which stages run or are skipped)
+    r#"
+    ALTER TABLE projects ADD COLUMN pipeline_json TEXT;
+    "#,
 ];
 
 static REGISTER_VEC: Once = Once::new();
@@ -538,6 +542,16 @@ mod tests {
         assert_eq!(scripts_count, 0);
         let exports_count: i64 = db.conn.query_row("SELECT count(*) FROM exports", [], |r| r.get(0)).unwrap();
         assert_eq!(exports_count, 0);
+
+        let pipeline_col_exists: bool = db
+            .conn
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('projects') WHERE name = 'pipeline_json'",
+                [],
+                |r| Ok(r.get::<_, i64>(0)? > 0),
+            )
+            .unwrap();
+        assert!(pipeline_col_exists);
 
         let fk: bool = db.conn.pragma_query_value(None, "foreign_keys", |r| r.get(0)).unwrap();
         assert!(fk);

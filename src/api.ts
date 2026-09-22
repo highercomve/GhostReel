@@ -70,6 +70,14 @@ export const doctor = () => invoke<DoctorView>("doctor");
 
 // ---- projects & library ------------------------------------------------------------------
 
+export interface PipelineConfig {
+  probe: boolean;
+  transcribe: boolean;
+  frames: boolean;
+  describe: boolean;
+  embed: boolean;
+}
+
 export interface Project {
   id: number;
   name: string;
@@ -79,6 +87,7 @@ export interface Project {
   width: number;
   height: number;
   created_at: number;
+  pipeline: PipelineConfig;
 }
 
 export interface StageCounts {
@@ -347,8 +356,32 @@ export const clock = (s: number) => {
 export const fileName = (p: string) => p.split(/[\\/]/).pop() ?? p;
 
 export const listProjects = () => invoke<ProjectSummary[]>("list_projects");
-export const createProject = (name: string, fpsNum: number, fpsDen: number, width: number, height: number) =>
-  invoke<Project>("create_project", { name, fpsNum, fpsDen, width, height });
+export const createProject = (
+  name: string,
+  fpsNum: number,
+  fpsDen: number,
+  width: number,
+  height: number,
+  pipeline?: Partial<PipelineConfig>,
+) =>
+  invoke<Project>("create_project", {
+    name,
+    fpsNum,
+    fpsDen,
+    width,
+    height,
+    pipeline: pipeline
+      ? {
+          probe: pipeline.probe ?? true,
+          transcribe: pipeline.transcribe ?? true,
+          frames: pipeline.frames ?? true,
+          describe: pipeline.describe ?? true,
+          embed: pipeline.embed ?? true,
+        }
+      : null,
+  });
+export const setProjectPipeline = (projectId: number, pipeline: PipelineConfig) =>
+  invoke<Project>("set_project_pipeline", { projectId, pipeline });
 export const renameProject = (projectId: number, name: string) =>
   invoke<Project>("rename_project", { projectId, name });
 export interface PurgeStats {

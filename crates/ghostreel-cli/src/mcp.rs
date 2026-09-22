@@ -13,7 +13,7 @@ use anyhow::Context;
 use ghostreel_core::config::Config;
 use ghostreel_core::db::Db;
 use ghostreel_core::paths::Paths;
-use ghostreel_core::projects::NewProject;
+use ghostreel_core::projects::{NewProject, PipelineConfig};
 use ghostreel_core::{doctor, index, runtime, script};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -347,6 +347,15 @@ async fn call_tool(paths: &Paths, name: &str, args: &Value) -> anyhow::Result<Va
                 }
                 None => (25, 1),
             };
+            let mut pipeline = PipelineConfig::default();
+            if let Some(nt) = args.get("no_transcribe").and_then(|v| v.as_bool())
+                && nt
+            {
+                pipeline.transcribe = false;
+            }
+            if let Some(t) = args.get("transcribe").and_then(|v| v.as_bool()) {
+                pipeline.transcribe = t;
+            }
             let p = NewProject {
                 name: arg_str(args, "name")?,
                 description: args.get("description").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
@@ -354,6 +363,7 @@ async fn call_tool(paths: &Paths, name: &str, args: &Value) -> anyhow::Result<Va
                 fps_den,
                 width: args.get("width").and_then(|v| v.as_i64()).unwrap_or(1920),
                 height: args.get("height").and_then(|v| v.as_i64()).unwrap_or(1080),
+                pipeline: Some(pipeline),
             };
             Ok(serde_json::to_value(db.create_project(&p)?)?)
         }

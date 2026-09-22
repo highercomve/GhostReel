@@ -1138,6 +1138,7 @@ mod tests {
                 fps_den: 1,
                 width: 1920,
                 height: 1080,
+                pipeline: None,
             })
             .unwrap();
         let folder = db.add_folder(project.id, temp.path(), true).unwrap();

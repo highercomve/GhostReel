@@ -112,11 +112,23 @@ pub struct Options {
     /// Set to stop the run at the next safe point (between videos/frames); unfinished work stays
     /// pending for a later run.
     pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Explicit stages to run (overrides project/default configuration).
+    pub stages: Option<Vec<String>>,
 }
 
 impl Options {
     pub fn cancelled(&self) -> bool {
         self.cancel.as_ref().is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    pub fn is_stage_enabled(&self, stage: &str, project_pipeline: Option<&crate::projects::PipelineConfig>) -> bool {
+        if let Some(ref stages) = self.stages {
+            return stages.iter().any(|s| s == stage);
+        }
+        if let Some(pipeline) = project_pipeline {
+            return pipeline.is_enabled(stage);
+        }
+        true
     }
 }
 
@@ -190,18 +202,27 @@ pub async fn run(db: &mut Db, rt: &Runtime, opts: &Options, mut on_event: impl F
 
     reset_interrupted(db)?;
     ensure_jobs(db)?;
+    sync_pipeline_jobs(db, opts.project_id)?;
+
+    let project_pipeline = opts.project_id.and_then(|pid| db.project(pid).ok()).map(|p| p.pipeline);
+    let stage_active = |stage: &str| -> bool { opts.is_stage_enabled(stage, project_pipeline.as_ref()) };
+
     let to_hash: Vec<ToHash> = pending.iter_mut().flat_map(|w| std::mem::take(&mut w.to_hash)).collect();
     let hash_work = to_hash.iter().filter(|f| f.known_hash.is_none()).count() as u64;
     let already_queued = claimable_jobs(db, "probe", opts)?.len() as u64;
     tracker.set_total("hash", hash_work);
     // Upper bound until hashing tells us which files are genuinely new content.
-    tracker.set_total("probe", already_queued + to_hash.len() as u64);
-    if rt.frames.is_some() {
+    if stage_active("probe") {
+        tracker.set_total("probe", already_queued + to_hash.len() as u64);
+    }
+    if rt.frames.is_some() && stage_active("frames") {
         let (known, unknown) = stage_work(db, "frames", opts)?;
         tracker.set_total("frames", (known + (unknown as f64 + to_hash.len() as f64) * UNKNOWN_DURATION_S) as u64);
     }
     let stt_phase = stt_phase(&rt.stt);
-    if let Some(phase) = stt_phase {
+    if let Some(phase) = stt_phase
+        && stage_active("transcribe")
+    {
         let (known, unknown) = transcribe_work(db, opts)?;
         tracker.set_total(phase, (known + (unknown as f64 + to_hash.len() as f64) * UNKNOWN_DURATION_S) as u64);
     }
@@ -224,46 +245,60 @@ pub async fn run(db: &mut Db, rt: &Runtime, opts: &Options, mut on_event: impl F
         removed: summary.removed,
     });
 
+    if new > 0 || changed > 0 {
+        sync_pipeline_jobs(db, opts.project_id)?;
+    }
+
     // 3. Jobs, stage by stage.
-    if opts.cancelled() {
-        summary.cancelled = true;
-        return Ok(summary);
+    if stage_active("probe") {
+        if opts.cancelled() {
+            summary.cancelled = true;
+            return Ok(summary);
+        }
+        let (done, failed) = run_probe_jobs(db, &rt.ffprobe, opts, &mut tracker, &mut on_event).await?;
+        summary.jobs_done += done;
+        summary.jobs_failed += failed;
     }
-    let (done, failed) = run_probe_jobs(db, &rt.ffprobe, opts, &mut tracker, &mut on_event).await?;
-    summary.jobs_done += done;
-    summary.jobs_failed += failed;
 
-    if opts.cancelled() {
-        summary.cancelled = true;
-        return Ok(summary);
+    if stage_active("transcribe") {
+        if opts.cancelled() {
+            summary.cancelled = true;
+            return Ok(summary);
+        }
+        let (done, failed) = run_transcribe_jobs(db, rt, opts, &mut tracker, &mut on_event).await?;
+        summary.jobs_done += done;
+        summary.jobs_failed += failed;
     }
-    let (done, failed) = run_transcribe_jobs(db, rt, opts, &mut tracker, &mut on_event).await?;
-    summary.jobs_done += done;
-    summary.jobs_failed += failed;
 
-    if opts.cancelled() {
-        summary.cancelled = true;
-        return Ok(summary);
+    if stage_active("frames") {
+        if opts.cancelled() {
+            summary.cancelled = true;
+            return Ok(summary);
+        }
+        let (done, failed) = run_frame_jobs(db, rt, opts, &mut tracker, &mut on_event).await?;
+        summary.jobs_done += done;
+        summary.jobs_failed += failed;
     }
-    let (done, failed) = run_frame_jobs(db, rt, opts, &mut tracker, &mut on_event).await?;
-    summary.jobs_done += done;
-    summary.jobs_failed += failed;
 
-    if opts.cancelled() {
-        summary.cancelled = true;
-        return Ok(summary);
+    if stage_active("describe") {
+        if opts.cancelled() {
+            summary.cancelled = true;
+            return Ok(summary);
+        }
+        let (done, failed) = run_describe_jobs(db, rt, opts, &mut tracker, &mut on_event).await?;
+        summary.jobs_done += done;
+        summary.jobs_failed += failed;
     }
-    let (done, failed) = run_describe_jobs(db, rt, opts, &mut tracker, &mut on_event).await?;
-    summary.jobs_done += done;
-    summary.jobs_failed += failed;
 
-    if opts.cancelled() {
-        summary.cancelled = true;
-        return Ok(summary);
+    if stage_active("embed") {
+        if opts.cancelled() {
+            summary.cancelled = true;
+            return Ok(summary);
+        }
+        let (done, failed) = run_embed_jobs(db, rt, opts, &mut tracker, &mut on_event).await?;
+        summary.jobs_done += done;
+        summary.jobs_failed += failed;
     }
-    let (done, failed) = run_embed_jobs(db, rt, opts, &mut tracker, &mut on_event).await?;
-    summary.jobs_done += done;
-    summary.jobs_failed += failed;
 
     tracker.finish();
     tracker.save_rates(db)?;
@@ -458,6 +493,92 @@ fn ensure_jobs(db: &Db) -> Result<(), Error> {
 
 fn reset_interrupted(db: &Db) -> Result<(), Error> {
     db.conn.execute("UPDATE jobs SET state = 'pending', updated_at = ?1 WHERE state = 'running'", [now()])?;
+    Ok(())
+}
+
+/// Keep job states in sync with project pipeline settings.
+/// When a stage is disabled for all projects watching a video, pending/failed jobs become `skipped`.
+/// When a stage is enabled for a project, previously `skipped` jobs for its videos become `pending`.
+pub fn sync_pipeline_jobs(db: &Db, project_id: Option<i64>) -> Result<(), Error> {
+    let projects = db.projects()?;
+    let project_map: HashMap<i64, &crate::projects::Project> = projects.iter().map(|p| (p.id, p)).collect();
+
+    // Map each video in scope to the project ids that watch it.
+    let mut video_projects: HashMap<i64, Vec<i64>> = HashMap::new();
+    {
+        let sql = "
+            SELECT vf.video_id, pf.project_id
+              FROM video_files vf
+              JOIN project_folders pf ON pf.folder_id = vf.folder_id
+             WHERE (?1 IS NULL OR vf.video_id IN (
+                 SELECT vf2.video_id FROM video_files vf2
+                 JOIN project_folders pf2 ON pf2.folder_id = vf2.folder_id
+                 WHERE pf2.project_id = ?1
+             ))
+               AND NOT EXISTS (SELECT 1 FROM project_exclusions x WHERE x.project_id = pf.project_id AND x.video_id = vf.video_id AND x.role = 'removed')";
+        let mut st = db.conn.prepare(sql)?;
+        let rows = st.query_map([project_id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;
+        for row in rows {
+            let (vid, pid) = row?;
+            video_projects.entry(vid).or_default().push(pid);
+        }
+    }
+
+    let timestamp = now();
+    for &stage in STAGES {
+        let mut to_skip = Vec::new();
+        let mut to_unskip = Vec::new();
+
+        for (&vid, pids) in &video_projects {
+            let any_enabled = pids.iter().any(|pid| {
+                project_map.get(pid).is_none_or(|p| p.pipeline.is_enabled(stage))
+            });
+            if any_enabled {
+                to_unskip.push(vid);
+            } else {
+                to_skip.push(vid);
+            }
+        }
+
+        for chunk in to_skip.chunks(500) {
+            let placeholders: String = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "UPDATE jobs SET state = 'skipped', updated_at = ?1
+                  WHERE stage = ?2 AND state IN ('pending', 'failed') AND video_id IN ({placeholders})"
+            );
+            let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() + 2);
+            params.push(&timestamp);
+            params.push(&stage);
+            for id in chunk {
+                params.push(id);
+            }
+            db.conn.execute(&sql, rusqlite::params_from_iter(params))?;
+        }
+
+        for chunk in to_unskip.chunks(500) {
+            let placeholders: String = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = if stage == "transcribe" {
+                format!(
+                    "UPDATE jobs SET state = 'pending', attempts = 0, last_error = NULL, updated_at = ?1
+                      WHERE stage = ?2 AND state = 'skipped'
+                        AND video_id IN (SELECT id FROM videos WHERE COALESCE(has_audio, 1) != 0)
+                        AND video_id IN ({placeholders})"
+                )
+            } else {
+                format!(
+                    "UPDATE jobs SET state = 'pending', attempts = 0, last_error = NULL, updated_at = ?1
+                      WHERE stage = ?2 AND state = 'skipped' AND video_id IN ({placeholders})"
+                )
+            };
+            let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() + 2);
+            params.push(&timestamp);
+            params.push(&stage);
+            for id in chunk {
+                params.push(id);
+            }
+            db.conn.execute(&sql, rusqlite::params_from_iter(params))?;
+        }
+    }
     Ok(())
 }
 
@@ -2523,5 +2644,73 @@ done
                 .unwrap();
             assert_eq!(state, "done", "stage {stage} should still be done");
         }
+    }
+
+    #[tokio::test]
+    async fn pipeline_disabled_stage_is_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = Db::open_in_memory().unwrap();
+        let custom_pipeline = crate::projects::PipelineConfig {
+            probe: true,
+            transcribe: false,
+            frames: true,
+            describe: false,
+            embed: true,
+        };
+        let p = db
+            .create_project(&NewProject::named("NoSpeech").with_pipeline(custom_pipeline))
+            .unwrap();
+
+        let media = tmp.path().join("media");
+        std::fs::create_dir_all(&media).unwrap();
+        db.add_folder(p.id, &media, true).unwrap();
+        let folder_id: i64 = db.conn.query_row("SELECT id FROM folders LIMIT 1", [], |r| r.get(0)).unwrap();
+
+        // Insert a video with audio
+        db.conn
+            .execute(
+                "INSERT INTO videos(id, content_hash, size, duration_s, has_audio) VALUES (1, 'hash_no_speech', 500, 10.0, 1)",
+                [],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO video_files(video_id, folder_id, path, size, mtime, last_seen) VALUES (1, ?1, '/a.mp4', 500, 0, 1)",
+                [folder_id],
+            )
+            .unwrap();
+
+        // Ensure jobs and sync
+        ensure_jobs(&db).unwrap();
+        sync_pipeline_jobs(&db, Some(p.id)).unwrap();
+
+        let tr_state: String = db
+            .conn
+            .query_row("SELECT state FROM jobs WHERE video_id = 1 AND stage = 'transcribe'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(tr_state, "skipped", "transcribe job should be skipped because project disabled it");
+
+        let desc_state: String = db
+            .conn
+            .query_row("SELECT state FROM jobs WHERE video_id = 1 AND stage = 'describe'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(desc_state, "skipped", "describe job should be skipped because project disabled it");
+
+        let frames_state: String = db
+            .conn
+            .query_row("SELECT state FROM jobs WHERE video_id = 1 AND stage = 'frames'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(frames_state, "pending", "frames job should still be pending");
+
+        // Re-enable transcribe
+        let mut new_pipeline = p.pipeline.clone();
+        new_pipeline.transcribe = true;
+        db.update_project_pipeline(p.id, &new_pipeline).unwrap();
+
+        let tr_state_after: String = db
+            .conn
+            .query_row("SELECT state FROM jobs WHERE video_id = 1 AND stage = 'transcribe'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(tr_state_after, "pending", "transcribe job should be pending after re-enabling");
     }
 }
