@@ -72,15 +72,7 @@ fn create_project(
     pipeline: Option<PipelineConfig>,
 ) -> CmdResult<Project> {
     open_db()?
-        .create_project(&NewProject {
-            name,
-            description: String::new(),
-            fps_num,
-            fps_den,
-            width,
-            height,
-            pipeline,
-        })
+        .create_project(&NewProject { name, description: String::new(), fps_num, fps_den, width, height, pipeline })
         .map_err(err)
 }
 

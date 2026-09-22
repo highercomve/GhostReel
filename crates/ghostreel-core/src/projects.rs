@@ -33,13 +33,7 @@ pub struct PipelineConfig {
 
 impl Default for PipelineConfig {
     fn default() -> Self {
-        Self {
-            probe: true,
-            transcribe: true,
-            frames: true,
-            describe: true,
-            embed: true,
-        }
+        Self { probe: true, transcribe: true, frames: true, describe: true, embed: true }
     }
 }
 
@@ -597,16 +591,9 @@ mod tests {
         assert!(default_proj.pipeline.embed);
         assert_eq!(default_proj.pipeline.enabled_stages(), vec!["probe", "transcribe", "frames", "describe", "embed"]);
 
-        let custom_pipeline = PipelineConfig {
-            probe: true,
-            transcribe: false,
-            frames: true,
-            describe: false,
-            embed: true,
-        };
-        let b_roll = db
-            .create_project(&NewProject::named("BRoll").with_pipeline(custom_pipeline))
-            .unwrap();
+        let custom_pipeline =
+            PipelineConfig { probe: true, transcribe: false, frames: true, describe: false, embed: true };
+        let b_roll = db.create_project(&NewProject::named("BRoll").with_pipeline(custom_pipeline)).unwrap();
         assert!(!b_roll.pipeline.transcribe);
         assert!(!b_roll.pipeline.describe);
         assert!(b_roll.pipeline.frames);

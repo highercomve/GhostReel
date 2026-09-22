@@ -545,11 +545,9 @@ mod tests {
 
         let pipeline_col_exists: bool = db
             .conn
-            .query_row(
-                "SELECT count(*) FROM pragma_table_info('projects') WHERE name = 'pipeline_json'",
-                [],
-                |r| Ok(r.get::<_, i64>(0)? > 0),
-            )
+            .query_row("SELECT count(*) FROM pragma_table_info('projects') WHERE name = 'pipeline_json'", [], |r| {
+                Ok(r.get::<_, i64>(0)? > 0)
+            })
             .unwrap();
         assert!(pipeline_col_exists);
 

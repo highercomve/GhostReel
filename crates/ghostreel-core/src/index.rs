@@ -530,9 +530,7 @@ pub fn sync_pipeline_jobs(db: &Db, project_id: Option<i64>) -> Result<(), Error>
         let mut to_unskip = Vec::new();
 
         for (&vid, pids) in &video_projects {
-            let any_enabled = pids.iter().any(|pid| {
-                project_map.get(pid).is_none_or(|p| p.pipeline.is_enabled(stage))
-            });
+            let any_enabled = pids.iter().any(|pid| project_map.get(pid).is_none_or(|p| p.pipeline.is_enabled(stage)));
             if any_enabled {
                 to_unskip.push(vid);
             } else {
@@ -2657,9 +2655,7 @@ done
             describe: false,
             embed: true,
         };
-        let p = db
-            .create_project(&NewProject::named("NoSpeech").with_pipeline(custom_pipeline))
-            .unwrap();
+        let p = db.create_project(&NewProject::named("NoSpeech").with_pipeline(custom_pipeline)).unwrap();
 
         let media = tmp.path().join("media");
         std::fs::create_dir_all(&media).unwrap();
