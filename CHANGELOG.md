@@ -5,6 +5,23 @@ versions follow [SemVer](https://semver.org/) while the project is 0.x (minor = 
 
 ## [Unreleased]
 
+## [0.4.3] — 2026-09-22
+
+### Fixed
+
+- **Jev is reachable from any chat.** The **Model / Jev / Jev → model** selector disappeared as
+  soon as a chat was selected, so building with Jev was only possible from a fresh chat. It is
+  always shown now, and the chosen mode no longer resets when switching or starting chats.
+- **A build continues the chat it was asked in.** Building with Jev inside an open chat adds the
+  brief, the cut and its editorial notes to that session instead of opening a new one, so the
+  model's next turn still has the whole conversation.
+- **Chats and timelines stay in step.** A new chat starts with an empty timeline instead of showing
+  the last script of another chat; opening a script selects the chat it belongs to; the chat link
+  to the version on screen is marked; and saving an edited script keeps it in its session.
+- **Existing preview renders are found.** The preview panel picks up an MP4 already rendered for
+  the script, and the preview/export task still running or finished for it, after navigating away
+  and back.
+
 ## [0.4.2] — 2026-09-21
 
 ### Added
