@@ -44,7 +44,7 @@ scripts/build-helpers.sh                       # ghostreel-asr + ghostreel-llm (
 node scripts/fetch-sidecars.mjs                # pinned BtbN LGPL ffmpeg/ffprobe (scripts/sidecars.json, sha256)
 node scripts/stage-helpers.mjs [--cuda]        # helpers → src-tauri/binaries/<name>-<triple>, CUDA libs → src-tauri/lib/
                                                # also writes src-tauri/tauri.bundle.json (externalBin + resources)
-NO_STRIP=true npx tauri build --config src-tauri/tauri.bundle.json --bundles appimage,deb
+NO_STRIP=true npx tauri build --config src-tauri/tauri.bundle.json --bundles appimage
 scripts/fix-appimage.sh                        # AppImage only: drop host driver libcuda, dedupe CUDA libs, repack
 scripts/package-cli.sh                         # target/dist/ghostreel-cli-linux-x64.tar.gz
 ```

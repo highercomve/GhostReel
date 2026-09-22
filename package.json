@@ -10,7 +10,7 @@
     "tauri": "tauri",
     "doctor": "cargo run -q -p ghostreel-cli -- doctor",
     "sidecars": "node scripts/fetch-sidecars.mjs && node scripts/stage-helpers.mjs",
-    "bundle:linux": "npm run sidecars && NO_STRIP=true tauri build --config src-tauri/tauri.bundle.json --bundles appimage,deb && scripts/fix-appimage.sh",
+    "bundle:linux": "npm run sidecars && NO_STRIP=true tauri build --config src-tauri/tauri.bundle.json --bundles appimage && scripts/fix-appimage.sh",
     "bundle:windows": "npm run sidecars && tauri build --config src-tauri/tauri.bundle.json --bundles nsis",
     "bundle:cli": "scripts/package-cli.sh"
   },

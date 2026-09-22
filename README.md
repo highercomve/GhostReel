@@ -70,7 +70,7 @@ Download the latest build from [Releases](https://github.com/highercomve/ghostre
 | Platform | File | Notes |
 |---|---|---|
 | **Windows 10/11** | `GhostReel_x.y.z_x64-setup.exe` | NVIDIA driver 570+ for GPU (CUDA 12.8 runtime is bundled) |
-| **Linux** | `.AppImage` or `.deb` | NVIDIA driver 570+ for GPU |
+| **Linux** | `.AppImage` | NVIDIA driver 570+ for GPU |
 | **CLI only** | `ghostreel-cli-*.zip` / `.tar.gz` | same helpers and ffmpeg, no desktop app |
 
 ffmpeg/ffprobe are bundled. On first start open **Models** and download what you need:
@@ -274,7 +274,7 @@ Release bundles (see `AGENTS.md` → Packaging):
 
 ```bash
 scripts/build-helpers.sh               # ghostreel-asr + ghostreel-llm (CUDA if the toolkit is present)
-npm run bundle:linux                   # AppImage + deb (+ CLI tarball)
+npm run bundle:linux                   # AppImage (+ CLI tarball)
 npm run bundle:windows                 # NSIS installer (on Windows)
 ```
 
