@@ -5,6 +5,27 @@ versions follow [SemVer](https://semver.org/) while the project is 0.x (minor = 
 
 ## [Unreleased]
 
+## [0.4.4] — 2026-09-22
+
+### Added
+
+- **Concurrent multi-sequence batching in `ghostreel-llm`**: Added `--concurrency <N>` to the
+  standalone llama.cpp helper, evaluating visual prompts and autoregressively decoding tokens for
+  multiple keyframes concurrently in continuous forward passes. Automatically computes optimal
+  concurrency based on free GPU VRAM and model weights (e.g. 4 concurrent sequences on 12 GB VRAM),
+  increasing describe throughput by up to ~6× (~0.75s/frame vs ~4.5s/frame).
+- **Configurable keyframe vision sampling resolution**: Default sampling resolution resized from
+  1280px to 768px (configurable down to 512px / 640px or up to 1024px / 1280px). Cuts visual token
+  counts and prompt evaluation time by ~2–4× while preserving sharp scene understanding. Available
+  in AI Models settings and directly in the project view.
+- **Lazy camera steadiness analysis**: Decoupled ffmpeg shake and jerk measurement from synchronous
+  keyframe extraction so initial indexing completes much faster. Steadiness runs as a dedicated
+  background job post-indexing or on-demand, with support for re-analyzing existing projects.
+- **Streamlined Project Header & Actions Menu**: Replaced crowded horizontal header buttons with a
+  clean right-aligned `[ ⚙ Project ▾ ]` actions menu beside `[ Index now ]`. Consolidates sampling
+  resolution, keyframe rebuilds, camera shake analysis, project renaming, and instant access to
+  "Delete project…" without scrolling down the video table.
+
 ## [0.4.3] — 2026-09-22
 
 ### Fixed
