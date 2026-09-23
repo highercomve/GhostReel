@@ -5,6 +5,26 @@ versions follow [SemVer](https://semver.org/) while the project is 0.x (minor = 
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-09-23
+
+### Added
+
+- **B-roll only script chats**: a composer switch that cuts a montage on a theme with no interviews
+  and no voice-over. Each chat keeps its choice, and chooses between the clips' natural sound or
+  silence (for music). The model gets its own editing instructions (theme, shot-size progression,
+  visual continuity), the footage digest marks interview tapes, and any clip over someone speaking
+  on the microphone is dropped.
+- **Full model log**: a "Full log" button in the script chat shows every prompt, the model's
+  thinking, its answers with token counts and timing, and the local helper's output, live while a
+  turn runs. llama.cpp debug noise is filtered out.
+
+### Fixed
+
+- **Claude CLI backend**: the prompt is sent on stdin as a plain brief. Pointed at a prompt file,
+  Claude described the file instead of answering ("no JSON object in CLI output").
+- **Claude CLI sessions**: turns resume their own pinned session instead of `--continue`, which
+  could pick up whatever Claude session last ran in the folder.
+
 ## [0.5.0] — 2026-09-22
 
 ### Added
