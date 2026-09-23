@@ -5,6 +5,21 @@ versions follow [SemVer](https://semver.org/) while the project is 0.x (minor = 
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-09-22
+
+### Added
+
+- **Built-in Web Server (Remote Access)**: GhostReel can now serve its full React desktop UI over HTTP,
+  allowing users to view projects, monitor tasks, and drive editing from a phone, tablet, or another
+  computer on the local network.
+- **Embedded Axum web server (`webui.rs`)**: Reads the embedded frontend bundle from Tauri's assets,
+  serves media clips and keyframe thumbnails, and proxies desktop invocations via `POST /api/call`.
+- **Real-time Server-Sent Events (`/api/events`)**: Streams live queue events, background task updates,
+  and chat generation progress to all connected web clients via `onEvent()`.
+- **Optional HTTP Basic Authentication**: Protect web access with configurable username and password credentials.
+- **Web Access Settings**: Dedicated configuration section in Settings to toggle the server, customize bind
+  address/port, set credentials, and view active LAN URLs.
+
 ## [0.4.5] — 2026-09-22
 
 ### Added
