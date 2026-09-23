@@ -1680,6 +1680,8 @@ name = "ghostreel-app"
 version = "0.4.5"
 dependencies = [
  "axum",
+ "base64 0.22.1",
+ "futures-util",
  "ghostreel-core",
  "serde",
  "serde_json",

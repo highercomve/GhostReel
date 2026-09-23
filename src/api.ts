@@ -1,6 +1,39 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 
-export const fileUrl = (path: string) => convertFileSrc(path);
+/** True in the desktop app: Tauri v2 injects its internals on `window`; a plain browser has none. */
+export const isDesktop = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+
+const errorOf = (body: unknown): string | null =>
+  typeof body === "object" && body !== null && typeof (body as { error?: unknown }).error === "string"
+    ? (body as { error: string }).error
+    : null;
+
+/**
+ * One backend command, whichever host this is running in: a Tauri command, or `POST /api/call`
+ * when the frontend is served over HTTP. A failed command rejects with its own message either
+ * way, so callers can keep doing `String(e)`.
+ */
+export async function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+  if (isDesktop) return invoke<T>(cmd, args);
+  const res = await fetch("/api/call", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ cmd, args: args ?? {} }),
+  });
+  const text = await res.text();
+  let body: unknown = null;
+  try {
+    body = text ? JSON.parse(text) : null;
+  } catch {
+    throw `${cmd}: the server answered ${res.status}, not JSON`;
+  }
+  if (!res.ok) throw errorOf(body) ?? `${cmd} failed (HTTP ${res.status})`;
+  return body as T;
+}
+
+const mediaPath = (path: string) => `/media?path=${encodeURIComponent(path)}`;
+
+export const fileUrl = (path: string) => (isDesktop ? convertFileSrc(path) : mediaPath(path));
 
 // Mirrors ghostreel-core's doctor::Report (serde field names).
 export type Target = "server" | "local" | "unavailable";
@@ -66,7 +99,7 @@ export interface DoctorView {
   blockers: string[];
 }
 
-export const doctor = () => invoke<DoctorView>("doctor");
+export const doctor = () => call<DoctorView>("doctor");
 
 // ---- projects & library ------------------------------------------------------------------
 
@@ -174,8 +207,8 @@ export interface FrameRow {
   visible_text: string | null;
 }
 
-export const videoFrames = (videoId: number) => invoke<FrameRow[]>("video_frames", { videoId });
-export const videoSteadiness = (videoId: number) => invoke<SteadinessView>("video_steadiness", { videoId });
+export const videoFrames = (videoId: number) => call<FrameRow[]>("video_frames", { videoId });
+export const videoSteadiness = (videoId: number) => call<SteadinessView>("video_steadiness", { videoId });
 
 export interface TranscriptSegment {
   start: number;
@@ -184,9 +217,9 @@ export interface TranscriptSegment {
 }
 
 /** The models a coding-agent CLI will accept; empty when it cannot say. */
-export const cliModels = (tool: string) => invoke<string[]>("cli_models", { tool });
+export const cliModels = (tool: string) => call<string[]>("cli_models", { tool });
 
-export const videoTranscript = (videoId: number) => invoke<TranscriptSegment[]>("video_transcript", { videoId });
+export const videoTranscript = (videoId: number) => call<TranscriptSegment[]>("video_transcript", { videoId });
 
 export interface ProjectView {
   project: Project;
@@ -203,9 +236,9 @@ export interface ExcludedVideo {
   path: string;
 }
 export const excludeVideo = (projectId: number, videoId: number, role: ExclusionRole) =>
-  invoke<void>("exclude_video", { projectId, videoId, role });
+  call<void>("exclude_video", { projectId, videoId, role });
 export const includeVideo = (projectId: number, videoId: number) =>
-  invoke<void>("include_video", { projectId, videoId });
+  call<void>("include_video", { projectId, videoId });
 
 export type IndexEvent =
   | { event: "scan_folder"; path: string }
@@ -301,9 +334,9 @@ export interface PlannedSegment {
   has_audio: boolean;
 }
 
-export const enqueueIndex = (projectId: number) => invoke<number>("enqueue_index", { projectId });
+export const enqueueIndex = (projectId: number) => call<number>("enqueue_index", { projectId });
 export const enqueueSteadiness = (projectId: number, force = false) =>
-  invoke<number>("enqueue_steadiness", { projectId, force });
+  call<number>("enqueue_steadiness", { projectId, force });
 /** `out`: save the rendered MP4 there (demo export) instead of the previews folder. */
 export const enqueuePreview = (
   scriptId: number,
@@ -311,15 +344,15 @@ export const enqueuePreview = (
   burnNarration: boolean,
   normalizeAudio: boolean,
   out?: string,
-) => invoke<number>("enqueue_preview", { scriptId, burnTitles, burnNarration, normalizeAudio, out: out ?? null });
+) => call<number>("enqueue_preview", { scriptId, burnTitles, burnNarration, normalizeAudio, out: out ?? null });
 export const enqueueExport = (scriptId: number, format: string, path: string) =>
-  invoke<number>("enqueue_export", { scriptId, format, path });
-export const previewPlan = (scriptId: number) => invoke<PlannedSegment[]>("preview_plan", { scriptId });
+  call<number>("enqueue_export", { scriptId, format, path });
+export const previewPlan = (scriptId: number) => call<PlannedSegment[]>("preview_plan", { scriptId });
 export const getScriptPreview = (scriptId: number) =>
-  invoke<string | null>("get_script_preview", { scriptId });
-export const queueList = () => invoke<Task[]>("queue_list");
-export const cancelTask = (id: number) => invoke<boolean>("cancel_task", { id });
-export const clearFinishedTasks = () => invoke<void>("clear_finished_tasks");
+  call<string | null>("get_script_preview", { scriptId });
+export const queueList = () => call<Task[]>("queue_list");
+export const cancelTask = (id: number) => call<boolean>("cancel_task", { id });
+export const clearFinishedTasks = () => call<void>("clear_finished_tasks");
 
 export interface Hit {
   video_id: number;
@@ -334,16 +367,18 @@ export interface Hit {
 }
 
 export const search = (projectId: number, query: string, limit = 30) =>
-  invoke<{ hits: Hit[]; note: string | null }>("search", { projectId, query, limit });
+  call<{ hits: Hit[]; note: string | null }>("search", { projectId, query, limit });
 let mediaBasePromise: Promise<string> | null = null;
 /** URL the player can stream (byte ranges) — WebKitGTK can't stream video from the asset protocol. */
 export const mediaUrl = async (path: string) => {
-  mediaBasePromise ??= invoke<string>("media_base");
+  // Served over HTTP the web server streams ranges itself; the desktop media port is loopback-only.
+  if (!isDesktop) return mediaPath(path);
+  mediaBasePromise ??= call<string>("media_base");
   return `${await mediaBasePromise}?path=${encodeURIComponent(path)}`;
 };
-export const openExternal = (path: string, t: number) => invoke<void>("open_external", { path, t });
+export const openExternal = (path: string, t: number) => call<void>("open_external", { path, t });
 /** What the player should load: the original, or a playable proxy built on first open. */
-export const videoPlayback = (videoId: number) => invoke<{ path: string; proxy: boolean }>("video_playback", { videoId });
+export const videoPlayback = (videoId: number) => call<{ path: string; proxy: boolean }>("video_playback", { videoId });
 
 export const clock = (s: number) => {
   const t = Math.max(0, Math.floor(s));
@@ -355,7 +390,7 @@ export const clock = (s: number) => {
 
 export const fileName = (p: string) => p.split(/[\\/]/).pop() ?? p;
 
-export const listProjects = () => invoke<ProjectSummary[]>("list_projects");
+export const listProjects = () => call<ProjectSummary[]>("list_projects");
 export const createProject = (
   name: string,
   fpsNum: number,
@@ -364,7 +399,7 @@ export const createProject = (
   height: number,
   pipeline?: Partial<PipelineConfig>,
 ) =>
-  invoke<Project>("create_project", {
+  call<Project>("create_project", {
     name,
     fpsNum,
     fpsDen,
@@ -381,9 +416,9 @@ export const createProject = (
       : null,
   });
 export const setProjectPipeline = (projectId: number, pipeline: PipelineConfig) =>
-  invoke<Project>("set_project_pipeline", { projectId, pipeline });
+  call<Project>("set_project_pipeline", { projectId, pipeline });
 export const renameProject = (projectId: number, name: string) =>
-  invoke<Project>("rename_project", { projectId, name });
+  call<Project>("rename_project", { projectId, name });
 export interface PurgeStats {
   videos: number;
   files_deleted: number;
@@ -391,11 +426,11 @@ export interface PurgeStats {
 }
 /** `purge`: also delete keyframes, previews and the index of footage no other project uses. */
 export const removeProject = (projectId: number, purge = false) =>
-  invoke<PurgeStats>("remove_project", { projectId, purge });
-export const projectView = (projectId: number) => invoke<ProjectView>("project_view", { projectId });
+  call<PurgeStats>("remove_project", { projectId, purge });
+export const projectView = (projectId: number) => call<ProjectView>("project_view", { projectId });
 export const addFolder = (projectId: number, path: string, recursive = true) =>
-  invoke<void>("add_folder", { projectId, path, recursive });
-export const removeFolder = (projectId: number, path: string) => invoke<void>("remove_folder", { projectId, path });
+  call<void>("add_folder", { projectId, path, recursive });
+export const removeFolder = (projectId: number, path: string) => call<void>("remove_folder", { projectId, path });
 
 
 export const FPS_PRESETS: { label: string; num: number; den: number }[] = [
@@ -546,7 +581,7 @@ export interface ChatProgress {
 }
 
 export const chatTurn = (projectId: number, sessionId: number | null, message: string, images?: string[]) =>
-  invoke<ChatTurnView>("chat_turn", { projectId, sessionId, message, images: images ?? [] });
+  call<ChatTurnView>("chat_turn", { projectId, sessionId, message, images: images ?? [] });
 
 /**
  * Build a cut by choosing instead of writing: Jev picks the quotes and the shots out of the index
@@ -560,24 +595,24 @@ export const buildScriptWithJev = (
   sessionId: number | null,
   brief: string,
   targetS: number,
-) => invoke<BuiltCut>("build_script_with_jev", { projectId, sessionId, brief, targetS });
+) => call<BuiltCut>("build_script_with_jev", { projectId, sessionId, brief, targetS });
 
 export const chatSessions = (projectId: number) =>
-  invoke<ChatSession[]>("chat_sessions", { projectId });
+  call<ChatSession[]>("chat_sessions", { projectId });
 
-export const deleteChatSession = (sessionId: number) => invoke<boolean>("delete_chat_session", { sessionId });
+export const deleteChatSession = (sessionId: number) => call<boolean>("delete_chat_session", { sessionId });
 
 export const chatMessages = (sessionId: number) =>
-  invoke<ChatMessage[]>("chat_messages", { sessionId });
+  call<ChatMessage[]>("chat_messages", { sessionId });
 
 export const listScripts = (projectId: number) =>
-  invoke<ScriptSummary[]>("list_scripts", { projectId });
+  call<ScriptSummary[]>("list_scripts", { projectId });
 
 export const getScript = (scriptId: number) =>
-  invoke<ScriptView>("get_script", { scriptId });
+  call<ScriptView>("get_script", { scriptId });
 
 export const saveScript = (projectId: number, script: Script, sessionId: number | null) =>
-  invoke<SaveScriptView>("save_script", { projectId, script, sessionId });
+  call<SaveScriptView>("save_script", { projectId, script, sessionId });
 
 // ---- models management -------------------------------------------------------------------
 
@@ -757,24 +792,24 @@ export interface AiSettingsPatch {
   jev?: JevSettingsPatch;
 }
 
-export const getAiSettings = () => invoke<AiSettings>("get_ai_settings");
+export const getAiSettings = () => call<AiSettings>("get_ai_settings");
 /** Run one describe call through the configured CLI agent. `capability`: "vision" | "chat_model". */
-export const testCliAgent = (capability: string) => invoke<string>("test_cli_agent", { capability });
-export const setAiSettings = (patch: AiSettingsPatch) => invoke<AiSettings>("set_ai_settings", { patch });
-export const probeBackends = () => invoke<BackendsResolution>("probe_backends");
-export const serverModels = (url: string) => invoke<string[]>("server_models", { url });
+export const testCliAgent = (capability: string) => call<string>("test_cli_agent", { capability });
+export const setAiSettings = (patch: AiSettingsPatch) => call<AiSettings>("set_ai_settings", { patch });
+export const probeBackends = () => call<BackendsResolution>("probe_backends");
+export const serverModels = (url: string) => call<string[]>("server_models", { url });
 
-export const modelsStatus = () => invoke<ModelsStatusView>("models_status");
+export const modelsStatus = () => call<ModelsStatusView>("models_status");
 export const enqueueModelDownload = (modelId: string) =>
-  invoke<number>("enqueue_model_download", { modelId });
+  call<number>("enqueue_model_download", { modelId });
 export const removeModel = (modelId: string) =>
-  invoke<void>("remove_model", { modelId });
+  call<void>("remove_model", { modelId });
 export const setWhisperModel = (modelId: string) =>
-  invoke<void>("set_whisper_model", { modelId });
-export const openModelsDir = () => invoke<void>("open_models_dir");
+  call<void>("set_whisper_model", { modelId });
+export const openModelsDir = () => call<void>("open_models_dir");
 
 export const redoProjectStage = (projectId: number, stage: string) =>
-  invoke<number>("redo_project_stage", { projectId, stage });
+  call<number>("redo_project_stage", { projectId, stage });
 
 /** Compact bar meter like "▰▰▰▱▱" for a 1–5 score. */
 export const scoreMeter = (n: number) =>
@@ -784,7 +819,35 @@ export interface ChatSettings {
   system_prompt: string;
   default_system_prompt: string;
 }
-export const getChatSettings = () => invoke<ChatSettings>("get_chat_settings");
-export const setChatSystemPrompt = (prompt: string) => invoke<ChatSettings>("set_chat_system_prompt", { prompt });
+export const getChatSettings = () => call<ChatSettings>("get_chat_settings");
+export const setChatSystemPrompt = (prompt: string) => call<ChatSettings>("set_chat_system_prompt", { prompt });
 
-export const appVersion = () => invoke<string>("app_version");
+export const appVersion = () => call<string>("app_version");
+
+// ---- web access (serving this frontend over HTTP) ----------------------------------------
+
+export interface WebStatus {
+  enabled: boolean;
+  running: boolean;
+  bind: string;
+  port: number;
+  /** What to open on another device; empty until the server is up. */
+  urls: string[];
+  auth_enabled: boolean;
+  auth_user: string;
+  /** Why the server is not running, e.g. the port is taken. */
+  error: string | null;
+}
+
+export interface WebConfigPatch {
+  enabled?: boolean;
+  bind?: string;
+  port?: number;
+  auth_enabled?: boolean;
+  auth_user?: string;
+  /** "" leaves the stored password alone; `web_status` never returns it. */
+  auth_password?: string;
+}
+
+export const webStatus = () => call<WebStatus>("web_status");
+export const setWebConfig = (patch: WebConfigPatch) => call<WebStatus>("set_web_config", { patch });

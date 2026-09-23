@@ -1,5 +1,4 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { listen } from "@tauri-apps/api/event";
 import { ask, open } from "@tauri-apps/plugin-dialog";
 import {
   addFolder,
@@ -26,6 +25,7 @@ import {
   type ProjectView,
   type VideoRow,
 } from "./api";
+import { onEvent } from "./events";
 import TaskCard from "./TaskCard";
 import { useQueue } from "./useQueue";
 import VideoPanel from "./VideoPanel";
@@ -127,13 +127,10 @@ export default function ProjectPage({ projectId, onChanged }: { projectId: numbe
     return () => clearInterval(id);
   }, [running?.id, refresh]); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => {
-    const un = listen<number>("task-finished", () => {
+    return onEvent<number>("task-finished", () => {
       refresh();
       onChanged();
     });
-    return () => {
-      un.then((f) => f());
-    };
   }, [refresh, onChanged]);
 
   const run = async (fn: () => Promise<unknown>) => {

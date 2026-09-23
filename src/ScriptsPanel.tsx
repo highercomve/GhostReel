@@ -1,5 +1,4 @@
 import { useEffect, useRef, useState } from "react";
-import { listen } from "@tauri-apps/api/event";
 import {
   fileUrl,
   getAiSettings,
@@ -23,6 +22,7 @@ import {
   type ToolCallRecord,
   type VisionSettingsPatch,
 } from "./api";
+import { onEvent } from "./events";
 import ScriptEditor from "./ScriptEditor";
 import TaskCard from "./TaskCard";
 import { useQueue } from "./useQueue";
@@ -330,8 +330,7 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
 
   // Listen to live chat-progress events
   useEffect(() => {
-    const un = listen<ChatProgress>("chat-progress", (e) => {
-      const p = e.payload;
+    return onEvent<ChatProgress>("chat-progress", (p) => {
       const cached = sessionEventsCache.get(p.session_id) ?? [];
       const updated = [...cached, p.event];
       sessionEventsCache.set(p.session_id, updated);
@@ -339,9 +338,6 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
         setLiveEvents(updated);
       }
     });
-    return () => {
-      un.then((f) => f());
-    };
   }, [selectedSessionId, liveSessionId]);
 
   // Restore live events on mount or session change
@@ -412,7 +408,7 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
 
   // Also listen for task-finished event as a fallback
   useEffect(() => {
-    const un = listen<number>("task-finished", async () => {
+    return onEvent<number>("task-finished", async () => {
       const [sessList, scriptList] = await Promise.all([
         chatSessions(projectId).catch(() => [] as ChatSession[]),
         listScripts(projectId).catch(() => [] as ScriptSummary[]),
@@ -433,9 +429,6 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
       setOptimisticUser(null);
       setTurnRunning(false);
     });
-    return () => {
-      un.then((f) => f());
-    };
   }, [projectId, selectedSessionId, liveSessionId]);
 
   useEffect(() => {

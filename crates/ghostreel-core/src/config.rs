@@ -583,6 +583,36 @@ impl FramesConfig {
     }
 }
 
+/// Serving the desktop app's own UI over HTTP, so it can be opened from a phone or
+/// another computer. Off unless it is turned on in Settings.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WebConfig {
+    pub enabled: bool,
+    /// Address to listen on. `127.0.0.1` keeps it on this machine; `0.0.0.0` answers
+    /// on every interface.
+    pub bind: String,
+    pub port: u16,
+    /// HTTP Basic auth. Without it anything that can reach the port has the whole app.
+    pub auth_enabled: bool,
+    pub auth_user: String,
+    /// Stored as written, in `config.toml`.
+    pub auth_password: String,
+}
+
+impl Default for WebConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind: "0.0.0.0".to_string(),
+            port: 4317,
+            auth_enabled: false,
+            auth_user: String::new(),
+            auth_password: String::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -603,6 +633,9 @@ pub struct Config {
     /// The optional editorial judge. Off, and inert, unless a key is put in front of it.
     #[serde(default)]
     pub jev: JevConfig,
+    /// Serving the UI over HTTP for other devices.
+    #[serde(default)]
+    pub web: WebConfig,
 }
 
 impl Config {

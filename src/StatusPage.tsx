@@ -1,8 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
-import { invoke } from "@tauri-apps/api/core";
-import { doctor, type DoctorView, type Resolution } from "./api";
+import { appVersion, doctor, type DoctorView, type Resolution } from "./api";
 
 const CAPABILITIES: { key: "vision" | "embeddings" | "stt"; label: string; hint: string }[] = [
   { key: "vision", label: "Frame descriptions", hint: "vision model" },
@@ -183,7 +182,7 @@ export default function StatusPage() {
 
   useEffect(() => {
     refresh();
-    invoke<string>("app_version")
+    appVersion()
       .then(setAppVer)
       .catch(() => {});
   }, [refresh]);

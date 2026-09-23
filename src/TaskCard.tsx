@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
-import { listen } from "@tauri-apps/api/event";
 import { cancelTask, etaText, PHASE_LABELS, type ChatProgress, type Task } from "./api";
+import { onEvent } from "./events";
 
 const STATE_LABEL: Record<string, string> = {
   queued: "Waiting",
@@ -92,13 +92,10 @@ export default function TaskCard({ task, compact = false }: { task: Task; compac
   const sessionId = task.kind.type === "chat" ? task.kind.session_id : null;
   useEffect(() => {
     if (!open || sessionId == null) return;
-    const un = listen<ChatProgress>("chat-progress", (e) => {
-      if (e.payload.session_id !== sessionId) return;
-      setLog((prev) => [...prev, chatLine(e.payload.event)].slice(-200));
+    return onEvent<ChatProgress>("chat-progress", (p) => {
+      if (p.session_id !== sessionId) return;
+      setLog((prev) => [...prev, chatLine(p.event)].slice(-200));
     });
-    return () => {
-      un.then((f) => f());
-    };
   }, [open, sessionId]);
 
   useEffect(() => {

@@ -3,6 +3,7 @@
 
 mod media;
 mod queue;
+mod webui;
 
 use std::path::PathBuf;
 
@@ -1215,6 +1216,25 @@ fn app_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
 }
 
+/// Web access: whether the UI is being served to other devices, and where.
+#[tauri::command]
+fn web_status(server: State<'_, webui::WebServer>) -> CmdResult<webui::WebStatus> {
+    let config = Config::load(&paths()?.config_file).unwrap_or_default();
+    Ok(webui::status(&server, &config.web))
+}
+
+/// Saves a web access change and restarts the server to match it.
+#[tauri::command]
+async fn set_web_config(app: AppHandle, patch: webui::WebConfigPatch) -> CmdResult<webui::WebStatus> {
+    use tauri::Manager;
+    let p = paths()?;
+    let mut config = Config::load(&p.config_file).map_err(err)?;
+    webui::merge(&mut config.web, patch)?;
+    config.save(&p.config_file).map_err(err)?;
+    webui::apply(&app, &config.web).await;
+    Ok(webui::status(&app.state::<webui::WebServer>(), &config.web))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     #[cfg(target_os = "linux")]
@@ -1228,6 +1248,7 @@ pub fn run() {
         .manage(SearchState::default())
         .manage(tokio::sync::OnceCell::<media::MediaServer>::new())
         .manage(queue::Queue::default())
+        .manage(webui::WebServer::default())
         .setup(|app| {
             // Frames/thumbnails are served from the data dir via the asset protocol; scope it
             // at runtime because GHOSTREEL_DATA can move it.
@@ -1252,6 +1273,14 @@ pub fn run() {
                 }
             }
             tauri::async_runtime::spawn(queue::worker(app.handle().clone()));
+            webui::forward_events(app.handle());
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                if let Ok(p) = Paths::resolve() {
+                    let web = Config::load(&p.config_file).unwrap_or_default().web;
+                    webui::apply(&handle, &web).await;
+                }
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -1305,6 +1334,8 @@ pub fn run() {
             probe_backends,
             test_cli_agent,
             app_version,
+            web_status,
+            set_web_config,
         ])
         .run(tauri::generate_context!())
         .expect("error while running GhostReel");

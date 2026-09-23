@@ -1,5 +1,4 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { listen } from "@tauri-apps/api/event";
 import {
   cliModels,
   cancelTask,
@@ -25,6 +24,7 @@ import {
   type VisionSettingsPatch,
   testCliAgent,
 } from "./api";
+import { onEvent } from "./events";
 import { useQueue } from "./useQueue";
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
@@ -285,10 +285,7 @@ export default function ModelsPage() {
 
   useEffect(() => {
     refresh();
-    const un = listen("task-finished", () => refresh());
-    return () => {
-      un.then((f) => f());
-    };
+    return onEvent<number>("task-finished", () => refresh());
   }, [refresh]);
 
   // ─── patch helpers ──────────────────────────────────────────────────────────

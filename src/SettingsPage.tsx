@@ -2,11 +2,210 @@ import { useEffect, useRef, useState } from "react";
 import {
   getAiSettings,
   getChatSettings,
+  isDesktop,
   setAiSettings,
   setChatSystemPrompt,
+  setWebConfig,
+  webStatus,
   type AiSettings,
   type ChatSettings,
+  type WebConfigPatch,
+  type WebStatus,
 } from "./api";
+
+/** Bound here, nothing else on the network can reach it — which is what makes a password optional. */
+const isLoopback = (bind: string) => bind === "127.0.0.1" || bind === "localhost" || bind === "::1";
+
+function WebAccess() {
+  const [web, setWeb] = useState<WebStatus | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [bind, setBind] = useState("");
+  const [port, setPort] = useState("");
+  const [user, setUser] = useState("");
+  const [password, setPassword] = useState("");
+
+  const load = (s: WebStatus) => {
+    setWeb(s);
+    setBind(s.bind);
+    setPort(String(s.port));
+    setUser(s.auth_user);
+    setPassword("");
+  };
+
+  useEffect(() => {
+    // Nothing to show if the backend has no web server at all.
+    webStatus().then(load).catch(() => {});
+  }, []);
+
+  const apply = async (patch: WebConfigPatch) => {
+    try {
+      load(await setWebConfig(patch));
+      setError(null);
+    } catch (err) {
+      setError(String(err));
+    }
+  };
+
+  if (!web) return null;
+
+  // Read-only in a browser: these controls are reached *through* the server they would stop.
+  const locked = !isDesktop;
+  const exposed = web.enabled && !web.auth_enabled && !isLoopback(web.bind);
+  const state = web.running
+    ? `running on ${web.bind}:${web.port}`
+    : web.enabled
+      ? web.error
+        ? "enabled, but it is not running"
+        : "starting…"
+      : "off — nothing is served";
+
+  const commitBind = () => {
+    const v = bind.trim();
+    if (!v || v === web.bind) return;
+    apply({ bind: v });
+  };
+  const commitPort = () => {
+    const v = Number(port);
+    if (!Number.isInteger(v) || v < 1 || v > 65535) {
+      setError("The port must be a number between 1 and 65535");
+      return;
+    }
+    if (v === web.port) return;
+    apply({ port: v });
+  };
+  const commitUser = () => {
+    const v = user.trim();
+    if (v === web.auth_user) return;
+    apply({ auth_user: v });
+  };
+  const commitPassword = () => {
+    if (!password) return;
+    apply({ auth_password: password });
+  };
+  const onEnter = (commit: () => void) => (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === "Enter") commit();
+  };
+
+  return (
+    <>
+      <h2>Web access</h2>
+      <section className="card">
+        <p className="muted small">
+          Serve GhostReel over HTTP as well as in this window, so it can be opened in a browser — here, or on a
+          phone or another computer on the same network. Everything still runs on this computer; the browser is
+          only a window onto it.
+        </p>
+        {locked && (
+          <p className="muted small">
+            You are looking at GhostReel through this server, so it can only be changed in the desktop app —
+            switching it off from here would close the page you are reading.
+          </p>
+        )}
+        {error && <div className="banner bad">{error}</div>}
+        {web.error && <div className="banner bad">The server did not start: {web.error}</div>}
+        {exposed && (
+          <div className="banner bad">
+            This server has no password and is not limited to this computer. Anyone on the same network can open
+            it and use GhostReel as you: read and change your projects, watch your footage, and reach the files on
+            this computer that GhostReel can reach. Turn sign-in on below unless you trust every device on this
+            network.
+          </div>
+        )}
+        <div className="settings-fields">
+          <div className="settings-field">
+            <label>Serve</label>
+            <input
+              type="checkbox"
+              checked={web.enabled}
+              disabled={locked}
+              onChange={(e) => apply({ enabled: e.currentTarget.checked })}
+            />
+            <span className="muted small">{state}</span>
+          </div>
+          {web.running && web.urls.length > 0 && (
+            <div className="settings-field">
+              <label>Open at</label>
+              <span className="muted small">
+                {web.urls.map((u, i) => (
+                  <span key={u}>
+                    {i > 0 && " · "}
+                    <code>{u}</code>
+                  </span>
+                ))}
+              </span>
+            </div>
+          )}
+          <div className="settings-field">
+            <label>Address</label>
+            <input
+              type="text"
+              value={bind}
+              disabled={locked}
+              onChange={(e) => setBind(e.currentTarget.value)}
+              onBlur={commitBind}
+              onKeyDown={onEnter(commitBind)}
+            />
+            <span className="muted small">
+              0.0.0.0 to reach it from other devices · 127.0.0.1 for this computer only
+            </span>
+          </div>
+          <div className="settings-field">
+            <label>Port</label>
+            <input
+              type="number"
+              min={1}
+              max={65535}
+              style={{ width: "7em" }}
+              value={port}
+              disabled={locked}
+              onChange={(e) => setPort(e.currentTarget.value)}
+              onBlur={commitPort}
+              onKeyDown={onEnter(commitPort)}
+            />
+          </div>
+          <div className="settings-field">
+            <label>Sign-in</label>
+            <input
+              type="checkbox"
+              checked={web.auth_enabled}
+              disabled={locked}
+              onChange={(e) => apply({ auth_enabled: e.currentTarget.checked })}
+            />
+            <span className="muted small">
+              {web.auth_enabled
+                ? "on — the browser asks for the name and password below"
+                : "off — anyone who can reach the address is let straight in"}
+            </span>
+          </div>
+          <div className="settings-field">
+            <label>Username</label>
+            <input
+              type="text"
+              value={user}
+              disabled={locked || !web.auth_enabled}
+              onChange={(e) => setUser(e.currentTarget.value)}
+              onBlur={commitUser}
+              onKeyDown={onEnter(commitUser)}
+            />
+          </div>
+          <div className="settings-field">
+            <label>Password</label>
+            <input
+              type="password"
+              value={password}
+              disabled={locked || !web.auth_enabled}
+              placeholder="type to set a password"
+              onChange={(e) => setPassword(e.currentTarget.value)}
+              onBlur={commitPassword}
+              onKeyDown={onEnter(commitPassword)}
+            />
+            <span className="muted small">left blank, the saved password stays as it is</span>
+          </div>
+        </div>
+      </section>
+    </>
+  );
+}
 
 export default function SettingsPage() {
   const [settings, setSettings] = useState<ChatSettings | null>(null);
@@ -302,6 +501,8 @@ export default function SettingsPage() {
           </button>
         </div>
       </section>
+
+      <WebAccess />
     </main>
   );
 }
