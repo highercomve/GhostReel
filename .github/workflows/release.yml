@@ -35,11 +35,11 @@ permissions:
 jobs:
   create-release:
     name: Create release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       release_id: ${{ steps.create.outputs.result }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           sparse-checkout: CHANGELOG.md
           sparse-checkout-cone-mode: false
@@ -96,7 +96,7 @@ jobs:
           docker image prune -af
 
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Linux dependencies
         run: |
@@ -136,7 +136,7 @@ jobs:
           shared-key: linux-cuda
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
@@ -294,7 +294,7 @@ jobs:
       GHOSTREEL_GPU: cuda
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # Jimver pin v0.2.24 checked to exist; CUDA 12.8 ships .so.12 / 64_12.dll runtimes
       - name: Install CUDA Toolkit
@@ -324,7 +324,7 @@ jobs:
           shared-key: windows-cuda
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
@@ -465,7 +465,7 @@ jobs:
     needs: [create-release, linux-x64, windows-x64]
     # Publish whatever built: a failed platform shouldn't hold back the other's installer.
     if: always() && needs.create-release.result == 'success' && (needs.linux-x64.result == 'success' || needs.windows-x64.result == 'success')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Download Linux updater snippet
         if: needs.linux-x64.result == 'success'
