@@ -16,6 +16,7 @@ import {
   type ChatMessage,
   type ChatProgress,
   type ChatSession,
+  type ChatStyle,
   type Issue,
   type ModelStatus,
   type ScriptSummary,
@@ -23,6 +24,7 @@ import {
   type VisionSettingsPatch,
 } from "./api";
 import { onEvent } from "./events";
+import ChatLogModal from "./ChatLogModal";
 import ScriptEditor from "./ScriptEditor";
 import TaskCard from "./TaskCard";
 import { useQueue } from "./useQueue";
@@ -97,6 +99,7 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
   const [inputMessage, setInputMessage] = useState("");
   const [attachedImages, setAttachedImages] = useState<string[]>([]);
   const [previewImage, setPreviewImage] = useState<string | null>(null);
+  const [logOpen, setLogOpen] = useState(false);
   const [turnRunning, setTurnRunning] = useState(false);
   const [liveEvents, setLiveEvents] = useState<ChatEvent[]>([]);
   const [optimisticUser, setOptimisticUser] = useState<{ text: string; images: string[] } | null>(null);
@@ -180,6 +183,11 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
   const [jevReady, setJevReady] = useState<boolean | null>(null);
   /** Whether every finished cut is read editorially. `null` until settings have been read. */
   const [judging, setJudging] = useState<boolean | null>(null);
+  /**
+   * B-roll only: a montage on a theme with no interviews and no voice-over. Chosen per chat and
+   * kept on it, so a follow-up turn cannot quietly drift back to an interview cut.
+   */
+  const [style, setStyle] = useState<ChatStyle>({ broll: false, natural_sound: true });
   const [latestIssues, setLatestIssues] = useState<Issue[] | undefined>(undefined);
 
   const messagesRef = useRef<HTMLDivElement>(null);
@@ -469,6 +477,19 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
     setLiveEvents([]);
   };
 
+  // A chat that chose a style keeps it: follow the selected chat's own. A new chat keeps
+  // whatever the composer is set to.
+  const selectedStyle = sessions.find((s) => s.id === selectedSessionId)?.style;
+  // Only a b-roll chat has chosen its sound; an interview chat leaves the composer's choice alone.
+  useEffect(() => {
+    if (selectedStyle) setStyle((s) => (selectedStyle.broll ? selectedStyle : { ...s, broll: false }));
+  }, [selectedSessionId, selectedStyle?.broll, selectedStyle?.natural_sound]);
+
+  // Jev builds from interview quotes; a montage has none, so only the model can write one.
+  useEffect(() => {
+    if (style.broll && mode !== "chat") setMode("chat");
+  }, [style.broll, mode]);
+
   const handleSend = async () => {
     const text = inputMessage.trim();
     const imagesToSend = [...attachedImages];
@@ -512,7 +533,7 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
           "Improve this cut. Keep it to the brief, fix the editorial notes above, and keep every " +
           "quote a whole sentence. Reply with the full script JSON.";
       }
-      const res = await chatTurn(projectId, session, message, imagesToSend);
+      const res = await chatTurn(projectId, session, message, imagesToSend, style);
       setSelectedSessionId(res.session_id);
       userSelectedRef.current = true;
       sessionEventsCache.delete(res.session_id);
@@ -690,7 +711,19 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
               ? cleanTitle(sessions.find((s) => s.id === selectedSessionId)?.title)
               : "New Script Chat"}
           </span>
-          {isTurnRunning && <span className="pill local small">Running</span>}
+          <span className="chat-header-actions">
+            {isTurnRunning && <span className="pill local small">Running</span>}
+            {(selectedSessionId ?? liveSessionId) != null && (
+              <button
+                type="button"
+                className="small"
+                onClick={() => setLogOpen(true)}
+                title="Every prompt, the model's thinking and answers, and the helper's output"
+              >
+                Full log
+              </button>
+            )}
+          </span>
         </div>
 
         <div className="chat-messages" ref={messagesRef}>
@@ -879,7 +912,7 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
           <div className="composer-modes" role="radiogroup" aria-label="How to build this cut">
             {MODES.map((m) => {
               const needsJev = m.id !== "chat";
-              const blocked = needsJev && jevReady === false;
+              const blocked = needsJev && (jevReady === false || style.broll);
               return (
                 <button
                   key={m.id}
@@ -888,8 +921,14 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
                   aria-checked={mode === m.id}
                   className={`composer-mode${mode === m.id ? " on" : ""}${blocked ? " blocked" : ""}`}
                   disabled={isTurnRunning}
-                  title={blocked ? "Needs Jev turned on with an API key — see Settings" : m.hint}
-                  onClick={() => setMode(m.id)}
+                  title={
+                    needsJev && style.broll
+                      ? "Jev builds from interview quotes — a b-roll montage is written by the model"
+                      : blocked
+                        ? "Needs Jev turned on with an API key — see Settings"
+                        : m.hint
+                  }
+                  onClick={() => !(needsJev && style.broll) && setMode(m.id)}
                 >
                   {m.label}
                 </button>
@@ -1036,7 +1075,7 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
             </div>
           )}
 
-          <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: "8px", alignItems: "center" }}>
             {/*
               The judge is a separate want from the builder: somebody may have Jev assemble a cut
               and not want every draft scored. `jev.enabled` gates both, so this writes its own flag.
@@ -1070,6 +1109,44 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
 
             <button
               type="button"
+              className={`composer-judge${style.broll ? " on" : ""}`}
+              disabled={isTurnRunning}
+              aria-pressed={style.broll}
+              title={
+                style.broll
+                  ? "This chat cuts a montage on a theme: pictures only, no interviews, no voice-over. Click to go back to interview-led cuts."
+                  : "Cut a montage on a theme: pictures only, no interviews, no voice-over."
+              }
+              onClick={() => setStyle((s) => ({ ...s, broll: !s.broll }))}
+            >
+              B-roll only
+            </button>
+            {style.broll && (
+              <div className="composer-audio" role="radiogroup" aria-label="B-roll sound">
+                {(
+                  [
+                    [true, "Natural sound", "Each clip plays its own ambient sound; anyone speaking is muted."],
+                    [false, "Silent", "Every clip is muted, for music laid over it later."],
+                  ] as const
+                ).map(([natural, label, hint]) => (
+                  <button
+                    key={label}
+                    type="button"
+                    role="radio"
+                    aria-checked={style.natural_sound === natural}
+                    className={`composer-judge${style.natural_sound === natural ? " on" : ""}`}
+                    disabled={isTurnRunning}
+                    title={hint}
+                    onClick={() => setStyle((s) => ({ ...s, natural_sound: natural }))}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+            )}
+
+            <button
+              type="button"
               className="composer-attach-btn"
               disabled={isTurnRunning}
               onClick={() => fileInputRef.current?.click()}
@@ -1081,9 +1158,13 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
 
           <div className="composer-go">
             <p className="composer-hint small muted">
-              {jevReady === false && mode !== "chat"
-                ? "Needs Jev turned on with an API key — see Settings."
-                : MODES.find((m) => m.id === mode)?.hint}
+              {style.broll
+                ? `A montage on the theme you describe: pictures only, no interviews, no voice-over. ${
+                    style.natural_sound ? "Clips keep their natural sound." : "Clips are muted, ready for music."
+                  }`
+                : jevReady === false && mode !== "chat"
+                  ? "Needs Jev turned on with an API key — see Settings."
+                  : MODES.find((m) => m.id === mode)?.hint}
             </p>
             <button
               type="button"
@@ -1139,6 +1220,9 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
       </div>
 
       {/* Lightbox modal for previewing attached images */}
+      {logOpen && (selectedSessionId ?? liveSessionId) != null && (
+        <ChatLogModal sessionId={(selectedSessionId ?? liveSessionId)!} onClose={() => setLogOpen(false)} />
+      )}
       {previewImage && (
         <div className="chat-image-modal-overlay" onClick={() => setPreviewImage(null)}>
           <div className="chat-image-modal-content" onClick={(e) => e.stopPropagation()}>

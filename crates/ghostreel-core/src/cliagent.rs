@@ -2,7 +2,8 @@
 //!
 //! Each tool has a different invocation shape:
 //! - **claude**: `claude -p "<prompt>" --output-format json --allowedTools Read [--model <m>]`
-//!   stdout is JSON; answer is `result` (a string).
+//!   stdout is JSON; answer is `result` (a string). Chat turns send the prompt on stdin instead,
+//!   as a plain brief, and pin the conversation with `--session-id` / `--resume <id>`.
 //! - **agy**: `agy --dangerously-skip-permissions --add-dir <dir> --output-format json [--model <m>] -p "<prompt>"`
 //!   stdout is JSON; answer is `response` (a string).
 //! - **opencode**: `opencode run [-m <provider/model>] "<prompt>"`
@@ -114,6 +115,26 @@ fn as_plain_brief(prompt: &str) -> String {
 
 pub struct CliAgent {
     pub cfg: CliAgentConfig,
+    /// claude's conversation for this agent, pinned with `--session-id` on the first call and
+    /// resumed by id afterwards. `--continue` resumed whatever ran last in the working folder,
+    /// which could be the user's own session in a terminal.
+    session: std::sync::Mutex<Option<String>>,
+}
+
+/// A fresh random UUID (v4 layout) for `claude --session-id`, which rejects anything else.
+fn new_session_id() -> String {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut h = blake3::Hasher::new();
+    h.update(&std::process::id().to_le_bytes());
+    h.update(&SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed).to_le_bytes());
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    h.update(&nanos.to_le_bytes());
+    let mut b = [0u8; 16];
+    b.copy_from_slice(&h.finalize().as_bytes()[..16]);
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    let x: String = b.iter().map(|v| format!("{v:02x}")).collect();
+    format!("{}-{}-{}-{}-{}", &x[0..8], &x[8..12], &x[12..16], &x[16..20], &x[20..32])
 }
 
 /// The most a whole command line may be before the prompt is spilled to a file instead.
@@ -179,7 +200,7 @@ fn extract_attached_image_paths(prompt: &str) -> Vec<PathBuf> {
 
 impl CliAgent {
     pub fn new(cfg: CliAgentConfig) -> Self {
-        Self { cfg }
+        Self { cfg, session: std::sync::Mutex::new(None) }
     }
 
     /// Resolve binary or return `None`.
@@ -285,13 +306,15 @@ impl CliAgent {
     /// which grows quadratically: on a 96-video library agy needed more than three minutes for a
     /// single round and hit the timeout.
     fn build_argv_complete_from(&self, bin: &Path, prompt: &str, continued: bool) -> Vec<std::ffi::OsString> {
-        let mut args = self.build_argv_complete(bin, prompt);
+        let mut args = self.build_argv_complete(bin, prompt, continued);
         if !continued {
             return args;
         }
         match self.cfg.tool.as_str() {
-            // Both take the flag anywhere; the prompt stays as the new message.
-            "claude" | "agy" => args.insert(1, "--continue".into()),
+            // claude resumes its own session by id (see `session`); `build_argv_complete` does it.
+            "claude" => {}
+            // agy takes the flag anywhere; the prompt stays as the new message.
+            "agy" => args.insert(1, "--continue".into()),
             // codex resumes by subcommand: `codex exec resume --last`.
             "codex" => {
                 if let Some(i) = args.iter().position(|a| a == "exec") {
@@ -310,11 +333,13 @@ impl CliAgent {
         args
     }
 
-    fn build_argv_complete(&self, bin: &Path, prompt: &str) -> Vec<std::ffi::OsString> {
+    fn build_argv_complete(&self, bin: &Path, prompt: &str, continued: bool) -> Vec<std::ffi::OsString> {
         let mut args: Vec<std::ffi::OsString> = Vec::new();
         // Too long to pass as an argument on this platform: write it down and point at it. The
         // agents all read files; what they cannot do is take 75 KB through argv on Windows.
-        let spilled = spill_prompt(prompt);
+        // claude is the exception: it takes the prompt on stdin (`stdin_prompt`), because told to
+        // read a file it treats the file as data and answers about it instead of following it.
+        let spilled = if self.cfg.tool == "claude" { None } else { spill_prompt(prompt) };
         let owned;
         let effective_prompt: &str = match &spilled {
             Some((file, _)) => {
@@ -340,12 +365,28 @@ impl CliAgent {
         match self.cfg.tool.as_str() {
             "claude" => {
                 args.push(bin.as_os_str().to_owned());
+                // The prompt itself arrives on stdin: see `stdin_prompt`.
                 args.push("-p".into());
-                args.push(effective_prompt.into());
                 args.push("--output-format".into());
                 args.push("json".into());
+                // First call pins a new session; later ones in this agent resume exactly it.
+                {
+                    let mut session = self.session.lock().unwrap_or_else(|e| e.into_inner());
+                    match (continued, session.as_ref()) {
+                        (true, Some(id)) => {
+                            args.push("--resume".into());
+                            args.push(id.clone().into());
+                        }
+                        _ => {
+                            let id = new_session_id();
+                            args.push("--session-id".into());
+                            args.push(id.clone().into());
+                            *session = Some(id);
+                        }
+                    }
+                }
                 args.push("--allowedTools".into());
-                // Reading the spilled prompt or attached images is the tool it needs.
+                // Reading attached images is the only tool it needs.
                 args.push(if !grant_dirs.is_empty() { "Read".into() } else { std::ffi::OsString::from("none") });
                 for dir in &grant_dirs {
                     args.push("--add-dir".into());
@@ -407,6 +448,18 @@ impl CliAgent {
         args
     }
 
+    /// What to write to the tool's stdin for a complete call. claude reads its prompt there, as a
+    /// plain brief: handed the ChatML transcript (or a file holding it) it described the prompt
+    /// instead of answering it. Every other tool gets nothing and must not wait for input.
+    fn stdin_prompt(&self, prompt: &str, continued: bool) -> Option<String> {
+        match self.cfg.tool.as_str() {
+            // A continued turn is only the new tool results, already plain text.
+            "claude" if continued => Some(prompt.to_string()),
+            "claude" => Some(as_plain_brief(prompt)),
+            _ => None,
+        }
+    }
+
     /// How long this agent is allowed to take. Read by the chat, which gives a script-writing
     /// agent a longer clock than a frame-describing one.
     pub fn timeout_secs(&self) -> u64 {
@@ -414,7 +467,7 @@ impl CliAgent {
     }
 
     /// Run a CLI and return stdout.
-    async fn run_cli(&self, bin: &Path, args: &[std::ffi::OsString]) -> Result<String, Error> {
+    async fn run_cli(&self, bin: &Path, args: &[std::ffi::OsString], stdin: Option<String>) -> Result<String, Error> {
         if args.is_empty() {
             return Err(Error::Vision(format!("unknown CLI tool '{}'", self.cfg.tool)));
         }
@@ -425,9 +478,9 @@ impl CliAgent {
         }
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
-        // codex treats a non-TTY stdin as extra prompt input and waits for EOF; none of these
-        // tools should read from us at all.
-        cmd.stdin(std::process::Stdio::null());
+        // codex treats a non-TTY stdin as extra prompt input and waits for EOF: a tool that is
+        // not handed a prompt there must not read from us at all.
+        cmd.stdin(if stdin.is_some() { std::process::Stdio::piped() } else { std::process::Stdio::null() });
         // ETXTBSY: the binary was written moments ago (a fresh install, or a test fixture) and the
         // kernel still holds it open. One short retry is enough.
         let child = match cmd.spawn() {
@@ -438,6 +491,16 @@ impl CliAgent {
             other => other,
         }
         .map_err(|e| Error::Vision(format!("cannot run {}: {e}", bin.display())))?;
+        let mut child = child;
+        if let (Some(text), Some(mut pipe)) = (stdin, child.stdin.take()) {
+            use tokio::io::AsyncWriteExt as _;
+            // Written from its own task: a 100 KB prompt fills the pipe, and the tool may start
+            // writing stdout before it has read all of it.
+            tokio::spawn(async move {
+                let _ = pipe.write_all(text.as_bytes()).await;
+                let _ = pipe.shutdown().await;
+            });
+        }
         let output = tokio::time::timeout(Duration::from_secs(self.cfg.timeout_secs), child.wait_with_output())
             .await
             .map_err(|_| Error::Vision(format!("{} timed out after {}s", self.cfg.tool, self.cfg.timeout_secs)))?
@@ -522,7 +585,7 @@ impl CliAgent {
         let bin =
             self.available().ok_or_else(|| Error::Vision(format!("CLI tool '{}' not found on PATH", self.cfg.tool)))?;
         let args = self.build_argv_describe(&bin, image, schema_hint);
-        let raw = self.run_cli(&bin, &args).await?;
+        let raw = self.run_cli(&bin, &args, None).await?;
         let text = Self::extract_text(&self.cfg.tool, &raw)?;
         Self::extract_json_object(&text)
     }
@@ -538,7 +601,17 @@ impl CliAgent {
         let bin =
             self.available().ok_or_else(|| Error::Vision(format!("CLI tool '{}' not found on PATH", self.cfg.tool)))?;
         let args = self.build_argv_complete_from(&bin, prompt, continued);
-        let raw = self.run_cli(&bin, &args).await?;
+        let stdin = self.stdin_prompt(prompt, continued);
+        let shown = args.iter().skip(1).map(|a| a.to_string_lossy()).collect::<Vec<_>>().join(" ");
+        crate::llmlog::push("prompt", format!("{} {shown}\n\n{}", self.cfg.tool, stdin.as_deref().unwrap_or(prompt)));
+        let raw = match self.run_cli(&bin, &args, stdin).await {
+            Ok(raw) => raw,
+            Err(e) => {
+                crate::llmlog::push("answer", format!("error: {e}"));
+                return Err(e);
+            }
+        };
+        crate::llmlog::push("answer", raw.as_str());
         let text = Self::extract_text(&self.cfg.tool, &raw)?;
         Self::extract_json_object(&text)
     }
@@ -977,9 +1050,10 @@ mod brief_tests {
     #[test]
     fn spilling_grants_the_agent_the_directory_it_must_read() {
         let dir = std::env::temp_dir().join("ghostreel-prompts");
-        for tool in ["claude", "agy"] {
+        {
+            let tool = "agy";
             let agent = CliAgent::new(CliAgentConfig { tool: tool.into(), ..Default::default() });
-            let argv = agent.build_argv_complete(Path::new("/bin/true"), &"x".repeat(MAX_ARGV_CHARS + 1));
+            let argv = agent.build_argv_complete(Path::new("/bin/true"), &"x".repeat(MAX_ARGV_CHARS + 1), false);
             let flat: Vec<String> = argv.iter().map(|a| a.to_string_lossy().into_owned()).collect();
 
             assert!(flat.iter().any(|a| a == "--add-dir"), "{tool}: {flat:?}");
@@ -987,11 +1061,47 @@ mod brief_tests {
             // And the prompt itself is a short instruction, not the payload.
             assert!(flat.iter().all(|a| a.len() < 1000), "{tool} still passes the payload in argv");
         }
-        // claude cannot read a file with tools switched off.
+    }
+
+    /// claude told to "read the file" answered about the file ("it's a system prompt for…")
+    /// instead of producing JSON. It gets the prompt on stdin as a plain brief, never a file.
+    #[test]
+    fn claude_takes_the_prompt_on_stdin_as_a_plain_brief() {
         let claude = CliAgent::new(CliAgentConfig { tool: "claude".into(), ..Default::default() });
-        let argv = claude.build_argv_complete(Path::new("/bin/true"), &"x".repeat(MAX_ARGV_CHARS + 1));
+        let huge = format!("<|im_start|>system\nYou are an editor.<|im_end|>\n{}", "x".repeat(MAX_ARGV_CHARS + 1));
+        let argv = claude.build_argv_complete(Path::new("/bin/true"), &huge, false);
         let flat: Vec<String> = argv.iter().map(|a| a.to_string_lossy().into_owned()).collect();
-        assert!(flat.contains(&"Read".to_string()), "{flat:?}");
-        assert!(!flat.contains(&"none".to_string()));
+        assert!(flat.iter().all(|a| a.len() < 1000), "no payload in argv: {flat:?}");
+        assert!(!flat.iter().any(|a| a.contains("ghostreel-prompts")), "no spilled file: {flat:?}");
+        assert!(flat.contains(&"none".to_string()), "no tools needed: {flat:?}");
+
+        let stdin = claude.stdin_prompt(&huge, false).expect("claude reads stdin");
+        assert!(!stdin.contains("<|im_start|>"));
+        assert!(stdin.starts_with("You are the editor described below"));
+        assert!(
+            CliAgent::new(CliAgentConfig { tool: "agy".into(), ..Default::default() })
+                .stdin_prompt("p", false)
+                .is_none()
+        );
+    }
+
+    /// `--continue` resumed whatever claude session ran last in the folder. The agent pins its
+    /// own id on the first call and resumes exactly that one.
+    #[test]
+    fn claude_resumes_its_own_session_not_the_latest() {
+        let claude = CliAgent::new(CliAgentConfig { tool: "claude".into(), ..Default::default() });
+        let flat = |argv: Vec<std::ffi::OsString>| -> Vec<String> {
+            argv.iter().map(|a| a.to_string_lossy().into_owned()).collect()
+        };
+        let first = flat(claude.build_argv_complete_from(Path::new("/bin/true"), "p", false));
+        let i = first.iter().position(|a| a == "--session-id").expect("--session-id");
+        let id = first[i + 1].clone();
+        assert_eq!(id.len(), 36);
+        assert_eq!(&id[14..15], "4");
+
+        let next = flat(claude.build_argv_complete_from(Path::new("/bin/true"), "p", true));
+        assert!(!next.contains(&"--continue".to_string()), "{next:?}");
+        let r = next.iter().position(|a| a == "--resume").expect("--resume");
+        assert_eq!(next[r + 1], id);
     }
 }

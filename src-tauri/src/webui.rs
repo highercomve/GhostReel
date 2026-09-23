@@ -527,9 +527,10 @@ async fn dispatch(app: &AppHandle, cmd: &str, args: Value) -> Result<Value, Stri
             ok(crate::video_frames(video_id)?)
         }
         "chat_turn" => {
-            let (project_id, session_id, message, images) = args!(args;
-                project_id: i64, session_id: Option<i64>, message: String, images: Option<Vec<String>>);
-            ok(crate::chat_turn(app.clone(), queue(), project_id, session_id, message, images).await?)
+            let (project_id, session_id, message, images, style) = args!(args;
+                project_id: i64, session_id: Option<i64>, message: String, images: Option<Vec<String>>,
+                style: Option<ghostreel_core::script::ChatStyle>);
+            ok(crate::chat_turn(app.clone(), queue(), project_id, session_id, message, images, style).await?)
         }
         "chat_sessions" => {
             let (project_id,) = args!(args; project_id: i64);
@@ -542,6 +543,10 @@ async fn dispatch(app: &AppHandle, cmd: &str, args: Value) -> Result<Value, Stri
         "chat_messages" => {
             let (session_id,) = args!(args; session_id: i64);
             ok(crate::chat_messages(session_id)?)
+        }
+        "chat_log" => {
+            let (session_id, after_seq) = args!(args; session_id: i64, after_seq: u64);
+            ok(crate::chat_log(session_id, after_seq)?)
         }
         "list_scripts" => {
             let (project_id,) = args!(args; project_id: i64);

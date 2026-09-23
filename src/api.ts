@@ -527,12 +527,21 @@ export interface ScriptSummary {
   duration_s: number;
 }
 
+/** How a chat builds its cuts; kept on the chat for every turn in it. */
+export interface ChatStyle {
+  /** Pictures only on a theme: no interviews, no voice-over. */
+  broll: boolean;
+  /** With `broll`: clips play their own ambient sound instead of being muted for music. */
+  natural_sound: boolean;
+}
+
 export interface ChatSession {
   id: number;
   project_id: number;
   title: string;
   created_at: number;
   updated_at: number;
+  style?: ChatStyle;
 }
 
 export interface ToolCallRecord {
@@ -580,8 +589,13 @@ export interface ChatProgress {
   event: ChatEvent;
 }
 
-export const chatTurn = (projectId: number, sessionId: number | null, message: string, images?: string[]) =>
-  call<ChatTurnView>("chat_turn", { projectId, sessionId, message, images: images ?? [] });
+export const chatTurn = (
+  projectId: number,
+  sessionId: number | null,
+  message: string,
+  images?: string[],
+  style?: ChatStyle,
+) => call<ChatTurnView>("chat_turn", { projectId, sessionId, message, images: images ?? [], style });
 
 /**
  * Build a cut by choosing instead of writing: Jev picks the quotes and the shots out of the index
@@ -604,6 +618,18 @@ export const deleteChatSession = (sessionId: number) => call<boolean>("delete_ch
 
 export const chatMessages = (sessionId: number) =>
   call<ChatMessage[]>("chat_messages", { sessionId });
+
+/** One entry of a chat's model log: a prompt, the thinking, an answer, or helper output. */
+export interface LogEntry {
+  seq: number;
+  ts_ms: number;
+  session_id: number | null;
+  kind: "prompt" | "thinking" | "answer" | "helper" | "info";
+  text: string;
+}
+
+export const chatLog = (sessionId: number, afterSeq: number) =>
+  call<LogEntry[]>("chat_log", { sessionId, afterSeq });
 
 export const listScripts = (projectId: number) =>
   call<ScriptSummary[]>("list_scripts", { projectId });

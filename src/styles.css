@@ -990,6 +990,93 @@ main.wide {
   border-color: var(--bad);
 }
 
+.chat-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* Full model log for a chat */
+.chat-log-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.7);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 9998;
+}
+
+.chat-log {
+  width: min(1100px, 94vw);
+  height: 88vh;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.chat-log-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+.chat-log-filters {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-right: auto;
+}
+
+.chat-log-body {
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.chat-log-entry {
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--muted);
+  border-radius: 6px;
+  padding: 4px 8px;
+}
+
+.chat-log-entry.prompt { border-left-color: var(--accent); }
+.chat-log-entry.thinking { border-left-color: var(--warn); }
+.chat-log-entry.answer { border-left-color: var(--good); }
+
+.chat-log-entry summary {
+  cursor: pointer;
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+}
+
+.chat-log-kind {
+  font-weight: 600;
+  text-transform: uppercase;
+  font-size: 11px;
+  letter-spacing: 0.05em;
+}
+
+.chat-log-entry pre {
+  margin: 6px 0 2px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 12px;
+  max-height: 60vh;
+  overflow-y: auto;
+}
+
+.chat-log-entry.helper pre { color: var(--muted); }
+
+.chat-log-error { color: var(--bad); }
+
 /* Composer thumbnail attachments strip */
 .chat-composer-attachments {
   display: flex;
@@ -1238,6 +1325,7 @@ main.wide {
 /* Reads as state, not as a verb: it says what is happening, and clicking changes it. */
 .composer-judge {
   align-self: flex-start;
+  white-space: nowrap;
   padding: 3px 10px;
   font-size: 11px;
   background: transparent;
@@ -1255,6 +1343,11 @@ main.wide {
 .composer-judge:disabled {
   opacity: 0.4;
   cursor: not-allowed;
+}
+
+.composer-audio {
+  display: flex;
+  gap: 4px;
 }
 
 /* The chosen mode explains itself, because they differ by minutes and by what they can produce. */

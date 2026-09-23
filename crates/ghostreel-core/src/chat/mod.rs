@@ -27,7 +27,7 @@ use crate::Error;
 use crate::db::Db;
 use crate::embed::Embedder;
 use crate::projects::{Project, now};
-use crate::script::{Issue, IssueSeverity, Script, ScriptClip, save_version, snap_to_segments};
+use crate::script::{ChatStyle, Issue, IssueSeverity, Script, ScriptClip, save_version, snap_to_segments};
 use crate::search::{SearchOptions, query_vector, search_with_vector};
 
 /// Events emitted during agent execution.
@@ -56,6 +56,8 @@ pub struct ChatSession {
     pub title: String,
     pub created_at: i64,
     pub updated_at: i64,
+    #[serde(default)]
+    pub style: ChatStyle,
 }
 
 /// A message in a chat session.
@@ -341,7 +343,12 @@ pub fn enforce_grounding_and_pacing(
     let mut retimed = 0usize;
     for beat in &mut s.beats {
         for c in &mut beat.clips {
-            if c.audio != crate::script::Audio::Source || db.opens_on_mic(c.video_id, c.in_s, c.out_s) {
+            // A montage's clips play ambience, not answers: moving one onto the microphone would
+            // put the very speech it avoids into it.
+            if cfg.style.broll
+                || c.audio != crate::script::Audio::Source
+                || db.opens_on_mic(c.video_id, c.in_s, c.out_s)
+            {
                 continue;
             }
             // It opens on the interviewer: move to the first on-mic segment, keeping the length.
@@ -374,8 +381,11 @@ pub fn enforce_grounding_and_pacing(
     // Left alone, a scenery shot marked "source" reads as "someone speaks here", which is exactly
     // the case the editing rules tell the model to leave narration empty for — so a whole script
     // of b-roll ends up silent.
+    if cfg.style.broll {
+        issues.extend(settle_broll_audio(db, s, cfg.style));
+    }
     let mut unmuted = 0usize;
-    for beat in &mut s.beats {
+    for beat in s.beats.iter_mut().filter(|_| !cfg.style.broll) {
         for c in &mut beat.clips {
             if c.audio == crate::script::Audio::Source && !clip_has_speech(db, c.video_id, c.in_s, c.out_s) {
                 c.audio = crate::script::Audio::Mute;
@@ -409,7 +419,9 @@ pub fn enforce_grounding_and_pacing(
         });
     }
     // Now that it is settled who speaks, let their voice carry the pictures that follow.
-    issues.extend(lay_audio_beds(db, s, cfg));
+    if !cfg.style.broll {
+        issues.extend(lay_audio_beds(db, s, cfg));
+    }
     for beat in &mut s.beats {
         let mut kept = Vec::with_capacity(beat.clips.len());
         for c in beat.clips.drain(..) {
@@ -497,7 +509,9 @@ pub fn enforce_grounding_and_pacing(
         });
     }
     // Pad before trimming, so the target is met with the people's pauses already in.
-    pad_speech(db, s, cfg);
+    if !cfg.style.broll {
+        pad_speech(db, s, cfg);
+    }
     // Padding can grow two clips of the same video into each other: check again.
     let overlapped = drop_repeated_footage(s);
     if overlapped > 0 {
@@ -509,13 +523,57 @@ pub fn enforce_grounding_and_pacing(
         });
     }
     let before = s.total_duration_s();
-    let speaking = |c: &ScriptClip| clip_has_speech(db, c.video_id, c.in_s, c.out_s);
+    // In a montage nothing is speech, so every clip may be trimmed.
+    let speaking = |c: &ScriptClip| !cfg.style.broll && clip_has_speech(db, c.video_id, c.in_s, c.out_s);
     if enforce_target && trim_to_target_with(s, speaking, cfg) {
         issues.push(Issue {
             severity: IssueSeverity::Info,
             beat_id: None,
             clip_index: None,
             message: format!("clips shortened proportionally: {before:.1} s → {:.1} s", s.total_duration_s()),
+        });
+    }
+    issues
+}
+
+/// A montage's sound, decided rather than drafted: no narration, no beds, and each clip muted or
+/// playing its own ambience as the chat chose.
+///
+/// A clip over someone speaking on the microphone is dropped. Muting it was tried first: the cut
+/// then held a talking head with no voice, which reads as a broken export, not as b-roll. The fit
+/// that follows holds the remaining shots longer to make up the time.
+fn settle_broll_audio(db: &Db, s: &mut Script, style: ChatStyle) -> Vec<Issue> {
+    let mut issues = Vec::new();
+    let mut voiced = 0usize;
+    let mut unvoiced = 0usize;
+    for beat in &mut s.beats {
+        if beat.narration.as_deref().is_some_and(|n| !n.trim().is_empty()) {
+            unvoiced += 1;
+        }
+        beat.narration = Some(String::new());
+        beat.bed = None;
+        let before = beat.clips.len();
+        beat.clips.retain(|c| !clip_has_speech(db, c.video_id, c.in_s, c.out_s));
+        voiced += before - beat.clips.len();
+        for c in &mut beat.clips {
+            c.audio = if style.natural_sound { crate::script::Audio::Source } else { crate::script::Audio::Mute };
+        }
+    }
+    s.beats.retain(|b| !b.clips.is_empty());
+    if unvoiced > 0 {
+        issues.push(Issue {
+            severity: IssueSeverity::Info,
+            beat_id: None,
+            clip_index: None,
+            message: format!("removed narration from {unvoiced} beat(s): this chat is b-roll only"),
+        });
+    }
+    if voiced > 0 {
+        issues.push(Issue {
+            severity: IssueSeverity::Info,
+            beat_id: None,
+            clip_index: None,
+            message: format!("dropped {voiced} clip(s) where someone speaks on the microphone"),
         });
     }
     issues
@@ -871,7 +929,11 @@ pub fn speech_digest(db: &Db, project_id: i64, max_chars: usize) -> String {
 /// Deliberately a *digest*, not the descriptions: one line per video, the first description and a
 /// count, so the model learns which tapes hold pictures and goes looking. The full text is still
 /// `search_moments` and `get_video`.
-pub fn picture_digest(db: &Db, project_id: i64, max_chars: usize) -> String {
+///
+/// With `mark_talk` — a b-roll chat — each line also says how much of the tape is somebody
+/// talking on the microphone, and the quiet tapes come first. A montage cut from an interview
+/// tape is a muted talking head; the model cannot see that from a description of the first frame.
+pub fn picture_digest(db: &Db, project_id: i64, max_chars: usize, mark_talk: bool) -> String {
     let Ok(mut st) = db.conn.prepare(
         "SELECT fr.video_id, MIN(vf.path), COUNT(*), MIN(fr.t_s), MAX(fr.t_s)
            FROM frames fr
@@ -887,12 +949,31 @@ pub fn picture_digest(db: &Db, project_id: i64, max_chars: usize) -> String {
     ) else {
         return String::new();
     };
-    let videos: Vec<(i64, String, i64, f64, f64)> = st
+    let mut videos: Vec<(i64, String, i64, f64, f64)> = st
         .query_map([project_id], |r| Ok((r.get(0)?, r.get::<_, String>(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
         .map(|rows| rows.filter_map(|r| r.ok()).collect())
         .unwrap_or_default();
     if videos.is_empty() {
         return String::new();
+    }
+    let talk_share = |video_id: i64| -> f64 {
+        db.conn
+            .query_row(
+                "SELECT COALESCE(SUM(t.end_s - t.start_s), 0) / MAX(v.duration_s, 1)
+                   FROM videos v LEFT JOIN transcript_segments t
+                     ON t.video_id = v.id AND COALESCE(t.off_mic, 0) = 0
+                  WHERE v.id = ?1",
+                [video_id],
+                |r| r.get::<_, f64>(0),
+            )
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0)
+    };
+    let shares: std::collections::HashMap<i64, f64> =
+        if mark_talk { videos.iter().map(|v| (v.0, talk_share(v.0))).collect() } else { Default::default() };
+    if mark_talk {
+        // Stable, so tapes with the same share keep the most-described first.
+        videos.sort_by(|a, b| shares[&a.0].total_cmp(&shares[&b.0]));
     }
 
     let mut out = String::from(
@@ -920,7 +1001,16 @@ pub fn picture_digest(db: &Db, project_id: i64, max_chars: usize) -> String {
             })
             .unwrap_or_default();
         let shows: String = shows.trim().chars().take(180).collect();
-        let block = format!("  #{video_id} {name} — {count} moments, {first_t:.0}-{last_t:.0}s: {shows}\n");
+        let talk = match shares.get(video_id) {
+            Some(&share) if share >= 0.4 => {
+                format!(" [interview: someone talks on the mic for {:.0}% of it - avoid]", share * 100.0)
+            }
+            Some(&share) if share >= 0.05 => {
+                format!(" [someone talks for {:.0}% of it - use the quiet stretches]", share * 100.0)
+            }
+            _ => String::new(),
+        };
+        let block = format!("  #{video_id} {name} — {count} moments, {first_t:.0}-{last_t:.0}s{talk}: {shows}\n");
         if out.len() + block.len() <= max_chars {
             out.push_str(&block);
         } else {
@@ -1913,8 +2003,13 @@ fn fit_to_target(db: &Db, script: &mut Script, cfg: &crate::config::ScriptConfig
         return grew;
     }
 
-    let speaking: Vec<bool> =
-        script.beats.iter().flat_map(|b| &b.clips).map(|c| clip_has_speech(db, c.video_id, c.in_s, c.out_s)).collect();
+    // In a montage nothing is speech: every shot may be trimmed.
+    let speaking: Vec<bool> = script
+        .beats
+        .iter()
+        .flat_map(|b| &b.clips)
+        .map(|c| !cfg.style.broll && clip_has_speech(db, c.video_id, c.in_s, c.out_s))
+        .collect();
     let spoken: f64 = script
         .beats
         .iter()
@@ -2260,13 +2355,64 @@ HOW TO EDIT
 
 /// Construct the system prompt for the editor agent: the editing instructions (`custom` or the
 /// default), the fixed tool contract, and the current draft.
+/// The editing instructions for a b-roll montage: a theme told in pictures, nobody speaking, no
+/// voice-over. `{audio_rule}` is filled with the chat's choice of natural sound or silence.
+///
+/// Its own prompt rather than a paragraph appended to the default, whose every step starts from
+/// what people say: a model told "read the interviews first, open on the speaker's face" and then
+/// "but no interviews" follows the first half.
+pub const BROLL_EDITOR_PROMPT: &str = "You are a senior editor cutting a b-roll montage for project \"{project}\" \
+({fps} fps, {width}x{height}): a piece told in pictures only, on one theme, with no interviews and no voice-over.
+
+HOW THIS WORKS
+WHAT THE FOOTAGE SHOWS lists every video that has described pictures. Work in this order.
+ a. Read the brief and decide the theme and the feeling: what the piece is about, and what a viewer should come away with.
+ b. Find the pictures: search_moments for the subjects of the theme, then get_video to see the keyframes, the shot sizes and the shaky stretches. A range you have not seen returned is a guess, and guesses are dropped.
+ c. Lay out beats - each a short visual sequence on one idea of the theme - and order them so the piece goes somewhere.
+ d. Add up the clip lengths and fix the total yourself before you answer.
+ e. Answer with one JSON object and nothing else.
+Before you answer, check: every range came from a tool; nobody is talking to the camera in any clip; no clip is under 3 s; no two neighbouring shots look alike; the total is within 10% of the target; every beat belongs to the theme.
+
+HOW TO EDIT
+1. One theme, held all the way: every shot earns its place by belonging to it. A string of nice shots with nothing in common is not a piece.
+2. Structure: an establishing opening (a wide of the place or the subject), 3-6 beats that each develop one idea of the theme, and a closing image that lands - a strong wide, a detail that sums the piece up, a movement that settles.
+3. Cohesion between shots: inside a beat move through shot sizes (wide, then medium, then a close detail); keep the same setting, light and time of day together; carry movement across a cut (motion in the same direction, a pan into a pan); when you change place, match on subject, shape or colour. Never put two near-identical shots side by side, and never reuse the same footage twice.
+4. Nobody talking: this piece has no interviews. Do not use a range where someone speaks to the camera or into a microphone - a moving mouth with no voice looks like a mistake. People doing things (walking, working, playing, laughing, looking around) are good b-roll. get_transcript shows where people speak on a tape: cut around those stretches.
+5. Choose only strong shots: a clear subject (people at something, a landmark, a building, a sign, activity, a striking view). Skip footage whose keyframes describe black or blank frames, blur, transitions, the ground or sky only, or the same view as the previous clip.
+6. Pacing: hold shots 3-8 s - longer for wides and slow movement, shorter for details. Let the rhythm build and settle; do not cut at the same length every time, and never flash a shot past.
+7. Camera work: every search hit and video says whether the camera is static, tripod, stabilised or handheld, and get_video lists shaky stretches as shaky_at timestamps. A shaky shot looks wrong in a finished cut: cut around those stretches, and when two clips cover the same moment prefer the mounted or stabilised one.
+8. Audio: {audio_rule}
+9. Narration: none. Set narration to \"\" on every beat and do not give any beat a \"bed\". on_screen_text may carry a short title or a place name when it helps the piece.
+10. Length: the clips add up to the length the user asked for; set target_duration_s to it, and give it about 10% more - a cut that comes in long is trimmed to fit, one that comes in short cannot be fixed. If the user gave no length, choose what the material supports (usually 30-90 s).
+11. You can answer in words instead of drafting: reply with {\"action\":\"reply\",\"text\":...} when the request is ambiguous and one question would settle it, or when the footage cannot support the theme - say what is missing. Do not reply to avoid work: when the request is clear, draft.
+12. A line marked [applied after drafting] in an earlier reply is a change already made to the saved script. It is done: build on it rather than undoing it.
+13. The user's feedback overrides these defaults. When revising, change what they asked for and keep what they didn't mention; never return the previous draft unchanged.
+14. Always reply in the user's language.
+15. The user may attach images (screenshots of the timeline or the player, or frames). Inspect them and address what they point at in your revised script.
+";
+
 pub fn build_system_prompt(
     project: &Project,
     latest_script_json: Option<&str>,
     custom: Option<&str>,
     detail: tools::Detail,
+    style: ChatStyle,
 ) -> String {
-    let template = custom.map(str::trim).filter(|c| !c.is_empty()).unwrap_or(DEFAULT_EDITOR_PROMPT);
+    let broll_template;
+    let template = if style.broll {
+        // The house prompt in Settings is written for interview-led cuts; a montage needs its own.
+        broll_template = BROLL_EDITOR_PROMPT.replace(
+            "{audio_rule}",
+            if style.natural_sound {
+                "set every clip's audio to \"source\": its own ambient sound (street, wind, water, a crowd) carries the piece. That is one more reason to avoid anyone speaking."
+            } else {
+                "set every clip's audio to \"mute\": the piece is pictures only, and music is laid over it later."
+            },
+        );
+        broll_template.as_str()
+    } else {
+        custom.map(str::trim).filter(|c| !c.is_empty()).unwrap_or(DEFAULT_EDITOR_PROMPT)
+    };
     let fps = if project.fps_den == 1 {
         project.fps_num.to_string()
     } else {
@@ -2427,6 +2573,9 @@ async fn fill_missing_narration(
 /// Editorial problems the model can fix in a redraft: narration too short for its beat, and clips
 /// over footage the tools know nothing about (no speech and no described keyframe nearby).
 pub fn content_issues(db: &Db, script: &Script, cfg: &crate::config::ScriptConfig) -> Vec<Issue> {
+    if cfg.style.broll {
+        return broll_issues(db, script);
+    }
     let mut issues = empty_speech_issues(db, script);
     let mut seen_narration: Vec<String> = Vec::new();
     for beat in &script.beats {
@@ -2478,6 +2627,37 @@ pub fn content_issues(db: &Db, script: &Script, cfg: &crate::config::ScriptConfi
                     ),
                 });
             }
+        }
+    }
+    issues
+}
+
+/// What a montage can get wrong that the model can fix in a redraft: a shot of somebody talking,
+/// and a range nobody has described.
+fn broll_issues(db: &Db, script: &Script) -> Vec<Issue> {
+    let mut issues = Vec::new();
+    for beat in &script.beats {
+        for (i, c) in beat.clips.iter().enumerate() {
+            let message = if clip_has_speech(db, c.video_id, c.in_s, c.out_s) {
+                format!(
+                    "video #{} {:.1}–{:.1} s has someone speaking on the microphone; this cut is b-roll only — \
+                     pick a stretch where nobody talks",
+                    c.video_id, c.in_s, c.out_s
+                )
+            } else if !clip_has_described_frame(db, c.video_id, c.in_s, c.out_s) {
+                format!(
+                    "video #{} {:.1}–{:.1} s has no described keyframe; pick a range you have seen described",
+                    c.video_id, c.in_s, c.out_s
+                )
+            } else {
+                continue;
+            };
+            issues.push(Issue {
+                severity: IssueSeverity::Warning,
+                beat_id: Some(beat.id.clone()),
+                clip_index: Some(i),
+                message,
+            });
         }
     }
     issues
@@ -2957,7 +3137,27 @@ pub fn create_session(db: &Db, project_id: i64, title: &str) -> Result<i64, Erro
     Ok(db.conn.last_insert_rowid())
 }
 
-/// List all chat sessions for a project ordered by most recently updated.
+fn parse_style(json: Option<&str>) -> ChatStyle {
+    json.and_then(|j| serde_json::from_str(j).ok()).unwrap_or_default()
+}
+
+/// How this chat builds its cuts; the default for a chat that never chose.
+pub fn session_style(db: &Db, session_id: i64) -> ChatStyle {
+    let json: Option<String> = db
+        .conn
+        .query_row("SELECT style_json FROM chat_sessions WHERE id = ?1", [session_id], |r| r.get(0))
+        .ok()
+        .flatten();
+    parse_style(json.as_deref())
+}
+
+/// Record how this chat builds its cuts. Every later turn in it follows the same style.
+pub fn set_session_style(db: &Db, session_id: i64, style: ChatStyle) -> Result<(), Error> {
+    let json = serde_json::to_string(&style).map_err(|e| Error::Invalid(e.to_string()))?;
+    db.conn.execute("UPDATE chat_sessions SET style_json = ?1 WHERE id = ?2", params![json, session_id])?;
+    Ok(())
+}
+
 /// Delete a chat session and its messages. Scripts drafted in it are kept and merely lose the
 /// link (the schema sets their `session_id` to NULL): a script is a deliverable, a chat is not.
 pub fn delete_session(db: &Db, session_id: i64) -> Result<bool, Error> {
@@ -2967,7 +3167,7 @@ pub fn delete_session(db: &Db, session_id: i64) -> Result<bool, Error> {
 
 pub fn sessions(db: &Db, project_id: i64) -> Result<Vec<ChatSession>, Error> {
     let mut st = db.conn.prepare(
-        "SELECT id, project_id, title, created_at, updated_at
+        "SELECT id, project_id, title, created_at, updated_at, style_json
          FROM chat_sessions WHERE project_id = ?1 ORDER BY updated_at DESC",
     )?;
     let rows = st.query_map([project_id], |r| {
@@ -2977,6 +3177,7 @@ pub fn sessions(db: &Db, project_id: i64) -> Result<Vec<ChatSession>, Error> {
             title: r.get(2)?,
             created_at: r.get(3)?,
             updated_at: r.get(4)?,
+            style: parse_style(r.get::<_, Option<String>>(5)?.as_deref()),
         })
     })?;
     Ok(rows.filter_map(Result::ok).collect())
@@ -3200,8 +3401,11 @@ pub async fn run_turn(
             _ => tools::Detail::Full,
         },
     };
+    // Every repair pass reads the chat's style from here.
+    ctx.script.style = session_style(&ctx.db, session_id);
+    let style = ctx.script.style;
     let mut sys_prompt =
-        build_system_prompt(&project, latest_script_json.as_deref(), ctx.system_prompt.as_deref(), detail);
+        build_system_prompt(&project, latest_script_json.as_deref(), ctx.system_prompt.as_deref(), detail, style);
     let reference_chars = match &ctx.backend {
         ChatBackend::Server { .. } => 6000,
         // Roughly an eighth of the window (~4 chars per token), so results leave room for the draft.
@@ -3218,14 +3422,18 @@ pub async fn run_turn(
         // Half the window at ~4 chars a token, leaving the other half for tools and the draft.
         ChatBackend::Local { ctx_tokens, .. } => ((*ctx_tokens as usize) * 4 / 2).clamp(4_000, 60_000),
     };
-    if ctx.script.speech_in_prompt {
+    if style.broll {
+        // A montage is chosen from pictures: the speech would only pull it back to the interviews,
+        // and the room it takes goes to the table of contents instead.
+        sys_prompt.push_str(&picture_digest(&ctx.db, project_id, speech_chars / 2, true));
+    } else if ctx.script.speech_in_prompt {
         sys_prompt.push_str(&speech_digest(&ctx.db, project_id, speech_chars));
         // And a table of contents for the pictures. Without it the prompt describes every word
         // anybody said and nothing at all about what is on screen, so a model that does not
         // happen to call a tool concludes there is no b-roll — which is what both local models
         // did on a project holding 639 described frames. A line per video is a fraction of the
         // speech digest and removes the whole failure.
-        sys_prompt.push_str(&picture_digest(&ctx.db, project_id, speech_chars / 4));
+        sys_prompt.push_str(&picture_digest(&ctx.db, project_id, speech_chars / 4, false));
     }
     // A length the user states ("60 second promo", "2 minutos") wins over whatever the model sets.
     let requested_s = requested_duration_s(message);
@@ -3677,7 +3885,12 @@ pub async fn run_turn(
                             // interviewee" — the model knows what to do and describes doing it
                             // instead of doing it. Saying "use a tool" is not enough; showing the
                             // JSON is.
-                            transcript.push_str(if pushed_back == 1 {
+                            transcript.push_str(if pushed_back == 1 && style.broll {
+                                "<|im_start|>user\nYou have not opened any footage yet, so that answer is a guess. \
+                                 WHAT THE FOOTAGE SHOWS lists every video that has pictures. Use a tool — \
+                                 search_moments for a subject, get_video to open a tape — and then draft. Only say the \
+                                 footage cannot support the request after you have looked.<|im_end|>\n"
+                            } else if pushed_back == 1 {
                                 "<|im_start|>user\nYou have not opened any footage yet, so that answer is a guess. \
                                  WHAT THE FOOTAGE SHOWS lists every video that has pictures, and WHAT PEOPLE SAY has \
                                  every word with its timestamps. Use a tool — search_moments for a subject, \
@@ -3853,7 +4066,8 @@ pub async fn run_turn(
                 pre_issues =
                     enforce_grounding_and_pacing(&ctx.db, project_id, s, &grounding, enforce_target, &ctx.script);
                 // Muting happens above, so by now the beats that need a voice-over are known.
-                let jobs = narration_jobs(&ctx.db, s, &ctx.script);
+                // A montage has no voice-over to write.
+                let jobs = if style.broll { Vec::new() } else { narration_jobs(&ctx.db, s, &ctx.script) };
                 let filled = fill_missing_narration(helper, s, jobs).await;
                 if filled > 0 {
                     pre_issues.push(Issue {
@@ -4085,7 +4299,10 @@ pub async fn run_turn(
     // above says exactly where it is losing points…", and the same script read 67 in the turn and
     // 76 when judged against what was actually asked for.
     let brief = session_brief(&ctx.db, session_id).unwrap_or_else(|| message.to_string());
-    let planned = parsed_script.as_ref().and_then(|s| judge::plan(&ctx.db, s, Some(&brief), &ctx.jev));
+    // The judge reads a cut against its voice — openings, the shots under what is said. A
+    // montage has none, and its answers would be about a piece that was not asked for.
+    let planned =
+        parsed_script.as_ref().filter(|_| !style.broll).and_then(|s| judge::plan(&ctx.db, s, Some(&brief), &ctx.jev));
     let judgement = match planned {
         Some(p) => match p.ask().await {
             Ok(j) => Some(j),
@@ -5476,6 +5693,110 @@ mod tests {
         assert_eq!(requested_duration_s("a 60-second teaser"), Some(60.0));
         assert_eq!(requested_duration_s("show the 3 houses"), None);
         assert_eq!(requested_duration_s("leave people talking longer"), None);
+    }
+
+    /// A b-roll chat: the sound is decided, not drafted — ambience or silence as chosen, anyone on
+    /// the microphone muted either way, and no narration or bed survives. Its checks are about
+    /// pictures: a shot of somebody talking is the thing to fix, missing narration is not.
+    #[test]
+    fn broll_style_decides_the_sound_and_drops_the_voice() {
+        use crate::script::{Audio, AudioBed, Beat, ScriptClip};
+        let mut db = Db::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let p = db.create_project(&NewProject::named("P")).unwrap();
+        let folder = db.add_folder(p.id, tmp.path(), true).unwrap();
+        db.conn
+            .execute("INSERT INTO videos(id, content_hash, size, duration_s) VALUES (1, 'h', 1, 400.0)", [])
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO video_files(video_id, folder_id, path, size, mtime, last_seen) VALUES (1, ?1, 'a.mp4', 1, 0, 0)",
+                [folder.id],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO transcript_segments(video_id, start_s, end_s, text)
+                 VALUES (1, 100.0, 110.0, 'We moved here in 2021 and have loved it since.')",
+                [],
+            )
+            .unwrap();
+        for t in [20.0, 105.0] {
+            db.conn.execute("INSERT INTO frames(video_id, t_s, description_json) VALUES (1, ?1, '{}')", [t]).unwrap();
+        }
+        let clip = |in_s: f64, out_s: f64, audio| ScriptClip { video_id: 1, in_s, out_s, audio, why: None };
+        let script = Script {
+            title: "t".into(),
+            target_duration_s: None,
+            fps: None,
+            width: None,
+            height: None,
+            beats: vec![Beat {
+                id: "b1".into(),
+                purpose: "p".into(),
+                narration: Some("The hills at dawn.".into()),
+                on_screen_text: None,
+                clips: vec![clip(22.0, 30.0, Audio::Mute), clip(100.0, 108.0, Audio::Source)],
+                notes: None,
+                bed: Some(AudioBed { video_id: 1, in_s: 100.0, out_s: 110.0, why: None, inferred: false }),
+            }],
+        };
+
+        let natural = ChatStyle { broll: true, natural_sound: true };
+        let mut s = script.clone();
+        let notes = settle_broll_audio(&db, &mut s, natural);
+        let b = &s.beats[0];
+        assert_eq!(b.narration.as_deref(), Some(""));
+        assert!(b.bed.is_none());
+        assert_eq!(b.clips.len(), 1, "the talking head is gone, not muted");
+        assert_eq!(b.clips[0].audio, Audio::Source, "scenery keeps its ambience");
+        assert_eq!(notes.len(), 2, "{notes:?}");
+
+        let mut s = script.clone();
+        settle_broll_audio(&db, &mut s, ChatStyle { broll: true, natural_sound: false });
+        assert!(s.beats[0].clips.iter().all(|c| c.audio == Audio::Mute), "silent means silent");
+
+        // A draft that still has one (a redraft the model is asked to fix) is told about it.
+        let cfg = crate::config::ScriptConfig { style: natural, ..sc() };
+        let issues = content_issues(&db, &script, &cfg);
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert_eq!(issues[0].clip_index, Some(1));
+        assert!(issues[0].message.contains("speaking"), "{issues:?}");
+
+        // Nothing is padded out to a sentence: the talking clip stays exactly where it was cut.
+        let mut s = script.clone();
+        repair::finish_script(&db, p.id, &mut s, false, &cfg).unwrap();
+        assert_eq!((s.beats[0].clips[1].in_s, s.beats[0].clips[1].out_s), (100.0, 108.0));
+
+        // The table of contents says which tapes are interviews, and lists the quiet ones first.
+        db.conn
+            .execute("INSERT INTO videos(id, content_hash, size, duration_s) VALUES (2, 'h2', 1, 60.0)", [])
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO video_files(video_id, folder_id, path, size, mtime, last_seen) VALUES (2, ?1, 'b.mp4', 1, 0, 0)",
+                [folder.id],
+            )
+            .unwrap();
+        db.conn.execute("INSERT INTO frames(video_id, t_s, description_json) VALUES (2, 5.0, '{}')", []).unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO transcript_segments(video_id, start_s, end_s, text) VALUES (2, 0.0, 50.0, 'talk')",
+                [],
+            )
+            .unwrap();
+        let digest = picture_digest(&db, p.id, 10_000, true);
+        let (quiet, interview) = (digest.find("#1 a.mp4").unwrap(), digest.find("#2 b.mp4").unwrap());
+        assert!(quiet < interview, "{digest}");
+        assert!(digest.contains("[interview: someone talks on the mic for 83% of it - avoid]"), "{digest}");
+        assert!(!picture_digest(&db, p.id, 10_000, false).contains("interview:"));
+
+        // And the prompt is the montage's own, with the sound rule filled in.
+        let prompt = build_system_prompt(&p, None, Some("custom interview prompt"), tools::Detail::Short, natural);
+        assert!(prompt.contains("b-roll montage"));
+        assert!(!prompt.contains("custom interview prompt"));
+        assert!(!prompt.contains("{audio_rule}"));
+        assert!(prompt.contains("ambient sound"));
     }
 
     #[test]

@@ -75,6 +75,7 @@ CI: `.github/workflows/{check,release}.yml`. `externalBin` and `resources` live 
   - Muted clips do not pad speech (`pad_speech` and `end_on_sentences` skip muted clips).
   - Speaker turns: `end_on_turns` cleans acknowledgements / handovers after `pad_speech`.
   - Empty thoughts ("Okay", "Thank you") are flagged by `empty_speech_issues`.
+- **B-roll chats** (`ChatStyle.broll`, per session in `chat_sessions.style_json`): a montage with no speech and no narration. Own prompt (`BROLL_EDITOR_PROMPT`), no speech digest, the picture digest marks interview tapes. `settle_broll_audio` drops clips over on-mic speech, clears narration/beds, and sets audio from `natural_sound`; the speech repairs, narration fill and judge are skipped.
 
 ### 4. Editorial Judge & Builder (`judge.rs`, `build.rs`, `jev.rs`)
 - **Judge (Jev / System One)**: Optional remote evaluation (`TYPESAFE_API_KEY`). Answers questions about picture grounding, openings, flow, and endings in parallel. State is ordered alphabetically (`BTreeMap`), framing text must sort before the data it frames.

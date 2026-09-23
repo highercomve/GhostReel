@@ -17,6 +17,7 @@ pub mod frames;
 pub mod index;
 pub mod interviewer;
 pub mod jev;
+pub mod llmlog;
 pub mod media;
 pub mod models;
 pub mod otio;

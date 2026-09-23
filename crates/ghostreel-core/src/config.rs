@@ -198,6 +198,10 @@ impl VisionConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ScriptConfig {
+    /// The chat's own style, set per turn from the session. Not a house setting: never read from
+    /// or written to the config file.
+    #[serde(skip)]
+    pub style: crate::script::ChatStyle,
     /// Slack around a range a tool returned, when checking a clip came from real footage (s).
     pub grounding_slack_s: f64,
     /// Longer than this and the model pasted a whole tool range rather than choosing a shot (s).
@@ -417,6 +421,7 @@ impl Default for ScriptConfig {
             max_sway: 1.0,
             shake_window_s: 4.0,
             shake_stride_s: 4.0,
+            style: Default::default(),
         }
     }
 }

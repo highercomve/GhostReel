@@ -32,6 +32,20 @@ pub fn finish_script(
     // picture this pass put there is not one the model chose.
     super::drop_closing_picture(s);
 
+    // A montage has no speech to end on, pad or lay under anything: it is fitted and checked.
+    if cfg.style.broll {
+        super::clamp_to_duration(db, s);
+        if enforce_target {
+            let before = s.total_duration_s();
+            if super::fit_to_target(db, s, cfg) {
+                note(&mut issues, format!("fitted to target: {before:.1} s → {:.1} s", s.total_duration_s()));
+            }
+        }
+        issues.extend(super::content_issues(db, s, cfg));
+        issues.extend(validate(db, project_id, s)?);
+        return Ok(Some(issues));
+    }
+
     let _ = super::snap_to_segments(db, s)?;
     super::pad_speech(db, s, cfg);
     super::clamp_to_duration(db, s);

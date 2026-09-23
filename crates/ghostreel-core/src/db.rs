@@ -272,6 +272,10 @@ const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE projects ADD COLUMN pipeline_json TEXT;
     "#,
+    // v12 — per-chat style (b-roll montage, natural sound)
+    r#"
+    ALTER TABLE chat_sessions ADD COLUMN style_json TEXT;
+    "#,
 ];
 
 static REGISTER_VEC: Once = Once::new();

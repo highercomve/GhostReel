@@ -1135,6 +1135,7 @@ async fn chat_turn(
     session_id: Option<i64>,
     message: String,
     images: Option<Vec<String>>,
+    style: Option<ghostreel_core::script::ChatStyle>,
 ) -> CmdResult<queue::ChatTurnView> {
     let session_id = match session_id {
         Some(id) => id,
@@ -1144,6 +1145,10 @@ async fn chat_turn(
             ghostreel_core::chat::create_session(&db, project_id, &title).map_err(err)?
         }
     };
+    // The composer's choice, recorded on the chat so every later turn keeps it.
+    if let Some(style) = style {
+        ghostreel_core::chat::set_session_style(&open_db()?, session_id, style).map_err(err)?;
+    }
     let label = format!("Script chat: {}", message.chars().take(40).collect::<String>());
     let (tx, rx) = tokio::sync::oneshot::channel();
     queue.enqueue_chat(&app, project_id, session_id, message, images.unwrap_or_default(), label, tx).await;
@@ -1169,6 +1174,12 @@ fn delete_chat_session(session_id: i64) -> CmdResult<bool> {
 fn chat_messages(session_id: i64) -> CmdResult<Vec<ghostreel_core::chat::ChatMessage>> {
     let db = open_db()?;
     ghostreel_core::chat::messages(&db, session_id).map_err(err)
+}
+
+/// The model's prompts, thinking, answers and helper output for a chat, after `after_seq`.
+#[tauri::command]
+fn chat_log(session_id: i64, after_seq: u64) -> CmdResult<Vec<ghostreel_core::llmlog::LogEntry>> {
+    Ok(ghostreel_core::llmlog::since(session_id, after_seq))
 }
 
 #[tauri::command]
@@ -1318,6 +1329,7 @@ pub fn run() {
             chat_turn,
             chat_sessions,
             chat_messages,
+            chat_log,
             delete_chat_session,
             list_scripts,
             get_script,

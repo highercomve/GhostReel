@@ -633,6 +633,8 @@ async fn run_chat(
     images: Vec<String>,
     cancel: Arc<AtomicBool>,
 ) -> Result<ChatTurnView, String> {
+    // Everything the model is sent and says during this turn goes to the chat's "Full log".
+    let _log = ghostreel_core::llmlog::session(session_id);
     let p = Paths::resolve().map_err(|e| e.to_string())?;
     let config = Config::load(&p.config_file).map_err(|e| e.to_string())?;
     // The chat has its own model settings (bigger context); the describe stage keeps [vision].

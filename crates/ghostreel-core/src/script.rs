@@ -103,6 +103,20 @@ impl<'de> Deserialize<'de> for Fps {
     }
 }
 
+/// How a chat builds its cuts, chosen per chat and kept for every turn in it.
+///
+/// The default is the interview-led documentary the pipeline was built around. `broll` is the
+/// other kind of piece: a montage on a theme, no one speaking, no voice-over — every speech pass
+/// (sentence endings, padding, audio beds, narration) stands aside for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct ChatStyle {
+    /// Pictures only: no interviews, no narration.
+    pub broll: bool,
+    /// With `broll`, play each clip's own ambient sound; otherwise every clip is muted, for music.
+    pub natural_sound: bool,
+}
+
 /// Audio mode for a clip.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]

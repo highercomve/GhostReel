@@ -257,7 +257,11 @@ impl LocalLlm {
             let mut keep = Vec::new();
             if let Some(e) = stderr {
                 let mut l = BufReader::new(e).lines();
+                let mut quiet = HelperNoise::default();
                 while let Ok(Some(line)) = l.next_line().await {
+                    for kept in quiet.feed(&line) {
+                        crate::llmlog::push("helper", kept);
+                    }
                     let lower = line.to_lowercase();
                     if line.starts_with("ghostreel-llm:") || lower.contains("error") || lower.contains("out of memory")
                     {
@@ -295,6 +299,18 @@ impl LocalLlm {
         let id = self.next_id;
         self.next_id += 1;
         req["id"] = json!(id);
+        // A chat's calls are what the "Full log" view shows; describe and embed are indexing.
+        let logged = req["cmd"] == "complete";
+        if logged {
+            let mut head = format!("max_tokens {} · think {}", req["max_tokens"], req["think"]);
+            if let Some(img) = req["image"].as_str() {
+                head.push_str(&format!(" · image {img}"));
+            }
+            if req.get("schema").is_some() {
+                head.push_str(" · JSON schema");
+            }
+            crate::llmlog::push("prompt", format!("{head}\n\n{}", req["prompt"].as_str().unwrap_or_default()));
+        }
         let line = format!("{req}\n");
         self.stdin.write_all(line.as_bytes()).await.map_err(|e| Error::Vision(format!("helper write: {e}")))?;
         self.stdin.flush().await.map_err(|e| Error::Vision(format!("helper write: {e}")))?;
@@ -309,6 +325,9 @@ impl LocalLlm {
             let v: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
             if v["id"] != json!(id) {
                 continue;
+            }
+            if logged {
+                log_reply(&v);
             }
             if v["ok"] == json!(true) {
                 return Ok(v);
@@ -485,6 +504,75 @@ impl LocalLlm {
     }
 }
 
+/// Drops llama.cpp's debug chatter from the helper's output before it reaches the chat log.
+///
+/// mtmd logs every prompt it tokenizes as `add_text: <the whole prompt>` — 75 KB and a thousand
+/// lines per round, a copy of what the log already shows as the prompt — and CUDA logs
+/// `CUDA Graph id N reused` once per generated token. What is left is loading, errors and timings.
+#[derive(Default)]
+struct HelperNoise {
+    /// Lines of an `add_text:` dump swallowed so far; `None` when not inside one.
+    dump: Option<usize>,
+}
+
+impl HelperNoise {
+    /// A line llama.cpp itself wrote, as opposed to a line of prompt text being echoed.
+    fn is_log_line(line: &str) -> bool {
+        const PREFIXES: [&str; 12] = [
+            "CUDA Graph",
+            "ggml_",
+            "llama_",
+            "clip_",
+            "sched_",
+            "load",
+            "image",
+            "encoding ",
+            "decoding ",
+            "add_text:",
+            "ghostreel-llm:",
+            "mtmd",
+        ];
+        PREFIXES.iter().any(|p| line.starts_with(p))
+    }
+
+    fn feed(&mut self, line: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Some(n) = self.dump {
+            if !Self::is_log_line(line) {
+                self.dump = Some(n + 1);
+                return out;
+            }
+            out.push(format!("add_text: [{} lines of prompt text; see the prompt above]", n + 1));
+            self.dump = None;
+        }
+        if line.starts_with("add_text:") {
+            self.dump = Some(0);
+        } else if !(line.starts_with("CUDA Graph id ") && line.ends_with(" reused")) {
+            out.push(line.to_string());
+        }
+        out
+    }
+}
+
+/// Log what the helper answered to a `complete`: its thinking, the answer, and what it cost.
+fn log_reply(v: &Value) {
+    if let Some(t) = v["thinking"].as_str().filter(|t| !t.is_empty()) {
+        crate::llmlog::push("thinking", t);
+    }
+    if let Some(e) = v["error"].as_str() {
+        crate::llmlog::push("answer", format!("error: {e}"));
+        return;
+    }
+    let stats = format!(
+        "{} prompt tokens · {} generated · {:.1} s{}",
+        v["prompt_tokens"],
+        v["gen_tokens"],
+        v["secs"].as_f64().unwrap_or(0.0),
+        if v["truncated"].as_bool().unwrap_or(false) { " · TRUNCATED" } else { "" }
+    );
+    crate::llmlog::push("answer", format!("{stats}\n\n{}", v["content"].as_str().unwrap_or_default()));
+}
+
 /// Output budget for a plain `complete` call: enough for a tool action or a short answer.
 pub const DEFAULT_COMPLETE_TOKENS: usize = 2048;
 
@@ -511,6 +599,37 @@ impl Describer {
                 parse_description(&json_text)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod noise_tests {
+    use super::HelperNoise;
+
+    #[test]
+    fn prompt_dumps_and_per_token_graph_lines_are_dropped() {
+        let stderr = [
+            "sched_reserve: reserve took 41.67 ms",
+            "add_text: <|im_start|>system",
+            "You are a senior documentary editor.",
+            "",
+            "<|im_start|>assistant",
+            "CUDA Graph id 200 reused",
+            "ggml_backend_cuda_graph_compute: CUDA graph warmup complete",
+            "CUDA Graph id 200 reused",
+            "llama_perf_context_print: eval time = 900 ms",
+        ];
+        let mut noise = HelperNoise::default();
+        let kept: Vec<String> = stderr.iter().flat_map(|l| noise.feed(l)).collect();
+        assert_eq!(
+            kept,
+            vec![
+                "sched_reserve: reserve took 41.67 ms",
+                "add_text: [4 lines of prompt text; see the prompt above]",
+                "ggml_backend_cuda_graph_compute: CUDA graph warmup complete",
+                "llama_perf_context_print: eval time = 900 ms",
+            ]
+        );
     }
 }
 
