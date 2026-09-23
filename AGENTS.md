@@ -1,369 +1,94 @@
 # AGENTS.md — GhostReel
 
-Instructions for AI coding agents in this repo (symlinked as `CLAUDE.md`).
+Instructions and architecture reference for AI coding agents (symlinked as `CLAUDE.md`).
 
 ## What this is
 
-GhostReel (formerly "HighVid") indexes folders of video so you can search inside them: whisper
-transcripts, keyframes described by a local vision model, embeddings, hybrid keyword + vector
-search that jumps to the timestamp. Tauri v2 desktop app + `ghostreel` CLI sharing
-`ghostreel-core`. Sibling of `~/Code/ghostpen`.
+GhostReel indexes folders of video for search and automated script editing: Whisper speech-to-text, keyframe extraction, vision model frame descriptions, vector embeddings, and hybrid keyword + semantic search with timestamp playback. Includes a Tauri v2 desktop app, an embedded Axum web server for remote LAN access, and the `ghostreel` CLI, all sharing `ghostreel-core`. Sibling of `ghostpen`.
 
-Source of truth: [`.agents/plan.md`](.agents/plan.md) (decisions D1–D12, runtime profiles §2a,
-S0 findings §11). Progress: [`.agents/TODO.md`](.agents/TODO.md).
+- Decisions & spec: `.agents/plan.md`
+- Tasks & progress: `.agents/TODO.md`
 
 ## Layout
 
-| path | what |
+| Path | Purpose |
 |---|---|
-| `crates/ghostreel-core` | config, paths, SQLite+FTS5+sqlite-vec DB, server probing, doctor, projects, media (hash/ffprobe), index (scan + jobs), watch, models, script, otio, fcpxml, export, preview |
-| `crates/ghostreel-cli` | `ghostreel` binary (`doctor`, `config`, `project`, `folder`, `index [--watch]`, `status`, `models [list|download|remove|dir|use]`, `script [import|list|show|export|preview|chat]`, `mcp` = MCP stdio server in `mcp.rs`) |
-| `src-tauri` | desktop app (package `ghostreel-app` → `target/*/ghostreel-app`, bundled as `GhostReel`; lib `ghostreel_lib`). Never name it `ghostreel`: it would overwrite the CLI binary in `target/` |
-| `src/` | React + TS frontend (Vite) |
-| `scripts/` | helper build, sidecar fetch/stage, CLI tarball (see Packaging), `install-local.sh`, `clean-stale-target.sh` |
-| `spikes/s0-local` | throwaway S0 spike (separate workspace, CUDA builds) |
+| `crates/ghostreel-core` | Core library: DB (SQLite + FTS5 + sqlite-vec), config, paths, projects, media (ffprobe/hash), index pipeline, watch, models, script engine, otio, fcpxml, export, preview |
+| `crates/ghostreel-cli` | `ghostreel` binary (`doctor`, `config`, `project`, `folder`, `index`, `status`, `models`, `script`, `mcp`) |
+| `src-tauri` | Tauri v2 desktop app (`ghostreel-app` package, binary `target/*/ghostreel-app`). Includes Axum WebUI server (`webui.rs`) |
+| `src/` | React 19 + TypeScript frontend (Vite) |
+| `crates/ghostreel-asr` | Helper binary: standalone Whisper speech-to-text |
+| `crates/ghostreel-llm` | Helper binary: standalone llama.cpp vision / chat helper with batched concurrency |
+| `scripts/` | Sidecar fetch/stage, local installer, packaging scripts |
 
-## Build & run
+## Build & Test Commands
 
 ```bash
-scripts/install-local.sh          # build + install app and CLI into ~/.local (see -h)
-scripts/clean-stale-target.sh     # after moving the checkout: drop build caches pointing at the old path
-cargo test --workspace            # core tests (no GPU, no servers needed)
+cargo test --workspace            # All tests (no GPU or external servers needed)
+cargo clippy --workspace          # Lint checks
+cargo fmt --all -- --check        # Formatting checks
 cargo run -p ghostreel-cli -- doctor
-npm install && npx tauri dev      # desktop app
-npx tauri build --no-bundle       # release app binary (embedded frontend)
+npm install && npm run build      # Frontend build check
+npx tauri dev                     # Run desktop app in dev mode
+scripts/install-local.sh          # Build + install app and CLI into ~/.local
 ```
-`GHOSTREEL_CONFIG=<file>` / `GHOSTREEL_DATA=<dir>` override config/data locations (tests, demos).
-`GHOSTREEL_DEBUG_CHAT=<file>` dumps the prompt and reply of every chat turn — the way to check what
-the editor was actually told rather than assuming.
 
-## Packaging (plan §8, M7)
+- `GHOSTREEL_CONFIG=<file>` / `GHOSTREEL_DATA=<dir>`: Override config and data directories for tests/demos.
+- `GHOSTREEL_DEBUG_CHAT=<file>`: Dumps prompt and reply of every script chat turn.
+
+## Packaging
 
 ```bash
-scripts/build-helpers.sh                       # ghostreel-asr + ghostreel-llm (CUDA if toolkit present)
-node scripts/fetch-sidecars.mjs                # pinned BtbN LGPL ffmpeg/ffprobe (scripts/sidecars.json, sha256)
-node scripts/stage-helpers.mjs [--cuda]        # helpers → src-tauri/binaries/<name>-<triple>, CUDA libs → src-tauri/lib/
-                                               # also writes src-tauri/tauri.bundle.json (externalBin + resources)
+scripts/build-helpers.sh                       # ghostreel-asr + ghostreel-llm
+node scripts/fetch-sidecars.mjs                # Download pinned ffmpeg/ffprobe
+node scripts/stage-helpers.mjs [--cuda]        # Stage sidecars into src-tauri/
 NO_STRIP=true npx tauri build --config src-tauri/tauri.bundle.json --bundles appimage
-scripts/fix-appimage.sh                        # AppImage only: drop host driver libcuda, dedupe CUDA libs, repack
+scripts/fix-appimage.sh                        # Repack AppImage dropping host libcuda
 scripts/package-cli.sh                         # target/dist/ghostreel-cli-linux-x64.tar.gz
 ```
-`npm run bundle:linux` / `bundle:windows` chain these. CI: `.github/workflows/{check,release}.yml`.
-- `externalBin`/`resources` live only in the generated overlay, never in `tauri.conf.json`:
-  tauri-build fails when a sidecar file is missing, which would break `tauri dev` and clippy.
-- Tauri strips the triple and puts sidecars next to the app exe (`usr/bin/` on Linux), where
-  `doctor::locate` already looks. Resources land in `usr/lib/GhostReel/` (Linux) / install dir (Windows).
-- Helpers are linked with RUNPATH `$ORIGIN/lib:$ORIGIN/../lib/GhostReel/lib` (their `build.rs`;
-  CLI tarball / deb+AppImage layouts). Never bundle `libcuda.so`/`libnvidia-*` (host driver).
-  Staging patchelfs binaries built before the build.rs existed. Inside the AppImage, Tauri's
-  linuxdeploy rewrites RUNPATH to `$ORIGIN/../lib` and copies libs into `usr/lib` (incl. the host's
-  `libcuda.so.1`) — hence `fix-appimage.sh`; always run it after an AppImage build.
-- ffmpeg pins must be month-end BtbN `autobuild-YYYY-MM-DD-*` tags (kept long-term), never `latest`.
+CI: `.github/workflows/{check,release}.yml`. `externalBin` and `resources` live exclusively in the generated `tauri.bundle.json`, never in `tauri.conf.json`.
 
-## Script chat (`chat.rs`)
+## Core Subsystems & Invariants
 
-The editor gets the whole project's speech in the prompt before it calls anything
-(`speech_digest`, ~11.5k tokens for 96 videos): a model that has to *ask* for each transcript
-reads two tapes and builds the teaser out of whoever it found there. Tools are for pictures.
+### 1. Indexing & Pipeline Stages (`index.rs`, `projects.rs`)
+- **5 Pipeline Stages**: `probe` -> `transcribe` -> `frames` -> `describe` -> `embed`.
+- **Configurable Stages**: Each project stores its `PipelineConfig` in `projects.pipeline_json` (migration 11).
+  - CLI: `ghostreel project create <name> --no-transcribe`, `ghostreel project config -p <P> --disable transcribe`, `ghostreel index --stages / --skip`.
+  - UI: Project creation modal and Project header settings dropdown (`⚙ Project ▾`).
+- **Job Synchronization (`sync_pipeline_jobs`)**: If a stage is disabled across all projects watching a video, its jobs are marked `skipped`. Re-enabling a stage resets them to `pending`. Videos with `has_audio == 0` remain `skipped` for transcription.
+- **Keyframe Sampling (`frames.rs`)**: Twin-comparison algorithm (Zhang et al.). Decodes at 4 fps; cuts trigger on `scene_threshold`, gradual transitions accumulate below threshold up to `change_budget`. `min_interval_s` enforces the minimum spacing.
+- **Identity & Files**: Videos are identified by `blake3` content hash. `video_files` tracks filesystem locations per `(folder, path)`.
 
-A draft then goes through repair passes, in this order, and the order matters:
-`tidy_beat_ids` → shaky stretches moved → off-mic openings retimed → clips without speech muted →
-`lay_audio_beds` → grounding → `snap_to_segments` / `pad_speech` → `fit_to_target` →
-`end_on_turns` → `end_on_sentences` → `clamp_beds_to_beats`. Invariants worth not breaking:
+### 2. Remote Web Server (`src-tauri/src/webui.rs`, `src/events.ts`)
+- Embedded Axum server runs inside Tauri app if enabled in Settings (`config.toml: [web]`).
+- Serves embedded UI bundle, media at `/media`, and proxies commands via `POST /api/call`.
+- Server-sent events at `/api/events` forward background queue updates, task completion, and chat progress.
+- Frontend uses `call()` in `api.ts` (falls back to Tauri `invoke` when in desktop window) and `onEvent()` in `events.ts` (falls back to Tauri `listen`).
+- Optional HTTP Basic auth (`auth_enabled`, `auth_user`, `auth_password`).
 
-- **Speech is never scaled and never ends mid-sentence.** Length is a target; a sentence is not.
-  Anything that trims clips must be followed by `end_on_sentences`. A cut made mostly of speech
-  therefore cannot be squeezed at all — what it loses instead is a whole beat, which ends on a
-  sentence by construction (`drop_beats_to_target`). The opening and the closing stay; middles go
-  from the back. It is planned up front rather than greedily, because a greedy loop that stops at
-  its floor leaves the cut over the ceiling and the next pass drops again (53.0 s → 43.4 s), and
-  it never takes a script below half the clips the model chose — past that the score reports the
-  overrun instead.
-- **The length is spelled out as arithmetic.** "40 seconds" plus "a clip may run to 30 s" is a
-  contradiction, and a model resolves it by ignoring the first. The prompt states the beats and
-  the per-shot limit a requested duration implies; it is the only lever that works before the
-  draft exists, and it took a local run from 179.6 s to 60.7 s against a 40 s target.
-- **No shot may take more than a third of the target.** `max_clip_s` is an absolute 30 s and says
-  nothing about a 40 s cut: a local model filled one with eight clips of twenty-odd seconds, every
-  one legal, and it ran 349% over with nothing to trim. `pacing_issues` flags it while the model
-  can still choose differently.
-- **A bed is the beat's sound**, so its clips play muted and it cannot outlast them — anything that
-  moves clips must be followed by `clamp_beds_to_beats`. That clamp is the *last* thing to touch a
-  bed and so the last chance to cut a speaker off: when trimming the bed to its pictures would land
-  inside a sentence, it holds the beat's last shot for the seconds the voice needs instead. The
-  pictures give way to the voice, never the other way round.
-- **A muted clip has no voice to protect**, so `pad_speech` and `end_on_sentences` both skip it.
-  Padding b-roll to finish speech nobody can hear turned a two-second cutaway into twenty.
-- **A clip must carry a whole thought.** Length, sentence boundaries and grounding were all
-  checked; nothing asked whether the words were worth hearing. A cut came back at 39.9 s against
-  a 40 s target — a perfect duration score — with three of eight clips being five seconds each of
-  "Thank you." and "Okay.", a third of the piece. `empty_speech_issues` reports them and the
-  prompt's checklist says it; `chat/build.rs` had held the rule since it was written, but only
-  for the cut it builds itself.
-- **A CLI brain writing a script gets a script-length clock.** One `CliAgentConfig` serves
-  describing a frame (seconds) and writing a script (minutes: agy needs about nine on a 96-video
-  project), and at the 180 s default every chat turn was killed. The chat takes the larger of the
-  agent's own timeout and `script.server_timeout_s`.
-- **A range stops where the speaker stopped** (`end_on_turns`): a run of two acknowledgements is a
-  handover, and the range keeps the longer side of it. Nothing else reaches this — the interviewer
-  chatting "I used to live up on like Spicewood Springs road" is ten words of plain English, which
-  no word count catches and Jev scores 0.20. It has to run *after* `pad_speech`, which grows a clip
-  back into the pauses either side, or the two take turns and a cut walks 52.5 s → 43.4 s on a
-  repair that should find nothing.
-- **Repairs are reported back to the model** on the assistant message (`repair_note`), because the
-  repair runs after the last redraft and the model otherwise repeats the same mistake.
-- **`script import` has its own copy of this sequence** (`ghostreel-cli/src/main.rs`) rather than
-  calling `repair::finish_script`. A pass added to one and not the other silently does nothing on
-  import — which is how `clamp_beds_to_beats` came to be missing there.
-- **The conversation is re-sent every round**, so the loop keeps three quarters of the window and
-  forgets the oldest tool results (`make_room`) rather than dying on the server's context error.
+### 3. Script Chat & Repair Invariants (`chat.rs`, `repair.rs`)
+- The prompt includes a full speech digest before any tools are called. Local models also receive a one-line per video `picture_digest`.
+- **Repairs run in strict order**: `tidy_beat_ids` -> shaky stretches moved -> off-mic openings retimed -> clips without speech muted -> `lay_audio_beds` -> grounding -> `snap_to_segments` / `pad_speech` -> `fit_to_target` -> `end_on_turns` -> `end_on_sentences` -> `clamp_beds_to_beats`.
+- **Invariants**:
+  - Speech is never scaled and never cut mid-sentence (`end_on_sentences`). Overrun cuts drop whole beats from the back instead (`drop_beats_to_target`).
+  - Audio beds belong to the beat: clips under beds play muted; beds never outlast pictures (`clamp_beds_to_beats`). If clamping lands mid-sentence, the beat holds the last picture.
+  - Muted clips do not pad speech (`pad_speech` and `end_on_sentences` skip muted clips).
+  - Speaker turns: `end_on_turns` cleans acknowledgements / handovers after `pad_speech`.
+  - Empty thoughts ("Okay", "Thank you") are flagged by `empty_speech_issues`.
 
-## The local (standalone) chat path
+### 4. Editorial Judge & Builder (`judge.rs`, `build.rs`, `jev.rs`)
+- **Judge (Jev / System One)**: Optional remote evaluation (`TYPESAFE_API_KEY`). Answers questions about picture grounding, openings, flow, and endings in parallel. State is ordered alphabetically (`BTreeMap`), framing text must sort before the data it frames.
+- **Jev Builder (`chat/build.rs`)**: Assembles cuts algorithmically without LLM hallucination: enumerates on-mic quotes (4–12s, whole sentences, non-acknowledgements) and described shots, scores picture match via keyword overlap, and creates turn 1 of chat for refinement.
+- **Off-mic detection (`interviewer.rs`)**: Acoustic level filter (`audio.rs`) + Jev question scoring (`jev.interviewer_threshold = 0.78`). Never removes flags, only adds evidence.
 
-A local model is grammar-constrained to one action per round — `tool`, `final` or `reply` — and
-`reply` is the cheapest branch to commit to. Left alone it is chosen constantly, and the turn ends
-having done nothing. Four things keep standalone working; each was a real failure first:
+### 5. Timeline Export (`otio.rs`, `fcpxml.rs`)
+- Native Rust implementations for `.otio` and Final Cut Pro 7 XML (`fcpxml.rs`). No Python dependencies. Audio beds export as J-cuts with shared source references.
 
-- **The prompt must describe the pictures, not only the speech.** `speech_digest` gave every word
-  and nothing about what is on screen, so a model that called no tool concluded there was no
-  b-roll — both local models refused a project holding 639 described frames. `picture_digest` is
-  one line per video and removes the whole class.
-- **A `reply` before any tool call is pushed back on, twice** (`MAX_PUSHBACKS`). The first nudge
-  names the tools; the second shows the JSON, because the first earns "I need to verify the visual
-  content" — the model describing the tool call instead of making it.
-- **`ToolMemo` applies here too.** Without it a local model asked the same question forever: four
-  identical `get_video` calls for the same range, each answered afresh.
-- **The final call drops the `reply` branch once footage has been opened**
-  (`local_final_action_schema(allow_reply)`). A model that had done the whole job handed it over as
-  markdown prose because that branch was still reachable.
+## Key Rules & Architectural Constraints
 
-`GHOSTREEL_DEBUG_CHAT` dumps every local round, not just the final draft — a turn that ends in
-`reply` never reaches the draft, which is exactly the failure worth seeing.
-
-## The editorial judge (`chat/judge.rs`, `jev.rs`)
-
-`chat/metrics.rs` counts craft faults and every one has a pass that drives it to zero. It cannot
-see whether the shot on screen shows what the voice is talking about, whether the opening earns
-attention, or whether the ending lands — the three things the editor actually complained about.
-Jev (TypeSafe's System One model) answers those as probabilities; the weights that turn them into
-one number live in `compose`, in code, so they can be changed without asking anything again.
-
-- **Off unless told otherwise.** It is the only part of GhostReel that leaves the machine, so it
-  needs both `jev.enabled` and a key (`TYPESAFE_API_KEY` beats `jev.api_key`). Settings has both.
-- **One request, every question.** Jev reads the state once and answers all of them in parallel.
-  Splitting them costs ~12x more for the same answers.
-- **The state's keys are read in alphabetical order**, because `serde_json::Map` is a `BTreeMap` —
-  not the order they were written in the `json!`. Where the framing sits relative to the data
-  changes the answers: `interviewer.rs` called its framing key `what_this_is`, so twenty lines of
-  dialogue arrived before the sentence explaining what they were, and the subject's own words
-  scored 0.89 as the interviewer (0.46 with the framing first). Name a framing key so it sorts
-  *before* what it frames, and assert it in a test. `judge.rs` still sorts to
-  `actual_seconds, beats, brief, …` — its brief is read after its beats, and its weights were
-  tuned that way, so changing it means re-running `eval_judge`.
-- **The state is what is heard and seen**, never timecodes or video ids: transcript text for each
-  clip and bed, the vision model's frame descriptions, and whether the cut closes on a held image.
-  Jev reads text only, and a judgement it cannot ground is a judgement of nothing.
-- **Narration is a voice.** A beat with a written line over muted pictures was described to the
-  judge as "nothing — the pictures play silent" and reported as hearing `""`, so it was scored
-  against an absence and the editor was told to "pick shots of what is being talked about ("")".
-  `state` labels it, and a mismatch quotes the narration when there is no transcript speech.
-- **A beat with no frame descriptions is not asked about.** Asking anyway returned a flat "no" and
-  scored good footage as filler; `unjudged_beats` reports the gap instead of averaging it away.
-- **A stretch with no frame of its own is described by the last frame before it.** Not a guess:
-  keyframes are de-duped by perceptual hash, so no frame means nothing changed — a locked-off
-  interview collapses to one every 16–24 s. Without this a bedded beat over a static camera looked
-  unindexed and was judged on its cutaway alone.
-- **What it finds goes back to the model** on the assistant message, beside the repair note — a
-  repair pass cannot make a shot of a road illustrate a sentence about a dog, so only the brain
-  that picked the shot can fix it.
-- `ghostreel script judge <id> --brief "…"`; `tests/eval_judge.rs` (`--ignored`) re-runs the four
-  recorded drafts when the questions change, since a reworded question is a different measurement.
-
-## What a server admits it can do (`probe.rs`)
-
-GhostReel talks to anything OpenAI-compatible, but only llama.cpp describes its own shape. Never
-offer a control the server behind it cannot honour — a setting that silently does nothing is worse
-than one that is not there. `Probe::caps` carries what was actually asked:
-
-- **`slots`** — `/props.total_slots`. Describing several frames at once only pays against a server
-  started with matching slots. `None` means the server did not say (LM Studio, Ollama, a hosted
-  endpoint) and is *not* the same as one; the settings page says so rather than guessing.
-- **`slot_ctx`** — from `/slots`, because a server's window is divided among them. `--parallel 4
-  -c 65536` gives each request 16k, and nothing errors when `chat_model.ctx_tokens` is larger —
-  the model just runs out of room mid-script. `doctor` warns.
-- **`router`** — llama.cpp router mode, detected by `/models` entries carrying a `status` field
-  (a plain server's carry only id/aliases/meta/tags). There is no version endpoint; that
-  difference *is* the detection. Only then can the model or its flags change without a restart
-  (`highllama router use <preset>`).
-
-## Keyframe sampling (`frames.rs`)
-
-One low-resolution decode at 4 fps reads every frame's scene score. A score over
-`scene_threshold` is a cut; the scores *below* it are accumulated, and when the running sum passes
-`frames.change_budget` that moment earns a frame too — the cumulative half of the **twin-comparison
-algorithm** (Zhang, Kankanhalli & Smoliar, 1993). A moving camera is formally an endless gradual
-transition: it never trips a cut threshold, so a drive through a neighbourhood used to be sampled
-by the interval clock alone, every keyframe a different street and everything between them
-unindexed.
-
-- **Accumulate, never compare to the last kept frame.** Measured on the DJI walk, distance from a
-  fixed frame saturates at ~0.25 after four seconds and never grows: at 90 s and a completely
-  different street it reads the same as at 4 s. Same budget, accumulation picked 10 keyframes and
-  reference-distance picked 1. Do not "improve" this into a reference comparison.
-- **`min_interval_s` is the only cost control that matters.** The budget is self-calibrating —
-  footage changing five times faster gets five times the frames, with no notion of what a car is —
-  and the floor is what stops that from becoming an overnight describe job. It is enforced in the
-  scan, and it does *not* reset the accumulator, so fast footage gets its frame the moment it is
-  allowed one instead of losing the overflow.
-- **Cost lives in frame count**, not in the scan: the decode is O(duration) and unchanged, but
-  extraction spawns an ffmpeg per frame and the describe stage is one vision call per frame.
-- Calibration (Greet Mag, Sep 2026): ffmpeg's scene score accumulates at ~0.12/s on a moving
-  camera and ~0.02/s on a locked-off interview. `change_budget = 1.0` therefore asks for a frame
-  every ~8 s of travel and never fires on a talking head. Change it with measurements.
-- PySceneDetect's `AdaptiveDetector` solves the *opposite* problem (suppressing false cuts during
-  camera motion); AKS/Q-Frame score frames against the *query*, which an index built once and
-  searched later cannot do. Neither applies here.
-
-## Who is the interviewer (`interviewer.rs`)
-
-`off_mic` decides whose voice to ignore, and everything reads it: the prompt's speech digest, the
-quote candidates, the judge's "heard". `audio.rs` sets it acoustically — a segment a margin below
-the video's median level is somebody off the lav — which only works when the interviewer is
-*quieter*. On one Greet Mag tape they were not (9 off-mic of 76, against 24–26 elsewhere) and a
-finished cut opened with "Okay, cool. So just tell me your name and the line of business that
-you're in." The editor's verdict: "it's like I asked for bloopers."
-
-`ghostreel script interviewer -p <project> [--dry-run|--undo]` asks Jev instead, one Noul per
-line. It only ever *adds* flags — the acoustic test is evidence too — and records how each one was
-set (`off_mic_source` 'level' or 'speech', with `off_mic_p`), because one bit cannot be reviewed,
-re-judged at a different threshold, or undone without re-measuring every video.
-
-- **Twenty lines per request, as state and as questions.** Accuracy falls off with the *length of
-  the state*, not the number of questions: the same unmistakable line reads 0.56 against 63 lines,
-  0.53 against 63 lines with only 20 questions asked, and 0.96 against 20. Batching per video was
-  not the fix it looked like — it helped only on the short tapes.
-- **`jev.interviewer_threshold` is 0.78**, which is the gap the footage showed: unmistakable lines
-  (a question, a mic check, a countdown) sit at 0.84–0.97 and real answers wrongly caught at
-  0.70–0.76. Change it with evidence, not taste.
-- It also catches slates ("Three, two, one, two"), mic checks, and — below the threshold — Whisper's
-  silence hallucination "ご視聴ありがとうございました".
-
-## Building a cut by choosing (`chat/build.rs`)
-
-A third way to get a script, beside the chat brains and importing JSON: `ghostreel script build`
-and the *Build with Jev* button. No model writes anything. Code enumerates every quotable run of
-on-mic speech and every described shot out of the index, Jev picks among them, and code assembles
-the result — so an invented timecode is not a bug that was fixed, it is a thing that cannot be
-expressed. It is also the fastest brain here: ~14 s against minutes for a local model, and on the
-Greet Mag brief it scores 98/100 mechanically (40.7 s against a 40 s target) and 67/100
-editorially, which beats every model draft recorded so far.
-
-It cannot write narration, invent a framing device, or say anything the interviews do not. Rules
-that questions only *suggest* are enforced in code, because "mostly" is not a rule:
-
-- **A quote is a whole sentence with something in it**: 4–12 s, ≥10 words, on-mic, and it may not
-  *end* on an acknowledgement — Jev chose a closing line finishing "…lost in some places. Okay."
-  and then scored that ending 0.29.
-- **Roles are picked one request at a time.** Independent questions cannot see each other's
-  answers: asked together, one strong line won opening, middle *and* closing, and the cut was two
-  quotes long.
-- **A voice already used is off the menu** while any unheard one remains. Suggesting it in the
-  question gave a four-line cut drawn from two people out of fifty-six.
-- **Shots come only from footage nobody in the cut speaks in**, so a talking head can never be the
-  b-roll under somebody else's voice.
-- **The option budget is spent on relevance, not on a sample.** A Choice takes at most 255
-  options and the state shares that budget, so 639 described shots must become a few dozen. Each
-  line now gets its own shortlist, ranked by content words shared with what is said over it, and
-  a line that names nothing visible ("and we just love it") falls back to a spread. Picture-match
-  went 0.70 → 0.84 with no mismatched beats, on the same four quotes: the deer shot finally
-  reached the deer line. Deliberately word overlap and not embeddings — the builder's shape is
-  that code enumerates and Jev judges, and pulling the search subsystem in here would widen what
-  a change to this file can break.
-- **A capped pool is spread, never truncated.** `.take(200)` in video order showed Jev shots from
-  25 of 96 videos, and re-indexing made it *worse*: more frames per video pushed more videos out
-  of the window, so half again as much footage produced the identical cut. `spread` takes a turn
-  from each video instead.
-- **The cutaway falls on a transcript boundary**, never inside a sentence. Cutting anywhere else
-  is undone by `end_on_sentences` and the first real build came out 84% over its target.
-
-## Jev builds, a chat brain refines
-
-The two ways of getting a cut are good at opposite things. The builder picks pictures well —
-0.84 picture-to-voice against agy's 0.77 — and structures poorly, because it chooses four quotes
-independently and nothing ever asks whether they make a story (flow 0.59). agy is the reverse.
-
-`script build` therefore judges its own cut and writes it into a chat session as turn one: the
-brief as the user message, the script JSON and the judge's notes as the assistant's. A chat turn
-on that session starts from real timecodes and a critique instead of fifteen rounds of looking.
-
-    ghostreel script build -p P -b "…"            # ~10 s, prints the session id
-    ghostreel script chat  -p P --session N "…"   # refine
-
-In the app the same chain is the **"Jev drafts first"** toggle beside the chat box: Send then
-builds, judges and refines in one go, against whichever brain Settings names. `build_script_with_jev`
-returns `{script_id, session_id}` and the panel selects both — before that it returned only a
-script id and saved it with no session, so the button produced a cut with nothing to hand it to
-and the best pipeline here was reachable only from the CLI. The judge is split (`plan` reads the
-database, `ask` does not) because a `Db` is not `Sync` and must not be held across the request.
-
-Measured on the same brief: **76 editorial in 2m45s**, against 65 for the builder alone and 76 for
-agy alone at 9m23s. Flow 0.59 → 0.73, ending 0.37 → 0.86, opening 0.59 → 0.71 — the last two the
-best recorded. Attempts to fix the builder's structure *in the builder*, by rewording how middles
-are chosen, made it worse twice; handing the problem to something that can hold a story did not.
-
-It works with a weak brain too, which is the point: the local Qwen 9B took a build from 62 to 64
-and flow 0.57 → 0.74 — the same structural lift agy gives — where writing from scratch it scored
-56 and 38 mechanically. It is no longer doing the research it is bad at.
-
-**One turn is one instruction's worth of change.** That first local run moved almost nothing
-because `judge::notes` only spoke below 0.4: ending 0.49, opening 0.56 and brief 0.68 went
-unmentioned, so the only thing said was one mismatched beat, and one beat is what changed.
-`judge::weakest` now always names the two dimensions losing the most points — ranked by points
-lost, not by value, since 30 points at 0.68 is a bigger prize than 5 at 0.41 — and
-`chat/refine.rs` runs the turn several times and **keeps the best one the judge saw, never the
-last**: a round can make a cut worse, and a loop that keeps the last answer is a random walk.
-`ghostreel script refine -p P --session N --rounds 3`.
-
-## Timeline export
-
-`.otio` (`otio.rs`) and Final Cut Pro 7 XML (`fcpxml.rs`) are both written here — there is no
-Python sidecar, and re-adding one would be a regression. `tests/fixtures/golden.xml` came from the
-official `otio-fcp-adapter` and is compared byte for byte; its one deliberate difference is noted
-in the test. In xmeml, `start`/`end` count in the sequence rate and `in`/`out`/`duration` in the
-source's, gaps are positions rather than elements, and a `<file>` is spelled out once then
-referenced by id — which is what lets a bed export as a J-cut.
-
-## Critical rules
-
-1. **Two first-class runtime profiles** (plan §2a): *standalone* (models in-process, Windows +
-   Linux, nothing else installed) and *shared servers* (highllama vision `:8089`, highllama
-   embeddings `:8091`, GhostPen STT `:8771`). Each capability has `auto|local|server`, and the
-   script chat additionally has `cli` (claude / agy / opencode / codex). Never load
-   a local model while the matching server is usable — the dev box must not hold models twice.
-2. **Only use a server that is reachable *and capable*** (`probe.rs`): vision needs
-   `modalities.vision`; embeddings must be 768-dim `embeddinggemma-300M-Q8_0` (a chat model's
-   CLS vectors silently ruin search); STT needs `capabilities.segments` (timestamps).
-3. **One embedding model everywhere** (`embeddinggemma-300M-Q8_0`, 768-dim) so indexes are
-   portable between profiles. The DB records `embed_model`/`embed_dim`.
-4. **whisper-rs and llama-cpp-2 can't share a binary** (duplicate ggml symbols, S0) →
-   local transcription will run in a separate `ghostreel-asr` helper.
-5. **VRAM budget is the RTX 3070 8 GB.** On the 4070 dev box keep highllama at `KVTYPE=q4_0`;
-   GhostPen's whisper segfaults when VRAM runs out.
-6. CUDA builds: `CMAKE_BUILD_PARALLEL_LEVEL=4` — full parallel llama.cpp+whisper.cpp CUDA builds OOM.
-7. Wayland: keep `apply_wayland_webkit_workaround()` (WebKit DMABUF "Error 71").
-8. Migrations in `db.rs` are append-only once committed. Table rebuilds run with foreign keys off
-   (see `Db::migrate`) — otherwise dropping `videos` cascades into jobs/transcripts.
-9. Video identity = content hash; `video_files` are locations, unique per *(folder, path)* so
-   overlapping folders of different projects don't fight over a file.
-10. Don't create branches in `~/Code/ghostpen` or `~/Code/highllama`; work on main there.
-11. **Vision model selection** (`config.vision.local_model`): the catalog has 4 pairs (bonsai-27b,
-    gemma-3-4b-it, qwen2.5-vl-7b, qwen2.5-vl-3b); `models use <id>` checks the vision catalog
-    **before** the generic `whisper()` function (which accepts any valid name). `ghostreel-llm`
-    uses the model's own chat template via `apply_chat_template`; Qwen-style thinking is suppressed
-    by appending `<think>\n\n</think>\n\n` when the template emits the ChatML assistant header.
-    Known gap: non-Bonsai templates are untested on GPU. Ternary Bonsai 2 (`PQ2_0`/`PTQ1_0`, ggml
-    types 142/143) needs PrismML's llama.cpp fork, which highllama installs beside its own build
-    (`highllama prism install`) and selects by reading the GGUF's tensor types.
-12. **A server brain gets a token ceiling and a long timeout**, not the reverse: `max_answer_tokens`
-    exists so a model that will not stop fails as itself instead of as a dead socket, and
-    `server_timeout_s` is generous because a local model needs minutes for a long script.
+1. **Two Runtime Profiles**: *standalone* (in-process helpers `ghostreel-asr`, `ghostreel-llm`) and *shared servers* (OpenAI-compatible endpoints). Always probe before use (`probe.rs`).
+2. **Fixed Embedding Model**: Always `embeddinggemma-300M-Q8_0` (768-dim). Do not swap or mix embedding models.
+3. **No Duplicate GGML Symbols**: `whisper-rs` and `llama-cpp-2` cannot link in the same binary; local models run in separate helpers.
+4. **VRAM & Parallelism**: Target baseline GPU is 8 GB VRAM. Limit CUDA builds to `CMAKE_BUILD_PARALLEL_LEVEL=4` to avoid compiler OOM.
+5. **Database Migrations**: Migrations in `db.rs` are strictly append-only. Table rebuilds must disable foreign keys during migration to prevent cascading deletes.
+6. **Code Formatting & Quality**: Always ensure `cargo fmt --all -- --check` and `cargo clippy --workspace` pass before pushing.
