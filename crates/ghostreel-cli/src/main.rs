@@ -1739,6 +1739,31 @@ fn print_report(r: &Report) {
         println!("  ✓ {} — {} / {} MiB used, driver {}", g.name, g.vram_used_mib, g.vram_total_mib, g.driver);
     }
 
+    println!("\nGhostPen service");
+    match &r.ghost_service {
+        Some(g) => {
+            let pid = g.pid.map(|p| format!(" (pid {p})")).unwrap_or_default();
+            println!("  ✓ {} @ {}{} — {}", g.app, g.url, pid, g.path.display());
+            println!(
+                "    capabilities: {}",
+                if g.capabilities.is_empty() { "none advertised".into() } else { g.capabilities.join(", ") }
+            );
+            if g.used_for.is_empty() {
+                println!("    not used: no auto backend resolved to it");
+            } else {
+                println!("    used for: {}", g.used_for.join(", "));
+            }
+        }
+        None => {
+            let cfg = Config::load(&r.config_file).unwrap_or_default();
+            let off = ghostreel_core::ghost_service::opted_out(
+                &cfg,
+                std::env::var("GHOSTREEL_NO_GHOST_SERVICE").ok().as_deref(),
+            );
+            println!("  - not running{}", if off { " (disabled)" } else { "" });
+        }
+    }
+
     println!("\nAI backends");
     print_backend("frame descriptions", &r.vision);
     print_backend("script chat", &r.chat);

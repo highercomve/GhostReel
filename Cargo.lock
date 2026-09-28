@@ -1724,6 +1724,7 @@ dependencies = [
  "dirs 7.0.0",
  "futures-util",
  "image",
+ "libc",
  "notify",
  "quick-xml",
  "reqwest",
