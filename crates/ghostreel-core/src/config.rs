@@ -618,6 +618,22 @@ impl Default for WebConfig {
     }
 }
 
+/// Cross-app sharing (`[ai]`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AiConfig {
+    /// Use GhostPen's shared model service when it is running (see `ghost_service`), so both apps
+    /// don't load an LLM into VRAM each. Only `auto` backends consider it; `local` and `server`
+    /// keep their exact meaning. `GHOSTREEL_NO_GHOST_SERVICE=1` opts out without editing the file.
+    pub use_ghost_service: bool,
+}
+
+impl Default for AiConfig {
+    fn default() -> Self {
+        Self { use_ghost_service: true }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -641,6 +657,9 @@ pub struct Config {
     /// Serving the UI over HTTP for other devices.
     #[serde(default)]
     pub web: WebConfig,
+    /// Sharing GhostPen's model service.
+    #[serde(default)]
+    pub ai: AiConfig,
 }
 
 impl Config {
@@ -780,6 +799,7 @@ impl Config {
         match key {
             "stt.backend" => self.stt.backend = backend(value)?,
             "stt.url" => self.stt.url = value.to_string(),
+            "ai.use_ghost_service" => self.ai.use_ghost_service = flag(value),
             "embed.backend" | "embeddings.backend" => self.embed.backend = backend(value)?,
             "embed.url" | "embeddings.url" => self.embed.url = value.to_string(),
             "frames.max_interval_s" => {
@@ -816,7 +836,7 @@ impl Config {
                      vision.* and chat_model.* (backend, url, model, local_model, ctx_tokens, kv_cache, \
                      flash_attn, think), vision.cli.* and chat_model.cli.* (tool, command, model, \
                      timeout_secs, concurrency), stt.backend, stt.url, embed.backend, embed.url, \
-                     frames.max_interval_s, frames.long_side"
+                     frames.max_interval_s, frames.long_side, ai.use_ghost_service"
                 ));
             }
         }

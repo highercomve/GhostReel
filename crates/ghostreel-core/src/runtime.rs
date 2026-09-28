@@ -8,6 +8,7 @@ use serde::Serialize;
 
 use crate::config::{Backend, Config};
 use crate::doctor::locate;
+use crate::ghost_service::{self, Capability, GhostService};
 use crate::models::{self, ModelSpec};
 use crate::paths::Paths;
 use crate::probe::{self, Target};
@@ -196,10 +197,11 @@ pub async fn resolve(paths: &Paths, config: &Config) -> Result<Runtime, crate::E
         locate("ffmpeg").ok_or_else(|| crate::Error::Invalid("ffmpeg not found (see `ghostreel doctor`)".into()))?;
     let ffprobe =
         locate("ffprobe").ok_or_else(|| crate::Error::Invalid("ffprobe not found (see `ghostreel doctor`)".into()))?;
+    let svc = ghost_service::discover(config);
     let (stt, vision, embed, gpus) = tokio::join!(
-        resolve_stt(paths, config),
-        resolve_vision(paths, config),
-        resolve_embed(paths, config),
+        resolve_stt_with(paths, config, svc.as_ref()),
+        resolve_vision_with(paths, config, svc.as_ref()),
+        resolve_embed_with(paths, config, svc.as_ref()),
         crate::doctor::nvidia_gpus()
     );
     let total_vram = gpus.first().map(|g| g.vram_total_mib);
@@ -221,7 +223,19 @@ pub async fn resolve(paths: &Paths, config: &Config) -> Result<Runtime, crate::E
 }
 
 pub async fn resolve_embed(paths: &Paths, config: &Config) -> EmbedSetup {
+    resolve_embed_with(paths, config, ghost_service::discover(config).as_ref()).await
+}
+
+async fn resolve_embed_with(paths: &Paths, config: &Config, svc: Option<&GhostService>) -> EmbedSetup {
     let cfg = &config.embed;
+    // GhostPen's shared service wins over the configured server for `auto` (plan §2a).
+    if cfg.backend == Backend::Auto
+        && let Some(s) = svc
+        && ghost_service::probe_service(&probe::probe_client(), s, Capability::Embeddings, &cfg.model).await.is_some()
+    {
+        let model = if s.models.embeddings.is_empty() { cfg.model.clone() } else { s.models.embeddings.clone() };
+        return EmbedSetup::Server { url: s.url.clone(), model };
+    }
     let probe = match cfg.backend {
         Backend::Local => None,
         _ => Some(probe::embeddings(&probe::probe_client(), &cfg.url, &cfg.model).await),
@@ -245,15 +259,36 @@ pub async fn resolve_embed(paths: &Paths, config: &Config) -> EmbedSetup {
 
 /// Frame descriptions (indexing): `[vision]`.
 pub async fn resolve_vision(paths: &Paths, config: &Config) -> VisionSetup {
-    resolve_llm(paths, config, &config.vision).await
+    let svc = ghost_service::discover(config);
+    resolve_llm_with(paths, config, &config.vision, svc.as_ref(), Capability::Vision).await
 }
 
 /// Script chat: `[chat_model]`, or `[vision]` with a bigger window on older configs.
 pub async fn resolve_chat(paths: &Paths, config: &Config) -> VisionSetup {
-    resolve_llm(paths, config, &config.chat_model()).await
+    let svc = ghost_service::discover(config);
+    resolve_llm_with(paths, config, &config.chat_model(), svc.as_ref(), Capability::Chat).await
 }
 
-async fn resolve_llm(paths: &Paths, config: &Config, cfg: &crate::config::VisionConfig) -> VisionSetup {
+async fn resolve_vision_with(paths: &Paths, config: &Config, svc: Option<&GhostService>) -> VisionSetup {
+    resolve_llm_with(paths, config, &config.vision, svc, Capability::Vision).await
+}
+
+async fn resolve_llm_with(
+    paths: &Paths,
+    config: &Config,
+    cfg: &crate::config::VisionConfig,
+    svc: Option<&GhostService>,
+    cap: Capability,
+) -> VisionSetup {
+    // GhostPen's shared service wins over the configured server for `auto`. Its own model id is
+    // always sent — never GhostReel's configured one, which the service may not have.
+    if cfg.backend == Backend::Auto
+        && let Some(s) = svc
+        && let Some(p) = ghost_service::probe_service(&probe::probe_client(), s, cap, &config.embed.model).await
+    {
+        let model = if s.models.chat.is_empty() { p.model.clone().unwrap_or_default() } else { s.models.chat.clone() };
+        return VisionSetup::Server(crate::vision::ServerVision::new(&s.url, &model, "").with_ctx(cfg.ctx_tokens));
+    }
     // CLI backend: resolve binary; `auto` never picks this.
     if cfg.backend == Backend::Cli {
         let agent_cfg = cfg.cli.clone();
@@ -297,7 +332,17 @@ async fn resolve_llm(paths: &Paths, config: &Config, cfg: &crate::config::Vision
 }
 
 pub async fn resolve_stt(paths: &Paths, config: &Config) -> SttSetup {
+    resolve_stt_with(paths, config, ghost_service::discover(config).as_ref()).await
+}
+
+async fn resolve_stt_with(paths: &Paths, config: &Config, svc: Option<&GhostService>) -> SttSetup {
     let cfg = &config.stt;
+    if cfg.backend == Backend::Auto
+        && let Some(s) = svc
+        && ghost_service::probe_service(&probe::probe_client(), s, Capability::Stt, &config.embed.model).await.is_some()
+    {
+        return SttSetup::Ready(Engine::server(&s.url));
+    }
     let probe = match cfg.backend {
         Backend::Local => None,
         _ => Some(probe::stt(&probe::probe_client(), &cfg.url).await),
@@ -342,6 +387,65 @@ fn local_stt(models_dir: &Path, search_paths: &[PathBuf], model: &str) -> SttSet
 mod tests {
     use super::*;
     use crate::doctor::Gpu;
+
+    /// A discovery file in a tempdir pointing at `url`, discovered the way production code does.
+    fn discover_at(dir: &Path, url: &str) -> GhostService {
+        let file = dir.join("ghost").join("models.json");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(
+            &file,
+            format!(
+                r#"{{"app":"GhostPen","pid":1,"url":"{url}",
+                "capabilities":{{"chat":true,"vision":true,"embeddings":true,"stt":true}},
+                "models":{{"chat":"qwen3.5-9b"}}}}"#
+            ),
+        )
+        .unwrap();
+        ghost_service::discover_in(&[file], |_| true).unwrap()
+    }
+
+    #[tokio::test]
+    async fn auto_backend_prefers_the_ghost_service() {
+        let url = crate::probe::tests_support::serve(vec![
+            ("GET /v1/models", 200, r#"{"data":[{"id":"qwen3.5-9b"}]}"#.into()),
+            ("GET /props", 200, r#"{"modalities":{"vision":true}}"#.into()),
+        ])
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let svc = discover_at(dir.path(), &url);
+        let paths = Paths { config_file: dir.path().join("config.toml"), data_dir: dir.path().join("data") };
+
+        // The configured server is dead: without the service this would resolve local.
+        let mut cfg = Config::default();
+        cfg.vision.url = "http://127.0.0.1:1".into();
+        match resolve_vision_with(&paths, &cfg, Some(&svc)).await {
+            VisionSetup::Server(s) => {
+                assert_eq!(s.url, svc.url);
+                assert_eq!(s.model, "qwen3.5-9b", "the service's model, never GhostReel's configured one");
+            }
+            other => panic!("expected Server via the service, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn local_backend_ignores_the_ghost_service() {
+        let url = crate::probe::tests_support::serve(vec![
+            ("GET /v1/models", 200, r#"{"data":[{"id":"qwen3.5-9b"}]}"#.into()),
+            ("GET /props", 200, r#"{"modalities":{"vision":true}}"#.into()),
+        ])
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let svc = discover_at(dir.path(), &url);
+        let paths = Paths { config_file: dir.path().join("config.toml"), data_dir: dir.path().join("data") };
+
+        let mut cfg = Config::default();
+        cfg.vision.backend = Backend::Local;
+        cfg.vision.local_model = "nonexistent-model-xyz".into();
+        match resolve_vision_with(&paths, &cfg, Some(&svc)).await {
+            VisionSetup::Unavailable(why) => assert!(why.contains("unknown vision model"), "{why}"),
+            other => panic!("backend = local must not touch the service, got {other:?}"),
+        }
+    }
 
     #[test]
     fn whisper_model_follows_vram() {

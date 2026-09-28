@@ -7,6 +7,7 @@ use serde::Serialize;
 
 use crate::config::{Backend, Config};
 use crate::db::Db;
+use crate::ghost_service::{self, Capability};
 use crate::paths::Paths;
 use crate::probe::{self, Resolution, Target};
 
@@ -42,6 +43,19 @@ pub struct ModelFile {
     pub found: Option<PathBuf>,
 }
 
+/// GhostPen's shared model service, when found and live (see `ghost_service`).
+#[derive(Debug, Clone, Serialize)]
+pub struct GhostServiceInfo {
+    pub path: PathBuf,
+    pub app: String,
+    pub url: String,
+    pub pid: Option<u32>,
+    /// Capabilities the file advertises (names of the true flags).
+    pub capabilities: Vec<String>,
+    /// Which capabilities resolved to it this run.
+    pub used_for: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Report {
     pub version: &'static str,
@@ -60,6 +74,7 @@ pub struct Report {
     pub local_runtime: LocalRuntimeInfo,
     pub embeddings: Resolution,
     pub stt: Resolution,
+    pub ghost_service: Option<GhostServiceInfo>,
     pub models: Vec<ModelFile>,
     /// Installed coding-agent CLI tools (name → path) and which capability uses one.
     pub cli_tools: CliToolsInfo,
@@ -174,6 +189,58 @@ pub async fn run(paths: &Paths) -> Report {
         CliToolsInfo { installed, active_for }
     };
 
+    // GhostPen's shared model service wins over the configured servers for `auto` backends —
+    // the same helper the runtime uses, so the report and a real run agree.
+    let svc = ghost_service::discover(&config);
+    let mut svc_used: Vec<String> = Vec::new();
+    let mut vision = probe::resolve(config.vision.backend, vp.clone());
+    let mut chat = probe::resolve(config.chat_model().backend, vp);
+    let mut embeddings = probe::resolve(config.embed.backend, ep);
+    let mut stt = probe::resolve(config.stt.backend, sp);
+    if let Some(s) = &svc {
+        if config.vision.backend == Backend::Auto
+            && let Some(p) = ghost_service::probe_service(&client, s, Capability::Vision, &config.embed.model).await
+        {
+            vision = ghost_service::service_resolution(config.vision.backend, p);
+            svc_used.push("frame descriptions".into());
+        }
+        let chat_backend = config.chat_model().backend;
+        if chat_backend == Backend::Auto
+            && let Some(p) = ghost_service::probe_service(&client, s, Capability::Chat, &config.embed.model).await
+        {
+            chat = ghost_service::service_resolution(chat_backend, p);
+            svc_used.push("script chat".into());
+        }
+        if config.embed.backend == Backend::Auto
+            && let Some(p) = ghost_service::probe_service(&client, s, Capability::Embeddings, &config.embed.model).await
+        {
+            embeddings = ghost_service::service_resolution(config.embed.backend, p);
+            svc_used.push("embeddings".into());
+        }
+        if config.stt.backend == Backend::Auto
+            && let Some(p) = ghost_service::probe_service(&client, s, Capability::Stt, &config.embed.model).await
+        {
+            stt = ghost_service::service_resolution(config.stt.backend, p);
+            svc_used.push("stt".into());
+        }
+    }
+    let ghost_service = svc.map(|s| {
+        let mut capabilities = Vec::new();
+        if s.capabilities.chat {
+            capabilities.push("chat".into());
+        }
+        if s.capabilities.vision {
+            capabilities.push("vision".into());
+        }
+        if s.capabilities.embeddings {
+            capabilities.push("embeddings".into());
+        }
+        if s.capabilities.stt {
+            capabilities.push("stt".into());
+        }
+        GhostServiceInfo { path: s.path, app: s.app, url: s.url, pid: s.pid, capabilities, used_for: svc_used }
+    });
+
     Report {
         version: env!("CARGO_PKG_VERSION"),
         config_file: paths.config_file.clone(),
@@ -183,16 +250,17 @@ pub async fn run(paths: &Paths) -> Report {
         ffmpeg,
         ffprobe,
         gpu,
-        vision: probe::resolve(config.vision.backend, vp.clone()),
-        chat: probe::resolve(config.chat_model().backend, vp),
+        vision,
+        chat,
         local_runtime: LocalRuntimeInfo {
             describe_ctx: config.vision.ctx_tokens,
             describe_kv: config.vision.kv_cache.clone(),
             chat_ctx: config.chat_model().ctx_tokens,
             chat_kv: config.chat_model().kv_cache.clone(),
         },
-        embeddings: probe::resolve(config.embed.backend, ep),
-        stt: probe::resolve(config.stt.backend, sp),
+        embeddings,
+        stt,
+        ghost_service,
         models,
         cli_tools,
     }

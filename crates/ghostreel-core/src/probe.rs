@@ -310,13 +310,13 @@ pub async fn server_models(url: &str) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
+/// Shared by the test modules of this crate (probe, ghost_service, runtime).
 #[cfg(test)]
-mod tests {
-    use super::*;
+pub(crate) mod tests_support {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// Minimal HTTP server: `routes` maps "METHOD /path" (query ignored) to (status, body).
-    async fn serve(routes: Vec<(&'static str, u16, String)>) -> String {
+    pub(crate) async fn serve(routes: Vec<(&'static str, u16, String)>) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -345,6 +345,12 @@ mod tests {
         });
         format!("http://{addr}")
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tests_support::serve;
 
     fn dead_url() -> String {
         // Bind then drop: nothing listens on this port afterwards.
