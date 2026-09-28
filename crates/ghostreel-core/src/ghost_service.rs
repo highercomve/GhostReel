@@ -180,6 +180,34 @@ pub async fn probe_service(
 
 /// The resolution `doctor` and `runtime` share when the service answers for a capability, so
 /// both always tell the same story.
+/// After an indexing run: the GhostPen model service it used releases its chat/vision and
+/// whisper models now (`POST /unload`), as the local helper is killed when a run ends. The small
+/// embedding model stays for search; GhostPen unloads it once idle. Best-effort: a service that
+/// is gone or too old for `/unload` is simply left alone.
+pub async fn release_after_run(rt: &crate::runtime::Runtime) {
+    let Some(svc) = discover_in(&candidate_paths(), pid_alive) else { return };
+    let base = svc.url.trim_end_matches('/');
+    let mut models = Vec::new();
+    if let crate::runtime::VisionSetup::Server(s) = &rt.vision
+        && s.url.trim_end_matches('/') == base
+    {
+        models.push("chat");
+    }
+    if let crate::runtime::SttSetup::Ready(crate::stt::Engine::Server { url, .. }) = &rt.stt
+        && url.trim_end_matches('/') == base
+    {
+        models.push("stt");
+    }
+    if models.is_empty() {
+        return;
+    }
+    let _ = probe::probe_client()
+        .post(format!("{base}/unload"))
+        .json(&serde_json::json!({ "models": models }))
+        .send()
+        .await;
+}
+
 pub fn service_resolution(backend: Backend, p: Probe) -> Resolution {
     let reason = format!("GhostPen shared service: {}{}", p.detail, p.caps.summary());
     Resolution { backend, target: Target::Server, probe: Some(p), reason }

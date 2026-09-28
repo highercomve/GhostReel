@@ -180,7 +180,19 @@ const UNKNOWN_DURATION_S: f64 = 120.0;
 /// Scan + run all pending jobs. Callers hold an [`IndexLock`].
 ///
 /// Emits [`Event::Progress`] (throttled) with overall completion and time remaining.
-pub async fn run(db: &mut Db, rt: &Runtime, opts: &Options, mut on_event: impl FnMut(Event)) -> Result<Summary, Error> {
+pub async fn run(db: &mut Db, rt: &Runtime, opts: &Options, on_event: impl FnMut(Event)) -> Result<Summary, Error> {
+    let result = run_jobs(db, rt, opts, on_event).await;
+    // Done with the models: a GhostPen service frees them now, as a local helper exits.
+    crate::ghost_service::release_after_run(rt).await;
+    result
+}
+
+async fn run_jobs(
+    db: &mut Db,
+    rt: &Runtime,
+    opts: &Options,
+    mut on_event: impl FnMut(Event),
+) -> Result<Summary, Error> {
     let mut summary = Summary::default();
     let mut tracker = Tracker::new(PHASES);
     tracker.load_rates(db)?;
