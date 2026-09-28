@@ -8,11 +8,25 @@ name: Release
 #   3. publish-release -> flip the draft to published once every platform uploaded
 #
 # Trigger: push a tag like `v0.1.1`, or run manually with a tag input.
+#
+# Pushes to master that touch the Rust build run the same jobs without bundling or publishing,
+# only to fill the caches: GitHub scopes a cache to the ref that saved it, and a tag can read
+# only its own and the default branch's. A cache saved by a tag is useless to the next tag
+# (every release rebuilt the CUDA helpers, ~30 min on Linux), so tags only restore.
 
 on:
   push:
     tags:
       - 'v*'
+    branches:
+      - master
+    paths:
+      - 'crates/**'
+      - 'src-tauri/**'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'scripts/build-helpers.sh'
+      - '.github/workflows/release.yml'
   workflow_dispatch:
     inputs:
       tag:
@@ -27,7 +41,12 @@ on:
 
 concurrency:
   group: release-${{ github.event.inputs.tag || github.ref_name }}
-  cancel-in-progress: true
+  # A cancelled cache run saves nothing: let it finish, the next one queues.
+  cancel-in-progress: ${{ github.ref_type == 'tag' || github.event_name == 'workflow_dispatch' }}
+
+env:
+  # 'true' for a release (a tag or a manual run), 'false' for a cache run on master.
+  RELEASE: ${{ github.ref_type == 'tag' || github.event_name == 'workflow_dispatch' }}
 
 permissions:
   contents: write
@@ -35,6 +54,7 @@ permissions:
 jobs:
   create-release:
     name: Create release
+    if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     outputs:
       release_id: ${{ steps.create.outputs.result }}
@@ -83,6 +103,8 @@ jobs:
   linux-x64:
     name: linux-x64
     needs: create-release
+    # Also when create-release is skipped (a cache run).
+    if: ${{ !cancelled() && needs.create-release.result != 'failure' }}
     runs-on: ${{ github.event.inputs.runner == 'blacksmith' && 'blacksmith-16vcpu-ubuntu-2204' || 'ubuntu-22.04' }}
     timeout-minutes: 240
     env:
@@ -134,6 +156,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: linux-cuda
+          save-if: ${{ github.ref == 'refs/heads/master' }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v7
@@ -169,7 +192,7 @@ jobs:
           JOBS: ${{ github.event.inputs.runner == 'blacksmith' && '16' || '4' }}
 
       - name: Save CUDA helpers
-        if: steps.helpers.outputs.cache-hit != 'true'
+        if: steps.helpers.outputs.cache-hit != 'true' && github.ref == 'refs/heads/master'
         uses: actions/cache/save@v4
         with:
           path: |
@@ -195,7 +218,13 @@ jobs:
       # linuxdeploy must resolve every library the helpers link, including libcuda.so.1, which
       # only an NVIDIA driver provides. Point it at the toolkit's stub; fix-appimage.sh then
       # removes libcuda from the AppImage so the user's own driver is used at runtime.
+      # A cache run compiles exactly what the bundle build compiles, without bundling.
+      - name: Build the app (cache run)
+        if: env.RELEASE != 'true'
+        run: npx tauri build --config src-tauri/tauri.bundle.json --no-bundle
+
       - name: Build Tauri bundles
+        if: env.RELEASE == 'true'
         run: |
           stub=$(find "$CUDA_PATH" -path '*stubs/libcuda.so' | head -n1)
           test -n "$stub" || { echo "::error::CUDA libcuda.so stub not found under $CUDA_PATH"; exit 1; }
@@ -209,10 +238,12 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
 
       - name: Fix AppImage (drop driver libs, dedupe CUDA libs, repack)
+        if: env.RELEASE == 'true'
         run: scripts/fix-appimage.sh
 
       # Repacking changes the file, so Tauri's signature from the build no longer matches: sign again.
       - name: Re-sign the AppImage for the updater
+        if: env.RELEASE == 'true'
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
         run: |
@@ -223,9 +254,11 @@ jobs:
           done
 
       - name: Package CLI
+        if: env.RELEASE == 'true'
         run: scripts/package-cli.sh
 
       - name: Upload artifacts
+        if: env.RELEASE == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: ghostreel-linux-x64
@@ -235,6 +268,7 @@ jobs:
 
       # One file at a time with retries (large parallel uploads time out). CLI tarball stays in artifacts.
       - name: Upload bundles to the release
+        if: env.RELEASE == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.event.inputs.tag || github.ref_name }}
@@ -258,6 +292,7 @@ jobs:
           done
 
       - name: Write updater snippet
+        if: env.RELEASE == 'true'
         env:
           TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
@@ -278,6 +313,7 @@ jobs:
           cat target/updater/updater-linux.json
 
       - name: Upload updater snippet
+        if: env.RELEASE == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: updater-linux
@@ -286,6 +322,8 @@ jobs:
   windows-x64:
     name: windows-x64
     needs: create-release
+    # Also when create-release is skipped (a cache run).
+    if: ${{ !cancelled() && needs.create-release.result != 'failure' }}
     runs-on: ${{ github.event.inputs.runner == 'blacksmith' && 'blacksmith-16vcpu-windows-2025' || 'windows-2022' }}
     timeout-minutes: 240
     env:
@@ -322,6 +360,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: windows-cuda
+          save-if: ${{ github.ref == 'refs/heads/master' }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v7
@@ -360,7 +399,7 @@ jobs:
         run: cargo build -j ${{ github.event.inputs.runner == 'blacksmith' && '16' || '4' }} --release -p ghostreel-llm --features cuda
 
       - name: Save CUDA helpers
-        if: steps.helpers.outputs.cache-hit != 'true'
+        if: steps.helpers.outputs.cache-hit != 'true' && github.ref == 'refs/heads/master'
         uses: actions/cache/save@v4
         with:
           path: |
@@ -378,12 +417,18 @@ jobs:
       - name: Stage helpers
         run: node scripts/stage-helpers.mjs --cuda
 
+      - name: Build the app (cache run)
+        if: env.RELEASE != 'true'
+        run: npx tauri build --config src-tauri/tauri.bundle.json --no-bundle
+
       - name: Build Tauri NSIS bundle
+        if: env.RELEASE == 'true'
         run: npx tauri build --config src-tauri/tauri.bundle.json --bundles nsis
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
 
       - name: Package Windows CLI zip
+        if: env.RELEASE == 'true'
         shell: pwsh
         run: |
           $stageDir = "target/dist/ghostreel-cli-windows-x64"
@@ -404,6 +449,7 @@ jobs:
           Compress-Archive -Path $stageDir -DestinationPath "target/dist/ghostreel-cli-windows-x64.zip" -Force
 
       - name: Upload artifacts
+        if: env.RELEASE == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: ghostreel-windows-x64
@@ -414,6 +460,7 @@ jobs:
       # One file at a time with retries: parallel 700 MB uploads from the runner time out (HTTP 400).
       # The CLI zip (same CUDA DLLs again) stays in the run's artifacts, not the release.
       - name: Upload installer to the release
+        if: env.RELEASE == 'true'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -438,6 +485,7 @@ jobs:
           }
 
       - name: Write updater snippet
+        if: env.RELEASE == 'true'
         shell: pwsh
         env:
           TAG: ${{ github.event.inputs.tag || github.ref_name }}
@@ -455,6 +503,7 @@ jobs:
           Get-Content target/updater/updater-windows.json
 
       - name: Upload updater snippet
+        if: env.RELEASE == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: updater-windows
