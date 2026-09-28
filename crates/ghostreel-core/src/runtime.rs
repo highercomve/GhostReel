@@ -287,7 +287,7 @@ async fn resolve_llm_with(
         && let Some(p) = ghost_service::probe_service(&probe::probe_client(), s, cap, &config.embed.model).await
     {
         let model = if s.models.chat.is_empty() { p.model.clone().unwrap_or_default() } else { s.models.chat.clone() };
-        return VisionSetup::Server(crate::vision::ServerVision::new(&s.url, &model, ""));
+        return VisionSetup::Server(crate::vision::ServerVision::new(&s.url, &model, "").with_ctx(cfg.ctx_tokens));
     }
     // CLI backend: resolve binary; `auto` never picks this.
     if cfg.backend == Backend::Cli {

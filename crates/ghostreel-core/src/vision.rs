@@ -115,6 +115,9 @@ pub struct ServerVision {
     /// Model id to send (empty: omit).
     pub model: String,
     pub api_key: String,
+    /// The context to ask for (Ollama's `options.num_ctx`, which a GhostPen service loads the
+    /// model with); 0 = don't ask.
+    pub ctx_tokens: u32,
     client: reqwest::Client,
 }
 
@@ -125,7 +128,19 @@ impl ServerVision {
             .timeout(Duration::from_secs(300))
             .build()
             .expect("static reqwest client config");
-        Self { url: url.trim_end_matches('/').to_string(), model: model.into(), api_key: api_key.into(), client }
+        Self {
+            url: url.trim_end_matches('/').to_string(),
+            model: model.into(),
+            api_key: api_key.into(),
+            ctx_tokens: 0,
+            client,
+        }
+    }
+
+    /// Ask the server for this context (`options.num_ctx`).
+    pub fn with_ctx(mut self, ctx_tokens: u32) -> Self {
+        self.ctx_tokens = ctx_tokens;
+        self
     }
 
     pub async fn describe(&self, image: &Path, speech: Option<&str>) -> Result<FrameDescription, Error> {
@@ -147,6 +162,9 @@ impl ServerVision {
         });
         if !self.model.is_empty() {
             body["model"] = json!(self.model);
+        }
+        if self.ctx_tokens > 0 {
+            body["options"] = json!({ "num_ctx": self.ctx_tokens });
         }
         let mut req = self.client.post(format!("{}/v1/chat/completions", self.url)).json(&body);
         if !self.api_key.is_empty() {

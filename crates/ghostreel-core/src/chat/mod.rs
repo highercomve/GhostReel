@@ -3553,6 +3553,9 @@ pub async fn run_turn(
                 if !model.is_empty() {
                     body["model"] = json!(model);
                 }
+                // Ollama's name for the context size: a GhostPen service loads the model with this
+                // window (llama-server ignores it; it was started with its own).
+                body["options"] = json!({ "num_ctx": *ctx_tokens });
 
                 let mut req = client.post(format!("{}/v1/chat/completions", url.trim_end_matches('/'))).json(&body);
                 if !api_key.is_empty() {
@@ -3688,6 +3691,7 @@ pub async fn run_turn(
             if !model.is_empty() {
                 final_body["model"] = json!(model);
             }
+            final_body["options"] = json!({ "num_ctx": *ctx_tokens });
 
             let mut req = client.post(format!("{}/v1/chat/completions", url.trim_end_matches('/'))).json(&final_body);
             if !api_key.is_empty() {
