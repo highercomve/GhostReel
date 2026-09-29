@@ -104,10 +104,23 @@ fn pid_alive(pid: u32) -> bool {
     unsafe { libc::kill(pid as i32, 0) == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM) }
 }
 
-/// No cheap liveness check; the HTTP probe decides.
+/// A stale file is common on Windows (GhostPen killed at logoff), and probing its dead port
+/// costs ~2 s there (Windows retries a refused localhost connect), so check the pid first.
+/// A process we may not open (another user's) counts as alive: the probe decides.
 #[cfg(windows)]
-fn pid_alive(_pid: u32) -> bool {
-    true
+fn pid_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ACCESS_DENIED, STILL_ACTIVE};
+    use windows_sys::Win32::System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return GetLastError() == ERROR_ACCESS_DENIED;
+        }
+        let mut code = 0u32;
+        let ok = GetExitCodeProcess(handle, &mut code) != 0;
+        CloseHandle(handle);
+        !ok || code == STILL_ACTIVE as u32
+    }
 }
 
 /// Testable core of [`discover`]: the first path that exists decides. If it is unreadable,
