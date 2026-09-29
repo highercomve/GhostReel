@@ -5,6 +5,23 @@ versions follow [SemVer](https://semver.org/) while the project is 0.x (minor = 
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-09-28
+
+### Added
+
+- **GhostPen's shared models**: when GhostPen is running, GhostReel uses its model service
+  (transcription, vision, chat with tools, embeddings) instead of loading a second copy of the models
+  into GPU memory. Backends set to `auto` pick it up from GhostPen's discovery file; without GhostPen,
+  GhostReel runs its own models as before. `[ai] use_ghost_service = false` (or
+  `GHOSTREEL_NO_GHOST_SERVICE`) turns it off, and `ghostreel doctor` shows what the service offers.
+- Requests to a server ask for the configured context size (`options.num_ctx`), and an indexing run
+  tells GhostPen to free its models when it ends.
+
+### Changed
+
+- **Faster releases**: the CUDA helpers and the Rust build cache are saved from `master`, where
+  every release can reuse them, instead of under each release tag, where the next one couldn't.
+
 ## [0.6.0] — 2026-09-23
 
 ### Added
