@@ -5,6 +5,14 @@ versions follow [SemVer](https://semver.org/) while the project is 0.x (minor = 
 
 ## [Unreleased]
 
+## [0.7.1] — 2026-09-29
+
+### Fixed
+
+- **Windows**: a discovery file left behind by a GhostPen that was killed (for example at logoff)
+  no longer costs every run a 2-second wait on its dead port: GhostReel checks GhostPen's process
+  first, as it already did on Linux and macOS.
+
 ## [0.7.0] — 2026-09-28
 
 ### Added
