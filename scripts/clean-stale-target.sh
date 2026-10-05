@@ -63,4 +63,5 @@ fi
 for dir in "${stale[@]}"; do
     rm -rf "$dir"
 done
+rm -f "$TARGET/.built-from"
 echo "removed. Their build scripts will re-run on the next build."
