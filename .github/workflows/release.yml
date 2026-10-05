@@ -3,7 +3,7 @@ name: Release
 # Build the GhostReel bundles (CUDA helpers included) and publish them to ONE GitHub Release,
 # the same shape as GhostPen's release.yml:
 #   1. create-release  -> one draft release for the tag (reused on re-runs)
-#   2. linux-x64 / windows-x64 -> build and upload their bundles into that draft by id
+#   2. linux-x64 / windows-x64 / macos -> build and upload their bundles into that draft by id
 #      (the API can't find draft releases by tag, so each job would otherwise make its own)
 #   3. publish-release -> flip the draft to published once every platform uploaded
 #
@@ -25,7 +25,7 @@ on:
       - 'src-tauri/**'
       - 'Cargo.lock'
       - 'Cargo.toml'
-      - 'scripts/build-helpers.sh'
+      - 'scripts/**'
       - '.github/workflows/release.yml'
   workflow_dispatch:
     inputs:
@@ -83,16 +83,18 @@ jobs:
             try {
               const version = tag.replace(/^v/, "");
               const log = fs.readFileSync("CHANGELOG.md", "utf8");
-              const m = log.match(new RegExp(`^## \\[${version.replace(/\./g, "\\.")}\\][^\n]*\n([\\s\\S]*?)(?=^## |\\Z)`, "m"));
+              const m = log.match(new RegExp(`^## \\[${version.replace(/\./g, "\\.")}\\][^\n]*\n([\\s\\S]*?)(?=^## |(?![\\s\\S]))`, "m"));
               if (m) notes = m[1].trim();
             } catch (e) { core.warning(`no CHANGELOG.md section for ${tag}: ${e.message}`); }
             const { data } = await github.rest.repos.createRelease({
               owner: context.repo.owner, repo: context.repo.repo,
               tag_name: tag, target_commitish: context.sha, name: `GhostReel ${tag}`,
               body: [
-                "**Windows:** `GhostReel_*_x64-setup.exe` · **Linux:** `.AppImage` · **CLI only:** `ghostreel-cli-*`.",
+                "**Windows:** `GhostReel_*_x64-setup.exe` · **Linux:** `.AppImage` · **macOS:** `.dmg` (Apple Silicon / Intel) · **CLI only:** `ghostreel-cli-*`.",
                 "",
-                "GPU acceleration needs an NVIDIA driver 570+ (CUDA 12.8 runtime is bundled). On first start open **Models** and download the models.",
+                "Linux/Windows GPU acceleration needs an NVIDIA driver 570+ (CUDA 12.8 runtime is bundled). macOS uses Metal. On first start open **Models** and download the models.",
+                "",
+                "macOS builds use a self-signed certificate. Drag GhostReel to Applications; on first launch approve it in System Settings → Privacy & Security → Open Anyway.",
                 ...(notes ? ["", "---", "", notes] : []),
               ].join("\n"),
               draft: true, prerelease: false,
@@ -509,11 +511,163 @@ jobs:
           name: updater-windows
           path: target/updater/updater-windows.json
 
+  macos:
+    name: macos-${{ matrix.arch }}
+    needs: create-release
+    if: ${{ !cancelled() && needs.create-release.result != 'failure' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+            triple: aarch64-apple-darwin
+            updater: darwin-aarch64
+          - runner: macos-15-intel
+            arch: x64
+            triple: x86_64-apple-darwin
+            updater: darwin-x86_64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    env:
+      GHOSTREEL_GPU: metal
+      MACOSX_DEPLOYMENT_TARGET: '12.0'
+      CMAKE_BUILD_PARALLEL_LEVEL: '3'
+      JOBS: '3'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install native build tools
+        run: brew install cmake ninja
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify native target
+        run: |
+          rustc -vV | grep -Fx 'host: ${{ matrix.triple }}'
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: macos-${{ matrix.arch }}-metal
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build Metal helpers
+        run: scripts/build-helpers.sh
+
+      - name: Build CLI
+        run: cargo build --release -p ghostreel-cli
+
+      - name: Fetch sidecars
+        run: node scripts/fetch-sidecars.mjs
+
+      - name: Stage helpers
+        run: node scripts/stage-helpers.mjs
+
+      - name: Check standalone sidecars
+        run: scripts/check-macos-sidecars.sh '${{ matrix.triple }}'
+
+      - name: Import persistent self-signed certificate
+        if: env.RELEASE == 'true'
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: scripts/macos-signing.sh import
+
+      - name: Build the app (cache run)
+        if: env.RELEASE != 'true'
+        run: npx tauri build --config src-tauri/tauri.bundle.json --no-bundle
+
+      - name: Build signed app and DMG
+        if: env.RELEASE == 'true'
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: npx tauri build --config src-tauri/tauri.bundle.json --bundles app,dmg --verbose
+
+      - name: Verify app and installer signatures
+        if: env.RELEASE == 'true'
+        run: |
+          codesign --verify --deep --strict --verbose=2 target/release/bundle/macos/GhostReel.app
+          shopt -s nullglob
+          dmgs=(target/release/bundle/dmg/*.dmg)
+          [ ${#dmgs[@]} -gt 0 ] || { echo 'No DMG produced' >&2; exit 1; }
+          for dmg in "${dmgs[@]}"; do
+            codesign --verify --strict --verbose=2 "$dmg"
+          done
+        shell: bash
+
+      - name: Upload artifacts
+        if: env.RELEASE == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ghostreel-macos-${{ matrix.arch }}
+          if-no-files-found: error
+          path: |
+            target/release/bundle/dmg/*.dmg
+            target/release/bundle/macos/*.app.tar.gz
+            target/release/bundle/macos/*.app.tar.gz.sig
+
+      - name: Upload bundles to the release
+        if: env.RELEASE == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          shopt -s nullglob
+          # Tauri calls both updater archives GhostReel.app.tar.gz; give each arch a unique asset.
+          archive=target/release/bundle/macos/GhostReel.app.tar.gz
+          test -s "$archive"
+          test -s "$archive.sig"
+          asset="GhostReel_${{ matrix.arch }}.app.tar.gz"
+          cp "$archive" "target/release/bundle/macos/$asset"
+          cp "$archive.sig" "target/release/bundle/macos/$asset.sig"
+          files=(target/release/bundle/dmg/*.dmg "target/release/bundle/macos/$asset" "target/release/bundle/macos/$asset.sig")
+          for file in "${files[@]}"; do
+            for attempt in 1 2 3; do
+              if gh release upload "$TAG" "$file" --clobber --repo "$GITHUB_REPOSITORY"; then break; fi
+              [ "$attempt" -lt 3 ] || exit 1
+              sleep 10
+            done
+          done
+          mkdir -p target/updater
+          # shellcheck disable=SC2016
+          node --input-type=module -e '
+            import fs from "node:fs";
+            const signature = fs.readFileSync("target/release/bundle/macos/GhostReel.app.tar.gz.sig", "utf8").trim();
+            const url = `https://github.com/${process.env.GITHUB_REPOSITORY}/releases/download/${process.env.TAG}/GhostReel_${{ matrix.arch }}.app.tar.gz`;
+            fs.writeFileSync("target/updater/updater-macos-${{ matrix.arch }}.json",
+              JSON.stringify({platform: "${{ matrix.updater }}", signature, url}));
+          '
+        shell: bash
+
+      - name: Upload updater snippet
+        if: env.RELEASE == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: updater-macos-${{ matrix.arch }}
+          path: target/updater/updater-macos-${{ matrix.arch }}.json
+          if-no-files-found: error
+
+      - name: Clean up signing keychain
+        if: always() && env.RELEASE == 'true'
+        run: scripts/macos-signing.sh cleanup
+
   publish-release:
     name: Publish release
-    needs: [create-release, linux-x64, windows-x64]
-    # Publish whatever built: a failed platform shouldn't hold back the other's installer.
-    if: always() && needs.create-release.result == 'success' && (needs.linux-x64.result == 'success' || needs.windows-x64.result == 'success')
+    needs: [create-release, linux-x64, windows-x64, macos]
+    # Do not publish a macOS release until both Mac installers and updater payloads are ready.
+    if: always() && needs.create-release.result == 'success' && needs.macos.result == 'success' && (needs.linux-x64.result == 'success' || needs.windows-x64.result == 'success')
     runs-on: ubuntu-24.04
     steps:
       - name: Download Linux updater snippet
@@ -532,6 +686,14 @@ jobs:
           path: updater-snippets
         continue-on-error: true
 
+      - name: Download macOS updater snippets
+        uses: actions/download-artifact@v4
+        with:
+          pattern: updater-macos-*
+          path: updater-snippets
+          merge-multiple: true
+        continue-on-error: true
+
       - name: Build and upload latest.json
         env:
           GH_TOKEN: ${{ github.token }}
@@ -540,7 +702,8 @@ jobs:
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
           export version="${TAG#v}"
-          export pub_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          pub_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          export pub_date
           export notes="GhostReel ${TAG}"
           shopt -s nullglob
           snippets=(updater-snippets/*.json)

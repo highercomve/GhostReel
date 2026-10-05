@@ -1,5 +1,5 @@
 {
-  "_comment": "Month-end BtbN autobuilds are kept long-term, \"latest\" rotates and must never be pinned.",
+  "_comment": "Month-end BtbN autobuilds are kept long-term, \"latest\" rotates and must never be pinned. macOS uses pinned standalone GPLv3 builds from Martin Riedl (arm64) and Evermeet (Intel); license and source notices are bundled.",
   "ffmpeg": {
     "version": "n8.1.2-50-g1a748fe2cd (BtbN autobuild-2026-08-31-13-27, LGPL)",
     "targets": {
@@ -20,6 +20,52 @@
           "ffmpeg": "bin/ffmpeg.exe",
           "ffprobe": "bin/ffprobe.exe"
         }
+      },
+      "aarch64-apple-darwin": {
+        "version": "Martin Riedl FFmpeg 9.0.2 (GPLv3)",
+        "files": {
+          "ffmpeg": {
+            "url": "https://ffmpeg.martin-riedl.de/download/macos/arm64/1789931890_9.0.2/ffmpeg.zip",
+            "sha256": "c8ed4c4e6978a03c485edbfe4e0a5dc2380f8a30bba5150531b31b094492d924",
+            "archive": "zip",
+            "bin": "ffmpeg"
+          },
+          "ffprobe": {
+            "url": "https://ffmpeg.martin-riedl.de/download/macos/arm64/1789931890_9.0.2/ffprobe.zip",
+            "sha256": "fcbe839537485eaee7a7a8bc5cbc0f90d53617e80943e8a5b2e31cb851197ea6",
+            "archive": "zip",
+            "bin": "ffprobe"
+          },
+          "ffmpeg-LICENSE.txt": {
+            "url": "https://raw.githubusercontent.com/FFmpeg/FFmpeg/n8.1/COPYING.GPLv3",
+            "sha256": "8ceb4b9ee5adedde47b31e975c1d90c73ad27b6b165a1dcd80c7c545eb65b903"
+          }
+        },
+        "source": "https://ffmpeg.martin-riedl.de/info/detail/macos/arm64/1789931890_9.0.2",
+        "sourceCode": "https://github.com/FFmpeg/FFmpeg/tree/n9.0.2"
+      },
+      "x86_64-apple-darwin": {
+        "version": "Evermeet FFmpeg 8.1 (GPLv3)",
+        "files": {
+          "ffmpeg": {
+            "url": "https://evermeet.cx/ffmpeg/ffmpeg-8.1.zip",
+            "sha256": "d67db25908eff64b7d0eaa73784f0c55728d9e036a96931095fcf8e8968eefab",
+            "archive": "zip",
+            "bin": "ffmpeg"
+          },
+          "ffprobe": {
+            "url": "https://evermeet.cx/ffmpeg/ffprobe-8.1.zip",
+            "sha256": "b6e9bf4f4ab2992dace205498d99d9e2ede684e3e8ae89485cadd3b91711ea04",
+            "archive": "zip",
+            "bin": "ffprobe"
+          },
+          "ffmpeg-LICENSE.txt": {
+            "url": "https://raw.githubusercontent.com/FFmpeg/FFmpeg/n8.1/COPYING.GPLv3",
+            "sha256": "8ceb4b9ee5adedde47b31e975c1d90c73ad27b6b165a1dcd80c7c545eb65b903"
+          }
+        },
+        "source": "https://evermeet.cx/ffmpeg/",
+        "sourceCode": "https://github.com/FFmpeg/FFmpeg/tree/n8.1"
       }
     }
   }

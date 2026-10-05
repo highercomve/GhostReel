@@ -15,8 +15,8 @@ straight to that moment. Organise footage in **projects**, then **chat with the 
 video** from your clips, preview the cut, and hand it to **Premiere Pro** as an FCP XML timeline
 (via OpenTimelineIO) — or export an MP4 to send as a quick demo.
 
-It runs **fully standalone** — models run on your GPU (CUDA) inside the app, nothing else to
-install — on **Windows and Linux**. If you already run model servers, it can use them instead so
+It runs **fully standalone** — models run on your GPU (CUDA on Linux/Windows, Metal on macOS) inside the app, nothing else to
+install — on **Windows, Linux and macOS**. If you already run model servers, it can use them instead so
 the same GPU never holds a model twice:
 [highllama](https://github.com/highercomve/highllama) for vision and embeddings and
 [GhostPen](https://github.com/highercomve/ghostpen) for transcription.
@@ -71,7 +71,12 @@ Download the latest build from [Releases](https://github.com/highercomve/ghostre
 |---|---|---|
 | **Windows 10/11** | `GhostReel_x.y.z_x64-setup.exe` | NVIDIA driver 570+ for GPU (CUDA 12.8 runtime is bundled) |
 | **Linux** | `.AppImage` | NVIDIA driver 570+ for GPU |
+| **macOS 12+** | `GhostReel_x.y.z_aarch64.dmg` / `_x64.dmg` | Apple Silicon / Intel; Metal acceleration, self-signed |
 | **CLI only** | `ghostreel-cli-*.zip` / `.tar.gz` | same helpers and ffmpeg, no desktop app |
+
+On macOS, open the DMG and drag **GhostReel** to **Applications**. The app is self-signed
+and is not notarized by Apple: after the first launch is blocked, open **System Settings →
+Privacy & Security → Open Anyway**. Subsequent releases reuse the same signing certificate.
 
 ffmpeg/ffprobe are bundled. On first start open **Models** and download what you need:
 
@@ -261,7 +266,8 @@ and consumed over HTTPS — no external update server required.
 
 Requirements: **Rust** (stable), **Node.js 22**, the [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/)
 and **ffmpeg** on `PATH` for development. GPU helpers need the **CUDA Toolkit 12.x** (and MSVC on
-Windows).
+Windows). On macOS, install the Xcode command-line tools (`xcode-select --install`)
+and CMake (`brew install cmake`); helpers use Metal automatically.
 
 ```bash
 npm install
@@ -276,9 +282,37 @@ Release bundles (see `AGENTS.md` → Packaging):
 scripts/build-helpers.sh               # ghostreel-asr + ghostreel-llm (CUDA if the toolkit is present)
 npm run bundle:linux                   # AppImage (+ CLI tarball)
 npm run bundle:windows                 # NSIS installer (on Windows)
+npm run bundle:macos                   # .app + DMG (on macOS; ad-hoc signed locally)
 ```
 
-CI builds both platforms on every `v*` tag (`.github/workflows/release.yml`).
+CI builds Linux, Windows and native Apple Silicon / Intel macOS installers on every `v*`
+tag (`.github/workflows/release.yml`). macOS updater archives use separate asset names
+and `darwin-aarch64` / `darwin-x86_64` entries in `latest.json`.
+
+### macOS release signing
+
+Like Oriel, GhostReel uses a persistent self-signed code-signing certificate. Create it
+once on any host with OpenSSL, outside the repository, and save both files securely:
+
+```bash
+scripts/macos-signing.sh create ~/.config/ghostreel/keys
+openssl base64 -A -in ~/.config/ghostreel/keys/ghostreel-codesign.p12 | gh secret set MACOS_CERTIFICATE
+gh secret set MACOS_CERT_PASSWORD < ~/.config/ghostreel/keys/ghostreel-codesign.password
+```
+
+Run the `gh` commands from this repository. Reuse these secrets for every release;
+rotating the certificate changes the app's signing identity. CI imports it into a temporary
+keychain, signs the app, its sidecars and the DMG with Tauri, verifies signatures and removes
+the keychain even on failure. Release builds require both macOS secrets; master cache builds
+need neither. The existing `TAURI_SIGNING_PRIVATE_KEY` still signs updater payloads separately.
+No Apple account or notarization credentials are required. For a local build with this identity,
+import the `.p12` into your login keychain and set `APPLE_SIGNING_IDENTITY` to its SHA-1 fingerprint
+before `npm run bundle:macos` (see [Tauri signing](https://v2.tauri.app/distribute/sign/macos/)).
+
+macOS FFmpeg/ffprobe are pinned standalone builds from
+[Martin Riedl](https://ffmpeg.martin-riedl.de/info/detail/macos/arm64/1789931890_9.0.2)
+(Apple Silicon) and [Evermeet](https://evermeet.cx/ffmpeg/) (Intel), verified by SHA-256. They include the software encoder, drawtext and subtitle filters used
+by previews. Their upstream license and source notice are included in the app's resources.
 
 ---
 

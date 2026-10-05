@@ -1,7 +1,7 @@
 {
   "name": "ghostreel",
   "private": true,
-  "version": "0.7.1",
+  "version": "0.7.2",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -12,7 +12,8 @@
     "sidecars": "node scripts/fetch-sidecars.mjs && node scripts/stage-helpers.mjs",
     "bundle:linux": "npm run sidecars && NO_STRIP=true tauri build --config src-tauri/tauri.bundle.json --bundles appimage && scripts/fix-appimage.sh",
     "bundle:windows": "npm run sidecars && tauri build --config src-tauri/tauri.bundle.json --bundles nsis",
-    "bundle:cli": "scripts/package-cli.sh"
+    "bundle:cli": "scripts/package-cli.sh",
+    "bundle:macos": "npm run sidecars && tauri build --config src-tauri/tauri.bundle.json --config '{\"bundle\":{\"createUpdaterArtifacts\":false}}' --bundles app,dmg"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",

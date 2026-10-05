@@ -6,10 +6,16 @@ license.workspace = true
 
 [dependencies]
 encoding_rs = "0.8.41"
-llama-cpp-2 = { version = "=0.1.156", features = ["mtmd"] }
 llama-cpp-sys-2 = "=0.1.156"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+
+# Keep macOS helpers standalone: avoid a dependency on Homebrew's libomp.dylib.
+[target.'cfg(target_os = "macos")'.dependencies]
+llama-cpp-2 = { version = "=0.1.156", default-features = false, features = ["mtmd", "common"] }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+llama-cpp-2 = { version = "=0.1.156", features = ["mtmd"] }
 
 [features]
 default = []

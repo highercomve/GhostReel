@@ -57,6 +57,9 @@ function getHostTriple() {
   if (process.platform === 'win32' && process.arch === 'x64') {
     return 'x86_64-pc-windows-msvc';
   }
+  if (process.platform === 'darwin') {
+    return process.arch === 'arm64' ? 'aarch64-apple-darwin' : 'x86_64-apple-darwin';
+  }
   return null;
 }
 
@@ -122,6 +125,61 @@ async function main() {
   const isWindows = target.includes('windows') || target.includes('win32');
   const exeExt = isWindows ? '.exe' : '';
   const binariesDir = join(repoRoot, 'src-tauri', 'binaries');
+  // Some macOS providers publish standalone executables instead of an archive.
+  if (targetConfig.files) {
+    const cacheDir = join(repoRoot, 'target', 'sidecar-cache');
+    mkdirSync(cacheDir, { recursive: true });
+    mkdirSync(binariesDir, { recursive: true });
+    for (const [name, file] of Object.entries(targetConfig.files)) {
+      const cached = join(cacheDir, `${name}-${target}-${file.sha256}`);
+      if (force || !existsSync(cached) || await computeSha256(cached) !== file.sha256) {
+        const part = `${cached}.part`;
+        for (let attempt = 1; attempt <= 3; attempt++) {
+          try {
+            console.log(`Downloading ${file.url} (attempt ${attempt})...`);
+            const response = await fetch(file.url, { signal: AbortSignal.timeout(120_000) });
+            if (!response.ok) throw new Error(`HTTP ${response.status}: ${file.url}`);
+            await pipeline(Readable.fromWeb(response.body), createWriteStream(part));
+            if (await computeSha256(part) !== file.sha256) throw new Error(`SHA-256 mismatch: ${name}`);
+            renameSync(part, cached);
+            break;
+          } catch (error) {
+            // A checksum mismatch is a rejected payload, not a transient network failure.
+            if (attempt === 3 || error.message.startsWith('SHA-256 mismatch')) throw error;
+            console.warn(`Download failed: ${error.message}; retrying...`);
+            await new Promise(resolve => setTimeout(resolve, 1000));
+          } finally {
+            rmSync(part, { force: true });
+          }
+        }
+      }
+      const isBinary = name === 'ffmpeg' || name === 'ffprobe';
+      const destination = join(binariesDir, isBinary ? `${name}-${target}` : `${name.slice(0, -4)}-${target}.txt`);
+      if (file.archive) {
+        // macOS providers may distribute each executable in its own ZIP.
+        const extractDir = join(cacheDir, `extract-${name}-${target}`);
+        rmSync(extractDir, { recursive: true, force: true });
+        mkdirSync(extractDir, { recursive: true });
+        try {
+          const result = spawnSync('unzip', ['-q', cached, '-d', extractDir], { stdio: 'inherit' });
+          if (result.status !== 0) throw new Error(`Extraction failed: ${name}`);
+          copyFileSync(join(extractDir, file.bin), destination);
+        } finally {
+          rmSync(extractDir, { recursive: true, force: true });
+        }
+      } else {
+        copyFileSync(cached, destination);
+      }
+      chmodSync(destination, isBinary ? 0o755 : 0o644);
+      console.log(`Staged ${destination}`);
+    }
+    writeFileSync(join(binariesDir, `ffmpeg-NOTICE-${target}.txt`),
+      `FFmpeg is bundled as a separate executable. macOS builds: ${targetConfig.version}.\n` +
+      `Binaries and build/source information: ${targetConfig.source}\n` +
+      `FFmpeg source: ${targetConfig.sourceCode}\n` +
+      'See ffmpeg-LICENSE.txt for licensing terms.\n');
+    return;
+  }
   const stampFile = join(binariesDir, `.ffmpeg-${target}.sha256`);
 
   // Check if stamp matches and outputs exist

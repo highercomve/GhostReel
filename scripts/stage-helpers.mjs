@@ -55,6 +55,9 @@ function getHostTriple() {
   if (process.platform === 'win32' && process.arch === 'x64') {
     return 'x86_64-pc-windows-msvc';
   }
+  if (process.platform === 'darwin') {
+    return process.arch === 'arm64' ? 'aarch64-apple-darwin' : 'x86_64-apple-darwin';
+  }
   return null;
 }
 
@@ -304,7 +307,14 @@ function main() {
       externalBin,
       // Linux: usr/lib/GhostReel/lib (helper RUNPATH $ORIGIN/../lib/GhostReel/lib).
       // Windows: next to the exe, where the DLL loader looks.
-      resources: { 'lib/': isWindows ? './' : 'lib/' },
+      resources: {
+        'lib/': isWindows ? './' : 'lib/',
+        ...Object.fromEntries(['ffmpeg-LICENSE.txt', 'ffmpeg-NOTICE.txt']
+          .map(name => ({ name, source: target.includes('apple-darwin')
+            ? `${name.slice(0, -4)}-${target}.txt` : name }))
+          .filter(({ source }) => existsSync(join(binariesDir, source)))
+          .map(({ name, source }) => [`binaries/${source}`, name])),
+      },
     },
   };
   const overlayPath = join(repoRoot, 'src-tauri', 'tauri.bundle.json');

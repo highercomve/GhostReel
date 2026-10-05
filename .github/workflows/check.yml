@@ -83,6 +83,9 @@ jobs:
             node --check "$f"
           done
 
+      - name: Test packaging scripts
+        run: node --test scripts/*.test.mjs
+
       - name: Check shell scripts
         run: |
           for f in scripts/*.sh; do
@@ -93,6 +96,7 @@ jobs:
 
       - name: Parse JSON configs
         run: |
+          # shellcheck disable=SC2016
           node -e '
             const fs = require("fs");
             const files = [
@@ -105,3 +109,48 @@ jobs:
             }
             console.log("JSON parse ok");
           '
+
+  macos:
+    name: macOS (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+            triple: aarch64-apple-darwin
+          - runner: macos-15-intel
+            arch: x64
+            triple: x86_64-apple-darwin
+    env:
+      GHOSTREEL_GPU: metal
+      MACOSX_DEPLOYMENT_TARGET: '12.0'
+      CMAKE_BUILD_PARALLEL_LEVEL: '3'
+      JOBS: '3'
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install native build tools
+        run: brew install cmake ninja
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: macos-${{ matrix.arch }}-metal
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install frontend dependencies
+        run: npm ci
+      - name: Build Metal helpers
+        run: scripts/build-helpers.sh
+      - name: Fetch and stage sidecars
+        run: npm run sidecars
+      - name: Check standalone sidecars
+        run: scripts/check-macos-sidecars.sh '${{ matrix.triple }}'
+      - name: Build macOS app
+        # PR builds exercise bundling and nested signatures without release secrets.
+        run: npx tauri build --config src-tauri/tauri.bundle.json --config '{"bundle":{"createUpdaterArtifacts":false}}' --bundles app,dmg
+      - name: Verify app signature
+        run: codesign --verify --deep --strict --verbose=2 target/release/bundle/macos/GhostReel.app

@@ -5,6 +5,36 @@ versions follow [SemVer](https://semver.org/) while the project is 0.x (minor = 
 
 ## [Unreleased]
 
+## [0.7.2] — 2026-10-05
+
+### Added
+
+- **macOS installers** for Apple Silicon and Intel, built natively in CI. The DMG includes
+  GhostReel, FFmpeg/ffprobe, and the transcription and language-model helpers; no Homebrew
+  installation is needed to run the app. Requires macOS 12 or later.
+- **Metal acceleration** for local Whisper transcription and llama.cpp vision and chat on
+  supported Macs. Local helper builds select Metal automatically on macOS.
+- **Persistent self-signed macOS code signing**, following Oriel's approach: release builds
+  reuse the same certificate, sign the app and installer, and verify signatures before uploading.
+- **macOS automatic updates** with separate signed updater archives and manifest entries for
+  Apple Silicon and Intel.
+
+### Fixed
+
+- macOS bundles include standalone, checksum-verified FFmpeg builds with the H.264 encoder,
+  title rendering, and subtitle filters needed for preview rendering and playback proxies.
+- Mac language-model helpers avoid a dependency on Homebrew's OpenMP runtime, and CPU fallback
+  builds do not inherit the CI runner's CPU instruction set.
+- CI validates both Mac architectures, required sidecar features, and system-library-only
+  dependencies before packaging. Temporary signing keychains are cleaned up even on failure.
+
+### Installation notes
+
+- Open the DMG and drag **GhostReel** into **Applications**. Builds are self-signed and are not
+  notarized by Apple; after the first launch is blocked, approve the app in **System Settings →
+  Privacy & Security → Open Anyway**.
+- Existing Linux and Windows installers continue to use CUDA; macOS uses Metal with CPU fallback.
+
 ## [0.7.1] — 2026-09-29
 
 ### Fixed
@@ -626,7 +656,8 @@ is and the editor cuts around the shaky stretches; camera originals play in the 
 
 See the git history: `git log v0.1.5`.
 
-[Unreleased]: https://github.com/highercomve/GhostReel/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/highercomve/GhostReel/compare/v0.7.2...HEAD
+[0.7.2]: https://github.com/highercomve/GhostReel/compare/v0.7.1...v0.7.2
 [0.2.0]: https://github.com/highercomve/GhostReel/compare/v0.1.7...v0.2.0
 [0.1.7]: https://github.com/highercomve/GhostReel/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/highercomve/GhostReel/compare/v0.1.5...v0.1.6
