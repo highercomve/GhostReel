@@ -1,0 +1,7 @@
+# Frozen Apple Silicon helper. No Python installation is required on the user's Mac.
+mlx-vlm==0.7.6
+mlx==0.32.3
+mlx-metal==0.32.3
+transformers==5.18.0
+llguidance==1.9.1
+pyinstaller==6.22.3

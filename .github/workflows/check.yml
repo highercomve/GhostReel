@@ -83,6 +83,9 @@ jobs:
             node --check "$f"
           done
 
+      - name: Test MLX protocol
+        run: python3 -m unittest discover -s scripts -p 'test_mlx*.py'
+
       - name: Test packaging scripts
         run: node --test scripts/*.test.mjs
 
@@ -145,10 +148,27 @@ jobs:
         run: npm ci
       - name: Build Metal helpers
         run: scripts/build-helpers.sh
+      - name: Setup Python for MLX
+        if: matrix.arch == 'arm64'
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: scripts/mlx-requirements.lock
+      - name: Build standalone MLX helper
+        if: matrix.arch == 'arm64'
+        run: scripts/build-mlx.sh
+
       - name: Fetch and stage sidecars
         run: npm run sidecars
       - name: Check standalone sidecars
         run: scripts/check-macos-sidecars.sh '${{ matrix.triple }}'
+      - name: Test frozen MLX vision and chat
+        if: matrix.arch == 'arm64'
+        timeout-minutes: 15
+        run: python3 scripts/smoke-mlx-runtime.py
+      - name: Test core on macOS
+        run: cargo test -p ghostreel-core
       - name: Build macOS app
         # PR builds exercise bundling and nested signatures without release secrets.
         run: npx tauri build --config src-tauri/tauri.bundle.json --config '{"bundle":{"createUpdaterArtifacts":false}}' --bundles app,dmg

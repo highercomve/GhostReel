@@ -1,0 +1,226 @@
+[
+  {
+    "id": "qwen2.5-vl-3b",
+    "repo": "mlx-community/Qwen2.5-VL-3B-Instruct-4bit",
+    "revision": "46d4cf06a06ffc1a766c214174f9cbed2f45bcab",
+    "files": [
+      {
+        "name": "added_tokens.json",
+        "size_bytes": 605
+      },
+      {
+        "name": "chat_template.json",
+        "size_bytes": 1050
+      },
+      {
+        "name": "config.json",
+        "size_bytes": 1659
+      },
+      {
+        "name": "merges.txt",
+        "size_bytes": 1671853
+      },
+      {
+        "name": "model.safetensors",
+        "size_bytes": 3073720461
+      },
+      {
+        "name": "model.safetensors.index.json",
+        "size_bytes": 108307
+      },
+      {
+        "name": "preprocessor_config.json",
+        "size_bytes": 350
+      },
+      {
+        "name": "special_tokens_map.json",
+        "size_bytes": 613
+      },
+      {
+        "name": "tokenizer.json",
+        "size_bytes": 11421896
+      },
+      {
+        "name": "tokenizer_config.json",
+        "size_bytes": 7256
+      },
+      {
+        "name": "vocab.json",
+        "size_bytes": 2776833
+      }
+    ],
+    "speed": 4,
+    "accuracy": 3,
+    "vram_mb": 5000
+  },
+  {
+    "id": "qwen2.5-vl-7b",
+    "repo": "mlx-community/Qwen2.5-VL-7B-Instruct-4bit",
+    "revision": "fdcc572e8b05ba9daeaf71be8c9e4267c826ff9b",
+    "files": [
+      {
+        "name": "added_tokens.json",
+        "size_bytes": 605
+      },
+      {
+        "name": "chat_template.json",
+        "size_bytes": 1050
+      },
+      {
+        "name": "config.json",
+        "size_bytes": 1660
+      },
+      {
+        "name": "merges.txt",
+        "size_bytes": 1671853
+      },
+      {
+        "name": "model-00001-of-00002.safetensors",
+        "size_bytes": 5330940405
+      },
+      {
+        "name": "model-00002-of-00002.safetensors",
+        "size_bytes": 306561369
+      },
+      {
+        "name": "model.safetensors.index.json",
+        "size_bytes": 107528
+      },
+      {
+        "name": "preprocessor_config.json",
+        "size_bytes": 350
+      },
+      {
+        "name": "special_tokens_map.json",
+        "size_bytes": 613
+      },
+      {
+        "name": "tokenizer.json",
+        "size_bytes": 11421896
+      },
+      {
+        "name": "tokenizer_config.json",
+        "size_bytes": 7256
+      },
+      {
+        "name": "vocab.json",
+        "size_bytes": 2776833
+      }
+    ],
+    "speed": 3,
+    "accuracy": 4,
+    "vram_mb": 8000
+  },
+  {
+    "id": "gemma-3-4b-it",
+    "repo": "mlx-community/gemma-3-4b-it-4bit",
+    "revision": "93724907d4ed1745d2fe50baadf3b0b01a65abf2",
+    "files": [
+      {
+        "name": "added_tokens.json",
+        "size_bytes": 35
+      },
+      {
+        "name": "chat_template.json",
+        "size_bytes": 1615
+      },
+      {
+        "name": "config.json",
+        "size_bytes": 1072
+      },
+      {
+        "name": "generation_config.json",
+        "size_bytes": 192
+      },
+      {
+        "name": "model.safetensors",
+        "size_bytes": 3400569562
+      },
+      {
+        "name": "model.safetensors.index.json",
+        "size_bytes": 90558
+      },
+      {
+        "name": "preprocessor_config.json",
+        "size_bytes": 570
+      },
+      {
+        "name": "processor_config.json",
+        "size_bytes": 70
+      },
+      {
+        "name": "special_tokens_map.json",
+        "size_bytes": 662
+      },
+      {
+        "name": "tokenizer.json",
+        "size_bytes": 33384568
+      },
+      {
+        "name": "tokenizer.model",
+        "size_bytes": 4689074
+      },
+      {
+        "name": "tokenizer_config.json",
+        "size_bytes": 1157007
+      }
+    ],
+    "speed": 4,
+    "accuracy": 3,
+    "vram_mb": 5500
+  },
+  {
+    "id": "qwen3.5-9b",
+    "repo": "mlx-community/Qwen3.5-9B-4bit",
+    "revision": "8b2b98c00a6b4d291155e4890773ca8f769aee53",
+    "files": [
+      {
+        "name": "chat_template.jinja",
+        "size_bytes": 7756
+      },
+      {
+        "name": "config.json",
+        "size_bytes": 3331
+      },
+      {
+        "name": "model-00001-of-00002.safetensors",
+        "size_bytes": 5349771222
+      },
+      {
+        "name": "model-00002-of-00002.safetensors",
+        "size_bytes": 600449850
+      },
+      {
+        "name": "model.safetensors.index.json",
+        "size_bytes": 123592
+      },
+      {
+        "name": "preprocessor_config.json",
+        "size_bytes": 390
+      },
+      {
+        "name": "processor_config.json",
+        "size_bytes": 1300
+      },
+      {
+        "name": "tokenizer.json",
+        "size_bytes": 19989343
+      },
+      {
+        "name": "tokenizer_config.json",
+        "size_bytes": 1139
+      },
+      {
+        "name": "video_preprocessor_config.json",
+        "size_bytes": 385
+      },
+      {
+        "name": "vocab.json",
+        "size_bytes": 6722759
+      }
+    ],
+    "speed": 2,
+    "accuracy": 5,
+    "vram_mb": 10000
+  }
+]

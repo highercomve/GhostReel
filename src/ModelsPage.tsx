@@ -181,11 +181,13 @@ function LocalRuntimeFields({
   cfg,
   onPatch,
   thinkHint,
+  mlx = false,
 }: {
   cfg: VisionSettings;
   onPatch: (p: VisionSettingsPatch) => void;
   /** Why thinking is or isn't worth its cost for this capability. */
   thinkHint: string;
+  mlx?: boolean;
 }) {
   return (
     <div className="settings-fields">
@@ -208,24 +210,24 @@ function LocalRuntimeFields({
       <div className="settings-field">
         <label>KV cache</label>
         <select value={cfg.kv_cache} onChange={(e) => onPatch({ kv_cache: e.currentTarget.value })}>
-          <option value="q4_0">q4_0 — ~4× the context per GB</option>
-          <option value="q8_0">q8_0 — balanced</option>
-          <option value="f16">f16 — best quality, 4× the VRAM</option>
+          <option value="q4_0">{mlx ? "4-bit — lower memory" : "q4_0 — ~4× the context per GB"}</option>
+          <option value="q8_0">{mlx ? "8-bit — balanced" : "q8_0 — balanced"}</option>
+          <option value="f16">{mlx ? "Full precision — higher memory" : "f16 — best quality, 4× the VRAM"}</option>
         </select>
       </div>
-      <div className="settings-field">
+      {!mlx && <div className="settings-field">
         <label>Flash attention</label>
         <select value={cfg.flash_attn} onChange={(e) => onPatch({ flash_attn: e.currentTarget.value })}>
           <option value="auto">auto</option>
           <option value="on">on</option>
           <option value="off">off</option>
         </select>
-      </div>
+      </div>}
       <div className="settings-field">
         <label>Think first</label>
         <input type="checkbox" checked={cfg.think} onChange={(e) => onPatch({ think: e.currentTarget.checked })} />
         <span className="muted small">
-          {thinkHint}
+          {mlx ? "Used for free-text replies; structured JSON replies skip reasoning." : thinkHint}
         </span>
       </div>
     </div>
@@ -776,6 +778,7 @@ export default function ModelsPage() {
           {(visionBackend === "auto" || visionBackend === "local") && (
             <LocalRuntimeFields
               cfg={ai.vision}
+              mlx={visionModels.some((m) => Boolean(m.entry.bundle))}
               onPatch={(v) => applyPatch({ vision: v })}
               thinkHint="slower — this runs once per keyframe, so it is usually off"
             />
@@ -789,6 +792,12 @@ export default function ModelsPage() {
         </div>
       )}
 
+      {visionModels.some((m) => Boolean(m.entry.bundle)) && (
+        <p className="muted small">
+          Apple Silicon uses MLX for vision and chat. Downloads include the complete model folder;
+          Whisper and embeddings keep their existing models.
+        </p>
+      )}
       {/* vision model table */}
       <div className="card table-card">
         <table className="models-table vision-table">
@@ -797,7 +806,7 @@ export default function ModelsPage() {
               {visionBackend !== "server" && <th className="col-radio">Use</th>}
               <th>Model</th>
               <th>Size</th>
-              <th>VRAM</th>
+              <th>{visionModels.some((m) => Boolean(m.entry.bundle)) ? "Memory" : "VRAM"}</th>
               <th>Speed</th>
               <th>Accuracy</th>
               <th>Note</th>
@@ -924,6 +933,7 @@ export default function ModelsPage() {
               </div>
               <LocalRuntimeFields
                 cfg={ai.chat_model}
+                mlx={visionModels.some((m) => Boolean(m.entry.bundle))}
                 onPatch={(v) => applyPatch({ chat_model: v })}
                 thinkHint="a few calls per script — reasoning makes a noticeably better edit"
               />

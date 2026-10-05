@@ -53,6 +53,13 @@ pub enum VisionSetup {
         /// Context window / KV cache / flash attention for this capability.
         runtime: crate::vision::HelperRuntime,
     },
+    /// MLX on Apple Silicon, using a complete revision-pinned model folder.
+    Mlx {
+        helper: PathBuf,
+        models_dir: PathBuf,
+        entry: Box<models::CatalogEntry>,
+        runtime: crate::vision::HelperRuntime,
+    },
     /// Coding-agent CLI (claude / agy / opencode).
     Cli(crate::config::CliAgentConfig),
     Unavailable(String),
@@ -69,6 +76,9 @@ impl VisionSetup {
                     "local {} ({} ctx, kv {}, flash {})",
                     model.file_name, runtime.ctx_tokens, runtime.kv_cache, runtime.flash_attn
                 )
+            }
+            VisionSetup::Mlx { entry, runtime, .. } => {
+                format!("local MLX {} ({} ctx)", entry.id, runtime.ctx_tokens)
             }
             VisionSetup::Cli(cfg) => {
                 if cfg.model.is_empty() {
@@ -316,6 +326,22 @@ async fn resolve_llm_with(
         Target::Unavailable => return VisionSetup::Unavailable(resolution.reason),
         Target::Local => {}
     }
+    if models::uses_mlx() {
+        let Some(entry) = models::find_entry(&cfg.local_model).filter(|e| e.bundle.is_some()) else {
+            return VisionSetup::Unavailable(format!("unknown vision model '{}'", cfg.local_model));
+        };
+        let Some(helper) = locate_helper("ghostreel-mlx") else {
+            return VisionSetup::Unavailable(
+                "local MLX helper ghostreel-mlx not found (build scripts/build-mlx.sh)".into(),
+            );
+        };
+        return VisionSetup::Mlx {
+            helper,
+            models_dir: models::effective_models_dir(paths, config),
+            entry: Box::new(entry),
+            runtime: cfg.into(),
+        };
+    }
     let (model, mmproj) = match models::vision_pair(&cfg.local_model) {
         Some(pair) => pair,
         None => {
@@ -472,6 +498,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
     #[tokio::test]
     async fn resolve_vision_known_models_pick_correct_specs() {
         let dir = tempfile::tempdir().unwrap();

@@ -71,7 +71,8 @@ Download the latest build from [Releases](https://github.com/highercomve/ghostre
 |---|---|---|
 | **Windows 10/11** | `GhostReel_x.y.z_x64-setup.exe` | NVIDIA driver 570+ for GPU (CUDA 12.8 runtime is bundled) |
 | **Linux** | `.AppImage` | NVIDIA driver 570+ for GPU |
-| **macOS 12+** | `GhostReel_x.y.z_aarch64.dmg` / `_x64.dmg` | Apple Silicon / Intel; Metal acceleration, self-signed |
+| **macOS 14+ · Apple Silicon** | `GhostReel_x.y.z_aarch64.dmg` | MLX vision/chat, Metal Whisper, self-signed |
+| **macOS 12+ · Intel** | `GhostReel_x.y.z_x64.dmg` | llama.cpp / Whisper with Metal, self-signed |
 | **CLI only** | `ghostreel-cli-*.zip` / `.tar.gz` | same helpers and ffmpeg, no desktop app |
 
 On macOS, open the DMG and drag **GhostReel** to **Applications**. The app is self-signed
@@ -267,7 +268,10 @@ and consumed over HTTPS — no external update server required.
 Requirements: **Rust** (stable), **Node.js 22**, the [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/)
 and **ffmpeg** on `PATH` for development. GPU helpers need the **CUDA Toolkit 12.x** (and MSVC on
 Windows). On macOS, install the Xcode command-line tools (`xcode-select --install`)
-and CMake (`brew install cmake`); helpers use Metal automatically.
+and CMake (`brew install cmake`); native helpers use Metal automatically.
+On Apple Silicon, also install Python 3.12 for **building** the frozen MLX helper:
+`GHOSTREEL_MLX_PYTHON=python3.12 scripts/build-mlx.sh`. Installers bundle Python and MLX;
+users do not need either installed.
 
 ```bash
 npm install
@@ -288,6 +292,26 @@ npm run bundle:macos                   # .app + DMG (on macOS; ad-hoc signed loc
 CI builds Linux, Windows and native Apple Silicon / Intel macOS installers on every `v*`
 tag (`.github/workflows/release.yml`). macOS updater archives use separate asset names
 and `darwin-aarch64` / `darwin-x86_64` entries in `latest.json`.
+
+### Apple Silicon models
+
+Apple Silicon uses MLX for local frame descriptions and script chat. The Models page selects
+MLX versions of Qwen2.5-VL 3B/7B, Gemma 3 4B, and Qwen3.5 9B. Downloads are pinned to a
+Hugging Face revision and include every weight shard, tokenizer, and processor configuration.
+Interrupted downloads resume, and a model is only marked installed once every file is complete.
+The initial vision model is Qwen2.5-VL 3B; the old Bonsai default migrates to it because Bonsai
+has no matching MLX release in this catalog. Script chat retains its Qwen3.5 9B default.
+
+Whisper and embeddinggemma retain their existing model files and helpers. Intel Macs, Linux,
+and Windows retain GGUF for vision/chat. MLX processes frames serially to bound memory usage;
+structured JSON replies use a grammar and skip free-form reasoning. MLX selects its own
+attention implementation, so llama.cpp's flash-attention setting is hidden on Apple Silicon.
+MLX requires macOS 14+; the Intel installer still supports macOS 12+.
+
+CI freezes `scripts/ghostreel_mlx.py` with Python 3.12, includes Metal shaders and processor
+implementations, and runs the standalone helper's Metal smoke test and a real-model vision/chat integration test. To test it locally after
+building: `target/release/ghostreel-mlx --self-test`. There is no claim of a speed advantage until
+frame-description and chat workloads have been benchmarked on the same Mac.
 
 ### macOS release signing
 

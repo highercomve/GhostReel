@@ -108,7 +108,7 @@ pub struct VisionConfig {
     pub model: String,
     /// Bearer token for non-local servers.
     pub api_key: String,
-    /// Local vision model catalog id (pair: model + projector). Default: "bonsai-27b".
+    /// Local vision/chat catalog ID: an MLX folder on Apple Silicon, a GGUF pair elsewhere.
     pub local_model: String,
     /// Context window for the local helper, in tokens (2048–131072).
     pub ctx_tokens: u32,
@@ -154,7 +154,7 @@ impl Default for VisionConfig {
             url: DEFAULT_VISION_URL.into(),
             model: String::new(),
             api_key: String::new(),
-            local_model: "bonsai-27b".into(),
+            local_model: crate::models::default_vision_model().into(),
             ctx_tokens: DESCRIBE_CTX_TOKENS,
             kv_cache: "q4_0".into(),
             flash_attn: "auto".into(),
@@ -855,7 +855,15 @@ impl Config {
     /// Load `path`, or defaults when the file does not exist.
     pub fn load(path: &Path) -> Result<Self, Error> {
         match std::fs::read_to_string(path) {
-            Ok(text) => toml::from_str(&text).map_err(|e| Error::Config(format!("{}: {e}", path.display()))),
+            Ok(text) => {
+                let mut config: Self =
+                    toml::from_str(&text).map_err(|e| Error::Config(format!("{}: {e}", path.display())))?;
+                config.vision.local_model = crate::models::platform_vision_model(&config.vision.local_model).into();
+                if let Some(chat) = &mut config.chat_model {
+                    chat.local_model = crate::models::platform_vision_model(&chat.local_model).into();
+                }
+                Ok(config)
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(Error::Io(path.to_path_buf(), e)),
         }
@@ -970,7 +978,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         let cfg = Config::default();
-        assert_eq!(cfg.vision.local_model, "bonsai-27b");
+        assert_eq!(cfg.vision.local_model, crate::models::default_vision_model());
 
         std::fs::write(&path, "[vision]\nlocal_model = \"gemma-3-4b-it\"\n").unwrap();
         let loaded = Config::load(&path).unwrap();

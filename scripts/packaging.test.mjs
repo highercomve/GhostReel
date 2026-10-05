@@ -61,14 +61,16 @@ for (const target of ['aarch64-apple-darwin', 'x86_64-apple-darwin']) {
     await f.run('fetch-sidecars.mjs');
     assert.equal(f.requests(), 4);
     await mkdir(join(f.root, 'target/release'), { recursive: true });
-    for (const helper of ['ghostreel-asr', 'ghostreel-llm']) {
+    for (const helper of ['ghostreel-asr', 'ghostreel-llm', ...(target.startsWith('aarch64') ? ['ghostreel-mlx'] : [])]) {
       await writeFile(join(f.root, 'target/release', helper), 'helper');
     }
     await f.run('stage-helpers.mjs');
     const overlay = JSON.parse(await readFile(join(f.root, 'src-tauri/tauri.bundle.json'), 'utf8'));
     assert.deepEqual(overlay.bundle.externalBin, [
       'binaries/ffmpeg', 'binaries/ffprobe', 'binaries/ghostreel-asr', 'binaries/ghostreel-llm',
+      ...(target.startsWith('aarch64') ? ['binaries/ghostreel-mlx'] : []),
     ]);
+    assert.equal(overlay.bundle.macOS?.minimumSystemVersion, target.startsWith('aarch64') ? '14.0' : undefined);
     assert.equal(overlay.bundle.resources[`binaries/ffmpeg-LICENSE-${target}.txt`], 'ffmpeg-LICENSE.txt');
     assert.equal(overlay.bundle.resources[`binaries/ffmpeg-NOTICE-${target}.txt`], 'ffmpeg-NOTICE.txt');
   });
@@ -129,7 +131,7 @@ test('check-macos-sidecars verifies arch and system dependencies', async t => {
   await copyFile(new URL('check-macos-sidecars.sh', import.meta.url), join(root, 'scripts/check-macos-sidecars.sh'));
 
   const triple = 'aarch64-apple-darwin';
-  for (const name of ['ghostreel-asr', 'ghostreel-llm']) {
+  for (const name of ['ghostreel-asr', 'ghostreel-llm', 'ghostreel-mlx']) {
     const file = join(root, 'src-tauri/binaries', `${name}-${triple}`);
     await writeFile(file, '#!/bin/sh\nexit 0\n');
     await chmod(file, 0o755);

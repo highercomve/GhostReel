@@ -1223,7 +1223,7 @@ pub async fn run_steadiness_jobs(
 fn describe_phase(setup: &VisionSetup) -> Option<&'static str> {
     match setup {
         VisionSetup::Server(_) => Some("describe_server"),
-        VisionSetup::Local { .. } => Some("describe_local"),
+        VisionSetup::Local { .. } | VisionSetup::Mlx { .. } => Some("describe_local"),
         VisionSetup::Cli(_) => Some("describe_server"), // CLI is billed externally, similar wall time
         VisionSetup::Unavailable(_) => None,
     }
@@ -1280,6 +1280,29 @@ async fn start_describer(
             Ok(Describer::Cli(agent))
         }
         VisionSetup::Unavailable(why) => Err(why.clone()),
+        VisionSetup::Mlx { helper, models_dir, entry, runtime } => {
+            if !entry.bundle_installed(models_dir) {
+                on_event(Event::DownloadingModel { file: format!("{} (MLX)", entry.id) });
+            }
+            tracker.start("download_vision");
+            let mut last = 0u64;
+            let dir = crate::models::download_bundle(entry, models_dir, |done, total| {
+                if let Some(total) = total {
+                    tracker.set_total("download_vision", total);
+                }
+                tracker.advance("download_vision", done.saturating_sub(last));
+                last = done;
+                if tracker.should_emit() {
+                    on_event(Event::Progress(tracker.snapshot(None)));
+                }
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+            LocalLlm::start_mlx(helper, &dir, runtime)
+                .await
+                .map(|l| Describer::Local(Box::new(l)))
+                .map_err(|e| e.to_string())
+        }
         VisionSetup::Local { helper, models_dir, model, mmproj, found, runtime } => {
             let mut paths = Vec::new();
             for spec in [model, mmproj] {

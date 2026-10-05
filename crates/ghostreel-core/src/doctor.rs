@@ -144,7 +144,7 @@ pub async fn run(paths: &Paths) -> Report {
         tokio::join!(tool("ffmpeg"), tool("ffprobe"), nvidia_gpus(), vision_probe, embed_probe, stt_probe);
 
     let models_dir = crate::models::effective_models_dir(paths, &config);
-    let mut search: Vec<PathBuf> = vec![models_dir];
+    let mut search: Vec<PathBuf> = vec![models_dir.clone()];
     search.extend(config.models.search_paths.iter().cloned());
 
     let (vision_file, proj_file) = match crate::models::vision_pair(&config.vision.local_model) {
@@ -152,7 +152,7 @@ pub async fn run(paths: &Paths) -> Report {
         None => ("Bonsai-27B-Q1_0.gguf".to_string(), "Bonsai-27B-mmproj-Q8_0.gguf".to_string()),
     };
 
-    let model_files = vec![
+    let mut model_files = vec![
         ("vision (local)".to_string(), vision_file),
         ("vision projector (local)".to_string(), proj_file),
         ("embeddings (local)".to_string(), "embeddinggemma-300M-Q8_0.gguf".to_string()),
@@ -160,13 +160,25 @@ pub async fn run(paths: &Paths) -> Report {
         ("whisper (local, CPU)".to_string(), "ggml-small.bin".to_string()),
     ];
 
-    let models = model_files
+    let mlx_entry = crate::models::find_entry(&config.vision.local_model).filter(|e| e.bundle.is_some());
+    if mlx_entry.is_some() {
+        model_files.retain(|(role, _)| !role.starts_with("vision"));
+    }
+    let mut models: Vec<ModelFile> = model_files
         .into_iter()
         .map(|(role, pattern)| {
             let found = find_file(&search, &pattern, 5);
             ModelFile { role, pattern, found }
         })
         .collect();
+
+    if let Some(entry) = mlx_entry {
+        models.push(ModelFile {
+            role: "vision/chat (local MLX)".into(),
+            pattern: format!("mlx/{} (complete folder)", entry.id),
+            found: entry.bundle_installed(&models_dir).then(|| entry.bundle_dir(&models_dir)),
+        });
+    }
 
     // Detect installed CLI tools and which capability uses one.
     let cli_tools = {

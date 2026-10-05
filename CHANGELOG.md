@@ -5,6 +5,37 @@ versions follow [SemVer](https://semver.org/) while the project is 0.x (minor = 
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-10-05
+
+### Added
+
+- MLX vision and script chat on Apple Silicon, with a bundled Python/Metal runtime and
+  automatically selected, revision-pinned MLX model downloads. Complete model folders support
+  resume, installation checks, and removal. Whisper and embeddings retain their existing engines.
+- Apple Silicon model catalog for Qwen2.5-VL 3B/7B, Gemma 3 4B, and Qwen3.5 9B; the old
+  Bonsai vision default migrates to Qwen2.5-VL 3B. Intel Macs, Linux, and Windows retain GGUF.
+
+### Changed
+
+- The Apple Silicon installer now requires macOS 14+ for MLX; Intel still supports macOS 12+.
+
+### Fixed
+
+- Multi-word searches rank exact phrases first, then matches containing every meaningful
+  query term, before partial matches. Repeated partial matches cannot overwhelm a phrase when
+  grouped into moments. Project and media-kind filters apply before keyword candidate limits.
+- macOS signing cleanup cannot wait indefinitely on the trust service: commands have individual
+  timeouts, sudo runs without prompting, and the cleanup step has a two-minute limit.
+
+### Installation notes
+
+- Apple Silicon installers require **macOS 14 or later**; Intel installers require **macOS 12
+  or later**. The MLX runtime is bundled, so no Python installation is needed.
+- macOS installers remain self-signed. Drag GhostReel into Applications and approve the first
+  launch in **System Settings → Privacy & Security → Open Anyway**.
+- MLX initially describes frames serially to bound memory usage. Structured JSON replies skip
+  free-form reasoning. No performance improvement over llama.cpp is claimed without benchmarks.
+
 ## [0.7.2] — 2026-10-05
 
 ### Added
@@ -656,7 +687,8 @@ is and the editor cuts around the shaky stretches; camera originals play in the 
 
 See the git history: `git log v0.1.5`.
 
-[Unreleased]: https://github.com/highercomve/GhostReel/compare/v0.7.2...HEAD
+[Unreleased]: https://github.com/highercomve/GhostReel/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/highercomve/GhostReel/compare/v0.7.2...v0.8.0
 [0.7.2]: https://github.com/highercomve/GhostReel/compare/v0.7.1...v0.7.2
 [0.2.0]: https://github.com/highercomve/GhostReel/compare/v0.1.7...v0.2.0
 [0.1.7]: https://github.com/highercomve/GhostReel/compare/v0.1.6...v0.1.7

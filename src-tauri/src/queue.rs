@@ -775,16 +775,12 @@ async fn run_download_model(
         return Err(format!("unknown model '{model_id}'"));
     }
 
-    let specs: Vec<(ghostreel_core::models::ModelSpec, u64)> = if let Some(ref e) = entry {
-        let mut v = vec![(e.spec(), e.size_bytes)];
-        if let Some(proj) = e.mmproj_spec() {
-            v.push((proj, e.mmproj_size_bytes.unwrap_or(0)));
-        }
-        v
-    } else {
-        vec![(whisper_spec.unwrap(), 0)]
-    };
+    let specs: Vec<(ghostreel_core::models::ModelSpec, u64)> =
+        if let Some(ref e) = entry { e.downloads() } else { vec![(whisper_spec.unwrap(), 0)] };
 
+    let total_size: u64 = specs.iter().map(|(_, size)| *size).sum();
+    let mut completed_bytes = 0;
+    let started = std::time::Instant::now();
     let mut last_path = String::new();
     for (spec, size_bytes) in specs {
         if cancel.load(Ordering::SeqCst) {
@@ -792,8 +788,16 @@ async fn run_download_model(
         }
 
         let dest = models_dir.join(&spec.file_name);
-        if dest.is_file() && dest.metadata().map(|m| m.len() > 0).unwrap_or(false) {
+        if dest.is_file()
+            && dest
+                .metadata()
+                .map(|m| {
+                    if entry.as_ref().is_some_and(|e| e.bundle.is_some()) { m.len() == size_bytes } else { m.len() > 0 }
+                })
+                .unwrap_or(false)
+        {
             last_path = dest.to_string_lossy().to_string();
+            completed_bytes += size_bytes;
             continue;
         }
 
@@ -811,17 +815,18 @@ async fn run_download_model(
         let file_name = spec.file_name.clone();
 
         let forward = tauri::async_runtime::spawn(async move {
-            let t0 = std::time::Instant::now();
             let mut last_emit = std::time::Instant::now();
             while let Some((done, total_opt)) = rx.recv().await {
-                let total = total_opt.unwrap_or(size_bytes).max(1);
-                let is_final = done >= total;
+                let file_total = total_opt.unwrap_or(size_bytes).max(1);
+                let is_final = done >= file_total;
+                let total = if total_size > 0 { total_size } else { file_total };
+                let done = completed_bytes + done;
                 if !is_final && last_emit.elapsed() < std::time::Duration::from_millis(200) {
                     continue;
                 }
                 last_emit = std::time::Instant::now();
                 let frac = (done as f64 / total as f64).clamp(0.0, 1.0);
-                let elapsed = t0.elapsed().as_secs_f64();
+                let elapsed = started.elapsed().as_secs_f64();
                 let eta_secs = if frac > 0.01 && elapsed > 0.5 { Some((elapsed / frac) * (1.0 - frac)) } else { None };
                 let queue = app_clone.state::<Queue>();
                 queue
@@ -871,6 +876,10 @@ async fn run_download_model(
             }
             return Err(e);
         }
+        if entry.as_ref().is_some_and(|e| e.bundle.is_some()) && !dest.metadata().is_ok_and(|m| m.len() == size_bytes) {
+            return Err(format!("incomplete MLX file {}", spec.file_name));
+        }
+        completed_bytes += size_bytes;
     }
 
     Ok(TaskOutcome::DownloadModel { path: last_path })

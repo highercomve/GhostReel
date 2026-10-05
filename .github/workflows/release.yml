@@ -92,7 +92,7 @@ jobs:
               body: [
                 "**Windows:** `GhostReel_*_x64-setup.exe` · **Linux:** `.AppImage` · **macOS:** `.dmg` (Apple Silicon / Intel) · **CLI only:** `ghostreel-cli-*`.",
                 "",
-                "Linux/Windows GPU acceleration needs an NVIDIA driver 570+ (CUDA 12.8 runtime is bundled). macOS uses Metal. On first start open **Models** and download the models.",
+                "Linux/Windows GPU acceleration needs an NVIDIA driver 570+ (CUDA 12.8 runtime is bundled). Apple Silicon uses MLX for vision/chat and Metal Whisper (macOS 14+); Intel uses llama.cpp/Whisper (macOS 12+). On first start open **Models** and download the models.",
                 "",
                 "macOS builds use a self-signed certificate. Drag GhostReel to Applications; on first launch approve it in System Settings → Privacy & Security → Open Anyway.",
                 ...(notes ? ["", "---", "", notes] : []),
@@ -565,6 +565,17 @@ jobs:
 
       - name: Build Metal helpers
         run: scripts/build-helpers.sh
+      - name: Setup Python for MLX
+        if: matrix.arch == 'arm64'
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: scripts/mlx-requirements.lock
+      - name: Build standalone MLX helper
+        if: matrix.arch == 'arm64'
+        run: scripts/build-mlx.sh
+
 
       - name: Build CLI
         run: cargo build --release -p ghostreel-cli
@@ -669,7 +680,7 @@ jobs:
     name: Publish release
     needs: [create-release, linux-x64, windows-x64, macos]
     # Do not publish a macOS release until both Mac installers and updater payloads are ready.
-    if: always() && needs.create-release.result == 'success' && needs.macos.result == 'success' && (needs.linux-x64.result == 'success' || needs.windows-x64.result == 'success')
+    if: always() && needs.create-release.result == 'success' && needs.macos.result == 'success' && needs.linux-x64.result == 'success' && needs.windows-x64.result == 'success'
     runs-on: ubuntu-24.04
     steps:
       - name: Download Linux updater snippet
@@ -678,7 +689,6 @@ jobs:
         with:
           name: updater-linux
           path: updater-snippets
-        continue-on-error: true
 
       - name: Download Windows updater snippet
         if: needs.windows-x64.result == 'success'
@@ -686,7 +696,6 @@ jobs:
         with:
           name: updater-windows
           path: updater-snippets
-        continue-on-error: true
 
       - name: Download macOS updater snippets
         uses: actions/download-artifact@v4
@@ -694,7 +703,6 @@ jobs:
           pattern: updater-macos-*
           path: updater-snippets
           merge-multiple: true
-        continue-on-error: true
 
       - name: Build and upload latest.json
         env:
@@ -713,6 +721,11 @@ jobs:
           if [ ${#snippets[@]} -gt 0 ]; then
             platforms=$(jq -s 'map({(.platform): {signature: .signature, url: .url}}) | add' "${snippets[@]}")
           fi
+          # A published update must include signed payloads for every supported platform.
+          printf '%s' "$platforms" | jq -e '
+            (keys | sort) == (["darwin-aarch64", "darwin-x86_64", "linux-x86_64", "windows-x86_64"] | sort)
+            and all(.[]; (.signature | length) > 0 and (.url | startswith("https://github.com/")))
+          ' >/dev/null
           jq -n --arg v "$version" --arg n "$notes" --arg d "$pub_date" --argjson p "$platforms" \
             '{version: $v, notes: $n, pub_date: $d, platforms: $p}' > latest.json
           cat latest.json

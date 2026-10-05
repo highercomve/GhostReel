@@ -54,16 +54,72 @@ const MAX_MOMENT_S: f64 = 60.0;
 /// ("unbox" → "unboxing"), any word may match; BM25 ranks chunks with more/rarer matches higher.
 /// Returns `None` when there is nothing searchable.
 pub fn fts_query(q: &str) -> Option<String> {
-    let words: Vec<String> =
-        q.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).map(|w| w.to_lowercase()).collect();
-    let meaningful: Vec<&String> = words.iter().filter(|w| !STOPWORDS.contains(&w.as_str())).collect();
-    // A query made only of stopwords ("the who") still searches them.
-    let chosen: Vec<&String> = if meaningful.is_empty() { words.iter().collect() } else { meaningful };
+    let words = search_words(q);
+    let chosen = meaningful_words(&words);
     let terms: Vec<String> = chosen
         .into_iter()
         .map(|w| if w.chars().count() >= 4 { format!("\"{w}\"*") } else { format!("\"{w}\"") })
         .collect();
     (!terms.is_empty()).then(|| terms.join(" OR "))
+}
+
+fn search_words(q: &str) -> Vec<String> {
+    q.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).map(|w| w.to_lowercase()).collect()
+}
+
+fn meaningful_words(words: &[String]) -> Vec<&String> {
+    let meaningful: Vec<&String> = words.iter().filter(|w| !STOPWORDS.contains(&w.as_str())).collect();
+    let mut chosen = if meaningful.is_empty() { words.iter().collect() } else { meaningful };
+    let mut seen = HashSet::new();
+    chosen.retain(|w| seen.insert(w.as_str()));
+    chosen
+}
+
+/// Retrieve phrase and all-term matches before broad fallback candidates. Apply scope before
+/// the limit so unrelated projects cannot crowd relevant chunks out of the candidate pool.
+type KeywordCandidates = (Vec<(i64, String)>, HashMap<i64, u8>);
+
+fn keyword_candidates(db: &Db, query: &str, opts: &SearchOptions) -> Result<KeywordCandidates, Error> {
+    let Some(broad) = fts_query(query) else {
+        return Ok((Vec::new(), HashMap::new()));
+    };
+    let words = search_words(query);
+    let multi = meaningful_words(&words).len() > 1;
+    let mut queries = Vec::new();
+    if multi {
+        queries.push((format!("\"{}\"", words.join(" ")), 3));
+        queries.push((broad.replace(" OR ", " AND "), 2));
+    }
+    queries.push((broad, if multi { 1 } else { 0 }));
+    let kinds =
+        opts.kinds.as_ref().map(serde_json::to_string).transpose().map_err(|e| Error::Invalid(e.to_string()))?;
+    let mut st = db.conn.prepare(
+        "SELECT chunks_fts.rowid, snippet(chunks_fts, 0, '[', ']', '…', 14)
+         FROM chunks_fts JOIN chunks c ON c.id = chunks_fts.rowid
+         WHERE chunks_fts MATCH ?1
+           AND (?3 IS NULL OR c.kind IN (SELECT value FROM json_each(?3)))
+           AND EXISTS (
+             SELECT 1 FROM video_files vf JOIN project_folders pf ON pf.folder_id = vf.folder_id
+             WHERE vf.video_id = c.video_id AND (?4 IS NULL OR pf.project_id = ?4)
+               AND NOT EXISTS (SELECT 1 FROM project_exclusions x
+                               WHERE x.project_id = pf.project_id AND x.video_id = vf.video_id))
+         ORDER BY bm25(chunks_fts), chunks_fts.rowid LIMIT ?2",
+    )?;
+    let mut candidates = Vec::new();
+    let mut quality = HashMap::new();
+    for (fts, tier) in queries {
+        let rows = st.query_map(params![fts, CANDIDATES as i64, kinds, opts.project_id], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (id, snippet) = row?;
+            if let std::collections::hash_map::Entry::Vacant(e) = quality.entry(id) {
+                e.insert(tier);
+                candidates.push((id, snippet));
+            }
+        }
+    }
+    Ok((candidates, quality))
 }
 
 struct ChunkInfo {
@@ -115,15 +171,7 @@ pub fn search_with_vector(
     };
 
     // Ranked candidate chunk ids from each retriever.
-    let mut keyword: Vec<(i64, String)> = Vec::new();
-    if let Some(fq) = fts_query(query) {
-        let mut st = db.conn.prepare(
-            "SELECT rowid, snippet(chunks_fts, 0, '[', ']', '…', 14) FROM chunks_fts WHERE chunks_fts MATCH ?1
-              ORDER BY bm25(chunks_fts) LIMIT ?2",
-        )?;
-        keyword =
-            st.query_map(params![fq, CANDIDATES as i64], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
-    }
+    let (keyword, quality) = keyword_candidates(db, query, opts)?;
     let mut semantic: Vec<i64> = Vec::new();
     if let Some(v) = vector {
         let mut st =
@@ -174,16 +222,18 @@ pub fn search_with_vector(
         e.1.push("meaning");
     }
     let mut ranked: Vec<(i64, f64, Vec<&'static str>)> = scores.into_iter().map(|(id, (s, m))| (id, s, m)).collect();
-    ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let tier = |id: i64| quality.get(&id).copied().unwrap_or(0);
+    ranked.sort_by(|a, b| tier(b.0).cmp(&tier(a.0)).then_with(|| b.1.total_cmp(&a.1)).then_with(|| a.0.cmp(&b.0)));
 
     // Group into moments.
-    let mut hits: Vec<(Hit, Option<i64>)> = Vec::new();
+    let mut hits: Vec<(Hit, Option<i64>, u8)> = Vec::new();
     for (id, score, matched) in ranked {
         let c = &info[&id];
         let snippet = snippets.get(&id).cloned().unwrap_or_else(|| short(&c.text));
-        if let Some((h, _)) = hits.iter_mut().find(|(h, _)| {
+        if let Some((h, _, match_tier)) = hits.iter_mut().find(|(h, _, _)| {
             h.video_id == c.video_id && c.start_s <= h.end_s + MERGE_GAP_S && c.end_s + MERGE_GAP_S >= h.start_s
         }) {
+            *match_tier = (*match_tier).max(tier(id));
             h.score += score * 0.5; // corroborating evidence, diminished
             // Grow the moment only while it stays short enough to be "a moment".
             let (start, end) = (h.start_s.min(c.start_s), h.end_s.max(c.end_s));
@@ -217,14 +267,17 @@ pub fn search_with_vector(
                 frame: None,
             },
             c.frame_id,
+            tier(id),
         ));
     }
-    hits.sort_by(|a, b| b.0.score.total_cmp(&a.0.score));
+    hits.sort_by(|a, b| {
+        b.2.cmp(&a.2).then_with(|| b.0.score.total_cmp(&a.0.score)).then_with(|| a.0.video_id.cmp(&b.0.video_id))
+    });
     hits.truncate(limit);
 
     // Paths and frames.
     let mut out = Vec::with_capacity(hits.len());
-    for (mut h, frame_id) in hits {
+    for (mut h, frame_id, _) in hits {
         h.path = db
             .conn
             .query_row(
@@ -318,5 +371,71 @@ mod tests {
         let hits = search(&db, tmp.path(), "flash", None, &kinds).await.unwrap();
         assert_eq!(hits[0].start_s, 200.0);
         assert!(search(&db, tmp.path(), "zebra", None, &opts).await.unwrap().is_empty());
+    }
+    #[test]
+    fn phrase_and_all_terms_rank_above_partial_matches_after_grouping() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = Db::open_in_memory().unwrap();
+        let project = db.create_project(&NewProject::named("Search")).unwrap();
+        let folder = db.add_folder(project.id, tmp.path(), true).unwrap();
+        for (id, text) in [
+            (1, "A woman stands near school lockers."),
+            (2, "A boy wears a black jacket."),
+            (3, "A woman is walking, wearing black clothes."),
+            (4, "A close-up of a Black woman meditating outdoors."),
+        ] {
+            db.conn
+                .execute(
+                    "INSERT INTO videos(id, content_hash, size) VALUES (?1, ?2, 1)",
+                    params![id, format!("hash-{id}")],
+                )
+                .unwrap();
+            db.conn.execute("INSERT INTO video_files(video_id, folder_id, path, size, mtime, last_seen) VALUES (?1, ?2, ?3, 1, 0, 0)",
+                params![id, folder.id, format!("{id}.mp4")]).unwrap();
+            // Repeated partial evidence must never overpower the full phrase when grouped.
+            for start in 0..if id == 1 { 20 } else { 1 } {
+                db.conn
+                    .execute(
+                        "INSERT INTO chunks(video_id, kind, start_s, end_s, text) VALUES (?1, 'frame', ?2, ?2 + 1, ?3)",
+                        params![id, start, text],
+                    )
+                    .unwrap();
+            }
+        }
+        let opts = SearchOptions { project_id: Some(project.id), limit: 10, kinds: None };
+        let hits = search_with_vector(&db, tmp.path(), "black woman", None, &opts).unwrap();
+        assert_eq!(hits.iter().map(|h| h.video_id).take(2).collect::<Vec<_>>(), [4, 3]);
+        assert!(hits[0].snippet.contains("[Black woman]"));
+        assert_eq!(hits.len(), 4, "partial matches remain available as fallback results");
+        let single = search_with_vector(&db, tmp.path(), "woman", None, &opts).unwrap();
+        assert_eq!(single.len(), 3);
+        // Semantic corroboration of partial matches must not push them above the phrase.
+        let chunk_id: i64 =
+            db.conn.query_row("SELECT id FROM chunks WHERE video_id = 1 LIMIT 1", [], |r| r.get(0)).unwrap();
+        let vector = vec![0.0f32; 768];
+        db.conn
+            .execute("INSERT INTO chunks_vec(rowid, embedding) VALUES (?1, ?2)", params![chunk_id, to_blob(&vector)])
+            .unwrap();
+        let hybrid = search_with_vector(&db, tmp.path(), "black woman", Some(&vector), &opts).unwrap();
+        assert_eq!(hybrid[0].video_id, 4);
+    }
+
+    #[test]
+    fn scoped_phrase_candidates_survive_broad_candidate_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = Db::open_in_memory().unwrap();
+        let project = db.create_project(&NewProject::named("Search")).unwrap();
+        let folder = db.add_folder(project.id, tmp.path(), true).unwrap();
+        db.conn.execute("INSERT INTO videos(id, content_hash, size) VALUES (1, 'h', 1)", []).unwrap();
+        db.conn.execute("INSERT INTO video_files(video_id, folder_id, path, size, mtime, last_seen) VALUES (1, ?1, 'one.mp4', 1, 0, 0)", [folder.id]).unwrap();
+        for i in 0..CANDIDATES + 50 {
+            db.conn.execute("INSERT INTO chunks(video_id, kind, start_s, end_s, text) VALUES (1, 'transcript', ?1, ?1 + 1, 'woman woman woman')", [i as i64 * 100]).unwrap();
+        }
+        db.conn.execute("INSERT INTO chunks(video_id, kind, start_s, end_s, text) VALUES (1, 'frame', 0, 1, 'A Black woman sits outdoors')", []).unwrap();
+        let opts = SearchOptions { project_id: Some(project.id), limit: 1, kinds: Some(vec!["frame".into()]) };
+        let hits = search_with_vector(&db, tmp.path(), "black woman", None, &opts).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].snippet.contains("[Black woman]"));
+        assert_eq!(fts_query("black black woman").as_deref(), Some("\"black\"* OR \"woman\"*"));
     }
 }

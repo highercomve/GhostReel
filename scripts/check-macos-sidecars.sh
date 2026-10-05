@@ -8,7 +8,9 @@ case "$triple" in
   x86_64-apple-darwin) arch=x86_64 ;;
   *) echo "Unsupported macOS target: $triple" >&2; exit 1 ;;
 esac
-for name in ffmpeg ffprobe ghostreel-asr ghostreel-llm; do
+helpers=(ffmpeg ffprobe ghostreel-asr ghostreel-llm)
+if [ "$arch" = arm64 ]; then helpers+=(ghostreel-mlx); fi
+for name in "${helpers[@]}"; do
   binary="src-tauri/binaries/$name-$triple"
   lipo "$binary" -verify_arch "$arch"
   deps=$(otool -L "$binary")
@@ -29,3 +31,7 @@ done
 "$ffmpeg" -hide_banner -loglevel error -f lavfi -i color=s=320x240:d=0.1 \
   -c:v libx264 -pix_fmt yuv420p -f null -
 "src-tauri/binaries/ffprobe-$triple" -version
+
+if [ "$arch" = arm64 ]; then
+  "src-tauri/binaries/ghostreel-mlx-$triple" --self-test
+fi

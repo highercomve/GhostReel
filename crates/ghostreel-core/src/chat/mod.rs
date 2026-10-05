@@ -154,6 +154,11 @@ impl ChatBackend {
                     ..cfg.clone()
                 })))
             }
+            crate::runtime::VisionSetup::Mlx { helper, models_dir, entry, runtime } => {
+                let dir = crate::models::download_bundle(entry, models_dir, |_, _| {}).await?;
+                let llm = crate::vision::LocalLlm::start_mlx(helper, &dir, runtime).await?;
+                Ok(ChatBackend::Local { helper: Box::new(llm), ctx_tokens: runtime.ctx_tokens, think: runtime.think })
+            }
             crate::runtime::VisionSetup::Local { helper, models_dir, model, mmproj, found, runtime } => {
                 let mut paths = Vec::with_capacity(2);
                 for spec in [model, mmproj] {
