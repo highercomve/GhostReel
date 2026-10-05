@@ -120,6 +120,7 @@ function main() {
   const targetDir = targetDirArg || process.env.CARGO_TARGET_DIR || resolve(repoRoot, 'target');
   const isWindows = target.includes('windows') || target.includes('win32');
   const isLinux = target.includes('linux');
+  const isMlx = target === 'aarch64-apple-darwin';
   const exeExt = isWindows ? '.exe' : '';
 
   const targetProfileDir = join(targetDir, target, profile);
@@ -129,10 +130,12 @@ function main() {
   // Verify required helpers exist BEFORE mutating any destination paths in src-tauri/
   const asrPath = join(binDir, `ghostreel-asr${exeExt}`);
   const llmPath = join(binDir, `ghostreel-llm${exeExt}`);
+  const mlxPath = join(binDir, 'ghostreel-mlx');
 
   const missingHelpers = [];
   if (!existsSync(asrPath)) missingHelpers.push(`ghostreel-asr${exeExt}`);
   if (!existsSync(llmPath)) missingHelpers.push(`ghostreel-llm${exeExt}`);
+  if (isMlx && !existsSync(mlxPath)) missingHelpers.push('ghostreel-mlx (run scripts/build-mlx.sh)');
 
   if (missingHelpers.length > 0) {
     console.error(`Error: Missing required helper(s) in ${binDir}: ${missingHelpers.join(', ')}`);
@@ -147,6 +150,7 @@ function main() {
   const helpersToStage = [
     { name: 'ghostreel-asr', src: asrPath },
     { name: 'ghostreel-llm', src: llmPath },
+    ...(isMlx ? [{ name: 'ghostreel-mlx', src: mlxPath }] : []),
   ];
   // Copy helpers
   const stagedHelpers = [];
@@ -295,7 +299,7 @@ function main() {
   // resources are kept out of tauri.conf.json because tauri-build fails when a listed sidecar is
   // missing, which would break `tauri dev` and clippy.
   const externalBin = [];
-  for (const name of ['ffmpeg', 'ffprobe', 'ghostreel-asr', 'ghostreel-llm']) {
+  for (const name of ['ffmpeg', 'ffprobe', 'ghostreel-asr', 'ghostreel-llm', ...(isMlx ? ['ghostreel-mlx'] : [])]) {
     if (existsSync(join(binariesDir, `${name}-${target}${exeExt}`))) {
       externalBin.push(`binaries/${name}`);
     } else if (name === 'ffmpeg' || name === 'ffprobe') {
@@ -305,6 +309,7 @@ function main() {
   const overlay = {
     bundle: {
       externalBin,
+      ...(isMlx ? { macOS: { minimumSystemVersion: '14.0' } } : {}),
       // Linux: usr/lib/GhostReel/lib (helper RUNPATH $ORIGIN/../lib/GhostReel/lib).
       // Windows: next to the exe, where the DLL loader looks.
       resources: {

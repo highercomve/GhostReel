@@ -565,6 +565,17 @@ jobs:
 
       - name: Build Metal helpers
         run: scripts/build-helpers.sh
+      - name: Setup Python for MLX
+        if: matrix.arch == 'arm64'
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: scripts/mlx-requirements.lock
+      - name: Build standalone MLX helper
+        if: matrix.arch == 'arm64'
+        run: scripts/build-mlx.sh
+
 
       - name: Build CLI
         run: cargo build --release -p ghostreel-cli

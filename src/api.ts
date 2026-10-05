@@ -658,6 +658,7 @@ export interface CatalogEntry {
   mmproj_url?: string;
   mmproj_size_bytes?: number;
   vram_mb?: number;
+  bundle?: { repo: string; revision: string; files: { name: string; size_bytes: number }[] };
 }
 
 export interface ModelStatus {

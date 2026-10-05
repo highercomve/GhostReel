@@ -194,6 +194,23 @@ pub struct LocalLlm {
     lines: Lines<BufReader<ChildStdout>>,
     next_id: u64,
     pub embed_dim: Option<usize>,
+    #[cfg(unix)]
+    process_group: Option<HelperProcessGroup>,
+}
+
+/// Frozen one-file helpers have a bootloader parent. Kill the entire owned group on Stop,
+/// load failure, timeout or drop, so its Python inference child cannot outlive the app.
+#[cfg(unix)]
+struct HelperProcessGroup(i32);
+
+#[cfg(unix)]
+impl Drop for HelperProcessGroup {
+    fn drop(&mut self) {
+        // SAFETY: this is the private group created for our child with process_group(0).
+        unsafe {
+            libc::kill(-self.0, libc::SIGKILL);
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -261,13 +278,37 @@ impl LocalLlm {
             .arg(&m.runtime.kv_cache)
             .arg("--flash-attn")
             .arg(&m.runtime.flash_attn);
+        Self::start_command(cmd, &m.helper, false).await
+    }
+
+    /// MLX uses the same JSON-lines protocol; process ownership and cancellation stay shared.
+    pub async fn start_mlx(helper: &Path, model_dir: &Path, runtime: &HelperRuntime) -> Result<Self, Error> {
+        let mut cmd = crate::proc::command(helper);
+        cmd.arg("--model-dir")
+            .arg(model_dir)
+            .arg("--ctx")
+            .arg(runtime.ctx_tokens.to_string())
+            .arg("--kv-type")
+            .arg(&runtime.kv_cache);
+        Self::start_command(cmd, helper, true).await
+    }
+
+    async fn start_command(mut cmd: tokio::process::Command, helper: &Path, frozen: bool) -> Result<Self, Error> {
+        #[cfg(unix)]
+        if frozen {
+            cmd.process_group(0);
+        }
+        #[cfg(not(unix))]
+        let _ = frozen;
         let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
-            .map_err(|e| Error::Vision(format!("cannot run {}: {e}", m.helper.display())))?;
+            .map_err(|e| Error::Vision(format!("cannot run {}: {e}", helper.display())))?;
+        #[cfg(unix)]
+        let process_group = if frozen { child.id().map(|id| HelperProcessGroup(id as i32)) } else { None };
         let stdin = child.stdin.take().ok_or_else(|| Error::Vision("helper stdin unavailable".into()))?;
         let stdout = child.stdout.take().ok_or_else(|| Error::Vision("helper stdout unavailable".into()))?;
         let stderr = child.stderr.take();
@@ -281,7 +322,9 @@ impl LocalLlm {
                         crate::llmlog::push("helper", kept);
                     }
                     let lower = line.to_lowercase();
-                    if line.starts_with("ghostreel-llm:") || lower.contains("error") || lower.contains("out of memory")
+                    if (line.starts_with("ghostreel-llm:") || line.starts_with("ghostreel-mlx:"))
+                        || lower.contains("error")
+                        || lower.contains("out of memory")
                     {
                         keep.push(line);
                         if keep.len() > 4 {
@@ -302,7 +345,15 @@ impl LocalLlm {
                     return Err(Error::Vision(format!("helper did not start: {line}")));
                 }
                 let embed_dim = v["embed_dim"].as_u64().map(|d| d as usize);
-                Ok(Self { child, stdin, lines, next_id: 1, embed_dim })
+                Ok(Self {
+                    child,
+                    stdin,
+                    lines,
+                    next_id: 1,
+                    embed_dim,
+                    #[cfg(unix)]
+                    process_group,
+                })
             }
             Ok(_) => {
                 let _ = child.wait().await;
@@ -418,6 +469,8 @@ impl LocalLlm {
     /// we set out here, so stopping a turn means ending the process; the next turn starts a new
     /// one. Without this, Stop only took effect after the model had finished anyway.
     pub async fn kill(&mut self) {
+        #[cfg(unix)]
+        drop(self.process_group.take());
         let _ = self.child.kill().await;
     }
 
@@ -841,5 +894,31 @@ done
         };
         let err = LocalLlm::start(&models).await.err().unwrap();
         assert!(err.to_string().contains("out of memory"), "{err}");
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn frozen_helper_cancellation_and_drop_kill_inference_children() {
+        use std::os::unix::fs::PermissionsExt;
+        for explicit_stop in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let helper = dir.path().join("fake-mlx");
+            let marker = dir.path().join("survived");
+            std::fs::write(
+                &helper,
+                format!(
+                    "#!/bin/sh\n(sleep 0.3; printf survived > '{}') &\nprintf '{{\"ready\":true}}\\n'\nread -r line\n",
+                    marker.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let mut llm = LocalLlm::start_mlx(&helper, dir.path(), &HelperRuntime::default()).await.unwrap();
+            if explicit_stop {
+                llm.kill().await;
+            }
+            drop(llm);
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            assert!(!marker.exists(), "inference child survived cancellation");
+        }
     }
 }

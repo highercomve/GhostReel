@@ -17,3 +17,7 @@ src-tauri/tauri.bundle.json
 !.vscode/extensions.json
 .DS_Store
 *.sw?
+
+# Frozen-helper Python caches
+__pycache__/
+*.pyc

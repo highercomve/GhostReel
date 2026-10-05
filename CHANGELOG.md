@@ -5,6 +5,24 @@ versions follow [SemVer](https://semver.org/) while the project is 0.x (minor = 
 
 ## [Unreleased]
 
+### Added
+
+- MLX vision and script chat on Apple Silicon, with a bundled Python/Metal runtime and
+  automatically selected, revision-pinned MLX model downloads. Complete model folders support
+  resume, installation checks, and removal. Whisper and embeddings retain their existing engines.
+- Apple Silicon model catalog for Qwen2.5-VL 3B/7B, Gemma 3 4B, and Qwen3.5 9B; the old
+  Bonsai vision default migrates to Qwen2.5-VL 3B. Intel Macs, Linux, and Windows retain GGUF.
+
+### Changed
+
+- The Apple Silicon installer now requires macOS 14+ for MLX; Intel still supports macOS 12+.
+
+### Fixed
+
+- Multi-word searches rank exact phrases first, then matches containing every meaningful
+  query term, before partial matches. Repeated partial matches cannot overwhelm a phrase when
+  grouped into moments. Project and media-kind filters apply before keyword candidate limits.
+
 ## [0.7.2] — 2026-10-05
 
 ### Added

@@ -554,13 +554,7 @@ async fn models_cmd(paths: &Paths, action: ModelsAction) -> anyhow::Result<ExitC
         }
         ModelsAction::Download { id } => {
             let specs = match ghostreel_core::models::find_entry(&id) {
-                Some(entry) => {
-                    let mut s = vec![entry.spec()];
-                    if let Some(m) = entry.mmproj_spec() {
-                        s.push(m);
-                    }
-                    s
-                }
+                Some(entry) => entry.downloads().into_iter().map(|(s, _)| s).collect(),
                 None => vec![ghostreel_core::models::whisper(&id).map_err(|e| anyhow::anyhow!("{e}"))?],
             };
             let is_tty = std::io::stdout().is_terminal();
