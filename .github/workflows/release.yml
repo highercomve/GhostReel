@@ -661,6 +661,8 @@ jobs:
 
       - name: Clean up signing keychain
         if: always() && env.RELEASE == 'true'
+        timeout-minutes: 2
+        continue-on-error: true
         run: scripts/macos-signing.sh cleanup
 
   publish-release:

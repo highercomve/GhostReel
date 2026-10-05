@@ -6,6 +6,33 @@
 set -euo pipefail
 umask 077
 
+# macOS trust/keychain services can block on headless runners. Cleanup is best-effort,
+# but every command must finish so successfully uploaded installers can be published.
+cleanup_command() {
+  python3 - "$@" <<'PYTHON'
+import os
+import shlex
+import signal
+import subprocess
+import sys
+
+command = sys.argv[1:]
+print(f"Cleaning signing state: {shlex.join(command)}", flush=True)
+try:
+    process = subprocess.Popen(command, stdin=subprocess.DEVNULL, start_new_session=True)
+    try:
+        status = process.wait(timeout=float(os.environ.get("GHOSTREEL_CLEANUP_TIMEOUT_SECONDS", "15")))
+        if status:
+            print(f"Warning: cleanup command exited with status {status}; continuing.", flush=True)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL)
+        process.wait()
+        print("Warning: cleanup command timed out; continuing with remaining cleanup.", flush=True)
+except OSError as error:
+    print(f"Warning: cleanup command failed: {error}; continuing.", flush=True)
+PYTHON
+}
+
 case "${1:-}" in
   create)
     out="${2:?Usage: scripts/macos-signing.sh create <directory>}"
@@ -77,7 +104,7 @@ CONF
     : "${RUNNER_TEMP:?RUNNER_TEMP is required}"
     tmp="$RUNNER_TEMP/ghostreel-signing"
     if [ -f "$tmp/cert.pem" ]; then
-      sudo security remove-trusted-cert -d "$tmp/cert.pem" || true
+      cleanup_command sudo -n security remove-trusted-cert -d "$tmp/cert.pem"
     fi
     if [ -f "$tmp/keychains.txt" ]; then
       keychains=()
@@ -85,9 +112,9 @@ CONF
         line="${line#*\"}"; line="${line%\"*}"
         [ -z "$line" ] || keychains+=("$line")
       done < "$tmp/keychains.txt"
-      security list-keychains -d user -s "${keychains[@]}"
+      cleanup_command security list-keychains -d user -s "${keychains[@]}"
     fi
-    [ ! -e "$tmp/build.keychain-db" ] || security delete-keychain "$tmp/build.keychain-db"
+    [ ! -e "$tmp/build.keychain-db" ] || cleanup_command security delete-keychain "$tmp/build.keychain-db"
     rm -rf "$tmp"
     ;;
   *)
