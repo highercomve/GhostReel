@@ -119,3 +119,80 @@ test('Metal helper builds enable the backend for both packages and portable CPU 
   assert.match(lines[0], /^OFF\|.*-p ghostreel-asr --features metal$/);
   assert.match(lines[1], /^OFF\|.*-p ghostreel-llm --features metal$/);
 });
+
+test('check-macos-sidecars verifies arch and system dependencies', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'ghostreel-check-macos-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await mkdir(join(root, 'scripts'));
+  await mkdir(join(root, 'bin'));
+  await mkdir(join(root, 'src-tauri/binaries'), { recursive: true });
+  await copyFile(new URL('check-macos-sidecars.sh', import.meta.url), join(root, 'scripts/check-macos-sidecars.sh'));
+
+  const triple = 'aarch64-apple-darwin';
+  for (const name of ['ghostreel-asr', 'ghostreel-llm']) {
+    const file = join(root, 'src-tauri/binaries', `${name}-${triple}`);
+    await writeFile(file, '#!/bin/sh\nexit 0\n');
+    await chmod(file, 0o755);
+  }
+
+  // Mock lipo: verify that input_file comes before -verify_arch
+  const lipo = join(root, 'bin/lipo');
+  await writeFile(lipo, `#!/bin/sh
+if [ "$1" = "-verify_arch" ]; then
+  echo "error: unknown architecture specification flag: $3" >&2
+  exit 1
+fi
+if [ "$2" != "-verify_arch" ] || [ "$3" != "arm64" ]; then
+  echo "unexpected lipo arguments: $*" >&2
+  exit 1
+fi
+exit 0
+`);
+  await chmod(lipo, 0o755);
+
+  // Mock otool: returns system libraries
+  const otool = join(root, 'bin/otool');
+  await writeFile(otool, `#!/bin/sh
+echo "$1:"
+echo "	/System/Library/Frameworks/Metal.framework/Versions/A/Metal"
+echo "	/usr/lib/libSystem.B.dylib"
+`);
+  await chmod(otool, 0o755);
+
+  // Mock ffmpeg that supports -filters with drawtext & subtitles and encoding test
+  const ffmpeg = join(root, 'src-tauri/binaries', `ffmpeg-${triple}`);
+  await writeFile(ffmpeg, `#!/bin/sh
+for arg in "$@"; do
+  if [ "$arg" = "-filters" ]; then
+    echo " ... drawtext ... "
+    echo " ... subtitles ... "
+    exit 0
+  fi
+done
+exit 0
+`);
+  await chmod(ffmpeg, 0o755);
+
+  const ffprobe = join(root, 'src-tauri/binaries', `ffprobe-${triple}`);
+  await writeFile(ffprobe, `#!/bin/sh\nexit 0\n`);
+  await chmod(ffprobe, 0o755);
+
+  // Run check-macos-sidecars.sh, expecting success
+  await exec('bash', [join(root, 'scripts/check-macos-sidecars.sh'), triple], {
+    env: { ...process.env, PATH: `${join(root, 'bin')}:${process.env.PATH}` },
+  });
+
+  // Now simulate a non-system dynamic dependency
+  await writeFile(otool, `#!/bin/sh
+echo "$1:"
+echo "	/opt/homebrew/lib/libomp.dylib"
+`);
+  await chmod(otool, 0o755);
+
+  await assert.rejects(
+    exec('bash', [join(root, 'scripts/check-macos-sidecars.sh'), triple], {
+      env: { ...process.env, PATH: `${join(root, 'bin')}:${process.env.PATH}` },
+    }),
+    /Non-system dynamic dependency/
+  );
+});

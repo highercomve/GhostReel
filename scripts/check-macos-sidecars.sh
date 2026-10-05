@@ -10,11 +10,13 @@ case "$triple" in
 esac
 for name in ffmpeg ffprobe ghostreel-asr ghostreel-llm; do
   binary="src-tauri/binaries/$name-$triple"
-  lipo -verify_arch "$arch" "$binary"
+  lipo "$binary" -verify_arch "$arch"
   deps=$(otool -L "$binary")
   # All native and codec libraries must be static; only OS libraries/frameworks may remain.
-  if printf '%s\n' "$deps" | tail -n +2 | grep -Ev '^[[:space:]]+(/usr/lib/|/System/Library/)'; then
-    echo "Non-system dynamic dependency in $binary" >&2
+  non_system=$(printf '%s\n' "$deps" | grep '^[[:space:]]' | grep -Ev '^[[:space:]]+(/usr/lib/|/System/Library/)' || true)
+  if [ -n "$non_system" ]; then
+    echo "Non-system dynamic dependency in $binary:" >&2
+    echo "$non_system" >&2
     exit 1
   fi
 done
