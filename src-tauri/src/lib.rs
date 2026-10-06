@@ -2,6 +2,7 @@
 //! `ghostreel-core`, shared with the CLI.
 
 mod media;
+mod menu;
 mod queue;
 mod webui;
 
@@ -1264,6 +1265,8 @@ pub fn run() {
             // Frames/thumbnails are served from the data dir via the asset protocol; scope it
             // at runtime because GHOSTREEL_DATA can move it.
             use tauri::Manager;
+            #[cfg(target_os = "macos")]
+            menu::install(app)?;
             if let Ok(p) = Paths::resolve() {
                 let _ = std::fs::create_dir_all(&p.data_dir);
                 app.asset_protocol_scope().allow_directory(&p.data_dir, true)?;

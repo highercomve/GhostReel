@@ -90,7 +90,7 @@ jobs:
               owner: context.repo.owner, repo: context.repo.repo,
               tag_name: tag, target_commitish: context.sha, name: `GhostReel ${tag}`,
               body: [
-                "**Windows:** `GhostReel_*_x64-setup.exe` · **Linux:** `.AppImage` · **macOS:** `.dmg` (Apple Silicon / Intel) · **CLI only:** `ghostreel-cli-*`.",
+                `**Windows:** \`GhostReel_*_x64-setup.exe\` · **Linux:** \`.AppImage\` · **macOS:** \`.dmg\` (Apple Silicon / Intel). **CLI bundles:** available in the [build artifacts](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}).`,
                 "",
                 "Linux/Windows GPU acceleration needs an NVIDIA driver 570+ (CUDA 12.8 runtime is bundled). Apple Silicon uses MLX for vision/chat and Metal Whisper (macOS 14+); Intel uses llama.cpp/Whisper (macOS 12+). On first start open **Models** and download the models.",
                 "",

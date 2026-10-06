@@ -5,6 +5,18 @@ versions follow [SemVer](https://semver.org/) while the project is 0.x (minor = 
 
 ## [Unreleased]
 
+## [0.8.1] — 2026-10-06
+
+### Added
+
+- “Check for Updates…” in the macOS GhostReel menu (⌘U), opening the existing updater
+  and checking immediately.
+
+### Fixed
+
+- Update checks and installation progress remain available when navigating between pages.
+  Repeated menu clicks cannot start overlapping checks or interrupt an installation.
+
 ## [0.8.0] — 2026-10-05
 
 ### Added
@@ -687,7 +699,8 @@ is and the editor cuts around the shaky stretches; camera originals play in the 
 
 See the git history: `git log v0.1.5`.
 
-[Unreleased]: https://github.com/highercomve/GhostReel/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/highercomve/GhostReel/compare/v0.8.1...HEAD
+[0.8.1]: https://github.com/highercomve/GhostReel/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/highercomve/GhostReel/compare/v0.7.2...v0.8.0
 [0.7.2]: https://github.com/highercomve/GhostReel/compare/v0.7.1...v0.7.2
 [0.2.0]: https://github.com/highercomve/GhostReel/compare/v0.1.7...v0.2.0

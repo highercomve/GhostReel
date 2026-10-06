@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useState } from "react";
-import { createProject, FPS_PRESETS, listProjects, type ProjectSummary } from "./api";
+import { createProject, FPS_PRESETS, isDesktop, listProjects, type ProjectSummary } from "./api";
 import ActivityPage from "./ActivityPage";
 import ModelsPage from "./ModelsPage";
 import ProjectPage from "./ProjectPage";
 import StatusPage from "./StatusPage";
+import { useUpdater } from "./UpdaterPanel";
+import { onEvent } from "./events";
 import SettingsPage from "./SettingsPage";
 import { isActive, useQueue } from "./useQueue";
 
@@ -65,6 +67,8 @@ export default function App() {
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
   const [page, setPage] = useState<Page>({ kind: "status" });
   const [creating, setCreating] = useState(false);
+  const updater = useUpdater();
+  const { checkForUpdates } = updater;
   const tasks = useQueue();
   const activeCount = tasks.filter(isActive).length;
   const runningTask = tasks.find((t) => t.state === "running");
@@ -82,6 +86,14 @@ export default function App() {
         .catch(() => {}),
     );
   }, [refresh]);
+
+  useEffect(() => {
+    if (!isDesktop) return;
+    return onEvent("check-for-updates", () => {
+      setPage({ kind: "status" });
+      void checkForUpdates();
+    });
+  }, [checkForUpdates]);
 
   return (
     <div className="shell">
@@ -149,7 +161,7 @@ export default function App() {
       </nav>
       <div className="content">
         {page.kind === "status" ? (
-          <StatusPage />
+          <StatusPage updater={updater} />
         ) : page.kind === "models" ? (
           <ModelsPage />
         ) : page.kind === "settings" ? (
