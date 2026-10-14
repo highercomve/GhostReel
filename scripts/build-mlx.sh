@@ -10,6 +10,10 @@ python="${GHOSTREEL_MLX_PYTHON:-python3}"
 root="${CARGO_TARGET_DIR:-target}"
 venv="$root/mlx-venv"
 "$python" -c 'import sys; assert sys.version_info[:2] == (3, 12), "MLX packaging requires Python 3.12 (GHOSTREEL_MLX_PYTHON)"'
+# The Rust cache restores everything under target/, and a venv copied from an older
+# runner image arrives with a pip that cannot execute. Rebuild it fresh every time;
+# keeping only the wheel cache saves the downloaded downloads (which are hash-locked anyway).
+rm -rf "$venv" "$root/mlx-build"
 "$python" -m venv "$venv"
 # A macOS 15 runner otherwise selects MLX's macOS 15 wheel even though our ARM app supports 14.
 mkdir -p "$root/mlx-wheels"
