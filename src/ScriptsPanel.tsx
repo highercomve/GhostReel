@@ -1,6 +1,6 @@
+import MediaImage from "./MediaImage";
 import { useEffect, useRef, useState } from "react";
 import {
-  fileUrl,
   getAiSettings,
   setAiSettings,
   cliModels,
@@ -106,7 +106,6 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
   const [turnError, setTurnError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  const resolveImgSrc = (img: string) => (img.startsWith("data:") ? img : fileUrl(img));
 
   const addImages = (files: FileList | File[]) => {
     for (let i = 0; i < files.length; i++) {
@@ -758,12 +757,12 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
                   {msg.images && msg.images.length > 0 && (
                     <div className="chat-attached-images">
                       {msg.images.map((img, idx) => (
-                        <img
+                        <MediaImage
                           key={idx}
-                          src={resolveImgSrc(img)}
+                          path={img}
                           alt={`Attached image ${idx + 1}`}
                           className="chat-attached-image"
-                          onClick={() => setPreviewImage(resolveImgSrc(img))}
+                          onClick={() => setPreviewImage(img)}
                           title="Click to view full image"
                         />
                       ))}
@@ -795,12 +794,12 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
                 {optimisticUser.images.length > 0 && (
                   <div className="chat-attached-images">
                     {optimisticUser.images.map((img, idx) => (
-                      <img
+                      <MediaImage
                         key={idx}
-                        src={resolveImgSrc(img)}
+                        path={img}
                         alt={`Attached image ${idx + 1}`}
                         className="chat-attached-image"
-                        onClick={() => setPreviewImage(resolveImgSrc(img))}
+                        onClick={() => setPreviewImage(img)}
                         title="Click to view full image"
                       />
                     ))}
@@ -1234,7 +1233,7 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
             >
               ×
             </button>
-            <img src={previewImage} alt="Expanded preview" />
+            <MediaImage path={previewImage} alt="Expanded preview" />
           </div>
         </div>
       )}

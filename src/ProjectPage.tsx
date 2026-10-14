@@ -1,3 +1,4 @@
+import MediaImage from "./MediaImage";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ask, open } from "@tauri-apps/plugin-dialog";
 import {
@@ -6,7 +7,6 @@ import {
   enqueueIndex,
   enqueueSteadiness,
   fileName,
-  fileUrl,
   fpsLabel,
   humanDuration,
   humanSize,
@@ -21,6 +21,8 @@ import {
   includeVideo,
   renameProject,
   search,
+  setVideoCategory,
+  CATEGORIES,
   type Hit,
   type ProjectView,
   type VideoRow,
@@ -30,6 +32,7 @@ import TaskCard from "./TaskCard";
 import { useQueue } from "./useQueue";
 import VideoPanel from "./VideoPanel";
 import ScriptsPanel from "./ScriptsPanel";
+import OrganizeModal from "./OrganizeModal";
 
 function SpeechCell({ v, transcribeEnabled }: { v: VideoRow; transcribeEnabled?: boolean }) {
   if (v.segments > 0) return <span className="good-text">{v.language ? v.language.toUpperCase() : "✓"}</span>;
@@ -45,6 +48,46 @@ function SpeechCell({ v, transcribeEnabled }: { v: VideoRow; transcribeEnabled?:
   }
 }
 
+function CategoryCell({
+  v,
+  onCategoryChange,
+}: {
+  v: VideoRow;
+  onCategoryChange: (newCategory: string) => void;
+}) {
+  const current = CATEGORIES.find((c) => c.id === v.category) ?? {
+    id: v.category,
+    label: v.category,
+    folder: v.category,
+    icon: "📁",
+  };
+
+  return (
+    <div className="cat-cell" onClick={(e) => e.stopPropagation()}>
+      <select
+        value={v.category}
+        onChange={(e) => onCategoryChange(e.target.value)}
+        className={`cat-select cat-${v.category}`}
+        title={`Category: ${current.label} (${v.category_source === "manual" ? "manual" : `${Math.round((v.category_confidence || 0) * 100)}% confidence`})`}
+      >
+        {CATEGORIES.map((cat) => (
+          <option key={cat.id} value={cat.id}>
+            {cat.icon} {cat.label}
+          </option>
+        ))}
+      </select>
+      {v.category_tag && (
+        <span
+          className="cat-subtag"
+          title={`Detected tag: ${v.category_tag}`}
+        >
+          {v.category_tag === "music" ? "🎵 music" : v.category_tag}
+        </span>
+      )}
+    </div>
+  );
+}
+
 /** "…the [compute] module…" → highlighted spans. */
 function Snippet({ text }: { text: string }) {
   const parts = text.split(/(\[[^\]]+\])/g);
@@ -57,7 +100,9 @@ function Snippet({ text }: { text: string }) {
   );
 }
 
-export default function ProjectPage({ projectId, onChanged }: { projectId: number; onChanged: () => void }) {
+export default function ProjectPage({ projectId, onChanged, openVideo }: {
+  projectId: number; onChanged: () => void; openVideo?: { videoId: number; t: number };
+}) {
   const [tab, setTab] = useState<"library" | "scripts">("library");
   const [view, setView] = useState<ProjectView | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -69,6 +114,8 @@ export default function ProjectPage({ projectId, onChanged }: { projectId: numbe
   const [searching, setSearching] = useState(false);
   const [editName, setEditName] = useState<string | null>(null);
   const [samplingSize, setSamplingSize] = useState<number>(768);
+  const [organizeModalOpen, setOrganizeModalOpen] = useState(false);
+  const [categoryFilter, setCategoryFilter] = useState<string | null>(null);
   const [menuOpen, setMenuOpen] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
@@ -224,6 +271,18 @@ export default function ProjectPage({ projectId, onChanged }: { projectId: numbe
     setTimeout(() => panelRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 50);
   };
 
+  useEffect(() => {
+    return onEvent<{ videoId: number; t: number }>("open-video-at", ({ videoId, t }) => {
+      openAt(videoId, t);
+    });
+  }, []);
+
+  const navigationReady = !!openVideo && view?.project.id === projectId &&
+    view.videos.some((video) => video.id === openVideo.videoId);
+  useEffect(() => {
+    if (navigationReady && openVideo) openAt(openVideo.videoId, openVideo.t);
+  }, [navigationReady, openVideo]);
+
   if (!view) return <main>{error ? <div className="banner bad">{error}</div> : <p className="muted">Loading…</p>}</main>;
 
   const { project: p, status: st } = view;
@@ -270,7 +329,7 @@ export default function ProjectPage({ projectId, onChanged }: { projectId: numbe
                 <div className="project-menu-section-title">Video Analysis</div>
 
                 <div className="project-menu-field">
-                  <span className="project-menu-label">Vision sampling</span>
+                  <span className="project-menu-label">Vision / playback size</span>
                   <select
                     className="project-menu-select"
                     value={samplingSize}
@@ -476,7 +535,7 @@ export default function ProjectPage({ projectId, onChanged }: { projectId: numbe
           {hits.length === 0 && <div className="muted">No matches.</div>}
           {hits.map((h, i) => (
             <div key={i} className="card hit" onClick={() => openAt(h.video_id, h.start_s)}>
-              {h.frame ? <img src={fileUrl(h.frame)} alt="" loading="lazy" /> : <div className="noframe" />}
+              {h.frame ? <MediaImage path={h.frame} alt="" loading="lazy" /> : <div className="noframe" />}
               <div className="hit-body">
                 <div className="hit-head">
                   <span className="label">{fileName(h.path)}</span>
@@ -537,9 +596,17 @@ export default function ProjectPage({ projectId, onChanged }: { projectId: numbe
             </button>
           </div>
         ))}
-        <div>
+        <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap" }}>
           <button className="ghost" onClick={onAddFolder}>
             + Add folder
+          </button>
+          <button
+            className="ghost"
+            onClick={() => setOrganizeModalOpen(true)}
+            disabled={view.videos.length === 0 || !!running}
+            title="Organize original video files into categorized subfolders on disk"
+          >
+            🗂️ Organize folders…
           </button>
         </div>
       </section>
@@ -555,6 +622,33 @@ export default function ProjectPage({ projectId, onChanged }: { projectId: numbe
           {st.vfr_videos ? ` · ${st.vfr_videos} variable frame rate` : ""}
         </span>
       </h2>
+
+      {view.videos.length > 0 && (
+        <div className="category-filter-bar">
+          <button
+            type="button"
+            className={`filter-pill ${categoryFilter === null ? "active" : ""}`}
+            onClick={() => setCategoryFilter(null)}
+          >
+            All ({view.videos.length})
+          </button>
+          {CATEGORIES.map((cat) => {
+            const count = view.videos.filter((v) => v.category === cat.id).length;
+            if (count === 0 && categoryFilter !== cat.id) return null;
+            return (
+              <button
+                key={cat.id}
+                type="button"
+                className={`filter-pill cat-${cat.id} ${categoryFilter === cat.id ? "active" : ""}`}
+                onClick={() => setCategoryFilter(categoryFilter === cat.id ? null : cat.id)}
+              >
+                {cat.icon} {cat.label} ({count})
+              </button>
+            );
+          })}
+        </div>
+      )}
+
       <section className="card">
         {view.videos.length === 0 ? (
           <div className="muted">No videos yet — add a folder and press “Index now”.</div>
@@ -563,6 +657,7 @@ export default function ProjectPage({ projectId, onChanged }: { projectId: numbe
             <thead>
               <tr>
                 <th>Name</th>
+                <th>Category</th>
                 <th>Length</th>
                 <th>Size</th>
                 <th>Format</th>
@@ -573,7 +668,7 @@ export default function ProjectPage({ projectId, onChanged }: { projectId: numbe
               </tr>
             </thead>
             <tbody>
-              {view.videos.map((v) => (
+              {(categoryFilter ? view.videos.filter((v) => v.category === categoryFilter) : view.videos).map((v) => (
                 <tr
                   key={v.id}
                   title={v.path}
@@ -589,6 +684,12 @@ export default function ProjectPage({ projectId, onChanged }: { projectId: numbe
                       </span>
                     )}
                     {v.has_audio === false && <span className="tag">no audio</span>}
+                  </td>
+                  <td>
+                    <CategoryCell
+                      v={v}
+                      onCategoryChange={(cat) => run(() => setVideoCategory(v.id, cat))}
+                    />
                   </td>
                   <td>{v.duration_s != null ? humanDuration(v.duration_s) : "–"}</td>
                   <td>{humanSize(v.size)}</td>
@@ -659,6 +760,17 @@ export default function ProjectPage({ projectId, onChanged }: { projectId: numbe
         </button>
       </p>
         </>
+      )}
+
+      {organizeModalOpen && (
+        <OrganizeModal
+          projectId={projectId}
+          onClose={() => setOrganizeModalOpen(false)}
+          onOrganized={() => {
+            refresh();
+            onChanged();
+          }}
+        />
       )}
     </main>
   );

@@ -24,6 +24,12 @@ pub struct SearchOptions {
     pub kinds: Option<Vec<String>>,
 }
 
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct HitProject {
+    pub id: i64,
+    pub name: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Hit {
     pub video_id: i64,
@@ -38,6 +44,7 @@ pub struct Hit {
     pub snippet: String,
     /// Frame image for the moment (closest keyframe).
     pub frame: Option<PathBuf>,
+    pub projects: Vec<HitProject>,
 }
 
 /// Words that match almost every chunk and only add noise to keyword ranking (English + Spanish).
@@ -265,6 +272,7 @@ pub fn search_with_vector(
                 matched_by: matched.iter().map(|m| m.to_string()).collect(),
                 snippet,
                 frame: None,
+                projects: Vec::new(),
             },
             c.frame_id,
             tier(id),
@@ -275,8 +283,16 @@ pub fn search_with_vector(
     });
     hits.truncate(limit);
 
-    // Paths and frames.
+    // Paths, frames, and projects.
     let mut out = Vec::with_capacity(hits.len());
+    let mut proj_st = db.conn.prepare(
+        "SELECT DISTINCT p.id, p.name FROM projects p
+          JOIN project_folders pf ON pf.project_id = p.id
+          JOIN video_files vf ON vf.folder_id = pf.folder_id
+         WHERE vf.video_id = ?1
+           AND NOT EXISTS (SELECT 1 FROM project_exclusions x WHERE x.project_id = p.id AND x.video_id = vf.video_id)
+         ORDER BY p.name",
+    )?;
     for (mut h, frame_id, _) in hits {
         h.path = db
             .conn
@@ -288,21 +304,36 @@ pub fn search_with_vector(
             )
             .map(PathBuf::from)
             .unwrap_or_default();
-        let rel: Option<String> = match frame_id {
-            Some(fid) => db.conn.query_row("SELECT thumb_path FROM frames WHERE id = ?1", [fid], |r| r.get(0)).ok(),
-            None => db
-                .conn
-                .query_row(
-                    "SELECT thumb_path FROM frames WHERE video_id = ?1 ORDER BY ABS(t_s - ?2) LIMIT 1",
-                    params![h.video_id, h.start_s],
-                    |r| r.get(0),
-                )
-                .ok(),
-        };
-        h.frame = rel.map(|r| data_dir.join(r));
+        h.frame = thumbnail_for_hit(db, data_dir, h.video_id, frame_id, h.start_s)?;
+        if let Ok(mapped) = proj_st.query_map([h.video_id], |r| Ok(HitProject { id: r.get(0)?, name: r.get(1)? })) {
+            h.projects = mapped.filter_map(|r| r.ok()).collect();
+        }
         out.push(h);
     }
     Ok(out)
+}
+
+/// Prefer the matched frame, then the nearest available keyframe. Missing or null paths
+/// should not hide another usable thumbnail from the same video.
+fn thumbnail_for_hit(
+    db: &Db,
+    data_dir: &Path,
+    video_id: i64,
+    frame_id: Option<i64>,
+    start_s: f64,
+) -> Result<Option<PathBuf>, Error> {
+    let mut statement = db.conn.prepare(
+        "SELECT thumb_path FROM frames WHERE video_id = ?1 AND thumb_path IS NOT NULL
+         ORDER BY CASE WHEN id = ?2 THEN 0 ELSE 1 END, ABS(t_s - ?3), id",
+    )?;
+    let rows = statement.query_map(params![video_id, frame_id, start_s], |r| r.get::<_, String>(0))?;
+    for row in rows {
+        let path = data_dir.join(row?);
+        if path.is_file() {
+            return Ok(Some(path));
+        }
+    }
+    Ok(None)
 }
 
 fn short(text: &str) -> String {
@@ -326,6 +357,26 @@ mod tests {
         );
         assert_eq!(fts_query("the who").as_deref(), Some("\"the\" OR \"who\""), "all-stopword queries still search");
         assert_eq!(fts_query("la red inalámbrica").as_deref(), Some("\"red\" OR \"inalámbrica\"*"));
+    }
+
+    #[test]
+    fn thumbnail_falls_back_from_missing_or_null_matched_frames() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Db::open_in_memory().unwrap();
+        db.conn.execute("INSERT INTO videos(id,content_hash,size) VALUES (1,'thumb-test',1)", []).unwrap();
+        db.conn
+            .execute_batch(
+                "INSERT INTO frames(id,video_id,t_s,thumb_path) VALUES
+            (1,1,0,NULL), (2,1,1,'missing.jpg'), (3,1,2,'available.jpg');",
+            )
+            .unwrap();
+        let available = temp.path().join("available.jpg");
+        std::fs::write(&available, b"test image").unwrap();
+        assert_eq!(thumbnail_for_hit(&db, temp.path(), 1, Some(1), 0.0).unwrap(), Some(available.clone()));
+        assert_eq!(thumbnail_for_hit(&db, temp.path(), 1, Some(2), 1.0).unwrap(), Some(available.clone()));
+        assert_eq!(thumbnail_for_hit(&db, temp.path(), 1, None, 0.0).unwrap(), Some(available.clone()));
+        std::fs::remove_file(available).unwrap();
+        assert_eq!(thumbnail_for_hit(&db, temp.path(), 1, Some(3), 2.0).unwrap(), None);
     }
 
     #[tokio::test]
@@ -367,11 +418,14 @@ mod tests {
         let all =
             search(&db, tmp.path(), "unbox", None, &SearchOptions { limit: 10, ..Default::default() }).await.unwrap();
         assert_eq!(all.len(), 2);
+        assert_eq!(all[0].projects.len(), 1);
+        assert_eq!(all[1].projects.len(), 1);
         let kinds = SearchOptions { project_id: Some(pa.id), limit: 10, kinds: Some(vec!["transcript".into()]) };
         let hits = search(&db, tmp.path(), "flash", None, &kinds).await.unwrap();
         assert_eq!(hits[0].start_s, 200.0);
         assert!(search(&db, tmp.path(), "zebra", None, &opts).await.unwrap().is_empty());
     }
+
     #[test]
     fn phrase_and_all_terms_rank_above_partial_matches_after_grouping() {
         let tmp = tempfile::tempdir().unwrap();

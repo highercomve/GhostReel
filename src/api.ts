@@ -178,7 +178,59 @@ export interface VideoRow {
   steadiness_measured: boolean;
   /** static, tripod, stabilised, handheld, or unknown. */
   camera: string;
+  /** Category: interview, broll, screencast, drone, audio, other, or custom. */
+  category: string;
+  /** Confidence of auto-classification (0.0 to 1.0). */
+  category_confidence: number;
+  /** Source: 'auto' or 'manual'. */
+  category_source: string;
+  /** Secondary category tag (e.g. 'music'). */
+  category_tag?: string | null;
 }
+
+export interface SidecarMove {
+  from: string;
+  to: string;
+}
+
+export interface FileMoveItem {
+  video_id: number;
+  file_name: string;
+  current_path: string;
+  target_path: string;
+  category: string;
+  category_folder: string;
+  watched_folder_path: string;
+  already_organized: boolean;
+  conflict: string | null;
+  sidecars: SidecarMove[];
+}
+
+export interface OrganizePlan {
+  project_id: number;
+  items: FileMoveItem[];
+  total_files: number;
+  to_move_count: number;
+  already_organized_count: number;
+  conflict_count: number;
+}
+
+export interface OrganizeReport {
+  project_id: number;
+  moved_videos: number;
+  moved_sidecars: number;
+  skipped: number;
+  errors: string[];
+}
+
+export const CATEGORIES = [
+  { id: "interview", label: "Interview", folder: "Interviews", icon: "🎙️" },
+  { id: "broll", label: "B-Roll", folder: "B-Roll", icon: "🎬" },
+  { id: "screencast", label: "Screen Recording", folder: "Screen Recordings", icon: "💻" },
+  { id: "drone", label: "Drones & Aerials", folder: "Drones & Aerials", icon: "🚁" },
+  { id: "audio", label: "Music & Audio", folder: "Music & Audio", icon: "🎵" },
+  { id: "other", label: "Other", folder: "Other", icon: "📁" },
+] as const;
 
 /** One measured stretch of a video: `jerk` is camera shake as % of frame width per frame. */
 export interface MotionWindow {
@@ -354,6 +406,11 @@ export const queueList = () => call<Task[]>("queue_list");
 export const cancelTask = (id: number) => call<boolean>("cancel_task", { id });
 export const clearFinishedTasks = () => call<void>("clear_finished_tasks");
 
+export interface HitProject {
+  id: number;
+  name: string;
+}
+
 export interface Hit {
   video_id: number;
   path: string;
@@ -364,10 +421,30 @@ export interface Hit {
   matched_by: string[];
   snippet: string;
   frame: string | null;
+  projects?: HitProject[];
 }
 
-export const search = (projectId: number, query: string, limit = 30) =>
-  call<{ hits: Hit[]; note: string | null }>("search", { projectId, query, limit });
+export const search = (projectId?: number | null, query: string = "", limit = 30) =>
+  call<{ hits: Hit[]; note: string | null }>("search", { projectId: projectId ?? null, query, limit });
+
+export const videoDetails = (videoId: number) =>
+  call<VideoRow>("video_details", { videoId });
+
+export const openSearchWindow = () => {
+  if (isDesktop) {
+    return call<void>("open_search_window");
+  } else {
+    window.open("?window=search", "ghostreel-search", "width=1020,height=720");
+    return Promise.resolve();
+  }
+};
+
+export const focusMainWindow = () => {
+  if (isDesktop) {
+    return call<void>("focus_main_window");
+  }
+  return Promise.resolve();
+};
 let mediaBasePromise: Promise<string> | null = null;
 /** URL the player can stream (byte ranges) — WebKitGTK can't stream video from the asset protocol. */
 export const mediaUrl = async (path: string) => {
@@ -431,6 +508,13 @@ export const projectView = (projectId: number) => call<ProjectView>("project_vie
 export const addFolder = (projectId: number, path: string, recursive = true) =>
   call<void>("add_folder", { projectId, path, recursive });
 export const removeFolder = (projectId: number, path: string) => call<void>("remove_folder", { projectId, path });
+
+export const setVideoCategory = (videoId: number, category: string) =>
+  call<void>("set_video_category", { videoId, category });
+export const planOrganizeProject = (projectId: number) =>
+  call<OrganizePlan>("plan_organize_project", { projectId });
+export const executeOrganizeProject = (projectId: number) =>
+  call<OrganizeReport>("execute_organize_project", { projectId });
 
 
 export const FPS_PRESETS: { label: string; num: number; den: number }[] = [
@@ -878,3 +962,12 @@ export interface WebConfigPatch {
 
 export const webStatus = () => call<WebStatus>("web_status");
 export const setWebConfig = (patch: WebConfigPatch) => call<WebStatus>("set_web_config", { patch });
+
+export interface PlaybackProgress {
+  phase: string;
+  fraction: number | null;
+  encoded_s: number;
+  encoder: string | null;
+}
+export const videoPlaybackProgress = (videoId: number) =>
+  call<PlaybackProgress | null>("video_playback_progress", { videoId });

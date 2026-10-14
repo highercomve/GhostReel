@@ -807,33 +807,128 @@ pub fn render_preview(
 
 /// Where a video's playback proxy lives under the data dir.
 pub fn playback_proxy_path(data_dir: &Path, content_hash: &str) -> PathBuf {
+    playback_proxy_path_for_size(data_dir, content_hash, 768)
+}
+
+pub fn playback_proxy_path_for_size(data_dir: &Path, content_hash: &str, long_side: u32) -> PathBuf {
+    let long_side = long_side.clamp(256, 3840);
     let hex = content_hash.rsplit(':').next().unwrap_or(content_hash);
-    data_dir.join("proxies").join(&hex[..2.min(hex.len())]).join(format!("{hex}.mp4"))
+    data_dir.join("proxies").join(&hex[..2.min(hex.len())]).join(format!("{hex}-playback-v2-{long_side}.mp4"))
 }
 
 /// Whether a browser engine can be expected to play this file as it is: 8-bit 4:2:0 H.264 at
 /// 1080p or less. Camera originals — 4K, 10-bit 4:2:2, HEVC — are none of that, and WebKit
 /// software-decodes them so slowly the player sits black for a long time.
 pub async fn plays_natively(ffprobe: &Path, video: &Path) -> bool {
-    let out = crate::proc::command(ffprobe)
-        .args([
-            "-v",
-            "error",
-            "-select_streams",
-            "v:0",
-            "-show_entries",
-            "stream=codec_name,pix_fmt,height",
-            "-of",
-            "csv=p=0",
-        ])
+    // The elementary codec alone does not make camera containers or PCM audio browser-playable.
+    let extension = video.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    if !matches!(extension.as_str(), "mp4" | "m4v" | "mov") {
+        return false;
+    }
+    let Ok(out) = crate::proc::command(ffprobe)
+        .args(["-v", "error", "-show_entries", "stream=codec_type,codec_name,pix_fmt,height", "-of", "json"])
         .arg(video)
         .kill_on_drop(true)
         .output()
-        .await;
-    let Ok(out) = out else { return false };
-    let line = String::from_utf8_lossy(&out.stdout);
-    let f: Vec<&str> = line.lines().next().unwrap_or("").trim().split(',').collect();
-    f.len() >= 3 && f[0] == "h264" && f[1] == "yuv420p" && f[2].parse::<u32>().is_ok_and(|h| h <= 1080)
+        .await
+    else {
+        return false;
+    };
+    if !out.status.success() {
+        return false;
+    }
+    let Ok(info) = serde_json::from_slice::<serde_json::Value>(&out.stdout) else {
+        return false;
+    };
+    let Some(streams) = info["streams"].as_array() else {
+        return false;
+    };
+    let video_ok = streams.iter().find(|s| s["codec_type"] == "video").is_some_and(|s| {
+        s["codec_name"] == "h264" && s["pix_fmt"] == "yuv420p" && s["height"].as_u64().is_some_and(|h| h <= 1080)
+    });
+    let audio_ok = streams
+        .iter()
+        .filter(|s| s["codec_type"] == "audio")
+        .all(|s| matches!(s["codec_name"].as_str(), Some("aac" | "mp3")));
+    video_ok && audio_ok
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PlaybackProgress {
+    pub phase: String,
+    pub fraction: Option<f64>,
+    pub encoded_s: f64,
+    pub encoder: Option<String>,
+}
+
+struct ProxyJob {
+    gate: tokio::sync::Mutex<()>,
+    progress: std::sync::Mutex<PlaybackProgress>,
+}
+
+static PROXY_LOCKS: OnceLock<std::sync::Mutex<HashMap<PathBuf, std::sync::Weak<ProxyJob>>>> = OnceLock::new();
+
+fn proxy_job_for(path: &Path) -> Arc<ProxyJob> {
+    let mut map = PROXY_LOCKS.get_or_init(Default::default).lock().unwrap();
+    map.retain(|_, job| job.strong_count() > 0);
+    if let Some(job) = map.get(path).and_then(std::sync::Weak::upgrade) {
+        return job;
+    }
+    let job = Arc::new(ProxyJob {
+        gate: tokio::sync::Mutex::new(()),
+        progress: std::sync::Mutex::new(PlaybackProgress {
+            phase: "Checking playable copy…".into(),
+            fraction: None,
+            encoded_s: 0.0,
+            encoder: None,
+        }),
+    });
+    map.insert(path.to_path_buf(), Arc::downgrade(&job));
+    job
+}
+
+/// Shared progress for an active encode, including callers waiting for the same proxy.
+pub fn playback_proxy_progress(data_dir: &Path, hash: &str, long_side: u32) -> Option<PlaybackProgress> {
+    let map = PROXY_LOCKS.get()?.lock().ok()?;
+    let job = map.get(&playback_proxy_path_for_size(data_dir, hash, long_side))?.upgrade()?;
+    let progress = job.progress.lock().ok()?.clone();
+    Some(progress)
+}
+
+fn encoding_progress(line: &str, duration_s: Option<f64>) -> Option<(f64, Option<f64>)> {
+    let micros = line.strip_prefix("out_time_us=")?.parse::<f64>().ok()?;
+    if !micros.is_finite() {
+        return None;
+    }
+    let seconds = (micros / 1_000_000.0).max(0.0);
+    let fraction = duration_s.filter(|d| d.is_finite() && *d > 0.0).map(|d| (seconds / d).clamp(0.0, 0.99));
+    Some((seconds, fraction))
+}
+
+struct ProxyTemporaryFile(PathBuf);
+impl Drop for ProxyTemporaryFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Inspect actual decoded video and audio, rather than trusting a possibly corrupt MP4 header.
+/// This samples the start of the file; it is not a full-file integrity scan.
+pub async fn validate_proxy_file(ffmpeg: &Path, path: &Path) -> bool {
+    if !path.metadata().is_ok_and(|m| m.len() > 0) {
+        return false;
+    }
+    let Ok(out) = crate::proc::command(ffmpeg)
+        .args(["-v", "error", "-xerror", "-i"])
+        .arg(path)
+        .args(["-t", "1", "-map", "0:v:0", "-map", "0:a:0?", "-f", "null", "-"])
+        .kill_on_drop(true)
+        .output()
+        .await
+    else {
+        return false;
+    };
+    out.status.success()
 }
 
 /// A copy of the video the player can actually play: 720p, 8-bit 4:2:0 H.264 with AAC audio,
@@ -844,34 +939,102 @@ pub async fn playback_proxy(
     video: &Path,
     content_hash: &str,
 ) -> Result<PathBuf, Error> {
-    let out = playback_proxy_path(data_dir, content_hash);
-    if out.metadata().is_ok_and(|m| m.len() > 0) {
-        return Ok(out);
+    playback_proxy_with_progress(ffmpeg, data_dir, video, content_hash, None, 768).await
+}
+
+pub async fn playback_proxy_with_progress(
+    ffmpeg: &Path,
+    data_dir: &Path,
+    video: &Path,
+    content_hash: &str,
+    duration_s: Option<f64>,
+    long_side: u32,
+) -> Result<PathBuf, Error> {
+    let long_side = long_side.clamp(256, 3840);
+    let out = playback_proxy_path_for_size(data_dir, content_hash, long_side);
+
+    // 1. Per-video locking: prevents concurrent duplicate encodes for the same content_hash
+    let job = proxy_job_for(&out);
+    let _guard = job.gate.lock().await;
+
+    // 2. Cache validation & corrupted copy rebuilding
+    if out.exists() {
+        if validate_proxy_file(ffmpeg, &out).await {
+            return Ok(out);
+        }
+        // Remove corrupted or incomplete proxy copy so it can be rebuilt cleanly
+        let _ = tokio::fs::remove_file(&out).await;
     }
+
     if let Some(dir) = out.parent() {
         tokio::fs::create_dir_all(dir).await.map_err(|e| Error::Io(dir.to_path_buf(), e))?;
     }
-    let tmp = out.with_extension("part.mp4");
-    let enc = pick_encoder(ffmpeg);
+
+    // 3. Unique temporary file per attempt and process
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    let tmp = out.with_extension(format!("part-{}-{}.mp4", std::process::id(), nanos));
+    let _cleanup = ProxyTemporaryFile(tmp.clone());
+
+    let enc = tokio::task::spawn_blocking({
+        let ffmpeg = ffmpeg.to_path_buf();
+        move || pick_encoder(&ffmpeg)
+    })
+    .await
+    .map_err(|e| Error::Vision(format!("encoder detection: {e}")))?;
+    *job.progress.lock().unwrap() = PlaybackProgress {
+        phase: "Preparing a playable copy…".into(),
+        fraction: duration_s.map(|_| 0.0),
+        encoded_s: 0.0,
+        encoder: Some(enc.name.clone()),
+    };
     let mut cmd = crate::proc::command(ffmpeg);
-    cmd.args(["-y", "-v", "error", "-i"])
+    cmd.args(["-y", "-v", "error", "-progress", "pipe:1", "-nostats", "-i"])
         .arg(video)
-        .args(["-vf", "scale=-2:720,format=yuv420p"])
+        .args(["-vf", &format!("scale=w=\'min({long_side},iw)\':h=\'min({long_side},ih)\':force_original_aspect_ratio=decrease:force_divisible_by=2,setsar=1,format=yuv420p")])
+        .args(["-map", "0:v:0", "-map", "0:a:0?", "-sn", "-dn"])
         .args(enc.args.iter().map(String::as_str))
         .args(["-c:a", "aac", "-b:a", "128k", "-ac", "2", "-movflags", "+faststart"])
         .arg(&tmp)
         .kill_on_drop(true);
-    let status = cmd
-        .stdout(std::process::Stdio::null())
+    use tokio::io::AsyncBufReadExt;
+    let mut child = cmd
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .output()
-        .await
+        .spawn()
         .map_err(|e| Error::Vision(format!("ffmpeg: {e}")))?;
+    let mut lines = tokio::io::BufReader::new(child.stdout.take().unwrap()).lines();
+    let read_progress = async {
+        while let Some(line) = lines.next_line().await? {
+            if let Some((encoded_s, fraction)) = encoding_progress(&line, duration_s) {
+                let mut progress = job.progress.lock().unwrap();
+                progress.encoded_s = encoded_s.max(progress.encoded_s);
+                progress.fraction = fraction;
+            }
+        }
+        Ok::<_, std::io::Error>(())
+    };
+    // Drain stderr concurrently so FFmpeg cannot block on a full pipe.
+    let (read, output) = tokio::join!(read_progress, child.wait_with_output());
+    read.map_err(|e| Error::Vision(format!("proxy progress: {e}")))?;
+    let status = output.map_err(|e| Error::Vision(format!("ffmpeg: {e}")))?;
+
     if !status.status.success() {
         let _ = tokio::fs::remove_file(&tmp).await;
         let msg: String = String::from_utf8_lossy(&status.stderr).chars().take(300).collect();
         return Err(Error::Vision(format!("proxy encode failed: {msg}")));
     }
+
+    {
+        let mut progress = job.progress.lock().unwrap();
+        progress.phase = "Finishing playable copy…".into();
+        progress.fraction = None;
+    }
+    // 4. Validate the temporary file before promoting to final cache destination
+    if !validate_proxy_file(ffmpeg, &tmp).await {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(Error::Vision("proxy encode produced corrupt or unplayable output".into()));
+    }
+
     tokio::fs::rename(&tmp, &out).await.map_err(|e| Error::Io(out.clone(), e))?;
     Ok(out)
 }
@@ -1285,5 +1448,100 @@ mod tests {
             let dur: f64 = dur_str.parse().unwrap();
             assert!((dur - 3.5).abs() < 0.1, "duration {} should be ≈ 3.5s (tolerance 0.1s)", dur);
         }
+    }
+
+    #[test]
+    fn progress_uses_encoded_time_and_reserves_completion() {
+        assert_eq!(encoding_progress("out_time_us=2500000", Some(10.0)), Some((2.5, Some(0.25))));
+        assert_eq!(encoding_progress("out_time_us=12000000", Some(10.0)), Some((12.0, Some(0.99))));
+        assert_eq!(encoding_progress("out_time_us=1000000", None), Some((1.0, None)));
+        assert_eq!(encoding_progress("out_time_us=N/A", Some(10.0)), None);
+        assert_eq!(encoding_progress("out_time_us=NaN", Some(10.0)), None);
+    }
+
+    #[tokio::test]
+    async fn concurrent_playback_encodes_share_a_valid_resolution_specific_copy() {
+        let Some(ffmpeg) = crate::doctor::locate("ffmpeg") else {
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source.mp4");
+        let generated = crate::proc::command(&ffmpeg)
+            .args(["-v", "error", "-f", "lavfi", "-i", "testsrc2=size=960x540:rate=25:duration=2", "-c:v", "libx264"])
+            .arg(&source)
+            .status()
+            .await
+            .unwrap();
+        assert!(generated.success());
+        let hash = "b3e:concurrent";
+        let (a, b) = tokio::join!(
+            playback_proxy_with_progress(&ffmpeg, tmp.path(), &source, hash, Some(2.0), 512),
+            playback_proxy_with_progress(&ffmpeg, tmp.path(), &source, hash, Some(2.0), 512)
+        );
+        let a = a.unwrap();
+        assert_eq!(a, b.unwrap());
+        assert!(validate_proxy_file(&ffmpeg, &a).await);
+        assert_ne!(a, playback_proxy_path_for_size(tmp.path(), hash, 768));
+        let ffprobe = crate::doctor::locate("ffprobe").unwrap();
+        let out = crate::proc::command(ffprobe)
+            .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=p=0"])
+            .arg(&a)
+            .output()
+            .await
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "512,288");
+        // Preserve the container metadata while corrupting its media data: header-only checks miss this.
+        let mut bytes = std::fs::read(&a).unwrap();
+        let mdat = bytes.windows(4).position(|w| w == b"mdat").unwrap();
+        let end = (mdat + 4 + 8192).min(bytes.len());
+        bytes[mdat + 4..end].fill(0);
+        std::fs::write(&a, bytes).unwrap();
+        assert!(!validate_proxy_file(&ffmpeg, &a).await);
+        let rebuilt = playback_proxy_with_progress(&ffmpeg, tmp.path(), &source, hash, Some(2.0), 512).await.unwrap();
+        assert!(validate_proxy_file(&ffmpeg, &rebuilt).await);
+    }
+
+    #[tokio::test]
+    async fn test_playback_proxy_cache_validation_and_rebuilding() {
+        let Some(ffmpeg) = crate::doctor::locate("ffmpeg") else {
+            return;
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        // Create a fake corrupted proxy file (invalid data)
+        let hash = "b3e:corrupt123";
+        let proxy_path = playback_proxy_path(&data_dir, hash);
+        std::fs::create_dir_all(proxy_path.parent().unwrap()).unwrap();
+        std::fs::write(&proxy_path, "corrupted partial file with no moov atom").unwrap();
+
+        // validate_proxy_file should detect corruption
+        assert!(!validate_proxy_file(&ffmpeg, &proxy_path).await);
+
+        // Generate a small 1s source video
+        let video_path = temp.path().join("source.mp4");
+        let status = crate::proc::command(&ffmpeg)
+            .args([
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=320x240:rate=25:duration=1",
+                "-c:v",
+                "libx264",
+                "-f",
+                "mp4",
+            ])
+            .arg(&video_path)
+            .status()
+            .await
+            .unwrap();
+        assert!(status.success());
+
+        // playback_proxy must detect the corrupted cache file, remove it, and rebuild a valid one
+        let built_proxy = playback_proxy(&ffmpeg, &data_dir, &video_path, hash).await.unwrap();
+        assert!(built_proxy.exists());
+        assert!(validate_proxy_file(&ffmpeg, &built_proxy).await);
     }
 }

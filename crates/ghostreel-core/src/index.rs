@@ -312,6 +312,25 @@ async fn run_jobs(
         summary.jobs_failed += failed;
     }
 
+    // Auto-classify indexed videos that do not have manual category overrides.
+    if let Some(pid) = opts.project_id {
+        if let Err(error) = crate::classify::classify_project_videos(db, pid) {
+            tracing::warn!(%error, "automatic classification failed");
+        }
+    } else if let Ok(mut st) =
+        db.conn.prepare("SELECT id FROM videos WHERE COALESCE(category_source, 'auto') <> 'manual'")
+        && let Ok(vids) = st.query_map([], |r| r.get::<_, i64>(0)).map(|m| m.filter_map(Result::ok).collect::<Vec<_>>())
+    {
+        for vid in vids {
+            if let Ok(res) = crate::classify::classify_video(db, vid)
+                && let Err(error) =
+                    db.set_video_category(vid, &res.category, res.confidence, "auto", res.tag.as_deref())
+            {
+                tracing::warn!(%error, video_id = vid, "automatic classification update failed");
+            }
+        }
+    }
+
     tracker.finish();
     tracker.save_rates(db)?;
     on_event(Event::Progress(tracker.snapshot(None)));
@@ -2035,6 +2054,14 @@ pub struct VideoRow {
     pub steadiness_measured: bool,
     /// static, tripod, stabilised, handheld, or unknown.
     pub camera: String,
+    /// Category: interview, broll, screencast, drone, audio, other, or custom.
+    pub category: String,
+    /// Confidence of auto-classification (0.0 to 1.0).
+    pub category_confidence: f64,
+    /// Source: 'auto' or 'manual'.
+    pub category_source: String,
+    /// Secondary category tag (e.g. 'music').
+    pub category_tag: Option<String>,
 }
 
 /// Videos visible to a project (or all), one row per content with its first path.
@@ -2096,7 +2123,9 @@ pub fn videos_with_shake(
                 v.vcodec, v.has_audio, v.status, v.error, v.language,
                 (SELECT COUNT(*) FROM transcript_segments t WHERE t.video_id = v.id),
                 (SELECT j.state FROM jobs j WHERE j.video_id = v.id AND j.stage = 'transcribe'),
-                (SELECT COUNT(*) FROM frames f WHERE f.video_id = v.id)
+                (SELECT COUNT(*) FROM frames f WHERE f.video_id = v.id),
+                COALESCE(v.category, 'other'), COALESCE(v.category_confidence, 0.0), COALESCE(v.category_source, 'auto'),
+                v.category_tag
            FROM ({SCOPE}) sc JOIN videos v ON v.id = sc.video_id
           ORDER BY sc.path"
     ))?;
@@ -2122,6 +2151,10 @@ pub fn videos_with_shake(
             shaky_s: 0.0,
             steadiness_measured: false,
             camera: String::new(),
+            category: r.get(17)?,
+            category_confidence: r.get(18)?,
+            category_source: r.get(19)?,
+            category_tag: r.get(20)?,
         })
     })?;
     let mut out: Vec<VideoRow> = rows.collect::<Result<_, _>>()?;
@@ -2139,6 +2172,71 @@ pub fn videos_with_shake(
         }
     }
     Ok(out)
+}
+
+/// A single [`VideoRow`] with steadiness, camera style, and shakes.
+pub fn video_by_id(
+    db: &Db,
+    video_id: i64,
+    max_shake: f64,
+    shake_relative: f64,
+    max_sway: f64,
+) -> Result<VideoRow, Error> {
+    let mut st = db.conn.prepare(
+        "SELECT v.id, sc.path, sc.copies, v.size, v.duration_s, v.width, v.height, v.fps, COALESCE(v.vfr, 0),
+                v.vcodec, v.has_audio, v.status, v.error, v.language,
+                (SELECT COUNT(*) FROM transcript_segments t WHERE t.video_id = v.id),
+                (SELECT j.state FROM jobs j WHERE j.video_id = v.id AND j.stage = \x27transcribe\x27),
+                (SELECT COUNT(*) FROM frames f WHERE f.video_id = v.id),
+                COALESCE(v.category, 'other'), COALESCE(v.category_confidence, 0.0), COALESCE(v.category_source, 'auto'),
+                v.category_tag
+           FROM (
+             SELECT vf.video_id, MIN(vf.path) AS path, COUNT(DISTINCT vf.path) AS copies
+               FROM video_files vf
+              WHERE vf.video_id = ?1
+              GROUP BY vf.video_id
+           ) sc JOIN videos v ON v.id = sc.video_id",
+    )?;
+    let mut row = st.query_row([video_id], |r| {
+        Ok(VideoRow {
+            id: r.get(0)?,
+            path: PathBuf::from(r.get::<_, String>(1)?),
+            copies: r.get(2)?,
+            size: r.get(3)?,
+            duration_s: r.get(4)?,
+            width: r.get(5)?,
+            height: r.get(6)?,
+            fps: r.get(7)?,
+            vfr: r.get(8)?,
+            vcodec: r.get(9)?,
+            has_audio: r.get(10)?,
+            status: r.get(11)?,
+            error: r.get(12)?,
+            language: r.get(13)?,
+            segments: r.get(14)?,
+            transcribe: r.get(15)?,
+            frames: r.get(16)?,
+            shaky_s: 0.0,
+            steadiness_measured: false,
+            camera: String::new(),
+            category: r.get(17)?,
+            category_confidence: r.get(18)?,
+            category_source: r.get(19)?,
+            category_tag: r.get(20)?,
+        })
+    })?;
+    let windows = db.motion_windows(row.id).unwrap_or_default();
+    row.steadiness_measured = !windows.is_empty();
+    row.camera = crate::steadiness::camera_style(&windows).as_str().to_string();
+    if max_shake > 0.0 && !windows.is_empty() {
+        let limit = crate::steadiness::shake_limit(&windows, max_shake, shake_relative);
+        row.shaky_s = windows
+            .iter()
+            .filter(|w| w.jerk > limit || (max_sway > 0.0 && w.sway > max_sway))
+            .map(|w| w.end_s - w.start_s)
+            .sum();
+    }
+    Ok(row)
 }
 
 #[cfg(test)]

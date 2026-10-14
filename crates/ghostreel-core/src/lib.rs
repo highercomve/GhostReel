@@ -6,6 +6,7 @@
 pub mod audio;
 pub mod chat;
 pub mod chunks;
+pub mod classify;
 pub mod cliagent;
 pub mod config;
 pub mod db;
@@ -21,6 +22,7 @@ pub mod jev;
 pub mod llmlog;
 pub mod media;
 pub mod models;
+pub mod organize;
 pub mod otio;
 pub mod paths;
 pub mod preview;

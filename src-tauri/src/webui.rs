@@ -405,6 +405,18 @@ async fn dispatch(app: &AppHandle, cmd: &str, args: Value) -> Result<Value, Stri
             let (project_id, video_id) = args!(args; project_id: i64, video_id: i64);
             ok(crate::include_video(project_id, video_id)?)
         }
+        "set_video_category" => {
+            let (video_id, category) = args!(args; video_id: i64, category: String);
+            ok(crate::set_video_category(video_id, category)?)
+        }
+        "plan_organize_project" => {
+            let (project_id,) = args!(args; project_id: i64);
+            ok(crate::plan_organize_project(project_id)?)
+        }
+        "execute_organize_project" => {
+            let (project_id,) = args!(args; project_id: i64);
+            ok(crate::execute_organize_project(project_id).await?)
+        }
         "add_folder" => {
             let (project_id, path, recursive) = args!(args; project_id: i64, path: PathBuf, recursive: bool);
             ok(crate::add_folder(app.clone(), project_id, path, recursive)?)
@@ -414,8 +426,12 @@ async fn dispatch(app: &AppHandle, cmd: &str, args: Value) -> Result<Value, Stri
             ok(crate::remove_folder(project_id, path)?)
         }
         "search" => {
-            let (project_id, query, limit) = args!(args; project_id: i64, query: String, limit: Option<usize>);
+            let (project_id, query, limit) = args!(args; project_id: Option<i64>, query: String, limit: Option<usize>);
             ok(crate::search(app.state::<crate::SearchState>(), project_id, query, limit).await?)
+        }
+        "video_details" => {
+            let (video_id,) = args!(args; video_id: i64);
+            ok(crate::video_details(video_id)?)
         }
         // The window's media server listens on loopback only; a browser uses this server's.
         "media_base" => ok("/media"),
@@ -517,6 +533,10 @@ async fn dispatch(app: &AppHandle, cmd: &str, args: Value) -> Result<Value, Stri
         "video_steadiness" => {
             let (video_id,) = args!(args; video_id: i64);
             ok(crate::video_steadiness(video_id)?)
+        }
+        "video_playback_progress" => {
+            let (video_id,) = args!(args; video_id: i64);
+            ok(crate::video_playback_progress(video_id)?)
         }
         "video_playback" => {
             let (video_id,) = args!(args; video_id: i64);

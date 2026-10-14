@@ -3,7 +3,25 @@
 All notable changes to GhostReel. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [SemVer](https://semver.org/) while the project is 0.x (minor = features, patch = fixes).
 
-## [Unreleased]
+## [0.9.0] — 2026-10-14
+
+### Added
+
+- Global material search in a separate window, with project links and in-app clip previews.
+- Automatic video categories, manual overrides, category filtering, and a reviewed on-disk
+  organization plan that moves companion sidecars with footage.
+
+### Fixed
+
+- Search thumbnails, keyframe strips, and script images use the local HTTP media server to
+  avoid WebKit blocking asset URLs. Search falls back to the nearest available keyframe.
+- Playback copies show real encoding progress, share concurrent requests safely, and reject
+  cached copies whose media data fails decoding. Proxy cache keys include the configured
+  vision-sampling resolution; playback copies preserve aspect ratio and use that longest edge.
+- Organization refuses destination overwrites and category paths outside watched folders,
+  rolls back video moves after database errors, and keeps long filesystem work off the UI thread.
+- Cross-project preview navigation waits for project data, older search responses cannot replace
+  newer results, and automatic category ties are deterministic.
 
 ## [0.8.1] — 2026-10-06
 
@@ -699,7 +717,8 @@ is and the editor cuts around the shaky stretches; camera originals play in the 
 
 See the git history: `git log v0.1.5`.
 
-[Unreleased]: https://github.com/highercomve/GhostReel/compare/v0.8.1...HEAD
+[Unreleased]: https://github.com/highercomve/GhostReel/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/highercomve/GhostReel/compare/v0.8.1...v0.9.0
 [0.8.1]: https://github.com/highercomve/GhostReel/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/highercomve/GhostReel/compare/v0.7.2...v0.8.0
 [0.7.2]: https://github.com/highercomve/GhostReel/compare/v0.7.1...v0.7.2

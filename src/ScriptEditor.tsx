@@ -1,8 +1,8 @@
+import MediaImage from "./MediaImage";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   clock,
   fileName,
-  fileUrl,
   getScript,
   projectView,
   saveScript,
@@ -683,8 +683,8 @@ export default function ScriptEditor({
                             {/* Thumbnail */}
                             <div className="clip-thumb-wrap">
                               {frame ? (
-                                <img
-                                  src={fileUrl(frame.path)}
+                                <MediaImage
+                                  path={frame.path}
                                   alt=""
                                   className="clip-thumb"
                                   loading="lazy"
@@ -829,7 +829,7 @@ export default function ScriptEditor({
                                       onClick={() => onSelectReplacement(bIdx, cIdx, hit)}
                                     >
                                       {hit.frame ? (
-                                        <img src={fileUrl(hit.frame)} alt="" loading="lazy" />
+                                        <MediaImage path={hit.frame} alt="" loading="lazy" />
                                       ) : (
                                         <div className="noframe" />
                                       )}

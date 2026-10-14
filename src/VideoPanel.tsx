@@ -1,11 +1,13 @@
+import MediaImage from "./MediaImage";
 import type { SteadinessView } from "./api";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   clock,
   fileName,
-  fileUrl,
   mediaUrl,
   videoPlayback,
+  videoPlaybackProgress,
+  type PlaybackProgress,
   openExternal,
   videoFrames,
   videoSteadiness,
@@ -71,16 +73,33 @@ export default function VideoPanel({
     (w) => steadiness!.max_shake > 0 && (w.jerk > steadiness!.limit || (steadiness!.max_sway > 0 && w.sway > steadiness!.max_sway)),
   );
   const [preparing, setPreparing] = useState(false);
+  const [proxyProgress, setProxyProgress] = useState<PlaybackProgress | null>(null);
+  const [proxyError, setProxyError] = useState<string | null>(null);
   useEffect(() => {
     let cancelled = false;
     setPlayError(false);
     setSrc(null);
     setPreparing(true);
+    setProxyProgress(null);
+    setProxyError(null);
+    let finished = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const poll = async () => {
+      try {
+        const progress = await videoPlaybackProgress(video.id);
+        if (!cancelled && !finished) setProxyProgress(progress);
+      } catch { /* Playback remains usable if a progress poll fails. */ }
+      if (!cancelled && !finished) timer = setTimeout(poll, 500);
+    };
+    void poll();
     // A 4K 10-bit camera original sits black in the player for a long time; ask for something
     // it can play (a proxy, built once), and fall back to the original if that fails.
     videoPlayback(video.id)
       .then((pb) => mediaUrl(pb.path))
-      .catch(() => mediaUrl(video.path))
+      .catch((error) => {
+        if (!cancelled) setProxyError(String(error));
+        return mediaUrl(video.path);
+      })
       .then((url) => {
         if (!cancelled) setSrc(url);
       })
@@ -88,10 +107,13 @@ export default function VideoPanel({
         if (!cancelled) setPlayError(true);
       })
       .finally(() => {
+        finished = true;
+        clearTimeout(timer);
         if (!cancelled) setPreparing(false);
       });
     return () => {
       cancelled = true;
+      clearTimeout(timer);
     };
   }, [video.id, video.path]);
 
@@ -123,6 +145,12 @@ export default function VideoPanel({
       <div className="card-head">
         <span className="label">
           {fileName(video.path)}
+          {video.category && <span className={`tag cat-badge cat-${video.category}`}>{video.category}</span>}
+          {video.category_tag && (
+            <span className="tag cat-badge cat-tag" title={`Detected tag: ${video.category_tag}`}>
+              {video.category_tag === "music" ? "🎵 Music" : video.category_tag}
+            </span>
+          )}
           {video.language && <span className="tag">{video.language.toUpperCase()}</span>}
         </span>
         <span className="inline">
@@ -167,17 +195,29 @@ export default function VideoPanel({
             }
           }}
           onTimeUpdate={(e) => setNow(e.currentTarget.currentTime)}
-          onError={() => setPlayError(true)}
+          onError={() => { if (src && !preparing) setPlayError(true); }}
         />
         {preparing && !src && (
-          <div className="play-error muted">Preparing a playable copy…</div>
+          <div className="proxy-loading" role="status" aria-live="polite">
+            <div className="proxy-loading-label">
+              <span>{proxyProgress?.phase ?? "Checking playable copy…"}</span>
+              <span>{proxyProgress?.fraction != null ? `${Math.floor(proxyProgress.fraction * 100)}%` : ""}</span>
+            </div>
+            <progress aria-label="Playback copy creation" max={1}
+              value={proxyProgress?.fraction ?? undefined} />
+            {proxyProgress?.encoder && <div className="muted small">
+              {proxyProgress.encoder === "h264_nvenc" ? "GPU encoding" : "CPU encoding"}
+              {proxyProgress.encoded_s > 0 ? ` · ${clock(proxyProgress.encoded_s)} encoded` : ""}
+            </div>}
+          </div>
         )}
         {playError && (
           <div className="play-error">
-            This video format can't play here.{" "}
+            {proxyError ? "Could not prepare the playback copy." : "This video format can't play here."}{" "}
             <button className="ghost small" onClick={() => openExternal(video.path, now)}>
               Open in system player
             </button>
+            {proxyError && <details className="small"><summary>Error details</summary>{proxyError}</details>}
           </div>
         )}
       </div>
@@ -216,7 +256,7 @@ export default function VideoPanel({
                 jump(f.t_s);
               }}
             >
-              <img src={fileUrl(f.path)} alt="" loading="lazy" />
+              <MediaImage path={f.path} alt="" loading="lazy" />
               <figcaption>{clock(f.t_s)}</figcaption>
             </figure>
           ))}

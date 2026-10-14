@@ -159,6 +159,33 @@ fn include_video(project_id: i64, video_id: i64) -> CmdResult<()> {
 }
 
 #[tauri::command]
+fn set_video_category(video_id: i64, category: String) -> CmdResult<()> {
+    let db = open_db()?;
+    let tag = if category == "broll" || category == "audio" {
+        db.video_category(video_id).ok().and_then(|(_, _, _, t)| t)
+    } else {
+        None
+    };
+    db.set_video_category(video_id, &category, 1.0, "manual", tag.as_deref()).map_err(err)
+}
+
+#[tauri::command]
+fn plan_organize_project(project_id: i64) -> CmdResult<ghostreel_core::organize::OrganizePlan> {
+    let db = open_db()?;
+    ghostreel_core::organize::plan_organize_project(&db, project_id).map_err(err)
+}
+
+#[tauri::command]
+async fn execute_organize_project(project_id: i64) -> CmdResult<ghostreel_core::organize::OrganizeReport> {
+    tokio::task::spawn_blocking(move || {
+        let mut db = open_db()?;
+        ghostreel_core::organize::execute_organize_project(&mut db, project_id).map_err(err)
+    })
+    .await
+    .map_err(err)?
+}
+
+#[tauri::command]
 fn add_folder(app: AppHandle, project_id: i64, path: PathBuf, recursive: bool) -> CmdResult<Folder> {
     let folder = open_db()?.add_folder(project_id, &path, recursive).map_err(err)?;
     allow_media_dir(&app, &folder.path);
@@ -178,7 +205,7 @@ struct SearchState(tokio::sync::Mutex<Option<ghostreel_core::embed::Embedder>>);
 #[tauri::command]
 async fn search(
     state: State<'_, SearchState>,
-    project_id: i64,
+    project_id: Option<i64>,
     query: String,
     limit: Option<usize>,
 ) -> CmdResult<SearchView> {
@@ -193,8 +220,7 @@ async fn search(
             Err(why) => note = Some(format!("Keyword search only ({why})")),
         }
     }
-    let opts =
-        ghostreel_core::search::SearchOptions { project_id: Some(project_id), limit: limit.unwrap_or(30), kinds: None };
+    let opts = ghostreel_core::search::SearchOptions { project_id, limit: limit.unwrap_or(30), kinds: None };
     let vector = match cached.as_mut() {
         Some(e) => match ghostreel_core::search::query_vector(e, &query).await {
             Ok(v) => Some(v),
@@ -1090,30 +1116,91 @@ struct PlaybackView {
 #[tauri::command]
 async fn video_playback(video_id: i64) -> CmdResult<PlaybackView> {
     let p = paths()?;
-    let (path, hash): (String, String) = {
+    let (path, hash, duration, width, height): (String, String, Option<f64>, Option<u32>, Option<u32>) = {
         let db = Db::open(&p.db_file()).map_err(err)?;
         db.conn
             .query_row(
-                "SELECT vf.path, v.content_hash FROM videos v JOIN video_files vf ON vf.video_id = v.id WHERE v.id = ?1 LIMIT 1",
+                "SELECT vf.path, v.content_hash, v.duration_s, v.width, v.height FROM videos v JOIN video_files vf ON vf.video_id = v.id WHERE v.id = ?1 LIMIT 1",
                 [video_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
             .map_err(err)?
     };
+    let long_side = Config::load(&p.config_file).map_err(err)?.frames.clamped_long_side();
     let original = PathBuf::from(&path);
     let ffprobe = doctor::locate("ffprobe").ok_or_else(|| "ffprobe not found".to_string())?;
-    if ghostreel_core::preview::plays_natively(&ffprobe, &original).await {
+    if width.zip(height).is_some_and(|(w, h)| w.max(h) <= long_side)
+        && ghostreel_core::preview::plays_natively(&ffprobe, &original).await
+    {
         return Ok(PlaybackView { path: original, proxy: false });
     }
     let ffmpeg = doctor::locate("ffmpeg").ok_or_else(|| "ffmpeg not found".to_string())?;
-    let proxy = ghostreel_core::preview::playback_proxy(&ffmpeg, &p.data_dir, &original, &hash).await.map_err(err)?;
+    let proxy = ghostreel_core::preview::playback_proxy_with_progress(
+        &ffmpeg,
+        &p.data_dir,
+        &original,
+        &hash,
+        duration,
+        long_side,
+    )
+    .await
+    .map_err(err)?;
     Ok(PlaybackView { path: proxy, proxy: true })
+}
+
+#[tauri::command]
+fn video_playback_progress(video_id: i64) -> CmdResult<Option<ghostreel_core::preview::PlaybackProgress>> {
+    let p = paths()?;
+    let db = Db::open(&p.db_file()).map_err(err)?;
+    let hash: String =
+        db.conn.query_row("SELECT content_hash FROM videos WHERE id = ?1", [video_id], |r| r.get(0)).map_err(err)?;
+    let long_side = Config::load(&p.config_file).map_err(err)?.frames.clamped_long_side();
+    Ok(ghostreel_core::preview::playback_proxy_progress(&p.data_dir, &hash, long_side))
 }
 
 #[tauri::command]
 fn video_frames(video_id: i64) -> CmdResult<Vec<FrameRow>> {
     let p = paths()?;
     index::frames(&Db::open(&p.db_file()).map_err(err)?, &p.data_dir, video_id).map_err(err)
+}
+
+#[tauri::command]
+fn video_details(video_id: i64) -> CmdResult<VideoRow> {
+    let p = paths()?;
+    let db = Db::open(&p.db_file()).map_err(err)?;
+    index::video_by_id(&db, video_id, shake_limit(), shake_relative(), max_sway()).map_err(err)
+}
+
+#[tauri::command]
+async fn open_search_window(app: tauri::AppHandle) -> CmdResult<()> {
+    use tauri::Manager;
+    if let Some(win) = app.get_webview_window("search") {
+        let _ = win.unminimize();
+        let _ = win.show();
+        let _ = win.set_focus();
+        return Ok(());
+    }
+    let builder =
+        tauri::WebviewWindowBuilder::new(&app, "search", tauri::WebviewUrl::App("index.html?window=search".into()))
+            .title("Search Material — GhostReel")
+            .inner_size(1020.0, 720.0)
+            .min_inner_size(600.0, 450.0)
+            .resizable(true)
+            .center();
+
+    builder.build().map_err(err)?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn focus_main_window(app: tauri::AppHandle) -> CmdResult<()> {
+    use tauri::Manager;
+    if let Some(win) = app.get_webview_window("main") {
+        let _ = win.unminimize();
+        let _ = win.show();
+        let _ = win.set_focus();
+    }
+    Ok(())
 }
 
 #[derive(Serialize)]
@@ -1306,6 +1393,9 @@ pub fn run() {
             rename_project,
             exclude_video,
             include_video,
+            set_video_category,
+            plan_organize_project,
+            execute_organize_project,
             remove_project,
             project_view,
             add_folder,
@@ -1326,7 +1416,11 @@ pub fn run() {
             video_frames,
             video_steadiness,
             video_playback,
+            video_playback_progress,
+            video_details,
             search,
+            open_search_window,
+            focus_main_window,
             open_external,
             media_base,
             chat_turn,

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { createProject, FPS_PRESETS, isDesktop, listProjects, type ProjectSummary } from "./api";
+import { createProject, FPS_PRESETS, isDesktop, listProjects, openSearchWindow, focusMainWindow, type ProjectSummary } from "./api";
 import ActivityPage from "./ActivityPage";
 import ModelsPage from "./ModelsPage";
 import ProjectPage from "./ProjectPage";
@@ -9,7 +9,7 @@ import { onEvent } from "./events";
 import SettingsPage from "./SettingsPage";
 import { isActive, useQueue } from "./useQueue";
 
-type Page = { kind: "status" } | { kind: "models" } | { kind: "settings" } | { kind: "activity" } | { kind: "project"; id: number };
+type Page = { kind: "status" } | { kind: "models" } | { kind: "settings" } | { kind: "activity" } | { kind: "project"; id: number; openVideo?: { videoId: number; t: number } };
 
 function NewProject({ onCreated, onCancel }: { onCreated: (id: number) => void; onCancel: () => void }) {
   const [name, setName] = useState("");
@@ -95,6 +95,29 @@ export default function App() {
     });
   }, [checkForUpdates]);
 
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === "f") {
+        e.preventDefault();
+        void openSearchWindow();
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, []);
+
+  useEffect(() => {
+    return onEvent<{ projectId: number; videoId?: number; t?: number }>(
+      "navigate-to-project",
+      async ({ projectId, videoId, t }) => {
+        await focusMainWindow();
+        setPage({ kind: "project", id: projectId,
+          openVideo: videoId !== undefined && t !== undefined ? { videoId, t } : undefined,
+        });
+      },
+    );
+  }, []);
+
   return (
     <div className="shell">
       <nav>
@@ -102,6 +125,17 @@ export default function App() {
           <img src="/icon.png" alt="" width={28} height={28} />
           <span>GhostReel</span>
         </div>
+        <button
+          type="button"
+          className="nav-item search-material-btn"
+          onClick={() => void openSearchWindow()}
+          title="Search Material Globally (Ctrl+Shift+F / ⌘⇧F)"
+        >
+          <span className="search-nav-content">
+            <span className="search-nav-label">🔍 Search Material</span>
+            <kbd className="nav-shortcut">⇧⌘F</kbd>
+          </span>
+        </button>
         <div className="nav-title">Projects</div>
         {projects.map(({ project, status }) => (
           <button
@@ -169,7 +203,7 @@ export default function App() {
         ) : page.kind === "activity" ? (
           <ActivityPage />
         ) : (
-          <ProjectPage key={page.id} projectId={page.id} onChanged={refresh} />
+          <ProjectPage key={page.id} projectId={page.id} openVideo={page.openVideo} onChanged={refresh} />
         )}
       </div>
     </div>

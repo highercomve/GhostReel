@@ -276,6 +276,16 @@ const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE chat_sessions ADD COLUMN style_json TEXT;
     "#,
+    // v13 — video categorization (interview, b-roll, screencast, drone, audio, other)
+    r#"
+    ALTER TABLE videos ADD COLUMN category TEXT DEFAULT 'broll';
+    ALTER TABLE videos ADD COLUMN category_confidence REAL DEFAULT 0.0;
+    ALTER TABLE videos ADD COLUMN category_source TEXT DEFAULT 'auto';
+    "#,
+    // v14 — secondary category tag (e.g. 'music' for live performance B-Roll)
+    r#"
+    ALTER TABLE videos ADD COLUMN category_tag TEXT;
+    "#,
 ];
 
 static REGISTER_VEC: Once = Once::new();
@@ -401,6 +411,42 @@ impl Db {
             .ok();
         // No speech at all in range is not a problem for this check; silence opens nothing.
         first.is_none_or(|off_mic| !off_mic)
+    }
+
+    /// Record or override the category and optional secondary tag of a video ('interview', 'broll', 'screencast', 'drone', 'audio', 'other', etc.).
+    pub fn set_video_category(
+        &self,
+        video_id: i64,
+        category: &str,
+        confidence: f64,
+        source: &str,
+        tag: Option<&str>,
+    ) -> Result<(), Error> {
+        self.conn.execute(
+            "UPDATE videos SET category = ?2, category_confidence = ?3, category_source = ?4, category_tag = ?5 WHERE id = ?1",
+            params![video_id, category, confidence, source, tag],
+        )?;
+        Ok(())
+    }
+
+    /// Retrieve the category, confidence, source, and secondary tag of a video.
+    pub fn video_category(&self, video_id: i64) -> Result<(String, f64, String, Option<String>), Error> {
+        self.conn
+            .query_row(
+                "SELECT COALESCE(category, 'broll'), COALESCE(category_confidence, 0.0), COALESCE(category_source, 'auto'), category_tag FROM videos WHERE id = ?1",
+                [video_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .map_err(Error::from)
+    }
+
+    /// Update the recorded path of a video file when moved on the filesystem.
+    pub fn update_video_file_path(&self, old_path: &Path, new_path: &Path) -> Result<bool, Error> {
+        let old_str = old_path.to_string_lossy();
+        let new_str = new_path.to_string_lossy();
+        let updated =
+            self.conn.execute("UPDATE video_files SET path = ?2 WHERE path = ?1", params![old_str, new_str])?;
+        Ok(updated > 0)
     }
 
     fn migrate(&mut self) -> Result<(), Error> {

@@ -52,13 +52,10 @@ fn allowed(path: &std::path::Path) -> bool {
         return false;
     }
     let Ok(paths) = Paths::resolve() else { return false };
-    let previews_dir = paths.data_dir.join("previews");
-    if std::fs::canonicalize(&previews_dir).is_ok_and(|root| canonical.starts_with(root)) {
-        return true;
-    }
-    let proxies_dir = paths.data_dir.join("proxies");
-    if std::fs::canonicalize(&proxies_dir).is_ok_and(|root| canonical.starts_with(root)) {
-        return true;
+    for name in ["previews", "proxies", "frames", "chat_images"] {
+        if std::fs::canonicalize(paths.data_dir.join(name)).is_ok_and(|root| canonical.starts_with(root)) {
+            return true;
+        }
     }
     let Ok(db) = Db::open(&paths.db_file()) else { return false };
     let folders = db.folders(None).unwrap_or_default();
