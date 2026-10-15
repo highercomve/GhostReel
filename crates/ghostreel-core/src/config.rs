@@ -117,6 +117,9 @@ pub struct VisionConfig {
     pub kv_cache: String,
     /// Flash attention for the local helper: `auto`, `on` or `off`.
     pub flash_attn: String,
+    /// Keep this many blocks' MoE expert weights in system RAM. Dense models are unaffected.
+    /// 0 lets llama.cpp fit the model to available GPU memory automatically.
+    pub cpu_moe_layers: u32,
     /// How many tool calls the script chat may make before it has to draft: how much footage it
     /// gets to search, watch and read transcripts of. 0 = pick from the backend (a local model
     /// gets fewer, since every round costs it context it cannot spare).
@@ -158,6 +161,7 @@ impl Default for VisionConfig {
             ctx_tokens: DESCRIBE_CTX_TOKENS,
             kv_cache: "q4_0".into(),
             flash_attn: "auto".into(),
+            cpu_moe_layers: 0,
             max_tool_rounds: 0,
             think: false,
             describe_concurrency: default_describe_concurrency(),
@@ -168,6 +172,9 @@ impl Default for VisionConfig {
 
 impl VisionConfig {
     pub fn validate(&self, section: &str) -> Result<(), String> {
+        if self.cpu_moe_layers > 1024 {
+            return Err(format!("{section}.cpu_moe_layers must be between 0 and 1024"));
+        }
         if !(2048..=131_072).contains(&self.ctx_tokens) {
             return Err(format!("{section}.ctx_tokens must be between 2048 and 131072, got {}", self.ctx_tokens));
         }
@@ -266,7 +273,7 @@ pub struct ScriptConfig {
     pub max_bed_extend_s: f64,
     /// A clip is never stretched further than this to reach whole sentences (s).
     pub max_speech_extend_s: f64,
-    /// Tool rounds for a local model, whose context every result is spent from.
+    /// Local research tool-call ceiling, including proposed-clip inspections. Planning replies do not spend it.
     pub local_tool_rounds: u32,
     /// Tool rounds for a server or CLI brain: a stop against looping, not a research budget.
     pub roomy_tool_rounds: u32,
@@ -412,7 +419,7 @@ impl Default for ScriptConfig {
             server_timeout_s: 1800,
             max_bed_extend_s: 20.0,
             max_speech_extend_s: 12.0,
-            local_tool_rounds: 10,
+            local_tool_rounds: 30,
             roomy_tool_rounds: 60,
             local_tool_result_chars: 1500,
             roomy_tool_result_chars: 8000,
@@ -730,6 +737,7 @@ impl Config {
                 "ctx_tokens" => llm.ctx_tokens = num(key, value)?,
                 "kv_cache" => llm.kv_cache = value.to_string(),
                 "flash_attn" => llm.flash_attn = value.to_string(),
+                "cpu_moe_layers" => llm.cpu_moe_layers = num(key, value)?,
                 "think" => llm.think = flag(value),
                 "max_tool_rounds" => llm.max_tool_rounds = num(key, value)?,
                 "describe_concurrency" => llm.describe_concurrency = num(key, value)?,
@@ -926,6 +934,10 @@ mod tests {
         assert!(VisionConfig { ctx_tokens: 1024, ..VisionConfig::default() }.validate("vision").is_err());
         assert!(VisionConfig { kv_cache: "q2_k".into(), ..VisionConfig::default() }.validate("vision").is_err());
         assert!(VisionConfig { flash_attn: "maybe".into(), ..VisionConfig::default() }.validate("chat_model").is_err());
+        assert!(VisionConfig { cpu_moe_layers: 1025, ..VisionConfig::default() }.validate("chat_model").is_err());
+        let mut cfg = Config::default();
+        cfg.set_key("chat_model.cpu_moe_layers", "12").unwrap();
+        assert_eq!(cfg.chat_model().cpu_moe_layers, 12);
         assert!(back.validate().is_ok());
     }
 

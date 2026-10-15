@@ -340,6 +340,24 @@ fn native_catalog() -> Vec<CatalogEntry> {
             bundle: None,
         },
         CatalogEntry {
+            id: "qwen-agentworld-35b-a3b".into(),
+            kind: ModelKind::Vision,
+            file_name: "Qwen-AgentWorld-35B-A3B-UD-Q4_K_XL.gguf".into(),
+            url: "https://huggingface.co/unsloth/Qwen-AgentWorld-35B-A3B-GGUF/resolve/main/Qwen-AgentWorld-35B-A3B-UD-Q4_K_XL.gguf".into(),
+            size_bytes: 22_324_804_864,
+            speed: 3,
+            accuracy: 5,
+            note: "MoE · hybrid GPU/RAM; allow 32 GB system RAM, tune expert placement in Settings".into(),
+            languages: "multilingual".into(),
+            // AgentWorld uses the Qwen3.5-35B-A3B vision encoder architecture.
+            // Use a distinct installed name so the 9B model's projector cannot be selected.
+            mmproj_file_name: Some("mmproj-Qwen-AgentWorld-35B-A3B-BF16.gguf".into()),
+            mmproj_url: Some("https://huggingface.co/unsloth/Qwen3.5-35B-A3B-GGUF/resolve/main/mmproj-BF16.gguf".into()),
+            mmproj_size_bytes: Some(902_822_592),
+            vram_mb: Some(12000),
+            bundle: None,
+        },
+        CatalogEntry {
             id: "qwen2.5-vl-7b".into(),
             kind: ModelKind::Vision,
             file_name: "Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf".into(),
@@ -556,6 +574,11 @@ pub fn find_entry(id: &str) -> Option<CatalogEntry> {
         e.file_name.eq_ignore_ascii_case(trimmed)
             || e.mmproj_file_name.as_deref().is_some_and(|f| f.eq_ignore_ascii_case(trimmed))
     })
+}
+
+/// Block count for catalog MoE models; used only to label explicit expert placement.
+pub fn moe_blocks(id: &str) -> Option<u32> {
+    find_entry(id).filter(|e| e.id == "qwen-agentworld-35b-a3b").map(|_| 40)
 }
 
 /// Query installation status for every catalog entry.
@@ -848,6 +871,15 @@ pub async fn download(
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn agentworld_has_distinct_projector_and_known_expert_block_count() {
+        let entry = native_catalog().into_iter().find(|e| e.id == "qwen-agentworld-35b-a3b").unwrap();
+        assert_eq!(entry.file_name, "Qwen-AgentWorld-35B-A3B-UD-Q4_K_XL.gguf");
+        assert_eq!(moe_blocks(&entry.id), Some(40));
+        assert_eq!(moe_blocks("qwen3.5-9b"), None);
+        assert_ne!(entry.mmproj_file_name.as_deref(), Some("mmproj-F16.gguf"));
+    }
 
     #[test]
     fn whisper_names() {

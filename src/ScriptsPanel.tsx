@@ -1,4 +1,5 @@
 import MediaImage from "./MediaImage";
+import ChatAnswerStats from "./ChatAnswerStats";
 import { useEffect, useRef, useState } from "react";
 import {
   getAiSettings,
@@ -769,6 +770,7 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
                     </div>
                   )}
                   {msg.content && <div className="bubble-text">{msg.content}</div>}
+                  {msg.role === "assistant" && <ChatAnswerStats performance={msg.performance} />}
                   {msg.script_id != null && (
                     <div className="bubble-script-link">
                       <button
@@ -1070,6 +1072,33 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
                     Auto-selects best available
                   </span>
                 )}
+
+                <label
+                  className="composer-think-label"
+                  title="Tool-call budget for chat research. 0 uses the backend default (local agents allow 30). Applies to local, server and CLI brains."
+                >
+                  <input
+                    key={`budget-${aiSettings.chat_model.max_tool_rounds ?? 0}`}
+                    type="number"
+                    className="composer-budget-input"
+                    min={0}
+                    max={1000}
+                    step={1}
+                    defaultValue={aiSettings.chat_model.max_tool_rounds ?? 0}
+                    disabled={isTurnRunning}
+                    onBlur={(e) => {
+                      const value = Number(e.currentTarget.value);
+                      if (!Number.isInteger(value) || value < 0 || value > 1000) {
+                        e.currentTarget.value = String(aiSettings.chat_model.max_tool_rounds ?? 0);
+                        return;
+                      }
+                      if (value !== (aiSettings.chat_model.max_tool_rounds ?? 0)) {
+                        handleUpdateChatModel({ max_tool_rounds: value });
+                      }
+                    }}
+                  />
+                  tools
+                </label>
               </div>
             </div>
           )}

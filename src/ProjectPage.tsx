@@ -290,7 +290,7 @@ export default function ProjectPage({ projectId, onChanged, openVideo }: {
   const selectedVideo = view.videos.find((v) => v.id === selected) ?? null;
 
   return (
-    <main className={tab === "scripts" ? "wide" : ""}>
+    <main className="project-workspace">
       <header>
         <div>
           {editName != null ? (
@@ -649,7 +649,7 @@ export default function ProjectPage({ projectId, onChanged, openVideo }: {
         </div>
       )}
 
-      <section className="card">
+      <section className="card video-library" tabIndex={0} aria-label="Video library, scroll horizontally to see all columns">
         {view.videos.length === 0 ? (
           <div className="muted">No videos yet — add a folder and press “Index now”.</div>
         ) : (

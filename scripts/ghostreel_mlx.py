@@ -7,6 +7,7 @@ The frozen executable includes Python, MLX/Metal and tokenizer/processor depende
 import argparse
 import contextlib
 import json
+import math
 import os
 from pathlib import Path
 import sys
@@ -34,6 +35,7 @@ class MlxEngine:
         self.template = apply_chat_template
         self.prepare = _prepare_generation_inputs
         self.schema_processor = build_json_schema_logits_processor
+        self.model_name = Path(model_dir).name
         self.ctx = ctx
         self.kv_bits = {'q4_0': 4, 'q8_0': 8, 'f16': None}[kv_type]
         self.model, self.processor = load(str(model_dir), trust_remote_code=False, use_fast=False, local_files_only=True)
@@ -88,7 +90,11 @@ class MlxEngine:
             content = result.text
             if schema:
                 json.loads(content)  # Never return malformed JSON as a successful structured reply.
+            rate = getattr(result, "generation_tps", None)
+            generation_seconds = (result.generation_tokens / rate
+                                  if rate is not None and math.isfinite(rate) and rate > 0 else None)
             return {
+                'model': self.model_name, 'backend': 'mlx', 'generation_seconds': generation_seconds,
                 'ok': True, 'content': content, 'prompt_tokens': result.prompt_tokens,
                 'gen_tokens': result.generation_tokens, 'secs': time.monotonic() - started,
             }
@@ -163,7 +169,7 @@ def main():
     except Exception as error:
         print(f'ghostreel-mlx: {error}', file=sys.stderr, flush=True)
         raise SystemExit(1)
-    emit({'ready': True, 'backend': 'mlx', 'embed_dim': None, 'ctx': args.ctx})
+    emit({'ready': True, 'backend': 'mlx', 'model': engine.model_name, 'embed_dim': None, 'ctx': args.ctx})
     serve(engine)
 
 

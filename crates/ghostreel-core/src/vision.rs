@@ -194,6 +194,11 @@ pub struct LocalLlm {
     lines: Lines<BufReader<ChildStdout>>,
     next_id: u64,
     pub embed_dim: Option<usize>,
+    /// Actual window after model limits / memory fallback, rather than the requested size.
+    pub ctx_tokens: Option<u32>,
+    token_count: bool,
+    model_name: String,
+    inference: Vec<crate::inference::InferenceCall>,
     #[cfg(unix)]
     process_group: Option<HelperProcessGroup>,
 }
@@ -231,6 +236,7 @@ pub struct HelperRuntime {
     pub ctx_tokens: u32,
     pub kv_cache: String,
     pub flash_attn: String,
+    pub cpu_moe_layers: u32,
     /// Whether this helper's calls may reason before answering.
     pub think: bool,
 }
@@ -241,6 +247,7 @@ impl Default for HelperRuntime {
             ctx_tokens: crate::config::DESCRIBE_CTX_TOKENS,
             kv_cache: "q4_0".into(),
             flash_attn: "auto".into(),
+            cpu_moe_layers: 0,
             think: false,
         }
     }
@@ -252,6 +259,7 @@ impl From<&crate::config::VisionConfig> for HelperRuntime {
             ctx_tokens: c.ctx_tokens,
             kv_cache: c.kv_cache.clone(),
             flash_attn: c.flash_attn.clone(),
+            cpu_moe_layers: c.cpu_moe_layers,
             think: c.think,
         }
     }
@@ -278,6 +286,9 @@ impl LocalLlm {
             .arg(&m.runtime.kv_cache)
             .arg("--flash-attn")
             .arg(&m.runtime.flash_attn);
+        if m.runtime.cpu_moe_layers > 0 {
+            cmd.arg("--cpu-moe").arg(m.runtime.cpu_moe_layers.to_string());
+        }
         Self::start_command(cmd, &m.helper, false).await
     }
 
@@ -351,6 +362,10 @@ impl LocalLlm {
                     lines,
                     next_id: 1,
                     embed_dim,
+                    ctx_tokens: v["ctx"].as_u64().and_then(|n| u32::try_from(n).ok()).filter(|n| *n > 0),
+                    token_count: v["token_count"].as_bool().unwrap_or(false),
+                    model_name: v["model"].as_str().unwrap_or("Local model not reported").to_string(),
+                    inference: Vec::new(),
                     #[cfg(unix)]
                     process_group,
                 })
@@ -364,7 +379,26 @@ impl LocalLlm {
         }
     }
 
+    /// Tokenize without evaluating the model; used to reserve the complete draft's output.
+    /// Older/MLX helpers use a conservative estimate until they advertise this capability.
+    pub async fn prompt_tokens(&mut self, prompt: &str, think: bool, image: Option<&Path>) -> Result<usize, Error> {
+        if !self.token_count {
+            return Ok(prompt.len().div_ceil(3) + if image.is_some() { 4096 } else { 0 });
+        }
+        let v = self.request(json!({"cmd":"count_tokens", "prompt":prompt, "think":think, "image":image})).await?;
+        v["tokens"]
+            .as_u64()
+            .and_then(|n| usize::try_from(n).ok())
+            .ok_or_else(|| Error::Vision("helper did not report its prompt token count".into()))
+    }
+
+    pub fn take_inference(&mut self) -> Vec<crate::inference::InferenceCall> {
+        std::mem::take(&mut self.inference)
+    }
+
     async fn request(&mut self, mut req: Value) -> Result<Value, Error> {
+        let started = std::time::Instant::now();
+        let is_completion = req["cmd"].as_str() == Some("complete");
         let id = self.next_id;
         self.next_id += 1;
         req["id"] = json!(id);
@@ -399,6 +433,15 @@ impl LocalLlm {
                 log_reply(&v);
             }
             if v["ok"] == json!(true) {
+                if is_completion {
+                    let backend = v["backend"].as_str().unwrap_or("local");
+                    self.inference.push(crate::inference::InferenceCall::from_response(
+                        &v,
+                        backend,
+                        &self.model_name,
+                        started.elapsed().as_secs_f64(),
+                    ));
+                }
                 return Ok(v);
             }
             return Err(Error::Vision(v["error"].as_str().unwrap_or("helper error").to_string()));
@@ -709,6 +752,36 @@ mod tests {
     use super::*;
     use tokio::io::AsyncReadExt;
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn uses_reported_window_and_exact_token_count() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let helper = tmp.path().join("llm");
+        std::fs::write(
+            &helper,
+            r#"#!/bin/sh
+echo '{"ready":true,"ctx":4096,"token_count":true}'
+read -r line
+echo '{"id":1,"ok":true,"tokens":17}'
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut llm = LocalLlm::start(&LocalModels {
+            helper,
+            vision: Some(("m".into(), "p".into())),
+            embed: None,
+            cpu: true,
+            runtime: Default::default(),
+            concurrency: 1,
+        })
+        .await
+        .unwrap();
+        assert_eq!(llm.ctx_tokens, Some(4096));
+        assert_eq!(llm.prompt_tokens("use actual tokenizer", false, None).await.unwrap(), 17);
+    }
+
     #[test]
     fn parses_fenced_and_rejects_empty() {
         let d = parse_description(
@@ -844,7 +917,7 @@ while IFS= read -r line; do
   case "$line" in
     *'"cmd":"complete"'*)
       if [ "$mt" -ge 4096 ]; then
-        printf '{"id":%s,"ok":true,"content":"{\\"done\\":true}","truncated":false}\n' "$id"
+        printf '{"id":%s,"ok":true,"content":"{\\"done\\":true}","truncated":false,"model":"test-actual-model","backend":"llama.cpp","gen_tokens":80,"generation_seconds":2.0,"secs":3.0}\n' "$id"
       else
         printf '{"id":%s,"ok":true,"content":"{\\"beats\\":[{\\"narr","truncated":true}\n' "$id"
       fi ;;
@@ -873,6 +946,13 @@ done
         // A budget big enough for the whole answer succeeds.
         let ok = llm.complete_limited("prompt", None, 4096).await.unwrap();
         assert_eq!(ok, r#"{"done":true}"#);
+        let calls = llm.take_inference();
+        assert_eq!(calls.len(), 2, "a truncated attempt still used inference time");
+        assert_eq!(calls[1].model, "test-actual-model");
+        assert_eq!(calls[1].output_tokens, Some(80));
+        assert_eq!(calls[1].generation_seconds, Some(2.0));
+        assert_eq!(calls[1].request_seconds, 3.0);
+        assert!(llm.take_inference().is_empty(), "new turns must not inherit old measurements");
     }
 
     #[cfg(unix)]

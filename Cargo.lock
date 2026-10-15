@@ -1677,7 +1677,7 @@ dependencies = [
 
 [[package]]
 name = "ghostreel-app"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -1698,7 +1698,7 @@ dependencies = [
 
 [[package]]
 name = "ghostreel-asr"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "serde_json",
  "whisper-rs",
@@ -1706,7 +1706,7 @@ dependencies = [
 
 [[package]]
 name = "ghostreel-cli"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1717,7 +1717,7 @@ dependencies = [
 
 [[package]]
 name = "ghostreel-core"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "base64 0.23.1",
  "blake3",
@@ -1743,7 +1743,7 @@ dependencies = [
 
 [[package]]
 name = "ghostreel-llm"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "encoding_rs",
  "llama-cpp-2",
@@ -2660,8 +2660,6 @@ checksum = "47d9d19d1d6efa0109d2f65ff4c85cddd50bd572e5a00127ab10987290bcefae"
 [[package]]
 name = "llama-cpp-2"
 version = "0.1.156"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6450f6d59b4d758b0d92f50a640136c713ec7e08d8ebb0595db03c939b502d4"
 dependencies = [
  "encoding_rs",
  "enumflags2",

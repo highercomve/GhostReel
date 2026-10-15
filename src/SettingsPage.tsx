@@ -253,6 +253,26 @@ export default function SettingsPage() {
         </div>
       </header>
 
+      {ai && (
+        <>
+          <h2>Script chat · research</h2>
+          <section className="card">
+            <div className="settings-field">
+              <label htmlFor="research-budget">Research limit</label>
+              <input id="research-budget" type="number" min={0} max={1000} step={1} style={{ width: "7em" }}
+                defaultValue={ai.chat_model.max_tool_rounds ?? 0}
+                onBlur={async (e) => {
+                  const value = Number(e.currentTarget.value);
+                  if (!Number.isInteger(value) || value < 0 || value > 1000) { setError("Research limit must be a whole number from 0 to 1000."); return; }
+                  try { setAi(await setAiSettings({ chat_model: { max_tool_rounds: value } })); setError(null); }
+                  catch (err) { setError(String(err)); }
+                }} />
+              <span className="muted small">0 uses the configured backend default. Local agents allow 30 calls by default; planning replies do not spend them. Selected shots and spoken quotes are inspected before the local agent reviews its draft. Server and CLI backends use this as their research-round limit. An adequately researched edit can finish sooner.</span>
+            </div>
+          </section>
+        </>
+      )}
+
       {ai && ai.chat_model.backend !== "server" && (
         <>
           <h2>Script chat · model on this computer</h2>
@@ -281,7 +301,38 @@ export default function SettingsPage() {
                     }
                   }}
                 />
-                <span className="muted small">tokens · 32768 is a good default on an 8 GB card</span>
+                <span className="muted small">tokens · the loaded window is capped by the model and available memory</span>
+              </div>
+              <div className="settings-field">
+                <label>Flash attention · llama.cpp</label>
+                <select value={ai.chat_model.flash_attn} onChange={async (e) => {
+                  try { setAi(await setAiSettings({ chat_model: { flash_attn: e.currentTarget.value } })); }
+                  catch (err) { setError(String(err)); }
+                }}>
+                  <option value="auto">Automatic · use when supported</option>
+                  <option value="on">On · require support</option>
+                  <option value="off">Off · use f16 KV cache</option>
+                </select>
+              </div>
+              <div className="settings-field">
+                <label htmlFor="chat-moe-ram">MoE experts in system RAM · llama.cpp</label>
+                <input id="chat-moe-ram" type="range" min={0} max={ai.chat_model.moe_blocks ?? 64} step={1}
+                  style={{ width: "min(100%, 28em)" }}
+                  value={Math.min(ai.chat_model.cpu_moe_layers ?? 0, ai.chat_model.moe_blocks ?? 64)}
+                  onChange={(e) => setAi({ ...ai, chat_model: { ...ai.chat_model, cpu_moe_layers: Number(e.currentTarget.value) } })}
+                  onPointerUp={async (e) => {
+                    try { setAi(await setAiSettings({ chat_model: { cpu_moe_layers: Number(e.currentTarget.value) } })); }
+                    catch (err) { setError(String(err)); }
+                  }}
+                  onKeyUp={async (e) => {
+                    try { setAi(await setAiSettings({ chat_model: { cpu_moe_layers: Number(e.currentTarget.value) } })); }
+                    catch (err) { setError(String(err)); }
+                  }} />
+                <span className="small">{!ai.chat_model.cpu_moe_layers ? "Automatic · fit to available GPU memory"
+                  : ai.chat_model.moe_blocks
+                    ? `${Math.round(ai.chat_model.cpu_moe_layers / ai.chat_model.moe_blocks * 100)}% · ${ai.chat_model.cpu_moe_layers} of ${ai.chat_model.moe_blocks} expert blocks in RAM`
+                    : `${ai.chat_model.cpu_moe_layers} expert blocks in RAM`}</span>
+                <span className="muted small">Attention stays on the GPU. More experts in RAM free VRAM for context, but can slow generation. For AgentWorld on a 12 GB NVIDIA GPU, 80% (32 blocks) was tested at 128k context. Dense models ignore this setting; MLX manages its own memory. Changes apply when the model reloads.</span>
               </div>
               <div className="settings-field">
                 <label>KV cache</label>

@@ -54,6 +54,7 @@ class ProtocolTests(unittest.TestCase):
 class GenerationTests(unittest.TestCase):
     def engine(self, result):
         engine = helper.MlxEngine.__new__(helper.MlxEngine)
+        engine.model_name = "test-mlx-model"
         engine.ctx, engine.kv_bits = 8192, 4
         engine.model = SimpleNamespace(config={})
         engine.processor = object()
@@ -71,10 +72,12 @@ class GenerationTests(unittest.TestCase):
 
     def test_structured_generation_uses_grammar_and_preserves_metrics(self):
         engine = self.engine(SimpleNamespace(text='{"description":"red"}', finish_reason='stop',
-                                           prompt_tokens=12, generation_tokens=5))
+                                           prompt_tokens=12, generation_tokens=5, generation_tps=10.0))
         reply = engine.complete({'prompt': 'Describe', 'schema': {'type': 'object'}, 'think': True})
         self.assertTrue(reply['ok'])
         self.assertEqual(reply['gen_tokens'], 5)
+        self.assertEqual(reply['model'], 'test-mlx-model')
+        self.assertEqual(reply['generation_seconds'], 0.5)
         self.assertEqual(engine.options['logits_processors'], ['grammar'])
         self.assertFalse(engine.options['enable_thinking'])
         self.assertEqual(engine.options['kv_bits'], 4)

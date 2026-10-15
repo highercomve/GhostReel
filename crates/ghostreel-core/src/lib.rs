@@ -79,3 +79,5 @@ pub enum Error {
     #[error("cannot determine the user's {0} directory")]
     NoHomeDir(&'static str),
 }
+
+pub mod inference;

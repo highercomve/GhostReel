@@ -643,6 +643,21 @@ export interface ChatMessage {
   tool_calls: ToolCallRecord[] | null;
   script_id: number | null;
   created_at: number;
+  performance?: ChatPerformance | null;
+}
+
+export interface InferenceCall {
+  model: string;
+  backend: string;
+  prompt_tokens: number | null;
+  output_tokens: number | null;
+  generation_seconds: number | null;
+  request_seconds: number;
+}
+
+export interface ChatPerformance {
+  elapsed_seconds: number;
+  calls: InferenceCall[];
 }
 
 export interface ChatTurnView {
@@ -774,6 +789,9 @@ export interface VisionSettings {
   kv_cache: string;
   /** auto | on | off */
   flash_attn: string;
+  cpu_moe_layers: number;
+  moe_blocks?: number | null;
+  max_tool_rounds: number;
   think: boolean;
   /** Frames described at once against a server; only meaningful when the server has slots. */
   describe_concurrency: number;
@@ -867,6 +885,8 @@ export interface VisionSettingsPatch {
   ctx_tokens?: number;
   kv_cache?: string;
   flash_attn?: string;
+  cpu_moe_layers?: number;
+  max_tool_rounds?: number;
   think?: boolean;
   cli?: {
     tool?: string;

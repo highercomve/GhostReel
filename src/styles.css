@@ -16,6 +16,35 @@
   background: var(--bg);
 }
 
+.chat-answer-stats {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin-top: 12px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.chat-answer-stat-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 12px;
+}
+
+.chat-answer-model {
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+
+.chat-answer-rate {
+  color: var(--good);
+  white-space: nowrap;
+}
+
 @media (prefers-color-scheme: light) {
   :root {
     --bg: #f6f6fa;
@@ -205,7 +234,7 @@ button:disabled {
 
 .shell {
   display: grid;
-  grid-template-columns: 220px 1fr;
+  grid-template-columns: 220px minmax(0, 1fr);
   height: 100vh;
 }
 
@@ -270,6 +299,7 @@ nav {
 }
 
 .content {
+  min-width: 0;
   overflow-y: auto;
 }
 
@@ -637,6 +667,40 @@ mark {
 
 main.wide {
   max-width: 1440px;
+}
+
+/* Project tools use the available workspace, including on ultrawide displays. */
+main.project-workspace {
+  width: 100%;
+  max-width: none;
+  padding-inline: clamp(20px, 2.2vw, 48px);
+}
+
+.video-library {
+  overflow-x: auto;
+}
+
+.video-library table {
+  min-width: 1120px;
+}
+
+.video-library th,
+.video-library td {
+  padding: 10px 12px;
+}
+
+.video-library th:first-child,
+.video-library td.name {
+  width: 100%;
+  min-width: 240px;
+}
+
+.video-library td.name {
+  overflow-wrap: anywhere;
+}
+
+.project-workspace > header {
+  flex-wrap: wrap;
 }
 
 .tab-nav {
@@ -1302,6 +1366,16 @@ main.wide {
   border-radius: 4px;
   color: var(--text);
   max-width: 140px;
+}
+
+.composer-budget-input {
+  width: 3.5em;
+  padding: 2px 4px;
+  font-size: 11px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
 }
 
 .composer-think-label {

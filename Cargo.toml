@@ -2,12 +2,16 @@
 resolver = "2"
 members = ["crates/ghostreel-core", "crates/ghostreel-cli", "src-tauri", "crates/ghostreel-asr", "crates/ghostreel-llm"]
 # spikes/ are throwaway experiments with their own workspace (and CUDA builds).
-exclude = ["spikes"]
+exclude = ["spikes", "vendor/llama-cpp-2"]
 
 [workspace.package]
-version = "0.9.0"
+version = "0.10.0"
 edition = "2024"
 license = "MIT"
 
 [profile.release]
 debug = false
+
+# Pinned binding extension for owned resident CPU pools and pinned model-load settings.
+[patch.crates-io]
+llama-cpp-2 = { path = "vendor/llama-cpp-2" }

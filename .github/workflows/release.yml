@@ -185,7 +185,7 @@ jobs:
           path: |
             target/release/ghostreel-asr
             target/release/ghostreel-llm
-          key: helpers-linux-x64-cuda12.8.1-${{ env.CMAKE_CUDA_ARCHITECTURES }}-${{ hashFiles('crates/ghostreel-asr/**', 'crates/ghostreel-llm/**', 'scripts/build-helpers.sh') }}-${{ steps.helper-deps.outputs.hash }}
+          key: helpers-linux-x64-cuda12.8.1-${{ env.CMAKE_CUDA_ARCHITECTURES }}-${{ hashFiles('crates/ghostreel-asr/**', 'crates/ghostreel-llm/**', 'vendor/llama-cpp-2/**', 'scripts/build-helpers.sh') }}-${{ steps.helper-deps.outputs.hash }}
 
       - name: Build native helpers
         if: steps.helpers.outputs.cache-hit != 'true'
@@ -388,7 +388,7 @@ jobs:
           path: |
             target/release/ghostreel-asr.exe
             target/release/ghostreel-llm.exe
-          key: helpers-windows-x64-cuda12.8.1-${{ env.CMAKE_CUDA_ARCHITECTURES }}-${{ hashFiles('crates/ghostreel-asr/**', 'crates/ghostreel-llm/**', 'scripts/build-helpers.sh') }}-${{ steps.helper-deps.outputs.hash }}
+          key: helpers-windows-x64-cuda12.8.1-${{ env.CMAKE_CUDA_ARCHITECTURES }}-${{ hashFiles('crates/ghostreel-asr/**', 'crates/ghostreel-llm/**', 'vendor/llama-cpp-2/**', 'scripts/build-helpers.sh') }}-${{ steps.helper-deps.outputs.hash }}
 
       - name: Build helper ghostreel-asr
         if: steps.helpers.outputs.cache-hit != 'true'

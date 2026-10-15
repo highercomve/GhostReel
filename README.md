@@ -96,6 +96,93 @@ search results and a whole draft. Defaults: 8k context for descriptions, 32k for
 cache and flash attention, which is what fits a 32k window on an 8 GB card (an `f16` cache would need 4 GB for the
 cache alone).
 
+The llama.cpp helper fits GPU layers and MoE expert placement to available device memory, leaving
+headroom for the vision projector. Settings exposes flash attention (`auto`, `on`, `off`) and
+`chat_model.cpu_moe_layers`: 0 keeps automatic fitting; a positive value keeps the first N blocks'
+expert weights in system RAM. This only affects MoE models, and trades generation speed for GPU
+memory; it does not turn a dense model into an MoE. These controls do not apply to MLX.
+
+The helper caps the context at the model's trained limit and retries smaller windows on allocation
+failure. Script chat uses that **actual loaded window**, counts prompt tokens before generation,
+and drops old exchanges while retaining the rules, current request and latest evidence to reserve
+space for a complete draft. Text requests reuse the common prompt prefix, with a bounded snapshot
+of recurrent/SWA state so Qwen3.5 can reuse it too. Image requests and incompatible cache states
+rebuild safely.
+
+`python3 scripts/smoke-llm-cache.py --helper <ghostreel-llm> --model <model.gguf>
+--mmproj <projector.gguf> [--cpu]` checks cached results against fresh inference without downloading
+models. A local Qwen3.5 9B CPU check took 1.85 s for a growing conversation versus 14.38 s fresh
+(322 reused tokens, one generated token, excluding model load). This measures prompt reuse rather
+than whole-script or GPU throughput.
+
+For NVIDIA hardware validation, build the CUDA helper with
+`GHOSTREEL_GPU=cuda bash scripts/build-helpers.sh llm`, then run:
+
+```sh
+python3 scripts/smoke-llm-nvidia.py \
+  --helper target/release/ghostreel-llm \
+  --model /path/to/dense-model.gguf --mmproj /path/to/dense-projector.gguf \
+  --moe-model /path/to/moe-model.gguf --moe-mmproj /path/to/moe-projector.gguf \
+  --cpu-moe 32 --output-dir /tmp/ghostreel-nvidia-validation
+```
+
+The MoE arguments are optional. The check verifies real CUDA memory use, attention and expert
+placement from runtime logs, a 32k context, and a structured script response. The helper reports
+the selected expert override patterns in its ready message. Logs and `report.json` remain in
+the output directory for review; the check does not change the app's model settings.
+
+Validated on Linux with an RTX 4070 (12 GB), driver 615.78.08 and a CUDA 13.4 release build:
+
+| Model / mode | Loaded context | Helper GPU memory | Result |
+|---|---:|---:|---|
+| Qwen3.5 9B, automatic flash attention + q4 KV | 32k | 7256 MiB | 11,095-token prompt and structured script passed |
+| Qwen3.5 9B, flash attention off + f16 KV | 8k | 7224 MiB | Structured script passed |
+| Ornith 1.5 35B A3B, automatic expert placement | 32k | 10512 MiB | Expert tensors in host RAM; structured script passed |
+| Ornith 1.5 35B A3B, 32 expert blocks in RAM | 32k | 7164 MiB | Explicit host placement and structured script passed |
+
+For an apples-to-apples decode benchmark with the same AgentWorld GGUF and expert split:
+
+```sh
+python3 scripts/bench-llm-speed.py --helper target/release/ghostreel-llm \
+  --model /path/to/Qwen-AgentWorld-35B-A3B-UD-Q4_K_XL.gguf \
+  --mmproj /path/to/mmproj-Qwen-AgentWorld-35B-A3B-BF16.gguf \
+  --context 131072 --cpu-moe 32 --output-dir /tmp/ghostreel-agentworld-speed
+```
+
+On the same RTX 4070, a 54-token prompt and 256-token response measured **43.2 → 55.3 decode
+tokens/s** at an allocated 128k context, with 32 of 40 expert blocks in host RAM. The comparison
+holds the model, prompt, quantization and placement constant, changing the old 4-thread,
+per-decode pool/mmap settings to 8 threads, a resident thread pool and non-mapped host experts.
+At an allocated 16k context with 26 host expert blocks, it measured 39.6 → 57.6 tokens/s.
+These are short-prompt, single-run measurements, excluding model load and prompt processing;
+a full 128k input or a multi-pass script takes longer. The benchmark writes both reports and
+runtime logs. The UI's expert slider shows the share of AgentWorld's 40 blocks in RAM;
+a value of 0 lets automatic fitting choose placement.
+
+A real Greet Mag script-agent trial used an initial 28,275-token prompt, 128k allocated context,
+32 host expert blocks, and thinking disabled. Six model calls averaged **44.7 decode tokens/s**
+(1,839 generated tokens); the full turn took **87.0 seconds**, excluding model load. Initial
+prefill took 39.7 seconds; cached later prefills took 0.6–2.5 seconds. The saved 57.6-second draft
+passed structural validation after repairs. This checks the agent pipeline, not editorial quality.
+
+Local script agents default to 30 research tool calls. Planning replies do not use this budget;
+a separate model-call ceiling prevents endless retries. Proposed shots are checked with
+`get_video`, spoken quotes with `get_transcript`, and the model reviews the resulting evidence
+before finalizing. Revisions introducing new ranges are checked again within the same budget.
+Missing coverage after repairs is flagged as incomplete research. Adjust the limit in Settings
+or `chat_model.max_tool_rounds`; 0 uses `script.local_tool_rounds` / `script.roomy_tool_rounds`.
+
+New chat answers persist the actual model name, token count, decode rate and whole-turn time.
+When a server supplies token usage but no decode time, the footer explicitly labels its rate
+as **overall**, including prompt processing and request overhead. Older answers and providers
+without counters show that metrics are unavailable.
+
+For a larger CUDA cache check, add `--context 32768 --notes 1800` to `smoke-llm-cache.py`.
+The growing 9063-token prompt reused 9022 tokens and took 0.096 s versus 2.949 s fresh, with
+matching output. This is a one-token-response prompt-reuse check, excluding model load, not a
+whole-script throughput claim. Prefer automatic placement; explicit expert offload frees more
+VRAM at the cost of additional work in system RAM.
+
 ---
 
 ## Two ways to run the models

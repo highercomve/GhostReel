@@ -17,6 +17,7 @@ pub mod judge;
 pub mod metrics;
 pub mod refine;
 pub mod repair;
+mod research;
 pub use enforce_grounding_and_pacing as repair_draft;
 pub mod tools;
 pub use judge::Judgement;
@@ -71,6 +72,8 @@ pub struct ChatMessage {
     pub tool_calls: Option<Vec<ToolCallRecord>>,
     pub script_id: Option<i64>,
     pub created_at: i64,
+    #[serde(default)]
+    pub performance: Option<crate::inference::ChatPerformance>,
 }
 
 /// Result of a single agent turn.
@@ -157,7 +160,11 @@ impl ChatBackend {
             crate::runtime::VisionSetup::Mlx { helper, models_dir, entry, runtime } => {
                 let dir = crate::models::download_bundle(entry, models_dir, |_, _| {}).await?;
                 let llm = crate::vision::LocalLlm::start_mlx(helper, &dir, runtime).await?;
-                Ok(ChatBackend::Local { helper: Box::new(llm), ctx_tokens: runtime.ctx_tokens, think: runtime.think })
+                Ok(ChatBackend::Local {
+                    ctx_tokens: llm.ctx_tokens.unwrap_or(runtime.ctx_tokens),
+                    helper: Box::new(llm),
+                    think: runtime.think,
+                })
             }
             crate::runtime::VisionSetup::Local { helper, models_dir, model, mmproj, found, runtime } => {
                 let mut paths = Vec::with_capacity(2);
@@ -179,7 +186,11 @@ impl ChatBackend {
                     concurrency: 1,
                 };
                 let llm = crate::vision::LocalLlm::start(&models).await?;
-                Ok(ChatBackend::Local { helper: Box::new(llm), ctx_tokens: runtime.ctx_tokens, think: runtime.think })
+                Ok(ChatBackend::Local {
+                    ctx_tokens: llm.ctx_tokens.unwrap_or(runtime.ctx_tokens),
+                    helper: Box::new(llm),
+                    think: runtime.think,
+                })
             }
             crate::runtime::VisionSetup::Unavailable(why) => {
                 Err(Error::Vision(format!("vision/chat model unavailable: {why}")))
@@ -700,19 +711,9 @@ pub fn script_json_schema() -> Value {
 
 /// Local LLM action schema (oneOf tool action or final script action).
 pub fn local_action_schema() -> Value {
-    json!({
+    let mut schema = json!({
         "type": "object",
         "oneOf": [
-            {
-                "type": "object",
-                "properties": {
-                    "action": { "type": "string", "enum": ["tool"] },
-                    "tool": { "type": "string", "enum": tools::tool_names() },
-                    "args": { "type": "object" }
-                },
-                "required": ["action", "tool", "args"],
-                "additionalProperties": false
-            },
             {
                 "type": "object",
                 "properties": {
@@ -732,7 +733,24 @@ pub fn local_action_schema() -> Value {
                 "additionalProperties": false
             }
         ]
-    })
+    });
+    // Constrain each tool's arguments with the same schema sent to server models. A generic
+    // object permits filenames in numeric video_id fields and wastes whole research rounds.
+    let branches = schema["oneOf"].as_array_mut().expect("action branches");
+    for definition in tools::tools_definition().as_array().expect("tool definitions") {
+        let function = &definition["function"];
+        branches.push(json!({
+            "type": "object",
+            "properties": {
+                "action": { "type": "string", "enum": ["tool"] },
+                "tool": { "type": "string", "enum": [function["name"]] },
+                "args": function["parameters"]
+            },
+            "required": ["action", "tool", "args"],
+            "additionalProperties": false
+        }));
+    }
+    schema
 }
 
 /// Local LLM final action schema only.
@@ -834,6 +852,71 @@ fn make_room(messages: &mut Vec<Value>, budget_tokens: usize) -> bool {
         }
     }
     true
+}
+
+fn local_output_budget(context: u32, answer_limit: u32) -> usize {
+    (context as usize / 2).clamp(512, 12288).min(answer_limit as usize)
+}
+
+/// Discard old complete exchanges while keeping the system rules, current request, and
+/// newest exchange. Grounding remains in the harness and is supplied again for the draft.
+fn drop_oldest_local_exchange(transcript: &mut String, brief: &str) -> bool {
+    let starts: Vec<usize> = transcript.match_indices("<|im_start|>").map(|(i, _)| i).collect();
+    let pinned = format!("<|im_start|>user\n{brief}<|im_end|>");
+    for i in 1..starts.len().saturating_sub(2) {
+        let start = starts[i];
+        let end = starts[i + 1];
+        if transcript[start..end].starts_with(&pinned) {
+            continue;
+        }
+        let mut stop = end;
+        // Keep both halves of a historical conversation or tool exchange together.
+        let tool_pair = transcript[start..].starts_with("<|im_start|>assistant\n")
+            && transcript[end..].starts_with("<|im_start|>user\nTool result for ");
+        let history_pair = transcript[start..].starts_with("<|im_start|>user\n")
+            && transcript[end..].starts_with("<|im_start|>assistant\n");
+        if tool_pair || history_pair {
+            if i + 1 >= starts.len().saturating_sub(2) {
+                continue;
+            }
+            stop = starts.get(i + 2).copied().unwrap_or(transcript.len());
+        }
+        transcript.replace_range(start..stop, "");
+        return true;
+    }
+    false
+}
+
+async fn fit_local_prompt(
+    helper: &mut crate::vision::LocalLlm,
+    transcript: &mut String,
+    brief: &str,
+    context: u32,
+    output: usize,
+    think: bool,
+    image: Option<&Path>,
+) -> Result<(), Error> {
+    let mut dropped = false;
+    loop {
+        let tokens = helper.prompt_tokens(transcript, think, image).await?;
+        if tokens.saturating_add(output) <= context as usize {
+            if dropped {
+                crate::llmlog::push(
+                    "chat",
+                    format!(
+                        "Compacted old exchanges: {tokens} prompt + {output} output tokens in a {context}-token window"
+                    ),
+                );
+            }
+            return Ok(());
+        }
+        if !drop_oldest_local_exchange(transcript, brief) {
+            return Err(Error::Invalid(format!(
+                "The script request and latest research need {tokens} tokens plus {output} for the draft, but the local model loaded a {context}-token context. Raise the context window or shorten the request."
+            )));
+        }
+        dropped = true;
+    }
 }
 
 /// Everything anyone says in the project, with timestamps, laid out for the editor to read
@@ -2432,6 +2515,12 @@ pub fn build_system_prompt(
         .replace("{width}", &project.width.to_string())
         .replace("{height}", &project.height.to_string());
     prompt.push_str(&tools::tools_prose(detail));
+    prompt.push_str(
+        "\nResearch before selecting: compare relevant interview candidates and search for supporting \
+        B-roll and alternatives. Open the specific ranges you plan to use with get_video, and verify spoken \
+        quotes with get_transcript. Search results and the project digest are a starting point, not a \
+        completed footage review. Inspect the selected evidence before finalizing; do not stop after the first hit.\n",
+    );
 
     if let Some(draft) = latest_script_json {
         prompt.push_str(&format!(
@@ -3237,6 +3326,7 @@ pub fn messages(db: &Db, session_id: i64) -> Result<Vec<ChatMessage>, Error> {
 
         let mut tool_calls = None;
         let mut script_id = None;
+        let mut performance = None;
 
         if let Some(json_str) = tool_calls_json
             && let Ok(val) = serde_json::from_str::<Value>(&json_str)
@@ -3245,6 +3335,7 @@ pub fn messages(db: &Db, session_id: i64) -> Result<Vec<ChatMessage>, Error> {
                 tool_calls = serde_json::from_value::<Vec<ToolCallRecord>>(Value::Array(arr.clone())).ok();
             } else if let Some(obj) = val.as_object() {
                 script_id = obj.get("script_id").and_then(|v| v.as_i64());
+                performance = obj.get("performance").and_then(|v| serde_json::from_value(v.clone()).ok());
                 if let Some(tc) = obj.get("tool_calls") {
                     tool_calls = serde_json::from_value::<Vec<ToolCallRecord>>(tc.clone()).ok();
                 }
@@ -3256,7 +3347,7 @@ pub fn messages(db: &Db, session_id: i64) -> Result<Vec<ChatMessage>, Error> {
             .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
             .filter(|imgs| !imgs.is_empty());
 
-        Ok(ChatMessage { id, session_id: sid, role, content, images, tool_calls, script_id, created_at })
+        Ok(ChatMessage { id, session_id: sid, role, content, images, tool_calls, script_id, created_at, performance })
     })?;
 
     Ok(rows.filter_map(Result::ok).collect())
@@ -3324,6 +3415,11 @@ pub async fn run_turn(
     images: &[String],
     on_event: &mut (dyn FnMut(ChatEvent) + Send),
 ) -> Result<TurnResult, Error> {
+    let turn_started = std::time::Instant::now();
+    let mut inference = Vec::new();
+    if let ChatBackend::Local { helper, .. } = &mut ctx.backend {
+        helper.take_inference();
+    }
     let project = ctx.db.project(project_id)?;
     // A configured budget wins; otherwise the backend decides how much research it can afford.
     // Captured before the backend is borrowed, so every arm can check it.
@@ -3349,6 +3445,7 @@ pub async fn run_turn(
     let images_json = if !image_strings.is_empty() { serde_json::to_string(&image_strings).ok() } else { None };
 
     let mut grounding = Grounding::default();
+    let mut research_evidence = research::Evidence::default();
     // What this turn has already fetched, so asking twice costs nothing and asking a third time
     // is told to stop.
     let mut memo = ToolMemo::default();
@@ -3424,8 +3521,14 @@ pub async fn run_turn(
     // whoever it happened to find there.
     let speech_chars = match &ctx.backend {
         ChatBackend::Server { .. } | ChatBackend::Cli(_) => 60_000,
-        // Half the window at ~4 chars a token, leaving the other half for tools and the draft.
-        ChatBackend::Local { ctx_tokens, .. } => ((*ctx_tokens as usize) * 4 / 2).clamp(4_000, 60_000),
+        // Budget the footage digest after reserving the draft and the existing rules.
+        ChatBackend::Local { ctx_tokens, .. } => {
+            let prompt_tokens =
+                (*ctx_tokens as usize).saturating_sub(local_output_budget(*ctx_tokens, ctx.script.max_answer_tokens));
+            // Leave room for the rules, references, current request and later length directives.
+            // Picture summaries consume another quarter of this allowance below.
+            (prompt_tokens.saturating_mul(3).saturating_sub(sys_prompt.len() + 8192).saturating_mul(4) / 5).min(60_000)
+        }
     };
     if style.broll {
         // A montage is chosen from pictures: the speech would only pull it back to the interviews,
@@ -3567,6 +3670,7 @@ pub async fn run_turn(
                     req = req.bearer_auth(api_key.as_str());
                 }
 
+                let request_started = std::time::Instant::now();
                 let resp = req.send().await.map_err(|e| Error::Vision(format!("server at {url}: {e}")))?;
                 if !resp.status().is_success() {
                     let err_text = resp.text().await.unwrap_or_default();
@@ -3574,6 +3678,12 @@ pub async fn run_turn(
                 }
 
                 let v: Value = resp.json().await.map_err(|e| Error::Vision(format!("bad response JSON: {e}")))?;
+                inference.push(crate::inference::InferenceCall::from_response(
+                    &v,
+                    "server",
+                    if model.is_empty() { "Server model not reported" } else { model },
+                    request_started.elapsed().as_secs_f64(),
+                ));
                 let choice = v.get("choices").and_then(|c| c.get(0)).and_then(|c| c.get("message"));
                 let msg_obj = match choice {
                     Some(m) => m,
@@ -3702,12 +3812,19 @@ pub async fn run_turn(
             if !api_key.is_empty() {
                 req = req.bearer_auth(api_key.as_str());
             }
+            let request_started = std::time::Instant::now();
             let resp = req.send().await.map_err(|e| Error::Vision(format!("server at {url}: {e}")))?;
             if !resp.status().is_success() {
                 let err_text = resp.text().await.unwrap_or_default();
                 return Err(Error::Vision(format!("server HTTP error (final script): {err_text}")));
             }
             let v: Value = resp.json().await.map_err(|e| Error::Vision(format!("bad final JSON: {e}")))?;
+            inference.push(crate::inference::InferenceCall::from_response(
+                &v,
+                "server",
+                if model.is_empty() { "Server model not reported" } else { model },
+                request_started.elapsed().as_secs_f64(),
+            ));
             let content = v["choices"][0]["message"]["content"].as_str().unwrap_or_default();
 
             // Set when a redraft came back worse and was thrown away, so the turn can say so.
@@ -3751,9 +3868,16 @@ pub async fn run_turn(
                 if !api_key.is_empty() {
                     retry_req = retry_req.bearer_auth(api_key.as_str());
                 }
+                let retry_started = std::time::Instant::now();
                 if let Ok(retry_resp) = retry_req.send().await
                     && let Ok(rv) = retry_resp.json::<Value>().await
                 {
+                    inference.push(crate::inference::InferenceCall::from_response(
+                        &rv,
+                        "server",
+                        if model.is_empty() { "Server model not reported" } else { model },
+                        retry_started.elapsed().as_secs_f64(),
+                    ));
                     let retry_content = rv["choices"][0]["message"]["content"].as_str().unwrap_or_default();
                     if let Ok(mut rescript) = Script::parse_for_project(retry_content, &project) {
                         if let Some(t) = requested_s {
@@ -3836,25 +3960,35 @@ pub async fn run_turn(
             // A full script's JSON is far longer than a tool action, so the draft call gets its
             // own budget out of the configured context rather than the default.
             // Reasoning is spent from the same budget as the answer, so leave room for both.
-            let script_token_budget = (*ctx_tokens as usize / 2).clamp(4096, 12288);
+            let script_token_budget = local_output_budget(*ctx_tokens, ctx.script.max_answer_tokens);
 
-            let mut tool_rounds = 0;
+            let mut budget = research::ResearchBudget::new(rounds_budget);
             let mut empty_searches = 0usize;
             let mut hinted = false;
             // Whether any footage has been opened, and whether the "you have not looked yet"
             // nudge has already been spent.
             let mut tools_used = 0usize;
             let mut pushed_back = 0usize;
-            while tool_rounds < rounds_budget {
+            while budget.can_research() {
                 if cancelled() {
                     // The generation runs inside the helper process; ending the turn means
                     // ending it, or the model keeps going and Stop waits for it.
                     helper.kill().await;
                     return Err(Error::Invalid(CANCELLED.into()));
                 }
-                tool_rounds += 1;
+                budget.calls += 1;
                 // A tool action is short, but a model that reasons first spends the same budget on
                 // the thought — at the default 2048 it ran out mid-round and the turn died.
+                fit_local_prompt(
+                    helper,
+                    &mut transcript,
+                    &user_turn_text,
+                    *ctx_tokens,
+                    script_token_budget,
+                    *think,
+                    saved_image_paths.first().map(|p| p.as_path()),
+                )
+                .await?;
                 let out_str = helper
                     .complete_full_with_image(
                         &transcript,
@@ -3867,7 +4001,7 @@ pub async fn run_turn(
                 // Every round, not just the final draft: a turn that ends in `Reply` never
                 // reaches the draft call, so the one dump that existed showed nothing at all
                 // about why a local model talked instead of editing.
-                debug_dump(&format!("local-round-{tool_rounds}"), &transcript, &out_str);
+                debug_dump(&format!("local-round-{}", budget.calls), &transcript, &out_str);
                 let action: Result<LocalAction, _> = serde_json::from_str(&out_str);
                 match action {
                     // Answering in words is a complete turn: nothing is drafted and the previous
@@ -3920,6 +4054,7 @@ pub async fn run_turn(
                     }
                     Ok(LocalAction::Tool { tool, args }) => {
                         tools_used += 1;
+                        budget.tools += 1;
                         on_event(ChatEvent::ToolStarted { tool: tool.clone(), args: args.clone() });
                         let vector = if tool == "search_moments" {
                             if let (Some(e), Some(q)) =
@@ -3954,6 +4089,7 @@ pub async fn run_turn(
                                 fresh
                             }
                         };
+                        research_evidence.record(&tool, &args, &res);
                         on_event(ChatEvent::ToolFinished { tool: tool.clone(), summary: summary.clone() });
                         let empty = is_empty_search(&tool, &summary);
                         tool_records.push(ToolCallRecord { tool: tool.clone(), args: args.clone(), summary });
@@ -3995,6 +4131,16 @@ pub async fn run_turn(
                     "<|im_start|>user\n{}Produce the final script action.<|im_end|>\n",
                     allowed_clips_text(&grounding)
                 ));
+                fit_local_prompt(
+                    helper,
+                    &mut transcript,
+                    &user_turn_text,
+                    *ctx_tokens,
+                    script_token_budget,
+                    *think,
+                    None,
+                )
+                .await?;
                 let final_str = helper
                     .complete_full(
                         &transcript,
@@ -4051,20 +4197,109 @@ pub async fn run_turn(
                         issue_text.join("\n"),
                         allowed_clips_text(&grounding)
                     ));
-                    if let Ok(retry_str) = helper
-                        .complete_full_with_image(
-                            &transcript,
-                            saved_image_paths.first().map(|p| p.as_path()),
-                            Some(local_final_action_schema(false)),
-                            script_token_budget,
-                            *think,
-                        )
-                        .await
+                    let fits = fit_local_prompt(
+                        helper,
+                        &mut transcript,
+                        &user_turn_text,
+                        *ctx_tokens,
+                        script_token_budget,
+                        *think,
+                        saved_image_paths.first().map(|p| p.as_path()),
+                    )
+                    .await;
+                    if let Err(error) = &fits {
+                        crate::llmlog::push("chat", format!("Skipped optional redraft: {error}"));
+                    }
+                    if fits.is_ok()
+                        && let Ok(retry_str) = helper
+                            .complete_full_with_image(
+                                &transcript,
+                                saved_image_paths.first().map(|p| p.as_path()),
+                                Some(local_final_action_schema(false)),
+                                script_token_budget,
+                                *think,
+                            )
+                            .await
                         && let Ok(LocalAction::Final { mut script }) = serde_json::from_str::<LocalAction>(&retry_str)
                     {
                         script.fill_from_project(&project);
                         parsed_script = Some(script);
                     }
+                }
+            }
+
+            // Inspect the proposal before accepting it: a digest/search hit is only a candidate.
+            // Reserve a bounded review after real tool calls, without charging planning replies
+            // against the footage budget. New choices in a revision are checked on the next pass.
+            for pass in 0..3 {
+                let Some(proposal) = parsed_script.as_ref() else { break };
+                let needed: Vec<_> = research_evidence
+                    .missing(proposal, !style.broll)
+                    .into_iter()
+                    .filter(|inspection| !research_evidence.attempted(inspection))
+                    .collect();
+                if needed.is_empty() || budget.remaining() == 0 || !budget.can_review() {
+                    break;
+                }
+                let proposal_json = serde_json::to_string(&LocalAction::Final { script: proposal.clone() })
+                    .map_err(|e| Error::Invalid(e.to_string()))?;
+                let mut results = String::new();
+                for inspection in needed.into_iter().take(budget.remaining() as usize) {
+                    if cancelled() {
+                        helper.kill().await;
+                        return Err(Error::Invalid(CANCELLED.into()));
+                    }
+                    let args = inspection.args();
+                    on_event(ChatEvent::ToolStarted { tool: inspection.tool.into(), args: args.clone() });
+                    let (result, summary) = dispatch_tool(
+                        &ctx.db,
+                        &ctx.data_dir,
+                        project_id,
+                        inspection.tool,
+                        &args,
+                        &mut grounding,
+                        None,
+                        &ctx.script,
+                    );
+                    budget.tools += 1;
+                    research_evidence.record(inspection.tool, &args, &result);
+                    on_event(ChatEvent::ToolFinished { tool: inspection.tool.into(), summary: summary.clone() });
+                    tool_records.push(ToolCallRecord { tool: inspection.tool.into(), args: args.clone(), summary });
+                    results.push_str(&format!("\n{} {args}:\n{result}\n", inspection.tool));
+                }
+                transcript.push_str(&format!(
+                    "<|im_start|>assistant\n{proposal_json}<|im_end|>\n<|im_start|>user\n\
+                     Review your proposed edit against these newly inspected shot details and transcript ranges. \
+                     Keep choices the evidence supports. Replace unsupported shots and quotes, use numeric IDs, \
+                     and preserve the requested duration and story. Do not treat a search hit or a filename as \
+                     proof of what a shot shows. Return the complete final script action.\n{results}<|im_end|>\n"
+                ));
+                fit_local_prompt(
+                    helper,
+                    &mut transcript,
+                    &user_turn_text,
+                    *ctx_tokens,
+                    script_token_budget,
+                    *think,
+                    None,
+                )
+                .await?;
+                if cancelled() {
+                    helper.kill().await;
+                    return Err(Error::Invalid(CANCELLED.into()));
+                }
+                on_event(ChatEvent::Drafting);
+                budget.calls += 1;
+                let reviewed = helper
+                    .complete_full(&transcript, Some(local_final_action_schema(false)), script_token_budget, *think)
+                    .await?;
+                debug_dump(&format!("evidence-review-{}", pass + 1), &transcript, &reviewed);
+                match serde_json::from_str::<LocalAction>(&reviewed) {
+                    Ok(LocalAction::Final { mut script }) => {
+                        script.fill_from_project(&project);
+                        parsed_script = Some(script);
+                    }
+                    _ => return Err(Error::Invalid("evidence review did not return a complete script".into())),
                 }
             }
 
@@ -4279,6 +4514,13 @@ pub async fn run_turn(
         match repair::finish_script(&ctx.db, project_id, &mut s, enforce_target, &ctx.script)? {
             Some(more) => {
                 issues.extend(more);
+                if matches!(&ctx.backend, ChatBackend::Local { .. }) {
+                    let missing = research_evidence.missing(&s, !style.broll);
+                    if !missing.is_empty() {
+                        issues.push(Issue { severity: IssueSeverity::Warning, beat_id: None, clip_index: None,
+                            message: format!("research incomplete: {} shot/transcript range(s) in the saved edit were not fully inspected; review them before export", missing.len()) });
+                    }
+                }
                 let sid = save_version(&ctx.db, project_id, &s, Some(session_id))?;
                 script_id = Some(sid);
                 parsed_script = Some(s);
@@ -4342,6 +4584,31 @@ pub async fn run_turn(
         "I was unable to assemble a script from the available footage.".to_string()
     };
 
+    if let ChatBackend::Local { helper, .. } = &mut ctx.backend {
+        inference.extend(helper.take_inference());
+    }
+    if inference.is_empty() {
+        let (backend, model) = match &ctx.backend {
+            ChatBackend::Cli(agent) => (
+                format!("CLI · {}", agent.cfg.tool),
+                if agent.cfg.model.is_empty() { "Model not reported".to_string() } else { agent.cfg.model.clone() },
+            ),
+            ChatBackend::Local { .. } => ("local".to_string(), "Local model not reported".to_string()),
+            ChatBackend::Server { model, .. } => (
+                "server".to_string(),
+                if model.is_empty() { "Server model not reported".to_string() } else { model.clone() },
+            ),
+        };
+        inference.push(crate::inference::InferenceCall::from_response(
+            &Value::Null,
+            &backend,
+            &model,
+            turn_started.elapsed().as_secs_f64(),
+        ));
+    }
+    let performance =
+        crate::inference::ChatPerformance { elapsed_seconds: turn_started.elapsed().as_secs_f64(), calls: inference };
+
     // Persist messages in database
     let now_ts = now();
 
@@ -4365,9 +4632,11 @@ pub async fn run_turn(
     // 3. Assistant message. The repairs ride along with it: this is the text every backend
     // replays next turn, so it is the one place a note reaches the server, local and CLI brains
     // alike.
-    let assistant_tc_json = script_id.map(|sid| json!({ "script_id": sid }).to_string());
+    let assistant_tc_json = Some(json!({ "script_id": script_id, "performance": performance }).to_string());
     let mut stored_reply = reply.clone();
-    for note in [repair_note.as_ref(), judge_note.as_ref()].into_iter().flatten() {
+    let research_note =
+        issues.iter().find(|i| i.message.starts_with("research incomplete:")).map(|i| format!("[{}]", i.message));
+    for note in [repair_note.as_ref(), judge_note.as_ref(), research_note.as_ref()].into_iter().flatten() {
         stored_reply.push_str("\n\n");
         stored_reply.push_str(note);
     }
@@ -4596,6 +4865,19 @@ pub fn lay_audio_beds(db: &Db, s: &mut Script, cfg: &crate::config::ScriptConfig
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_compaction_keeps_rules_brief_latest_evidence_and_tool_pairs() {
+        let turn = |role: &str, text: &str| format!("<|im_start|>{role}\n{text}<|im_end|>\n");
+        let system = turn("system", "rules and footage digest");
+        let brief = turn("user", "make a 60 second script");
+        let old = turn("assistant", "old search call") + &turn("user", "Tool result for search: old evidence");
+        let latest = turn("assistant", "latest call") + &turn("user", "Tool result for get_video: latest evidence");
+        let mut prompt = system.clone() + &brief + &old + &latest;
+        assert!(drop_oldest_local_exchange(&mut prompt, "make a 60 second script"));
+        assert_eq!(prompt, system + &brief + &latest);
+        assert!(!drop_oldest_local_exchange(&mut prompt, "make a 60 second script"));
+    }
 
     /// Five seconds of "Thank you." is a third of a forty-second piece, and every existing check
     /// passed it: the clip is long enough, it ends on a sentence, the footage is real, and the
@@ -5464,6 +5746,123 @@ mod tests {
 
     /// The three actions a turn can take. A reply carries words and no script, which is what lets
     /// the editor ask a question instead of drafting around a guess.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_planning_preserves_research_budget_and_selected_clips_are_reviewed() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = Db::open_in_memory().unwrap();
+        let p = db.create_project(&NewProject::named("Research test")).unwrap();
+        let folder = db.add_folder(p.id, tmp.path(), true).unwrap();
+        for id in [1, 2] {
+            db.conn
+                .execute(
+                    "INSERT INTO videos(id,content_hash,size,duration_s) VALUES (?1,?2,100,10)",
+                    params![id, format!("research-{id}")],
+                )
+                .unwrap();
+            db.conn
+                .execute(
+                    "INSERT INTO video_files(video_id,folder_id,path,size,mtime,last_seen) VALUES (?1,?2,?3,100,0,0)",
+                    params![id, folder.id, tmp.path().join(format!("{id}.mp4")).to_str().unwrap()],
+                )
+                .unwrap();
+            db.conn
+                .execute(
+                    "INSERT INTO frames(video_id,t_s,description_json) VALUES (?1,2.5,?2)",
+                    params![id, r#"{"description":"Neighbors meeting on a residential street."}"#],
+                )
+                .unwrap();
+            db.conn
+                .execute(
+                    "INSERT INTO transcript_segments(video_id,start_s,end_s,text) VALUES (?1,0,5,?2)",
+                    params![id, "This neighborhood brings people together and makes everyone feel at home."],
+                )
+                .unwrap();
+        }
+        let final_action = json!({"action":"final","script":{
+            "title":"Community","target_duration_s":5,"beats":[{"id":"b1","purpose":"A community brings people together",
+                "clips":[{"video_id":2,"in_s":0,"out_s":5,"audio":"source"}]}]}});
+        let helper_path = tmp.path().join("helper");
+        let marker_path = tmp.path().join("reviewed");
+        let source = format!(
+            r#"#!/usr/bin/env python3
+import sys,json
+final=json.loads({:?})
+count=0
+print(json.dumps({{'ready':True,'ctx':32768,'token_count':True,'model':'test-model'}}),flush=True)
+for line in sys.stdin:
+ r=json.loads(line)
+ if r['cmd']=='count_tokens':
+  out={{'tokens':len(r.get('prompt',''))//4}}
+ else:
+  count+=1
+  if count<=2: action={{'action':'reply','text':'I will inspect the footage now.'}}
+  elif count==3: action={{'action':'tool','tool':'get_video','args':{{'video_id':1}}}}
+  else: action=final
+  if 'newly inspected shot details' in r.get('prompt',''):
+   open({:?},'w').write('reviewed')
+  out={{'content':json.dumps(action),'gen_tokens':10,'generation_seconds':0.1,'model':'test-model'}}
+ out.update(id=r['id'],ok=True)
+ print(json.dumps(out),flush=True)
+"#,
+            final_action.to_string(),
+            marker_path.to_str().unwrap()
+        );
+        std::fs::write(&helper_path, source).unwrap();
+        std::fs::set_permissions(&helper_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let helper = crate::vision::LocalLlm::start(&crate::vision::LocalModels {
+            helper: helper_path,
+            vision: Some(("model".into(), "projector".into())),
+            embed: None,
+            cpu: true,
+            runtime: Default::default(),
+            concurrency: 1,
+        })
+        .await
+        .unwrap();
+        let mut ctx = ChatContext {
+            db,
+            data_dir: tmp.path().into(),
+            backend: ChatBackend::Local { helper: Box::new(helper), ctx_tokens: 32768, think: false },
+            embedder: None,
+            system_prompt: None,
+            max_tool_rounds: 3,
+            script: crate::config::ScriptConfig {
+                closing_hold_s: 0.0,
+                infer_audio_beds: false,
+                speech_tail_s: 0.0,
+                speech_lead_s: 0.0,
+                speech_overrun_s: 0.0,
+                ..sc()
+            },
+            jev: Default::default(),
+            cancel: None,
+        };
+        let result =
+            run_turn(&mut ctx, p.id, None, "Create a 5 second community video", &[], &mut |_| {}).await.unwrap();
+        assert!(result.script_id.is_some());
+        assert_eq!(result.tool_calls.len(), 3, "two planning replies must leave room for actual inspections");
+        assert!(result.tool_calls.iter().any(|t| t.tool == "get_video" && t.args["video_id"] == 2));
+        assert!(result.tool_calls.iter().any(|t| t.tool == "get_transcript" && t.args["video_id"] == 2));
+        assert!(marker_path.exists(), "the model must receive inspection results before finalizing");
+        assert!(!result.issues.iter().any(|i| i.message.starts_with("research incomplete:")));
+    }
+
+    #[test]
+    fn local_tool_arguments_use_the_shared_typed_schemas() {
+        let schema = local_action_schema();
+        let branches = schema["oneOf"].as_array().unwrap();
+        for definition in tools::tools_definition().as_array().unwrap() {
+            let function = &definition["function"];
+            let branch = branches.iter().find(|b| b["properties"]["tool"]["enum"][0] == function["name"]).unwrap();
+            assert_eq!(branch["properties"]["args"], function["parameters"]);
+        }
+        let video = branches.iter().find(|b| b["properties"]["tool"]["enum"][0] == "get_video").unwrap();
+        assert_eq!(video["properties"]["args"]["properties"]["video_id"]["type"], "integer");
+        assert!(video["properties"]["args"]["required"].as_array().unwrap().contains(&json!("video_id")));
+    }
+
     #[test]
     fn a_turn_may_answer_in_words_instead_of_drafting() {
         let reply: LocalAction =
@@ -6463,7 +6862,7 @@ mod tests {
 
                 let req_text = String::from_utf8_lossy(&buf[..total_read]);
 
-                let resp_body = match step {
+                let mut resp_body = match step {
                     1 => {
                         assert!(req_text.contains("tools"));
                         json!({
@@ -6520,6 +6919,9 @@ mod tests {
                     _ => unreachable!(),
                 };
 
+                resp_body["model"] = json!("actual-served-model");
+                resp_body["usage"] = json!({"completion_tokens":80,"prompt_tokens":9000});
+                resp_body["timings"] = json!({"predicted_ms":2000.0});
                 let resp_bytes = resp_body.to_string();
                 let resp = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -6597,6 +6999,15 @@ mod tests {
         assert!(msgs[1].tool_calls.is_some());
         assert_eq!(msgs[2].role, "assistant");
         assert_eq!(msgs[2].script_id, res.script_id);
+        assert!(msgs[0].performance.is_none());
+        let performance = msgs[2].performance.as_ref().expect("persisted answer metrics");
+        assert!(performance.elapsed_seconds > 0.0);
+        assert_eq!(performance.calls.len(), 3);
+        for call in &performance.calls {
+            assert_eq!(call.model, "actual-served-model");
+            assert_eq!(call.output_tokens, Some(80));
+            assert_eq!(call.generation_seconds, Some(2.0));
+        }
     }
 
     #[tokio::test]

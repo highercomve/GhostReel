@@ -25,6 +25,7 @@ use std::time::Instant;
 
 use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::context::params::{KvCacheType, LlamaContextParams};
+use llama_cpp_2::context::session::{LlamaStateSeqFlags, SeqState};
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
@@ -48,6 +49,17 @@ struct Args {
     /// `auto`, `on` or `off`.
     flash_attn: String,
     concurrency: u32,
+    cpu_moe_layers: u32,
+    explicit_ngl: bool,
+    threads: i32,
+    threadpool: bool,
+    mmap: Option<bool>,
+}
+
+fn default_threads() -> i32 {
+    let logical = std::thread::available_parallelism().map_or(4, |n| n.get());
+    // Match GhostPen: avoid SMT contention on common 8-core / 16-thread CPUs.
+    (if logical >= 16 { logical / 2 } else { logical }).clamp(1, 256) as i32
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -60,6 +72,11 @@ fn parse_args() -> Result<Args, String> {
         kv_type: "q8_0".into(),
         flash_attn: "auto".into(),
         concurrency: 4,
+        cpu_moe_layers: 0,
+        explicit_ngl: false,
+        threads: default_threads(),
+        threadpool: true,
+        mmap: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -70,8 +87,20 @@ fn parse_args() -> Result<Args, String> {
             "--embed-model" => a.embed_model = Some(val()?),
             "--ctx" => a.ctx = val()?.parse().map_err(|_| "--ctx needs a number")?,
             "--concurrency" => a.concurrency = val()?.parse().map_err(|_| "--concurrency needs a number")?,
-            "--ngl" => a.ngl = val()?.parse().map_err(|_| "--ngl needs a number")?,
-            "--cpu" => a.ngl = 0,
+            "--ngl" => {
+                a.ngl = val()?.parse().map_err(|_| "--ngl needs a number")?;
+                a.explicit_ngl = true;
+            }
+            "--cpu-moe" => {
+                a.cpu_moe_layers = val()?.parse().map_err(|_| "--cpu-moe needs a number")?;
+                if a.cpu_moe_layers > 1024 {
+                    return Err("--cpu-moe must be between 0 and 1024".into());
+                }
+            }
+            "--cpu" => {
+                a.ngl = 0;
+                a.explicit_ngl = true;
+            }
             "--kv-type" => {
                 a.kv_type = val()?;
                 if !["f16", "q8_0", "q4_0"].contains(&a.kv_type.as_str()) {
@@ -84,6 +113,20 @@ fn parse_args() -> Result<Args, String> {
                     return Err(format!("--flash-attn must be auto, on or off (got {})", a.flash_attn));
                 }
             }
+            "--threads" => {
+                a.threads = val()?.parse().map_err(|_| "--threads needs a number")?;
+                if !(1..=256).contains(&a.threads) {
+                    return Err("--threads must be 1–256".into());
+                }
+            }
+            "--no-threadpool" => a.threadpool = false,
+            "--mmap" => {
+                a.mmap = Some(match val()?.as_str() {
+                    "on" => true,
+                    "off" => false,
+                    _ => return Err("--mmap must be on or off".into()),
+                });
+            }
             "--version" => {
                 println!("ghostreel-llm {}", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
@@ -91,7 +134,7 @@ fn parse_args() -> Result<Args, String> {
             "-h" | "--help" => {
                 println!(
                     "usage: ghostreel-llm [--model m.gguf --mmproj p.gguf] [--embed-model e.gguf] [--ctx N] \
-[--concurrency N] [--kv-type f16|q8_0|q4_0] [--flash-attn auto|on|off] [--ngl N|--cpu]"
+[--concurrency N] [--kv-type f16|q8_0|q4_0] [--flash-attn auto|on|off] [--cpu-moe N] [--threads N] [--mmap on|off] [--no-threadpool] [--ngl N|--cpu]"
                 );
                 std::process::exit(0);
             }
@@ -159,10 +202,13 @@ fn reply(v: Value) {
 
 struct Vision<'a> {
     model: &'a LlamaModel,
+    model_name: String,
     mtmd: MtmdContext,
     ctx: LlamaContext<'a>,
     n_batch: u32,
     concurrency: usize,
+    cached_prompt: Vec<llama_cpp_2::token::LlamaToken>,
+    prompt_checkpoint: Option<(usize, SeqState)>,
 }
 
 fn format_prompt_with_template(model: &LlamaModel, user_message: &str) -> String {
@@ -194,6 +240,8 @@ impl Vision<'_> {
         seed: u32,
         temperature: f32,
     ) -> Result<Value, String> {
+        let prompt_seconds = t0.elapsed().as_secs_f64();
+        let generation_start = Instant::now();
         let mut grammar = match schema {
             Some(s) if !s.is_null() => {
                 let g = llama_cpp_2::json_schema_to_grammar(&s.to_string()).map_err(|e| format!("schema: {e:?}"))?;
@@ -229,6 +277,9 @@ impl Vision<'_> {
                     .str_to_token(&close, llama_cpp_2::model::AddBos::Never)
                     .map_err(|e| format!("close think: {e}"))?;
                 for t in toks {
+                    if gen_tokens >= max_tokens || pos >= self.ctx.n_ctx() as i32 {
+                        break;
+                    }
                     batch.clear();
                     batch.add(t, pos, &[0], true).map_err(|e| e.to_string())?;
                     self.ctx.decode(&mut batch).map_err(|e| format!("decode: {e}"))?;
@@ -282,6 +333,10 @@ impl Vision<'_> {
             // A thought that never closed means the answer never started.
             "truncated": gen_tokens >= max_tokens || (think && !out.contains(CLOSE_THINK)),
             "secs": t0.elapsed().as_secs_f64(),
+            "prompt_seconds": prompt_seconds,
+            "generation_seconds": generation_start.elapsed().as_secs_f64(),
+            "model": self.model_name,
+            "backend": "llama.cpp",
         }))
     }
 
@@ -292,6 +347,8 @@ impl Vision<'_> {
         for chunk in items.chunks(chunk_size) {
             let t0 = Instant::now();
             self.ctx.clear_kv_cache();
+            self.cached_prompt.clear();
+            self.prompt_checkpoint = None;
 
             struct SlotState {
                 original_idx: usize,
@@ -597,52 +654,91 @@ impl Vision<'_> {
         image: Option<&str>,
     ) -> Result<Value, String> {
         let t0 = Instant::now();
-        self.ctx.clear_kv_cache();
-        // Thinking opens the block and leaves it to the model to close; otherwise the block is
-        // pre-closed, which is what tells a Qwen-style model to answer straight away.
-        let head = if think { "<think>\n" } else { "<think>\n\n</think>\n\n" };
-        let mut text = if prompt.starts_with("<|im_start|>") {
-            if prompt.ends_with("<think>\n\n</think>\n\n") {
-                if think {
-                    // Caller wants reasoning: reopen the block this prompt already closed.
-                    format!("{}{head}", prompt.trim_end_matches("<think>\n\n</think>\n\n"))
-                } else {
-                    prompt.to_string()
-                }
-            } else if prompt.ends_with("<|im_start|>assistant\n") {
-                format!("{prompt}{head}")
-            } else if prompt.ends_with("<|im_start|>assistant") {
-                format!("{prompt}\n{head}")
-            } else {
-                format!("{prompt}\n<|im_start|>assistant\n{head}")
-            }
-        } else {
-            format_prompt_with_template(self.model, prompt)
-        };
+        let mut text = completion_text(self.model, prompt, think);
 
         let bitmap = if let Some(img_path) = image {
             let bm =
                 MtmdBitmap::from_file(&self.mtmd, img_path, false).map_err(|e| format!("image {img_path}: {e:?}"))?;
-            let marker = llama_cpp_2::mtmd::mtmd_default_marker();
-            if let Some(pos) = text.rfind("<|im_start|>user\n") {
-                text.insert_str(pos + "<|im_start|>user\n".len(), marker);
-            } else {
-                text = format!("{marker}{text}");
-            }
+            insert_image_marker(&mut text);
             Some(bm)
         } else {
             None
         };
 
-        let bitmaps: Vec<&MtmdBitmap> = bitmap.as_ref().into_iter().collect();
-        let chunks = self
-            .mtmd
-            .tokenize(MtmdInputText { text, add_special: true, parse_special: true }, &bitmaps)
-            .map_err(|e| format!("tokenize: {e:?}"))?;
-        let prompt_tokens = chunks.total_tokens();
-        let n_past = chunks
-            .eval_chunks(&self.mtmd, &self.ctx, 0, 0, self.n_batch as i32, true)
-            .map_err(|e| format!("prompt eval: {e:?}"))?;
+        let (prompt_tokens, n_past) = if let Some(bitmap) = &bitmap {
+            self.cached_prompt.clear();
+            self.prompt_checkpoint = None;
+            self.ctx.clear_kv_cache();
+            let chunks = self
+                .mtmd
+                .tokenize(MtmdInputText { text, add_special: true, parse_special: true }, &[bitmap])
+                .map_err(|e| format!("tokenize: {e:?}"))?;
+            ensure_room(chunks.total_tokens(), max_tokens, self.ctx.n_ctx() as usize)?;
+            let n = chunks
+                .eval_chunks(&self.mtmd, &self.ctx, 0, 0, self.n_batch as i32, true)
+                .map_err(|e| format!("prompt eval: {e:?}"))?;
+            (chunks.total_tokens(), n)
+        } else {
+            let tokens = self
+                .model
+                .str_to_token(&text, llama_cpp_2::model::AddBos::Always)
+                .map_err(|e| format!("tokenize: {e}"))?;
+            ensure_room(tokens.len(), max_tokens, self.ctx.n_ctx() as usize)?;
+            let mut common = reusable_prefix(&self.cached_prompt, &tokens);
+            // A checkpoint before the assistant header survives appending a tool result.
+            // Restore recurrent/SWA state first, then remove the attention cache's tail.
+            if let Some((position, state)) = self.prompt_checkpoint.take()
+                && position <= common
+            {
+                if self.ctx.state_seq_set(&state, 0).is_ok() {
+                    common = position;
+                    self.prompt_checkpoint = Some((position, state));
+                } else {
+                    self.ctx.clear_kv_cache();
+                    common = 0;
+                }
+            }
+            if !self
+                .ctx
+                .clear_kv_cache_seq(Some(0), Some(common as u32), None)
+                .map_err(|e| format!("prompt cache: {e}"))?
+            {
+                self.ctx.clear_kv_cache();
+                common = 0;
+            }
+            self.cached_prompt.clear();
+            let prefix_end = text.rfind("<|im_start|>assistant").unwrap_or(text.len());
+            let prefix = self
+                .model
+                .str_to_token(&text[..prefix_end], llama_cpp_2::model::AddBos::Always)
+                .map_err(|e| format!("tokenize prefix: {e}"))?;
+            // Leave the trailing whitespace token to be re-tokenized when a new turn is appended.
+            let checkpoint = reusable_prefix(&prefix, &tokens).saturating_sub(1);
+            let mut batch = LlamaBatch::new(self.n_batch as usize, 1);
+            let mut position = common;
+            while position < tokens.len() {
+                let boundary = if position < checkpoint { checkpoint } else { tokens.len() };
+                let end = (position + self.n_batch as usize).min(boundary);
+                batch.clear();
+                for (i, token) in tokens.iter().enumerate().take(end).skip(position) {
+                    batch.add(*token, i as i32, &[0], i + 1 == tokens.len()).map_err(|e| e.to_string())?;
+                }
+                self.ctx.decode(&mut batch).map_err(|e| format!("prompt eval: {e}"))?;
+                position = end;
+                if position == checkpoint {
+                    let flags = LlamaStateSeqFlags::PARTIAL_ONLY;
+                    // One bounded host snapshot; skip caching unusually large recurrent states.
+                    if self.ctx.state_seq_get_size_ext(0, flags) <= 256 * 1024 * 1024 {
+                        self.prompt_checkpoint = self.ctx.state_seq_get(0, flags).ok().map(|state| (position, state));
+                    }
+                }
+            }
+            self.cached_prompt.clone_from(&tokens);
+            if common > 0 {
+                eprintln!("ghostreel-llm: reused {common}/{} prompt tokens", tokens.len());
+            }
+            (tokens.len(), tokens.len() as i32)
+        };
 
         self.sample(prompt_tokens, n_past, schema, max_tokens, t0, think, seed, temperature)
     }
@@ -680,25 +776,150 @@ impl Embedder<'_> {
     }
 }
 
+fn completion_text(model: &LlamaModel, prompt: &str, think: bool) -> String {
+    // Thinking opens the block and leaves it to the model to close; otherwise the block is
+    // pre-closed, which is what tells a Qwen-style model to answer straight away.
+    let head = if think { "<think>\n" } else { "<think>\n\n</think>\n\n" };
+    if prompt.starts_with("<|im_start|>") {
+        if prompt.ends_with("<think>\n\n</think>\n\n") {
+            if think {
+                // Caller wants reasoning: reopen the block this prompt already closed.
+                format!("{}{head}", prompt.trim_end_matches("<think>\n\n</think>\n\n"))
+            } else {
+                prompt.to_string()
+            }
+        } else if prompt.ends_with("<|im_start|>assistant\n") {
+            format!("{prompt}{head}")
+        } else if prompt.ends_with("<|im_start|>assistant") {
+            format!("{prompt}\n{head}")
+        } else {
+            format!("{prompt}\n<|im_start|>assistant\n{head}")
+        }
+    } else {
+        format_prompt_with_template(model, prompt)
+    }
+}
+
+fn insert_image_marker(text: &mut String) {
+    let marker = llama_cpp_2::mtmd::mtmd_default_marker();
+    if let Some(pos) = text.rfind("<|im_start|>user\n") {
+        text.insert_str(pos + "<|im_start|>user\n".len(), marker);
+    } else {
+        *text = format!("{marker}{text}");
+    }
+}
+
+fn reusable_prefix<T: PartialEq>(cached: &[T], tokens: &[T]) -> usize {
+    cached.iter().zip(tokens).take_while(|(a, b)| a == b).count().min(tokens.len().saturating_sub(1))
+}
+
+fn ensure_room(prompt: usize, output: usize, context: usize) -> Result<(), String> {
+    if output == 0 || prompt.saturating_add(output) > context {
+        return Err(format!(
+            "prompt needs {prompt} tokens plus {output} output tokens, but the local context holds {context}; reduce research/history or raise the context window"
+        ));
+    }
+    Ok(())
+}
+
+/// Auto-fit uses llama.cpp's own model geometry and free-device-memory measurements.
+/// Expert-only offload can free VRAM for a larger context, but is a capacity tradeoff,
+/// not a promise that CPU experts run faster than GPU experts.
+fn load_model(backend: &LlamaBackend, path: &str, args: &Args) -> Result<(LlamaModel, i32, Vec<String>), String> {
+    use std::ffi::CString;
+    let gpu = args.ngl > 0 && unsafe { llama_cpp_sys_2::llama_supports_gpu_offload() };
+    let mut params = Box::pin(LlamaModelParams::default());
+    let pattern = CString::new(moe_pattern(args.cpu_moe_layers)).map_err(|e| e.to_string())?;
+    if !gpu || args.explicit_ngl || args.cpu_moe_layers > 0 {
+        params.set(LlamaModelParams::default().with_n_gpu_layers(if gpu { args.ngl } else { 0 }));
+        if gpu && args.cpu_moe_layers > 0 {
+            params.as_mut().add_cpu_buft_override(&pattern);
+        }
+    } else {
+        let path_c = CString::new(path).map_err(|e| e.to_string())?;
+        let kv = match (args.flash_attn.as_str(), args.kv_type.as_str()) {
+            ("off", _) | (_, "f16") => KvCacheType::F16,
+            (_, "q4_0") => KvCacheType::Q4_0,
+            _ => KvCacheType::Q8_0,
+        };
+        let flash = match args.flash_attn.as_str() {
+            "on" => llama_cpp_sys_2::LLAMA_FLASH_ATTN_TYPE_ENABLED,
+            "off" => llama_cpp_sys_2::LLAMA_FLASH_ATTN_TYPE_DISABLED,
+            _ => llama_cpp_sys_2::LLAMA_FLASH_ATTN_TYPE_AUTO,
+        };
+        let mut context = LlamaContextParams::default()
+            .with_n_ctx(NonZeroU32::new(args.ctx))
+            .with_n_batch(512)
+            .with_n_ubatch(512)
+            .with_type_k(kv)
+            .with_type_v(kv)
+            .with_flash_attention_policy(flash);
+        // Leave room for the projector as well as runtime allocations.
+        let projector = args.mmproj.as_ref().and_then(|p| std::fs::metadata(p).ok()).map_or(0, |m| m.len());
+        let margin = (512_u64 * 1024 * 1024).saturating_add(projector).min(usize::MAX as u64) as usize;
+        let mut margins = vec![margin; unsafe { llama_cpp_sys_2::llama_max_devices() }];
+        if let Err(e) =
+            params.as_mut().fit_params(&path_c, &mut context, &mut margins, 2048, llama_cpp_sys_2::GGML_LOG_LEVEL_WARN)
+        {
+            eprintln!("ghostreel-llm: auto-fit failed ({e}); loading on CPU");
+            params.set(LlamaModelParams::default().with_n_gpu_layers(0));
+        }
+        eprintln!(
+            "ghostreel-llm: auto-fit selected {} GPU layers, expert overrides {:?}",
+            params.n_gpu_layers(),
+            params.tensor_buft_override_patterns()
+        );
+    }
+    let ngl = params.n_gpu_layers();
+    let expert_overrides = params.tensor_buft_override_patterns();
+    let mmap = args.mmap.unwrap_or(expert_overrides.is_empty());
+    params.as_mut().set_use_mmap(mmap);
+    eprintln!("ghostreel-llm: mmap={mmap}, CPU threads={}", args.threads);
+    LlamaModel::load_from_file(backend, path, &params)
+        .map(|model| {
+            // Auto-fit leaves -1 unchanged when the whole model already fits. llama.cpp
+            // treats that sentinel as full offload, not CPU-only placement.
+            let actual_ngl = effective_gpu_layers(ngl, model.n_layer());
+            (model, actual_ngl, expert_overrides)
+        })
+        .map_err(|e| format!("loading {path}: {e}"))
+}
+
+fn moe_pattern(layers: u32) -> String {
+    let blocks = (0..layers).map(|i| i.to_string()).collect::<Vec<_>>().join("|");
+    format!(r"blk\.({blocks})\.ffn_(up|down|gate_up|gate)_(ch|)exps")
+}
+
+fn effective_gpu_layers(configured: i32, layers: u32) -> i32 {
+    let maximum = layers.saturating_add(1).min(i32::MAX as u32) as i32;
+    if configured < 0 { maximum } else { configured.min(maximum) }
+}
+
 fn run() -> Result<(), String> {
     let args = parse_args()?;
     let backend = LlamaBackend::init().map_err(|e| e.to_string())?;
     let t0 = Instant::now();
 
-    let vision_model = match &args.model {
-        Some(path) => Some(
-            LlamaModel::load_from_file(&backend, path, &LlamaModelParams::default().with_n_gpu_layers(args.ngl))
-                .map_err(|e| format!("loading {path}: {e}"))?,
-        ),
-        None => None,
+    let (vision_model, effective_ngl, expert_overrides) = match &args.model {
+        Some(path) => {
+            let model = load_model(&backend, path, &args)?;
+            (Some(model.0), model.1, model.2)
+        }
+        None => (None, 0, Vec::new()),
     };
     let mut effective_ctx = args.ctx;
+    let mut effective_kv = args.kv_type.clone();
     let mut vision = match (&vision_model, &args.mmproj) {
         (Some(model), Some(mmproj)) => {
             let mtmd = MtmdContext::init_from_file(
                 mmproj,
                 model,
-                &MtmdContextParams { use_gpu: args.ngl > 0, print_timings: false, ..Default::default() },
+                &MtmdContextParams {
+                    use_gpu: effective_ngl > 0,
+                    n_threads: args.threads,
+                    print_timings: false,
+                    ..Default::default()
+                },
             )
             .map_err(|e| format!("loading {mmproj}: {e:?}"))?;
             let n_batch = 512;
@@ -712,29 +933,63 @@ fn run() -> Result<(), String> {
                 "off" => llama_cpp_sys_2::LLAMA_FLASH_ATTN_TYPE_DISABLED,
                 _ => llama_cpp_sys_2::LLAMA_FLASH_ATTN_TYPE_AUTO,
             };
-            let params = |ctx_tokens: u32| {
-                LlamaContextParams::default()
+            let mut ctx_tokens = args.ctx.min(model.n_ctx_train().max(512)).max(512);
+            let mut active_kv = if args.flash_attn == "off" { KvCacheType::F16 } else { kv };
+            let mut ctx = loop {
+                let params = LlamaContextParams::default()
                     .with_n_ctx(NonZeroU32::new(ctx_tokens))
                     .with_n_batch(n_batch)
                     .with_n_ubatch(n_batch)
+                    .with_n_threads(args.threads)
+                    .with_n_threads_batch(args.threads)
                     .with_flash_attention_policy(flash)
-                    .with_type_k(kv)
-                    .with_type_v(kv)
-            };
-            // Out of VRAM for the asked-for window: half it once rather than failing to start.
-            let (ctx, ctx_tokens) = match model.new_context(&backend, params(args.ctx)) {
-                Ok(c) => (c, args.ctx),
-                Err(first) => {
-                    let smaller = (args.ctx / 2).max(2048);
-                    eprintln!("ghostreel-llm: {} ctx failed ({first}); retrying with {smaller}", args.ctx);
-                    let c = model
-                        .new_context(&backend, params(smaller))
-                        .map_err(|e| format!("vision context: {e} (after {first})"))?;
-                    (c, smaller)
+                    .with_type_k(active_kv)
+                    .with_type_v(active_kv)
+                    .with_offload_kqv(effective_ngl > 0)
+                    .with_op_offload(effective_ngl > 0);
+                match model.new_context(&backend, params) {
+                    Ok(c) => break c,
+                    Err(e) => {
+                        if active_kv != KvCacheType::F16 && args.flash_attn == "auto" {
+                            active_kv = KvCacheType::F16;
+                            eprintln!("ghostreel-llm: quantized KV context failed ({e}); trying f16");
+                        } else if ctx_tokens > 2048 {
+                            ctx_tokens = (ctx_tokens / 2).max(2048);
+                            if args.flash_attn != "off" {
+                                active_kv = kv;
+                            }
+                            eprintln!("ghostreel-llm: retrying with a {ctx_tokens}-token context ({e})");
+                        } else {
+                            return Err(format!("local context: {e}"));
+                        }
+                    }
                 }
             };
-            effective_ctx = ctx_tokens;
-            Some(Vision { model, mtmd, ctx, n_batch, concurrency: args.concurrency.max(1) as usize })
+            if args.threadpool && !ctx.attach_resident_threadpool(std::num::NonZeroI32::new(args.threads).unwrap()) {
+                return Err("could not allocate the resident CPU threadpool".into());
+            }
+            effective_ctx = ctx.n_ctx();
+            effective_kv = match active_kv {
+                KvCacheType::F16 => "f16",
+                KvCacheType::Q4_0 => "q4_0",
+                _ => "q8_0",
+            }
+            .into();
+            eprintln!("ghostreel-llm: actual context {effective_ctx}, KV {active_kv:?}, GPU layers {effective_ngl}");
+            Some(Vision {
+                model,
+                model_name: std::path::Path::new(args.model.as_ref().unwrap())
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned(),
+                mtmd,
+                ctx,
+                n_batch,
+                concurrency: args.concurrency.max(1) as usize,
+                cached_prompt: Vec::new(),
+                prompt_checkpoint: None,
+            })
         }
         _ => None,
     };
@@ -772,9 +1027,16 @@ fn run() -> Result<(), String> {
         "embed_dim": dim,
         "ctx": effective_ctx,
         "concurrency": args.concurrency,
-        "kv_type": args.kv_type,
+        "kv_type": effective_kv,
         "flash_attn": args.flash_attn,
-        "ngl": args.ngl,
+        "ngl": effective_ngl,
+        "cpu_moe_layers": args.cpu_moe_layers,
+        "expert_overrides": expert_overrides,
+        "model": args.model.as_ref().and_then(|p| std::path::Path::new(p).file_stem()).map(|p| p.to_string_lossy()),
+        "backend": "llama.cpp",
+        "threads": args.threads,
+        "resident_threadpool": args.threadpool,
+        "token_count": true,
         "load_secs": t0.elapsed().as_secs_f64(),
     }));
 
@@ -792,6 +1054,29 @@ fn run() -> Result<(), String> {
             }
         };
         let result = match req.cmd.as_str() {
+            "count_tokens" => match (&vision, req.prompt.as_deref()) {
+                (Some(v), Some(prompt)) => {
+                    let text = completion_text(v.model, prompt, req.think.unwrap_or(false));
+                    if let Some(path) = req.image.as_deref() {
+                        let bitmap =
+                            MtmdBitmap::from_file(&v.mtmd, path, false).map_err(|e| format!("image {path}: {e:?}"));
+                        bitmap.and_then(|bitmap| {
+                            let mut text = text;
+                            insert_image_marker(&mut text);
+                            v.mtmd
+                                .tokenize(MtmdInputText { text, add_special: true, parse_special: true }, &[&bitmap])
+                                .map(|chunks| json!({"tokens":chunks.total_tokens()}))
+                                .map_err(|e| format!("tokenize: {e:?}"))
+                        })
+                    } else {
+                        v.model
+                            .str_to_token(&text, llama_cpp_2::model::AddBos::Always)
+                            .map(|tokens| json!({"tokens": tokens.len()}))
+                            .map_err(|e| format!("tokenize: {e}"))
+                    }
+                }
+                _ => Err("count_tokens needs a loaded model and prompt".into()),
+            },
             "batch_describe" => match (&mut vision, &req.items) {
                 (Some(v), Some(items)) => {
                     let t0 = Instant::now();
@@ -859,5 +1144,40 @@ fn main() -> ExitCode {
             eprintln!("ghostreel-llm: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auto_fit_full_offload_sentinel_keeps_gpu_context_and_projector_enabled() {
+        assert_eq!(effective_gpu_layers(-1, 32), 33);
+        assert_eq!(effective_gpu_layers(999, 32), 33);
+        assert_eq!(effective_gpu_layers(0, 32), 0);
+        assert_eq!(effective_gpu_layers(8, 32), 8);
+    }
+
+    #[test]
+    fn cache_reuses_only_shared_tokens_and_always_evaluates_logits() {
+        assert_eq!(reusable_prefix(&[1, 2, 3, 4], &[1, 2, 9]), 2);
+        assert_eq!(reusable_prefix(&[1, 2, 3], &[1, 2, 3]), 2);
+        assert_eq!(reusable_prefix(&[1, 2, 3], &[1, 2]), 1);
+        assert_eq!(reusable_prefix(&[1, 2], &[9, 2]), 0);
+        assert_eq!(reusable_prefix(&[1, 2], &[]), 0);
+    }
+
+    #[test]
+    fn generation_reserves_output_and_rejects_overflow() {
+        assert!(ensure_room(512, 512, 1024).is_ok());
+        assert!(ensure_room(513, 512, 1024).is_err());
+        assert!(ensure_room(usize::MAX, 512, 1024).is_err());
+        assert!(ensure_room(512, 0, 1024).is_err());
+    }
+
+    #[test]
+    fn expert_offload_targets_only_requested_blocks_expert_tensors() {
+        assert_eq!(moe_pattern(2), r"blk\.(0|1)\.ffn_(up|down|gate_up|gate)_(ch|)exps");
     }
 }

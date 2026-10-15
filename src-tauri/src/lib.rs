@@ -454,6 +454,9 @@ struct VisionSettingsView {
     ctx_tokens: u32,
     kv_cache: String,
     flash_attn: String,
+    cpu_moe_layers: u32,
+    moe_blocks: Option<u32>,
+    max_tool_rounds: u32,
     think: bool,
     /// Frames described at once against a server. Meaningless without slots, which is why the
     /// settings page shows it only when the server reports them.
@@ -548,6 +551,8 @@ struct VisionSettingsPatch {
     ctx_tokens: Option<u32>,
     kv_cache: Option<String>,
     flash_attn: Option<String>,
+    cpu_moe_layers: Option<u32>,
+    max_tool_rounds: Option<u32>,
     think: Option<bool>,
     cli: Option<CliSettingsPatch>,
 }
@@ -615,6 +620,9 @@ fn llm_view(c: &ghostreel_core::config::VisionConfig) -> VisionSettingsView {
         ctx_tokens: c.ctx_tokens,
         kv_cache: c.kv_cache.clone(),
         flash_attn: c.flash_attn.clone(),
+        cpu_moe_layers: c.cpu_moe_layers,
+        moe_blocks: ghostreel_core::models::moe_blocks(&c.local_model),
+        max_tool_rounds: c.max_tool_rounds,
         think: c.think,
         describe_concurrency: c.describe_concurrency,
         cli: CliSettingsView {
@@ -669,6 +677,12 @@ fn apply_llm_patch(
     }
     if let Some(fa) = v.flash_attn {
         cfg.flash_attn = fa;
+    }
+    if let Some(layers) = v.cpu_moe_layers {
+        cfg.cpu_moe_layers = layers;
+    }
+    if let Some(rounds) = v.max_tool_rounds {
+        cfg.max_tool_rounds = rounds;
     }
     if let Some(t) = v.think {
         cfg.think = t;

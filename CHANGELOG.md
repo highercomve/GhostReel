@@ -3,6 +3,46 @@
 All notable changes to GhostReel. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [SemVer](https://semver.org/) while the project is 0.x (minor = features, patch = fixes).
 
+## [0.10.0] — 2026-10-15
+
+### Added
+
+- Script-chat composer shows the tool-call budget beside the brain selectors, so the research
+  limit settable in Settings is adjustable directly in chat.
+
+- Every new script-chat answer records its actual model, token count, generation speed, and
+  total time. Server rates include request time when separate decode timing is unavailable.
+- AgentWorld 35B-A3B GGUF model discovery/download and a RAM-expert slider for hybrid inference.
+
+### Improved
+
+- Local script agents allow 30 research tool calls by default, count planning replies separately,
+  and inspect proposed shot and quote ranges before evidence-based draft review. Incomplete
+  coverage is reported explicitly, and Settings exposes the research limit.
+
+- Hybrid MoE inference uses a resident CPU thread pool and resident host expert buffers.
+  On RTX 4070, AgentWorld Q4_K_XL measured 55.3 decode tokens/s at an allocated 128k context
+  with 32 of 40 expert blocks in RAM (short-prompt benchmark, not a full-context throughput claim).
+
+- Project workspaces use the available window width; the library gives filenames room and scrolls
+  horizontally in small windows instead of squeezing metadata columns.
+- Local llama.cpp inference fits GPU layers and MoE experts to available memory, supports explicit
+  expert-block offload, and exposes flash attention in script Settings.
+- Script chat budgets against the actual loaded context, reserves output with tokenizer counts,
+  and compacts old exchanges. Text inference reuses prompt prefixes across tool rounds, including
+  Qwen3.5 recurrent state via bounded checkpoints.
+- Local contexts respect the model's trained limit, retry smaller allocations, and fall back to
+  f16 KV storage when automatic quantized attention cannot initialize.
+- Opt-in NVIDIA hardware checks cover flash attention, 32k contexts, automatic and explicit MoE
+  placement, real GPU memory use, and structured script generation; validated on an RTX 4070.
+
+### Fixed
+
+- Local agent tool calls enforce the shared argument schemas, including numeric video IDs,
+  instead of accepting arbitrary objects.
+- Preserve GPU projector and KV-cache offload when llama.cpp auto-fit returns its full-offload
+  sentinel. Explicit MoE placement also matches fused gate/up expert tensors.
+
 ## [0.9.0] — 2026-10-14
 
 ### Added
@@ -717,7 +757,8 @@ is and the editor cuts around the shaky stretches; camera originals play in the 
 
 See the git history: `git log v0.1.5`.
 
-[Unreleased]: https://github.com/highercomve/GhostReel/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/highercomve/GhostReel/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/highercomve/GhostReel/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/highercomve/GhostReel/compare/v0.8.1...v0.9.0
 [0.8.1]: https://github.com/highercomve/GhostReel/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/highercomve/GhostReel/compare/v0.7.2...v0.8.0
