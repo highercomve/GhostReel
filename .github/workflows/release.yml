@@ -600,11 +600,17 @@ jobs:
         if: env.RELEASE != 'true'
         run: npx tauri build --config src-tauri/tauri.bundle.json --no-bundle
 
-      - name: Build signed app and DMG
+      - name: Build signed app and updater archive
         if: env.RELEASE == 'true'
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-        run: npx tauri build --config src-tauri/tauri.bundle.json --bundles app,dmg --verbose
+        run: npx tauri build --config src-tauri/tauri.bundle.json --bundles app --verbose
+
+      # create-dmg mounts a writable image and can fail to detach it on hosted
+      # runners. hdiutil can create the compressed installer from a folder directly.
+      - name: Package signed DMG without mounting
+        if: env.RELEASE == 'true'
+        run: bash scripts/package-macos-dmg.sh '${{ matrix.arch == 'arm64' && 'aarch64' || 'x64' }}'
 
       - name: Verify app and installer signatures
         if: env.RELEASE == 'true'
