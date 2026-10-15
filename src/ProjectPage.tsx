@@ -1,5 +1,5 @@
 import MediaImage from "./MediaImage";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ask, open } from "@tauri-apps/plugin-dialog";
 import {
   addFolder,
@@ -33,6 +33,7 @@ import { useQueue } from "./useQueue";
 import VideoPanel from "./VideoPanel";
 import ScriptsPanel from "./ScriptsPanel";
 import OrganizeModal from "./OrganizeModal";
+import { useVideoSelection } from "./useVideoSelection";
 
 function SpeechCell({ v, transcribeEnabled }: { v: VideoRow; transcribeEnabled?: boolean }) {
   if (v.segments > 0) return <span className="good-text">{v.language ? v.language.toUpperCase() : "✓"}</span>;
@@ -109,9 +110,10 @@ export default function ProjectPage({ projectId, onChanged, openVideo }: {
   const [selected, setSelected] = useState<number | null>(null);
   const [seek, setSeek] = useState<{ t: number; nonce: number } | null>(null);
   const [query, setQuery] = useState("");
-  const [hits, setHits] = useState<Hit[] | null>(null);
-  const [searchNote, setSearchNote] = useState<string | null>(null);
-  const [searching, setSearching] = useState(false);
+  const [searchResult, setSearchResult] = useState<{ key: string; hits: Hit[]; note: string | null } | null>(null);
+  const [searchingKey, setSearchingKey] = useState<string | null>(null);
+  const searchSequence = useRef(0);
+  const [folderId, setFolderId] = useState<number | null>(null);
   const [editName, setEditName] = useState<string | null>(null);
   const [samplingSize, setSamplingSize] = useState<number>(768);
   const [organizeModalOpen, setOrganizeModalOpen] = useState(false);
@@ -120,6 +122,36 @@ export default function ProjectPage({ projectId, onChanged, openVideo }: {
   const menuRef = useRef<HTMLDivElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
   const tasks = useQueue();
+  const searchInput = useRef<HTMLInputElement>(null);
+  const scopeFolder = view?.folders.find((f) => f.id === folderId) ?? null;
+  const folderVideos = useMemo(() => view?.videos.filter((v) =>
+    folderId == null || v.folder_ids?.includes(folderId)) ?? [], [view, folderId]);
+  const visibleVideos = useMemo(() => folderVideos.filter((v) =>
+    categoryFilter == null || v.category === categoryFilter), [folderVideos, categoryFilter]);
+  const selection = useVideoSelection(visibleVideos.map((v) => v.id));
+  const selectedIds = folderVideos.filter((v) => selection.ids.has(v.id)).map((v) => v.id).sort((a, b) => a - b);
+  const hiddenSelected = selectedIds.length - visibleVideos.filter((v) => selection.ids.has(v.id)).length;
+  const searchKey = JSON.stringify([projectId, folderId, selectedIds, query.trim()]);
+  const hits = searchResult?.key === searchKey ? searchResult.hits : null;
+  const searchNote = searchResult?.key === searchKey ? searchResult.note : null;
+  const searching = searchingKey === searchKey;
+
+  const changeFolder = (id: number | null) => { selection.clear(); setFolderId(id); };
+  useEffect(() => {
+    // A response for an older query or scope must not replace the current search.
+    searchSequence.current += 1;
+    setSearchingKey(null);
+    setSearchResult(null);
+  }, [searchKey]);
+
+  useEffect(() => {
+    const current = new Set(view?.videos.map((v) => v.id) ?? []);
+    selection.setIds((previous) => {
+      const next = new Set([...previous].filter((id) => current.has(id)));
+      return next.size === previous.size ? previous : next;
+    });
+    if (view && folderId != null && !view.folders.some((f) => f.id === folderId)) changeFolder(null);
+  }, [view]); // selection is pruned on refresh, not when category filters hide rows
 
   useEffect(() => {
     if (!menuOpen) return;
@@ -157,7 +189,13 @@ export default function ProjectPage({ projectId, onChanged, openVideo }: {
   useEffect(() => {
     setView(null);
     setSelected(null);
-    setHits(null);
+    setSearchResult(null);
+    setSearchingKey(null);
+    searchSequence.current += 1;
+    selection.clear();
+    selection.setEnabled(false);
+    setFolderId(null);
+    setCategoryFilter(null);
     setQuery("");
     setEditName(null);
     refresh();
@@ -249,19 +287,19 @@ export default function ProjectPage({ projectId, onChanged, openVideo }: {
   const onSearch = async (e: React.FormEvent) => {
     e.preventDefault();
     const q = query.trim();
-    if (!q) {
-      setHits(null);
-      return;
-    }
-    setSearching(true);
+    if (!q) { setSearchResult(null); return; }
+    const sequence = ++searchSequence.current;
+    setSearchingKey(searchKey);
+    setError(null);
     try {
-      const r = await search(projectId, q);
-      setHits(r.hits);
-      setSearchNote(r.note);
+      const r = await search(projectId, q, 30, {
+        folderId, videoIds: selectedIds.length > 0 ? selectedIds : null,
+      });
+      if (sequence === searchSequence.current) setSearchResult({ key: searchKey, ...r });
     } catch (err) {
-      setError(String(err));
+      if (sequence === searchSequence.current) setError(String(err));
     } finally {
-      setSearching(false);
+      if (sequence === searchSequence.current) setSearchingKey(null);
     }
   };
 
@@ -516,13 +554,29 @@ export default function ProjectPage({ projectId, onChanged, openVideo }: {
           {!running && queued && <TaskCard task={queued} compact />}
           {!running && !queued && lastFinished && lastFinished.state !== "done" && <TaskCard task={lastFinished} compact />}
 
+      <div className="search-scope-bar">
+        <label htmlFor="search-folder">Search in</label>
+        <select id="search-folder" value={folderId ?? ""}
+          onChange={(e) => changeFolder(e.target.value ? Number(e.target.value) : null)}>
+          <option value="">All watched folders</option>
+          {view.folders.map((f) => <option key={f.id} value={f.id}>{f.path}</option>)}
+        </select>
+        <span className="search-scope-summary" role="status">
+          {selectedIds.length > 0 ? `${selectedIds.length} selected video${selectedIds.length === 1 ? "" : "s"}`
+            : `${folderVideos.length} video${folderVideos.length === 1 ? "" : "s"} · ${scopeFolder ? "this folder" : "whole project"}`}
+        </span>
+        {selectedIds.length > 0 && <button type="button" className="ghost small" onClick={selection.clear}>Clear selection</button>}
+      </div>
       <form className="search" onSubmit={onSearch}>
         <input
-          placeholder="Search this project: “unboxing the board”, “wifi password”, on-screen text…"
+          ref={searchInput}
+          aria-label="Search project footage"
+          placeholder={selectedIds.length ? `Search ${selectedIds.length} selected videos…`
+            : scopeFolder ? "Search this watched folder…" : "Search this project: “unboxing the board”, “wifi password”, on-screen text…"}
           value={query}
           onChange={(e) => {
             setQuery(e.target.value);
-            if (!e.target.value.trim()) setHits(null);
+            if (!e.target.value.trim()) setSearchResult(null);
           }}
         />
         <button type="submit" disabled={searching || !query.trim()}>
@@ -591,9 +645,15 @@ export default function ProjectPage({ projectId, onChanged, openVideo }: {
               {f.path}
               {!f.available && <span className="muted small"> — not available (drive unplugged?)</span>}
             </span>
-            <button className="ghost small" onClick={() => run(() => removeFolder(projectId, f.path))}>
-              Remove
-            </button>
+            <div className="folder-actions">
+              <button className={`ghost small${folderId === f.id ? " active" : ""}`}
+                onClick={() => { changeFolder(f.id); searchInput.current?.focus(); }}>
+                Search here
+              </button>
+              <button className="ghost small" onClick={() => run(() => removeFolder(projectId, f.path))}>
+                Remove
+              </button>
+            </div>
           </div>
         ))}
         <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap" }}>
@@ -630,10 +690,10 @@ export default function ProjectPage({ projectId, onChanged, openVideo }: {
             className={`filter-pill ${categoryFilter === null ? "active" : ""}`}
             onClick={() => setCategoryFilter(null)}
           >
-            All ({view.videos.length})
+            All ({folderVideos.length})
           </button>
           {CATEGORIES.map((cat) => {
-            const count = view.videos.filter((v) => v.category === cat.id).length;
+            const count = folderVideos.filter((v) => v.category === cat.id).length;
             if (count === 0 && categoryFilter !== cat.id) return null;
             return (
               <button
@@ -649,14 +709,35 @@ export default function ProjectPage({ projectId, onChanged, openVideo }: {
         </div>
       )}
 
-      <section className="card video-library" tabIndex={0} aria-label="Video library, scroll horizontally to see all columns">
+      <div className="video-selection-toolbar">
+        <button type="button" className={`ghost small${selection.enabled ? " active" : ""}`}
+          aria-pressed={selection.enabled} onClick={() => selection.setEnabled(!selection.enabled)}>Select videos</button>
+        <span className="small" role="status">{selectedIds.length ? `${selectedIds.length} selected` : "Select videos to narrow your search"}
+          {hiddenSelected > 0 ? ` · ${hiddenSelected} hidden by category` : ""}</span>
+        {selectedIds.length > 0 && <>
+          <button type="button" className="ghost small" onClick={() => {
+            searchInput.current?.focus(); searchInput.current?.scrollIntoView({ behavior: "smooth", block: "center" });
+          }}>Search selected</button>
+          <button type="button" className="ghost small" onClick={selection.clear}>Clear</button>
+        </>}
+        <span className="muted small selection-hint">{selection.enabled
+          ? "Drag across rows · Ctrl/⌘ adds · Shift-click selects a range · Esc cancels a drag"
+          : "Use checkboxes or Ctrl/⌘-click · Shift-click selects a range"}</span>
+      </div>
+      <section ref={selection.container} {...selection.pointer}
+        className={`card video-library${selection.enabled ? " selection-mode" : ""}`}
+        tabIndex={0} aria-label="Video library, scroll horizontally to see all columns">
         {view.videos.length === 0 ? (
           <div className="muted">No videos yet — add a folder and press “Index now”.</div>
         ) : (
           <table>
             <thead>
               <tr>
-                <th>Name</th>
+                <th className="selection-cell"><input type="checkbox" aria-label="Select all visible videos"
+                  checked={selection.all} disabled={visibleVideos.length === 0}
+                  ref={(element) => { if (element) element.indeterminate = !selection.all && visibleVideos.some((v) => selection.ids.has(v.id)); }}
+                  onChange={selection.toggleAll} /></th>
+                <th className="video-name-heading">Name</th>
                 <th>Category</th>
                 <th>Length</th>
                 <th>Size</th>
@@ -668,13 +749,26 @@ export default function ProjectPage({ projectId, onChanged, openVideo }: {
               </tr>
             </thead>
             <tbody>
-              {(categoryFilter ? view.videos.filter((v) => v.category === categoryFilter) : view.videos).map((v) => (
+              {visibleVideos.map((v) => (
                 <tr
                   key={v.id}
                   title={v.path}
-                  className={`clickable ${v.id === selected ? "selected" : ""}`}
-                  onClick={() => (v.id === selected ? setSelected(null) : openAt(v.id, 0))}
+                  data-video-id={v.id}
+                  className={`clickable ${v.id === selected ? "selected" : ""}${selection.ids.has(v.id) ? " search-selected" : ""}`}
+                  onClick={(e) => {
+                    if (selection.enabled || e.ctrlKey || e.metaKey || e.shiftKey) {
+                      if (e.detail < 2) selection.toggle(v.id, e.shiftKey);
+                    }
+                    else if (v.id === selected) setSelected(null);
+                    else openAt(v.id, 0);
+                  }}
+                  onDoubleClick={() => { if (selection.enabled) openAt(v.id, 0); }}
                 >
+                  <td className="selection-cell" onClick={(e) => e.stopPropagation()}>
+                    <input type="checkbox" aria-label={`Select ${fileName(v.path)}`}
+                      checked={selection.ids.has(v.id)}
+                      onChange={(e) => selection.toggle(v.id, !!(e.nativeEvent as MouseEvent).shiftKey)} />
+                  </td>
                   <td className="name">
                     {fileName(v.path)}
                     {v.copies > 1 && <span className="tag">×{v.copies}</span>}
@@ -735,6 +829,8 @@ export default function ProjectPage({ projectId, onChanged, openVideo }: {
             </tbody>
           </table>
         )}
+        {view.videos.length > 0 && visibleVideos.length === 0 && <p className="muted">No videos in this folder/category.</p>}
+        {selection.box && <div className="video-selection-box" aria-hidden="true" style={selection.box} />}
       </section>
 
       {view.excluded.length > 0 && (

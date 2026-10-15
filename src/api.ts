@@ -156,6 +156,7 @@ export interface FolderView {
 
 export interface VideoRow {
   id: number;
+  folder_ids: number[];
   path: string;
   copies: number;
   size: number;
@@ -424,8 +425,11 @@ export interface Hit {
   projects?: HitProject[];
 }
 
-export const search = (projectId?: number | null, query: string = "", limit = 30) =>
-  call<{ hits: Hit[]; note: string | null }>("search", { projectId: projectId ?? null, query, limit });
+export interface SearchScope { folderId?: number | null; videoIds?: number[] | null }
+export const search = (projectId?: number | null, query: string = "", limit = 30, scope: SearchScope = {}) =>
+  call<{ hits: Hit[]; note: string | null }>("search", {
+    projectId: projectId ?? null, query, limit, folderId: scope.folderId ?? null, videoIds: scope.videoIds ?? null,
+  });
 
 export const videoDetails = (videoId: number) =>
   call<VideoRow>("video_details", { videoId });

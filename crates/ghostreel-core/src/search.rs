@@ -19,6 +19,10 @@ const MERGE_GAP_S: f64 = 10.0;
 #[derive(Debug, Clone, Default)]
 pub struct SearchOptions {
     pub project_id: Option<i64>,
+    /// Restrict to a watched folder (its indexed nested files are included).
+    pub folder_id: Option<i64>,
+    /// None searches the scope; an explicitly empty selection matches nothing.
+    pub video_ids: Option<Vec<i64>>,
     pub limit: usize,
     /// Restrict to chunk kinds (`moment`, `transcript`, `frame`).
     pub kinds: Option<Vec<String>>,
@@ -100,14 +104,18 @@ fn keyword_candidates(db: &Db, query: &str, opts: &SearchOptions) -> Result<Keyw
     queries.push((broad, if multi { 1 } else { 0 }));
     let kinds =
         opts.kinds.as_ref().map(serde_json::to_string).transpose().map_err(|e| Error::Invalid(e.to_string()))?;
+    let video_ids =
+        opts.video_ids.as_ref().map(serde_json::to_string).transpose().map_err(|e| Error::Invalid(e.to_string()))?;
     let mut st = db.conn.prepare(
         "SELECT chunks_fts.rowid, snippet(chunks_fts, 0, '[', ']', '…', 14)
          FROM chunks_fts JOIN chunks c ON c.id = chunks_fts.rowid
          WHERE chunks_fts MATCH ?1
            AND (?3 IS NULL OR c.kind IN (SELECT value FROM json_each(?3)))
+           AND (?5 IS NULL OR c.video_id IN (SELECT value FROM json_each(?5)))
            AND EXISTS (
              SELECT 1 FROM video_files vf JOIN project_folders pf ON pf.folder_id = vf.folder_id
              WHERE vf.video_id = c.video_id AND (?4 IS NULL OR pf.project_id = ?4)
+               AND (?6 IS NULL OR vf.folder_id = ?6)
                AND NOT EXISTS (SELECT 1 FROM project_exclusions x
                                WHERE x.project_id = pf.project_id AND x.video_id = vf.video_id))
          ORDER BY bm25(chunks_fts), chunks_fts.rowid LIMIT ?2",
@@ -115,9 +123,10 @@ fn keyword_candidates(db: &Db, query: &str, opts: &SearchOptions) -> Result<Keyw
     let mut candidates = Vec::new();
     let mut quality = HashMap::new();
     for (fts, tier) in queries {
-        let rows = st.query_map(params![fts, CANDIDATES as i64, kinds, opts.project_id], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
-        })?;
+        let rows = st
+            .query_map(params![fts, CANDIDATES as i64, kinds, opts.project_id, video_ids, opts.folder_id], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            })?;
         for row in rows {
             let (id, snippet) = row?;
             if let std::collections::hash_map::Entry::Vacant(e) = quality.entry(id) {
@@ -168,22 +177,52 @@ pub fn search_with_vector(
     opts: &SearchOptions,
 ) -> Result<Vec<Hit>, Error> {
     let limit = if opts.limit == 0 { 20 } else { opts.limit };
+    let selected =
+        opts.video_ids.as_ref().map(serde_json::to_string).transpose().map_err(|e| Error::Invalid(e.to_string()))?;
     let allowed: HashSet<i64> = {
         let mut st = db.conn.prepare(
             "SELECT DISTINCT vf.video_id FROM video_files vf JOIN project_folders pf ON pf.folder_id = vf.folder_id
               WHERE (?1 IS NULL OR pf.project_id = ?1)
+                AND (?2 IS NULL OR vf.folder_id = ?2)
+                AND (?3 IS NULL OR vf.video_id IN (SELECT value FROM json_each(?3)))
                 AND NOT EXISTS (SELECT 1 FROM project_exclusions x WHERE x.project_id = pf.project_id AND x.video_id = vf.video_id)",
         )?;
-        st.query_map([opts.project_id], |r| r.get(0))?.collect::<Result<_, _>>()?
+        st.query_map(params![opts.project_id, opts.folder_id, selected], |r| r.get(0))?.collect::<Result<_, _>>()?
     };
+
+    if allowed.is_empty() {
+        return Ok(Vec::new());
+    }
 
     // Ranked candidate chunk ids from each retriever.
     let (keyword, quality) = keyword_candidates(db, query, opts)?;
     let mut semantic: Vec<i64> = Vec::new();
     if let Some(v) = vector {
-        let mut st =
-            db.conn.prepare("SELECT rowid FROM chunks_vec WHERE embedding MATCH ?1 AND k = ?2 ORDER BY distance")?;
-        semantic = st.query_map(params![to_blob(v), CANDIDATES as i64], |r| r.get(0))?.collect::<Result<_, _>>()?;
+        if opts.project_id.is_some() || opts.folder_id.is_some() || opts.video_ids.is_some() || opts.kinds.is_some() {
+            // Filter first. Global top-k followed by filtering can miss every selected file.
+            // vec0's default metric is L2; use the same metric for the scoped exact ranking.
+            let allowed_json = serde_json::to_string(&allowed).map_err(|e| Error::Invalid(e.to_string()))?;
+            let kinds = opts
+                .kinds
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(|e| Error::Invalid(e.to_string()))?;
+            let mut st = db.conn.prepare(
+                "SELECT v.rowid FROM chunks c CROSS JOIN chunks_vec v ON v.rowid = c.id
+                 WHERE c.video_id IN (SELECT value FROM json_each(?2))
+                   AND (?3 IS NULL OR c.kind IN (SELECT value FROM json_each(?3)))
+                 ORDER BY vec_distance_L2(v.embedding, ?1), v.rowid LIMIT ?4",
+            )?;
+            semantic = st
+                .query_map(params![to_blob(v), allowed_json, kinds, CANDIDATES as i64], |r| r.get(0))?
+                .collect::<Result<_, _>>()?;
+        } else {
+            let mut st = db
+                .conn
+                .prepare("SELECT rowid FROM chunks_vec WHERE embedding MATCH ?1 AND k = ?2 ORDER BY distance")?;
+            semantic = st.query_map(params![to_blob(v), CANDIDATES as i64], |r| r.get(0))?.collect::<Result<_, _>>()?;
+        }
     }
 
     let mut ids: Vec<i64> = keyword.iter().map(|(id, _)| *id).chain(semantic.iter().copied()).collect();
@@ -298,8 +337,12 @@ pub fn search_with_vector(
             .conn
             .query_row(
                 "SELECT vf.path FROM video_files vf JOIN project_folders pf ON pf.folder_id = vf.folder_id
-                  WHERE vf.video_id = ?1 AND (?2 IS NULL OR pf.project_id = ?2) ORDER BY vf.id LIMIT 1",
-                params![h.video_id, opts.project_id],
+                  WHERE vf.video_id = ?1 AND (?2 IS NULL OR pf.project_id = ?2)
+                    AND (?3 IS NULL OR vf.folder_id = ?3)
+                    AND NOT EXISTS (SELECT 1 FROM project_exclusions x
+                                    WHERE x.project_id = pf.project_id AND x.video_id = vf.video_id)
+                  ORDER BY vf.id LIMIT 1",
+                params![h.video_id, opts.project_id, opts.folder_id],
                 |r| r.get::<_, String>(0),
             )
             .map(PathBuf::from)
@@ -346,6 +389,103 @@ fn short(text: &str) -> String {
 mod tests {
     use super::*;
     use crate::projects::NewProject;
+
+    #[test]
+    fn selected_files_and_folder_intersect_and_return_the_matching_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = Db::open_in_memory().unwrap();
+        let p = db.create_project(&NewProject::named("Scoped")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("a")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("b")).unwrap();
+        let a = db.add_folder(p.id, &tmp.path().join("a"), true).unwrap();
+        let b = db.add_folder(p.id, &tmp.path().join("b"), true).unwrap();
+        db.conn
+            .execute_batch(
+                "INSERT INTO videos(id,content_hash,size) VALUES (1,'one',1),(2,'two',1);
+            INSERT INTO chunks(video_id,kind,start_s,end_s,text) VALUES
+            (1,'frame',0,5,'a community meeting'),(2,'frame',0,5,'another community meeting');",
+            )
+            .unwrap();
+        for (vid, folder, path) in
+            [(1, a.id, "a/original.mp4"), (1, b.id, "b/nested/copy.mp4"), (2, a.id, "a/other.mp4")]
+        {
+            db.conn
+                .execute(
+                    "INSERT INTO video_files(video_id,folder_id,path,size,mtime,last_seen) VALUES (?1,?2,?3,1,0,0)",
+                    params![vid, folder, path],
+                )
+                .unwrap();
+        }
+        let mut opts = SearchOptions {
+            project_id: Some(p.id),
+            folder_id: Some(b.id),
+            video_ids: Some(vec![1, 2]),
+            ..Default::default()
+        };
+        let hits = search_with_vector(&db, tmp.path(), "community", None, &opts).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].video_id, 1);
+        assert_eq!(hits[0].path, PathBuf::from("b/nested/copy.mp4"));
+        let videos = crate::index::videos(&db, Some(p.id)).unwrap();
+        let memberships = &videos.iter().find(|v| v.id == 1).unwrap().folder_ids;
+        assert!(memberships.contains(&a.id) && memberships.contains(&b.id));
+        opts.video_ids = Some(vec![]);
+        assert!(search_with_vector(&db, tmp.path(), "community", None, &opts).unwrap().is_empty());
+        opts.video_ids = Some(vec![2]);
+        assert!(search_with_vector(&db, tmp.path(), "community", None, &opts).unwrap().is_empty());
+        opts.video_ids = None;
+        opts.folder_id = Some(-123);
+        assert!(search_with_vector(&db, tmp.path(), "community", None, &opts).unwrap().is_empty());
+    }
+
+    #[test]
+    fn selected_files_are_filtered_before_keyword_and_vector_candidate_limits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = Db::open_in_memory().unwrap();
+        let p = db.create_project(&NewProject::named("Candidates")).unwrap();
+        let folder = db.add_folder(p.id, tmp.path(), true).unwrap();
+        let mut query = vec![0.0; crate::config::EMBED_DIM];
+        query[0] = 1.0;
+        let mut far = vec![0.0; crate::config::EMBED_DIM];
+        far[1] = 1.0;
+        for id in 1..=225 {
+            db.conn
+                .execute(
+                    "INSERT INTO videos(id,content_hash,size) VALUES (?1,?2,1)",
+                    params![id, format!("scope-{id}")],
+                )
+                .unwrap();
+            db.conn
+                .execute(
+                    "INSERT INTO video_files(video_id,folder_id,path,size,mtime,last_seen) VALUES (?1,?2,?3,1,0,0)",
+                    params![id, folder.id, format!("{id}.mp4")],
+                )
+                .unwrap();
+            db.conn
+                .execute(
+                    "INSERT INTO chunks(video_id,kind,start_s,end_s,text) VALUES (?1,'frame',0,5,'community')",
+                    [id],
+                )
+                .unwrap();
+            let chunk = db.conn.last_insert_rowid();
+            db.conn
+                .execute(
+                    "INSERT INTO chunks_vec(rowid,embedding) VALUES (?1,?2)",
+                    params![chunk, to_blob(if id == 225 { &far } else { &query })],
+                )
+                .unwrap();
+        }
+        let opts = SearchOptions { project_id: Some(p.id), video_ids: Some(vec![225]), ..Default::default() };
+        let hits = search_with_vector(&db, tmp.path(), "community", Some(&query), &opts).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].video_id, 225);
+        assert_eq!(hits[0].matched_by, vec!["keyword", "meaning"]);
+        let semantic = search_with_vector(&db, tmp.path(), "no keyword match", Some(&query), &opts).unwrap();
+        assert_eq!(semantic[0].video_id, 225);
+        assert_eq!(semantic[0].matched_by, vec!["meaning"]);
+        db.exclude_video(p.id, 225, "removed").unwrap();
+        assert!(search_with_vector(&db, tmp.path(), "community", Some(&query), &opts).unwrap().is_empty());
+    }
 
     #[test]
     fn fts_query_building() {
@@ -407,7 +547,7 @@ mod tests {
         ))
         .unwrap();
 
-        let opts = SearchOptions { project_id: Some(pa.id), limit: 10, kinds: None };
+        let opts = SearchOptions { project_id: Some(pa.id), limit: 10, kinds: None, ..Default::default() };
         let hits = search(&db, tmp.path(), "unbox", None, &opts).await.unwrap();
         assert_eq!(hits.len(), 1, "two overlapping chunks of video 1 merge; video 2 is another project");
         assert_eq!((hits[0].start_s, hits[0].end_s), (0.0, 30.0));
@@ -420,7 +560,12 @@ mod tests {
         assert_eq!(all.len(), 2);
         assert_eq!(all[0].projects.len(), 1);
         assert_eq!(all[1].projects.len(), 1);
-        let kinds = SearchOptions { project_id: Some(pa.id), limit: 10, kinds: Some(vec!["transcript".into()]) };
+        let kinds = SearchOptions {
+            project_id: Some(pa.id),
+            limit: 10,
+            kinds: Some(vec!["transcript".into()]),
+            ..Default::default()
+        };
         let hits = search(&db, tmp.path(), "flash", None, &kinds).await.unwrap();
         assert_eq!(hits[0].start_s, 200.0);
         assert!(search(&db, tmp.path(), "zebra", None, &opts).await.unwrap().is_empty());
@@ -456,7 +601,7 @@ mod tests {
                     .unwrap();
             }
         }
-        let opts = SearchOptions { project_id: Some(project.id), limit: 10, kinds: None };
+        let opts = SearchOptions { project_id: Some(project.id), limit: 10, kinds: None, ..Default::default() };
         let hits = search_with_vector(&db, tmp.path(), "black woman", None, &opts).unwrap();
         assert_eq!(hits.iter().map(|h| h.video_id).take(2).collect::<Vec<_>>(), [4, 3]);
         assert!(hits[0].snippet.contains("[Black woman]"));
@@ -486,7 +631,12 @@ mod tests {
             db.conn.execute("INSERT INTO chunks(video_id, kind, start_s, end_s, text) VALUES (1, 'transcript', ?1, ?1 + 1, 'woman woman woman')", [i as i64 * 100]).unwrap();
         }
         db.conn.execute("INSERT INTO chunks(video_id, kind, start_s, end_s, text) VALUES (1, 'frame', 0, 1, 'A Black woman sits outdoors')", []).unwrap();
-        let opts = SearchOptions { project_id: Some(project.id), limit: 1, kinds: Some(vec!["frame".into()]) };
+        let opts = SearchOptions {
+            project_id: Some(project.id),
+            limit: 1,
+            kinds: Some(vec!["frame".into()]),
+            ..Default::default()
+        };
         let hits = search_with_vector(&db, tmp.path(), "black woman", None, &opts).unwrap();
         assert_eq!(hits.len(), 1);
         assert!(hits[0].snippet.contains("[Black woman]"));

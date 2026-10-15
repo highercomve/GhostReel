@@ -384,7 +384,7 @@ button.danger {
 }
 
 .row.folder {
-  grid-template-columns: 22px 1fr auto;
+  grid-template-columns: 22px minmax(0, 1fr) auto;
 }
 
 h2 .normal {
@@ -689,7 +689,7 @@ main.project-workspace {
   padding: 10px 12px;
 }
 
-.video-library th:first-child,
+.video-library th.video-name-heading,
 .video-library td.name {
   width: 100%;
   min-width: 240px;
@@ -3271,3 +3271,40 @@ pre.cli-test-result { background: var(--panel, #171a21); border: 1px solid var(-
   .search-window-results { padding: 16px 0; }
   .hit-thumbnail-container { width: 140px; height: 80px; }
 }
+
+/* Keep search scope visible while selection remains independent of the open preview. */
+.search-scope-bar, .video-selection-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.search-scope-bar { margin: 4px 0 10px; font-size: 12px; }
+.search-scope-bar > label { color: var(--muted); }
+.search-scope-bar select { max-width: min(560px, 100%); min-width: 0; }
+.search-scope-summary { color: var(--good); }
+.video-selection-toolbar { margin: 10px 0 8px; }
+.selection-hint { margin-left: auto; }
+.video-selection-toolbar button.active, .folder button.active {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 18%, var(--panel));
+}
+.video-library { position: relative; }
+.video-library .video-name-heading { width: 100%; min-width: 240px; }
+.video-library .selection-cell { width: 36px; min-width: 36px; padding-inline: 8px; text-align: center; }
+.video-library input[type="checkbox"] { accent-color: var(--accent); cursor: pointer; }
+.video-library.selection-mode { user-select: none; cursor: crosshair; }
+.video-library.selection-mode tr { cursor: crosshair; }
+.video-library tr.search-selected { background: color-mix(in srgb, var(--accent) 14%, var(--panel)); }
+.video-library tr.search-selected td:first-child { box-shadow: inset 3px 0 var(--accent); }
+.video-selection-box {
+  position: absolute;
+  z-index: 2;
+  pointer-events: none;
+  border: 1px solid var(--accent-2);
+  background: color-mix(in srgb, var(--accent-2) 12%, transparent);
+  border-radius: 3px;
+}
+@media (max-width: 850px) { .selection-hint { flex-basis: 100%; margin-left: 0; } }
+
+.folder-actions { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; }

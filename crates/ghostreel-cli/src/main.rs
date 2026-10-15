@@ -1587,7 +1587,7 @@ async fn search_cmd(
             Err(why) => eprintln!("(meaning search unavailable: {why}; using keywords only)"),
         }
     }
-    let opts = ghostreel_core::search::SearchOptions { project_id: pid, limit, kinds };
+    let opts = ghostreel_core::search::SearchOptions { project_id: pid, limit, kinds, ..Default::default() };
     let hits = ghostreel_core::search::search(&db, &paths.data_dir, query, embedder.as_mut(), &opts).await?;
     if json {
         println!("{}", serde_json::to_string_pretty(&hits)?);

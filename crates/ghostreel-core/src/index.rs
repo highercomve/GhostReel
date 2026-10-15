@@ -2028,6 +2028,7 @@ pub struct Status {
 #[derive(Debug, Clone, Serialize)]
 pub struct VideoRow {
     pub id: i64,
+    pub folder_ids: Vec<i64>,
     pub path: PathBuf,
     pub copies: i64,
     pub size: i64,
@@ -2066,7 +2067,7 @@ pub struct VideoRow {
 
 /// Videos visible to a project (or all), one row per content with its first path.
 const SCOPE: &str = "
-    SELECT vf.video_id, MIN(vf.path) AS path, COUNT(DISTINCT vf.path) AS copies
+    SELECT vf.video_id, MIN(vf.path) AS path, COUNT(DISTINCT vf.path) AS copies, json_group_array(DISTINCT vf.folder_id) AS folder_ids
       FROM video_files vf JOIN project_folders pf ON pf.folder_id = vf.folder_id
      WHERE (?1 IS NULL OR pf.project_id = ?1)
        AND NOT EXISTS (SELECT 1 FROM project_exclusions x WHERE x.project_id = pf.project_id AND x.video_id = vf.video_id)
@@ -2125,13 +2126,14 @@ pub fn videos_with_shake(
                 (SELECT j.state FROM jobs j WHERE j.video_id = v.id AND j.stage = 'transcribe'),
                 (SELECT COUNT(*) FROM frames f WHERE f.video_id = v.id),
                 COALESCE(v.category, 'other'), COALESCE(v.category_confidence, 0.0), COALESCE(v.category_source, 'auto'),
-                v.category_tag
+                v.category_tag, sc.folder_ids
            FROM ({SCOPE}) sc JOIN videos v ON v.id = sc.video_id
           ORDER BY sc.path"
     ))?;
     let rows = st.query_map([project_id], |r| {
         Ok(VideoRow {
             id: r.get(0)?,
+            folder_ids: serde_json::from_str(&r.get::<_, String>(21)?).unwrap_or_default(),
             path: PathBuf::from(r.get::<_, String>(1)?),
             copies: r.get(2)?,
             size: r.get(3)?,
@@ -2189,9 +2191,9 @@ pub fn video_by_id(
                 (SELECT j.state FROM jobs j WHERE j.video_id = v.id AND j.stage = \x27transcribe\x27),
                 (SELECT COUNT(*) FROM frames f WHERE f.video_id = v.id),
                 COALESCE(v.category, 'other'), COALESCE(v.category_confidence, 0.0), COALESCE(v.category_source, 'auto'),
-                v.category_tag
+                v.category_tag, sc.folder_ids
            FROM (
-             SELECT vf.video_id, MIN(vf.path) AS path, COUNT(DISTINCT vf.path) AS copies
+             SELECT vf.video_id, MIN(vf.path) AS path, COUNT(DISTINCT vf.path) AS copies, json_group_array(DISTINCT vf.folder_id) AS folder_ids
                FROM video_files vf
               WHERE vf.video_id = ?1
               GROUP BY vf.video_id
@@ -2200,6 +2202,7 @@ pub fn video_by_id(
     let mut row = st.query_row([video_id], |r| {
         Ok(VideoRow {
             id: r.get(0)?,
+            folder_ids: serde_json::from_str(&r.get::<_, String>(21)?).unwrap_or_default(),
             path: PathBuf::from(r.get::<_, String>(1)?),
             copies: r.get(2)?,
             size: r.get(3)?,

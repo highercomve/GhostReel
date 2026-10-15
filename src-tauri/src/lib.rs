@@ -207,6 +207,8 @@ async fn search(
     state: State<'_, SearchState>,
     project_id: Option<i64>,
     query: String,
+    folder_id: Option<i64>,
+    video_ids: Option<Vec<i64>>,
     limit: Option<usize>,
 ) -> CmdResult<SearchView> {
     let p = paths()?;
@@ -220,7 +222,13 @@ async fn search(
             Err(why) => note = Some(format!("Keyword search only ({why})")),
         }
     }
-    let opts = ghostreel_core::search::SearchOptions { project_id, limit: limit.unwrap_or(30), kinds: None };
+    let opts = ghostreel_core::search::SearchOptions {
+        project_id,
+        folder_id,
+        video_ids,
+        limit: limit.unwrap_or(30),
+        kinds: None,
+    };
     let vector = match cached.as_mut() {
         Some(e) => match ghostreel_core::search::query_vector(e, &query).await {
             Ok(v) => Some(v),

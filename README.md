@@ -185,6 +185,18 @@ VRAM at the cost of additional work in system RAM.
 
 ---
 
+## Search selected footage
+
+In a project's Library, check videos to search just those files. Shift-click a checkbox for a
+range, Ctrl/⌘-click rows to add or remove files, or turn on **Select videos** and drag a rectangle
+across rows. The header checkbox selects all visible rows; category filters can hide selected
+rows, and the selection count makes that explicit. **Clear selection** returns to the folder or
+whole-project scope. Normal row clicks still open previews outside selection mode.
+
+Choose a watched folder under **Search in**, or click **Search here** beside its path, to restrict
+both the library and search to that folder's indexed videos, including its indexed subfolders.
+Changing folders clears the file selection. Keyword and semantic search both honor these scopes.
+
 ## Two ways to run the models
 
 | | Standalone (default on a fresh machine) | Shared servers |

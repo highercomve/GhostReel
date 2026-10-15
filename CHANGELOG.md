@@ -3,6 +3,22 @@
 All notable changes to GhostReel. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [SemVer](https://semver.org/) while the project is 0.x (minor = features, patch = fixes).
 
+## [0.11.0] — 2026-10-15
+
+### Added
+
+- Project search can be restricted to selected videos or a watched folder. The library supports
+  checkboxes, Shift-click ranges, selecting all visible rows, and mouse drag selection in
+  selection mode, with a visible search scope and a clear-selection action.
+
+### Fixed
+
+- macOS CI creates signed DMGs directly from a staging folder, avoiding temporary
+  mounted images that could fail to detach with a `Resource busy` error.
+- Scoped keyword and semantic retrieval apply file/folder filters before candidate limits;
+  unrelated footage cannot crowd selected clips out of search results. Scoped results use the
+  matching folder's file path, including videos with copies in multiple watched folders.
+
 ## [0.10.0] — 2026-10-15
 
 ### Added

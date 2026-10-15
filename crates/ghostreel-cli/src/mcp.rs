@@ -436,7 +436,8 @@ async fn call_tool(paths: &Paths, name: &str, args: &Value) -> anyhow::Result<Va
                     Err(why) => eprintln!("mcp: meaning search unavailable ({why}); keywords only"),
                 }
             }
-            let opts = ghostreel_core::search::SearchOptions { project_id: Some(p.id), limit, kinds };
+            let opts =
+                ghostreel_core::search::SearchOptions { project_id: Some(p.id), limit, kinds, ..Default::default() };
             let hits = ghostreel_core::search::search(&db, &paths.data_dir, &query, embedder.as_mut(), &opts).await?;
             Ok(serde_json::to_value(hits)?)
         }

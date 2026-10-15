@@ -1341,7 +1341,7 @@ pub fn dispatch_tool_limited(
             // `kind` filter here hid everything whenever that part of the index wasn't built yet
             // (frame descriptions still running) while the same words sat in the speech.
             let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10).clamp(1, 20) as usize;
-            let opts = SearchOptions { project_id: Some(project_id), limit, kinds: None };
+            let opts = SearchOptions { project_id: Some(project_id), limit, kinds: None, ..Default::default() };
 
             let hits = match search_with_vector(db, data_dir, query, vector, &opts) {
                 Ok(h) => h,

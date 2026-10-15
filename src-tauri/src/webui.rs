@@ -426,8 +426,9 @@ async fn dispatch(app: &AppHandle, cmd: &str, args: Value) -> Result<Value, Stri
             ok(crate::remove_folder(project_id, path)?)
         }
         "search" => {
-            let (project_id, query, limit) = args!(args; project_id: Option<i64>, query: String, limit: Option<usize>);
-            ok(crate::search(app.state::<crate::SearchState>(), project_id, query, limit).await?)
+            let (project_id, query, limit, folder_id, video_ids) = args!(args;
+                project_id: Option<i64>, query: String, limit: Option<usize>, folder_id: Option<i64>, video_ids: Option<Vec<i64>>);
+            ok(crate::search(app.state::<crate::SearchState>(), project_id, query, folder_id, video_ids, limit).await?)
         }
         "video_details" => {
             let (video_id,) = args!(args; video_id: i64);
