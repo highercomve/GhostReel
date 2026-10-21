@@ -1,0 +1,6 @@
+---
+.title = "GhostReel",
+.date = .date("2026-10-21T00:00:00"),
+.authors = ["GhostReel"],
+.layout = "home.shtml",
+---

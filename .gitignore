@@ -21,3 +21,6 @@ src-tauri/tauri.bundle.json
 # Frozen-helper Python caches
 __pycache__/
 *.pyc
+
+# Website build output (zine release --output site-public)
+site-public/

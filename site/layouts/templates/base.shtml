@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+	<head id="head">
+		<meta charset="utf-8">
+		<meta name="viewport" content="width=device-width, initial-scale=1">
+		<meta name="description" content="GhostReel: search inside your videos by what was said, shown or written on screen, and cut them into a story, locally.">
+		<meta property="og:title" content="GhostReel: search inside your videos, locally">
+		<meta property="og:description" content="Transcribe speech, describe keyframes, search footage and draft an edit on your own computer. Export MP4, FCP 7 XML for Premiere Pro, or .otio.">
+		<meta property="og:image" content="$site.host_url.suffix($site.asset('brand/icon-512.png').link())">
+		<meta name="theme-color" content="#0d0d15">
+		<link rel="icon" type="image/svg+xml" href="$site.asset('brand/icon.svg').link()">
+		<link rel="icon" type="image/png" href="$site.asset('brand/icon-64.png').link()">
+		<link rel="apple-touch-icon" href="$site.asset('brand/icon-192.png').link()">
+		<link rel="preconnect" href="https://fonts.googleapis.com">
+		<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+		<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap">
+		<link type="text/css" rel="stylesheet" href="$site.asset('style.css').link().suffix('?v=20261021')">
+		<style>[hidden] { display: none !important; }</style>
+		<super>
+	</head>
+	<body id="body">
+		<a class="skip-link" href="#content">Skip to content</a>
+		<header class="topbar">
+			<div class="topbar-inner">
+				<a class="brand" href="$site.page('').link()" aria-label="GhostReel home">
+					<img class="brand-mark" src="$site.asset('brand/icon-64.png').link()" alt="" width="28" height="28">
+					<span class="brand-name">GhostReel</span>
+				</a>
+				<button class="menu-toggle" type="button" aria-label="Menu" aria-expanded="false">
+					<span></span><span></span><span></span>
+				</button>
+				<nav class="topnav" aria-label="Main navigation">
+					<a href="$site.page('').link().suffix('#features')">Features</a>
+					<a href="$site.page('').link().suffix('#download')">Download</a>
+					<a href="$site.page('guide').link()">Guide</a>
+					<a class="topnav-gh" href="https://github.com/highercomve/GhostReel">GitHub</a>
+					<span class="version-badge" data-latest-version data-release-json="$site.asset('release.json').link()" hidden></span>
+				</nav>
+			</div>
+		</header>
+		<super>
+		<footer class="site-footer">
+			<div class="footer-inner">
+				<div class="footer-brand">
+					<img class="brand-mark" src="$site.asset('brand/icon-64.png').link()" alt="" width="22" height="22">
+					<span>GhostReel</span>
+					<p>Search inside your videos, and cut them into a story, locally.</p>
+				</div>
+				<div class="footer-cols">
+					<div>
+						<h4>GhostReel</h4>
+						<a href="$site.page('').link().suffix('#download')">Download</a>
+						<a href="$site.page('guide').link()">Guide</a>
+						<a href="https://github.com/highercomve/GhostReel/releases">Releases</a>
+						<a href="https://github.com/highercomve/GhostReel/issues">Issues</a>
+					</div>
+					<div>
+						<h4>Built with</h4>
+						<a href="https://v2.tauri.app">Tauri</a>
+						<a href="https://github.com/ggml-org/whisper.cpp">whisper.cpp</a>
+						<a href="https://github.com/ggml-org/llama.cpp">llama.cpp</a>
+						<a href="https://github.com/asg017/sqlite-vec">sqlite-vec</a>
+						<a href="https://ffmpeg.org">FFmpeg</a>
+					</div>
+					<div>
+						<h4>Also by the author</h4>
+						<a href="https://highercomve.github.io/GhostPen/">GhostPen</a>
+					</div>
+				</div>
+			</div>
+			<p class="footer-legal">MIT license · Built with <a href="https://v2.tauri.app">Tauri</a> and <a href="https://zine-ssg.io">Zine</a> · GhostReel reuses Whisper models already downloaded by <a href="https://highercomve.github.io/GhostPen/">GhostPen</a></p>
+		</footer>
+		<script src="$site.asset('site.js').link().suffix('?v=20261021')" defer></script>
+	</body>
+</html>

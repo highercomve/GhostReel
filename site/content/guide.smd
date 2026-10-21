@@ -1,0 +1,287 @@
+---
+.title = "Guide",
+.description = "Install GhostReel, set up its models, index your footage, search it, draft a script, and export the cut. Plus the command line and the MCP server for AI agents.",
+.date = .date("2026-10-21T00:00:00"),
+.authors = ["GhostReel"],
+.layout = "page.shtml",
+---
+
+```=html
+<a id="install"></a>
+```
+
+# Install
+
+Download the file for your system from the [download section](https://highercomve.github.io/GhostReel/#download)
+or the [GitHub releases](https://github.com/highercomve/GhostReel/releases).
+
+| Platform | File | Notes |
+| --- | --- | --- |
+| Windows 10/11 | `GhostReel_x.y.z_x64-setup.exe` | NVIDIA driver 570+ for the GPU (the CUDA 12.8 runtime is bundled) |
+| Linux | `GhostReel_x.y.z_amd64.AppImage` | NVIDIA driver 570+ for the GPU |
+| macOS 14+ · Apple Silicon | `GhostReel_x.y.z_aarch64.dmg` | MLX for vision and chat, Metal for Whisper |
+| macOS 12+ · Intel | `GhostReel_x.y.z_x64.dmg` | llama.cpp and Whisper with Metal |
+
+- **Windows**: run the installer.
+- **Linux**: make the AppImage executable (`chmod +x GhostReel_*.AppImage`)
+  and run it.
+- **macOS**: open the DMG and drag **GhostReel** to **Applications**. The app
+  is self-signed and not notarized by Apple, so the first launch is blocked:
+  open **System Settings → Privacy & Security → Open Anyway**. Later releases
+  reuse the same signing certificate.
+
+ffmpeg and ffprobe are bundled, so there is nothing else to install.
+
+## Updates
+
+GhostReel checks for new releases on the **Status** page. Click **Check for
+updates**: when a newer version is available you see the release notes and a
+**Download and install** button. Once the download finishes, **Restart to
+finish** applies the update. Updates are signed, and the app checks them with
+a public key embedded in it.
+
+# Set up the models
+
+On first start, open **Models** and download what you need:
+
+| Capability | Default model | Size | Alternatives |
+| --- | --- | --- | --- |
+| Speech | Whisper `large-v3-turbo` | 1.6 GB | `small` (488 MB), quantized turbo q8_0 / q5_0 (874 / 574 MB), `.en` variants |
+| Frame descriptions & script chat | `Bonsai-27B` Q1_0 + projector | 3.8 GB | Qwen2.5-VL 7B (4.7 GB), Gemma 3 4B (2.5 GB), Qwen2.5-VL 3B (1.9 GB) |
+| Search embeddings | `embeddinggemma-300M` Q8_0 | 334 MB | fixed, so indexes stay compatible between computers |
+
+GhostReel also picks up models you already have, such as
+[GhostPen](https://highercomve.github.io/GhostPen/)'s Whisper models and LM
+Studio's models, instead of downloading them again. The default setup fits an
+8 GB GPU.
+
+On **Apple Silicon**, frame descriptions and the script chat run with MLX. The
+Models page offers MLX versions of Qwen2.5-VL 3B and 7B, Gemma 3 4B and
+Qwen3.5 9B; the initial vision model there is Qwen2.5-VL 3B. Interrupted
+downloads resume, and a model is only marked installed once every file is
+complete.
+
+Frame descriptions and the script chat are configured separately: describing
+a keyframe is a short prompt plus one image, while the chat needs room for
+search results and a whole draft.
+
+## Where each model runs
+
+Each capability (speech, vision and chat, embeddings) is set to **Auto**,
+**This computer** or **Server** on the **Models** page:
+
+| | Standalone (default) | Shared servers |
+| --- | --- | --- |
+| Speech | `ghostreel-asr` helper (whisper.cpp) | GhostPen's speech server |
+| Vision & chat | `ghostreel-llm` helper (llama.cpp) | any OpenAI-compatible vision server, such as [highllama](https://github.com/highercomve/highllama) |
+| Embeddings | `ghostreel-llm` helper | a server with the same embedding model |
+
+*Auto* uses a server only when it is reachable **and capable** (vision
+support, timestamped transcripts, the exact embedding model), and falls back
+to the local helper otherwise. `ghostreel doctor` shows what would be used and
+why. Running against servers you already have means the same GPU never holds
+a model twice.
+
+## A coding-agent CLI instead of a model
+
+No GPU headroom for a vision model? Point a capability at a coding-agent CLI
+you already have (**claude**, **agy** or **opencode**) on the Models page
+(backend **CLI agent**), or from a terminal:
+
+```
+ghostreel config set vision.backend cli        # frame descriptions through a CLI
+ghostreel config set vision.cli.tool claude
+ghostreel config set chat_model.backend local  # …while the script chat stays local
+ghostreel config test-cli vision               # one call, prints what it answered
+```
+
+The two capabilities are independent. **Auto never picks a CLI**: it spends
+money or quota, so you have to choose it. Frame descriptions make one call per
+keyframe, so check the cost for your library first; the Models page has a
+**Test one call** button that checks the setup and the latency before you
+index.
+
+# Index your footage
+
+1. **New project**: a name, a frame rate and a resolution (used for timeline
+   exports).
+2. **Add folder**: pick the footage folder. GhostReel adds the whole tree,
+   finds every video and identifies it by its content, so moved or duplicated
+   files are indexed once.
+3. **Index now**. Progress shows in the project and on the **Activity** page.
+   Stop any time; indexing again resumes where it left off.
+
+Indexing transcribes the speech with timestamps and language detection,
+extracts keyframes (scene changes, plus a frame at least every few seconds,
+which you can configure) and describes each one (subject, setting, shot and
+on-screen text), embeds everything for search, and measures camera movement
+and handheld tremor so shaky stretches can be avoided.
+
+```=html
+<a id="search"></a>
+```
+
+# Search
+
+Search the project in your own words: *people talking about the park*, *for
+sale sign*, or text that appears on screen. Keyword search (SQLite FTS5) and
+semantic search (embeddinggemma vectors in sqlite-vec) are merged into
+**moments**. Click a hit to play from that moment; click a video to see its
+keyframes and its transcript, and click a transcript line to jump there.
+
+## Search selected footage
+
+In a project's **Library**, check videos to search just those files.
+Shift-click a checkbox for a range, Ctrl/⌘-click rows to add or remove files,
+or turn on **Select videos** and drag a rectangle across rows. The header
+checkbox selects all visible rows. **Clear selection** returns to the folder or
+whole-project scope.
+
+Choose a watched folder under **Search in**, or click **Search here** beside
+its path, to restrict both the library and search to that folder's videos,
+including its subfolders. Keyword and semantic search both honor these scopes.
+
+```=html
+<a id="scripts"></a>
+```
+
+# Script a video
+
+Open the **Scripts** tab and describe the video you want, for example *a 60
+second promo about the neighbourhood using the interviews*. The model explores
+the footage with tools (search, transcripts, keyframes), drafts beats with
+clips and voice-over, and revises from your feedback ("slower, let people
+finish talking"). You can also edit beats and clips by hand; each change is a
+new version.
+
+- Every clip is checked against the footage, and talking clips keep whole
+  sentences with a breath before the cut.
+- The editor instructions the model follows are editable in **Settings**.
+- Local script agents get a budget of research tool calls (30 by default),
+  adjustable in Settings or right in the chat composer.
+
+## Reference edits
+
+Mark a finished video (for example, an edit someone already made by hand) as a
+**reference**: the chat studies its length, pacing and structure, but never
+uses it as footage. You can also remove a video from a project's library.
+
+```=html
+<a id="export"></a>
+```
+
+# Preview and export
+
+**Render preview** renders a low-res preview of any script version, with
+titles and narration burned in. Then export:
+
+- **Export for Premiere (FCP XML)**: in Premiere Pro, *File → Import* the
+  `.xml`; the sequence links to your original files.
+- **Export .otio**: an OpenTimelineIO timeline.
+- **Export MP4**: a video file to send as a quick demo.
+
+```=html
+<a id="mcp"></a>
+```
+
+# Command line
+
+The `ghostreel` command line shares the app's core and covers indexing,
+search, transcripts, scripts, exports and models. It is built from the
+repository (see *Build from source* below):
+
+```
+ghostreel doctor                                   # GPU, ffmpeg, models, servers
+ghostreel project create "Greet Mag" --fps 30 --width 3840 --height 2160
+ghostreel folder add ~/Videos/shoot -p "Greet Mag"
+ghostreel index -p "Greet Mag"                     # --watch to keep indexing new files
+ghostreel search -p "Greet Mag" "neighbours talking about the community"
+ghostreel script chat --project "Greet Mag" "a 60 second promo using the interviews"
+ghostreel script export <script-id> --format fcp_xml -o promo.xml
+ghostreel models list | download <id> | use <id>
+ghostreel config set frames.max_interval_s 5 && ghostreel index -p "Greet Mag" --redo frames
+```
+
+Run `ghostreel --help` for everything else.
+
+## For AI agents (MCP)
+
+`ghostreel mcp` speaks the [Model Context Protocol](https://modelcontextprotocol.io)
+on stdio, so an agent can index footage, search it and build an edit. Register
+it once:
+
+```
+{
+  "mcpServers": {
+    "ghostreel": { "command": "ghostreel", "args": ["mcp"] }
+  }
+}
+```
+
+In Claude Code: `claude mcp add ghostreel -- ghostreel mcp`. Add
+`"env": {"GHOSTREEL_HOME": "/path"}` to work on a different library.
+
+| Tool | What it does |
+| --- | --- |
+| `doctor` | ffmpeg, GPU, database, models and which AI backends would be used |
+| `list_projects` · `create_project` | projects with their indexing progress; create one |
+| `add_folder` | watch a footage folder (the whole tree) |
+| `index` · `index_status` | run pending indexing for a while (resumable), or report progress |
+| `search` | hybrid keyword and meaning search; returns moments with timestamps |
+| `get_transcript` · `get_video` | what people say, and what each keyframe shows |
+| `list_scripts` · `get_script` | script versions of a project |
+| `draft_script` | let GhostReel's editing model draft or revise a script |
+| `save_script` | save your own script JSON as a new version; returns the issues found |
+| `export_script` | write `fcp_xml` (Premiere Pro) or `otio` |
+| `set_video_role` | take a video out of the library, or keep it as a reference edit |
+
+A typical run: `create_project` → `add_folder` → `index` until nothing is
+pending → `search`, `get_transcript` and `get_video` to learn the footage →
+`draft_script` or `save_script` → `export_script`. Clips must lie inside
+footage the tools reported: `save_script` returns an error per clip that
+doesn't (and still saves the version, so it can be fixed).
+
+# Where things are
+
+Everything lives in one folder: `~/.ghostreel/` (`%USERPROFILE%\.ghostreel\`
+on Windows). `GHOSTREEL_HOME` moves it.
+
+| Path | What |
+| --- | --- |
+| `config.toml` | backends, models, frame interval, chat instructions |
+| `ghostreel.db` | projects, transcripts, frame descriptions, vectors, scripts (SQLite) |
+| `frames/` | keyframe JPEGs |
+| `proxies/`, `previews/` | preview renders (safe to delete; regenerated) |
+| `models/` | downloaded models |
+
+## Privacy
+
+Your videos are only read, never modified or copied.
+
+- In **standalone** mode nothing leaves your machine.
+- With **servers**, frames, transcripts and prompts go to the URLs you
+  configured: point them at machines you trust. API keys are stored in plain
+  text in `config.toml`.
+- With a **coding-agent CLI**, that tool receives the frames or prompts for the
+  capability you gave it.
+
+# Build from source
+
+Requirements: Rust (stable), Node.js 22, the
+[Tauri prerequisites](https://v2.tauri.app/start/prerequisites/) and ffmpeg on
+`PATH`. GPU helpers need the CUDA Toolkit 12.x (and MSVC on Windows). On macOS,
+install the Xcode command-line tools and CMake; native helpers use Metal
+automatically.
+
+```
+git clone https://github.com/highercomve/GhostReel
+cd GhostReel
+npm install
+cargo test --workspace                 # core tests (no GPU, no servers)
+cargo run -p ghostreel-cli -- doctor   # the ghostreel CLI
+npx tauri dev                          # desktop app with hot reload
+scripts/build-helpers.sh               # ghostreel-asr + ghostreel-llm (CUDA if the toolkit is present)
+```
+
+See the [README](https://github.com/highercomve/GhostReel#build-from-source)
+for release bundles, Apple Silicon (MLX) builds and macOS signing.
