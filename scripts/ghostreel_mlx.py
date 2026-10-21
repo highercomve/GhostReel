@@ -84,7 +84,10 @@ class MlxEngine:
                 verbose=False, **options,
             )
             if result.finish_reason == 'length':
-                raise ValueError('model response truncated: increase the output budget or context window')
+                raise ValueError(
+                    f'model response truncated after {result.generation_tokens} tokens: {result.text[:240]!r}; '
+                    'increase the output budget or context window'
+                )
             if result.prompt_tokens + result.generation_tokens > self.ctx:
                 raise ValueError('image, prompt and response exceed the configured context window')
             content = result.text
