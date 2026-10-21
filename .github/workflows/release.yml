@@ -43,7 +43,8 @@ on:
 concurrency:
   group: release-${{ github.event.inputs.tag || github.ref_name }}
   # A cancelled cache run saves nothing: let it finish, the next one queues.
-  cancel-in-progress: ${{ github.ref_type == 'tag' || github.event_name == 'workflow_dispatch' }}
+  # Manual retries queue behind a running release so it can finish saving expensive caches.
+  cancel-in-progress: ${{ github.ref_type == 'tag' }}
 
 env:
   VULKAN_VERSION: '1.4.328.1'
@@ -402,6 +403,19 @@ jobs:
 
       - name: Set up MSVC environment
         uses: ilammy/msvc-dev-cmd@v1
+
+      # MSBuild's FileTracker exceeds MAX_PATH in Vulkan's nested shader-generator build.
+      # Ninja avoids that extra tracking directory while retaining the MSVC compiler.
+      - name: Configure Ninja for Vulkan
+        if: matrix.backend == 'vulkan'
+        shell: pwsh
+        run: |
+          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) {
+            choco install ninja --no-progress -y
+            if ($LASTEXITCODE -ne 0) { throw "Ninja installation failed" }
+          }
+          ninja --version
+          "CMAKE_GENERATOR=Ninja" >> $env:GITHUB_ENV
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
