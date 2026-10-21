@@ -3,7 +3,7 @@ name: Cloudflare Pages
 on:
   push:
     branches: [master]
-    paths: ['site/**', 'zine.ziggy', '.github/workflows/cloudflare.yml', 'scripts/site-for-cloudflare.sh']
+    paths: ['site/**', 'zine.ziggy', '.github/workflows/cloudflare.yml']
   workflow_dispatch:
 
 permissions:
@@ -46,9 +46,6 @@ jobs:
             echo "::warning::Could not read the latest release: keeping the committed site/assets/release.json."
           fi
           cat site/assets/release.json
-
-      - name: Serve from ghostreel.foreachdeveloper.com
-        run: scripts/site-for-cloudflare.sh ghostreel GhostReel
 
       # Not Zine's default public/: that is the desktop app's Vite static folder.
       - name: Build site

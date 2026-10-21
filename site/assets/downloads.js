@@ -1,5 +1,5 @@
 // Resolve the latest release assets into direct file links.
-// The Pages build writes the latest release to release.json, so visitors don't
+// The site build writes the latest release to release.json, so visitors don't
 // hit GitHub's API rate limit; the live API is only a fallback.
 (() => {
   const endpoint = 'https://api.github.com/repos/highercomve/GhostReel/releases/latest';

@@ -6,6 +6,8 @@
 
 **Search inside your videos — and cut them into a story — locally.**
 
+[Website](https://ghostreel.foreachdeveloper.com) · [Guide](https://ghostreel.foreachdeveloper.com/guide/) · [Download](https://github.com/highercomve/GhostReel/releases)
+
 </div>
 
 GhostReel watches folders of video footage and makes everything in them searchable: it

@@ -12,7 +12,7 @@
 
 # Install
 
-Download the file for your system from the [download section](https://highercomve.github.io/GhostReel/#download)
+Download the file for your system from the [download section](https://ghostreel.foreachdeveloper.com/#download)
 or the [GitHub releases](https://github.com/highercomve/GhostReel/releases).
 
 | Platform | File | Notes |
@@ -51,7 +51,7 @@ On first start, open **Models** and download what you need:
 | Search embeddings | `embeddinggemma-300M` Q8_0 | 334 MB | fixed, so indexes stay compatible between computers |
 
 GhostReel also picks up models you already have, such as
-[GhostPen](https://highercomve.github.io/GhostPen/)'s Whisper models and LM
+[GhostPen](https://ghostpen.foreachdeveloper.com/)'s Whisper models and LM
 Studio's models, instead of downloading them again. The default setup fits an
 8 GB GPU.
 

@@ -10,7 +10,7 @@ From the repository root, start Zine's live development server:
 zine
 ```
 
-Open http://localhost:1990/GhostReel/. Zine watches the site files and reloads
+Open http://localhost:1990/. Zine watches the site files and reloads
 the page after edits. To use another port, run `zine --port 1991`.
 
 To build the static site locally, run:
@@ -22,8 +22,10 @@ zine release --force --output site-public
 The output goes to `site-public/` (gitignored), not Zine's default `public/`:
 `public/` is the desktop app's Vite static folder.
 
+The site is served at https://ghostreel.foreachdeveloper.com/ from Cloudflare
+Pages. `.github/workflows/cloudflare.yml` builds and deploys it on every push to
+`master` that touches `site/` or `zine.ziggy`.
+
 The download buttons read `site/assets/release.json`, a snapshot of the latest
-GitHub release. The Pages and Cloudflare workflows refresh it on every build,
-and the Release workflow rebuilds both sites after publishing a release.
-`scripts/site-for-cloudflare.sh` rewrites the config for
-https://ghostreel.foreachdeveloper.com/ in CI; don't commit its output.
+GitHub release. The Cloudflare workflow refreshes it on every build, and the
+Release workflow rebuilds the site after publishing a release.

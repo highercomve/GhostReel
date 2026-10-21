@@ -64,11 +64,11 @@
 					</div>
 					<div>
 						<h4>Also by the author</h4>
-						<a href="https://highercomve.github.io/GhostPen/">GhostPen</a>
+						<a href="https://ghostpen.foreachdeveloper.com/">GhostPen</a>
 					</div>
 				</div>
 			</div>
-			<p class="footer-legal">MIT license · Built with <a href="https://v2.tauri.app">Tauri</a> and <a href="https://zine-ssg.io">Zine</a> · GhostReel reuses Whisper models already downloaded by <a href="https://highercomve.github.io/GhostPen/">GhostPen</a></p>
+			<p class="footer-legal">MIT license · Built with <a href="https://v2.tauri.app">Tauri</a> and <a href="https://zine-ssg.io">Zine</a> · GhostReel reuses Whisper models already downloaded by <a href="https://ghostpen.foreachdeveloper.com/">GhostPen</a></p>
 		</footer>
 		<script src="$site.asset('site.js').link().suffix('?v=20261021')" defer></script>
 	</body>
