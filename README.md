@@ -17,7 +17,7 @@ straight to that moment. Organise footage in **projects**, then **chat with the 
 video** from your clips, preview the cut, and hand it to **Premiere Pro** as an FCP XML timeline
 (via OpenTimelineIO) — or export an MP4 to send as a quick demo.
 
-It runs **fully standalone** — models run on your GPU (CUDA on Linux/Windows, Metal on macOS) inside the app, nothing else to
+It runs **fully standalone** — models run on your GPU (CUDA or Vulkan on Linux/Windows, Metal on macOS) inside the app, nothing else to
 install — on **Windows, Linux and macOS**. If you already run model servers, it can use them instead so
 the same GPU never holds a model twice:
 [highllama](https://github.com/highercomve/highllama) for vision and embeddings and
@@ -73,6 +73,8 @@ Download the latest build from [Releases](https://github.com/highercomve/ghostre
 |---|---|---|
 | **Windows 10/11** | `GhostReel_x.y.z_x64-setup.exe` | NVIDIA driver 570+ for GPU (CUDA 12.8 runtime is bundled) |
 | **Linux** | `.AppImage` | NVIDIA driver 570+ for GPU |
+| Windows 10/11 · Vulkan | `GhostReel_x.y.z_x64_vulkan-setup.exe` | AMD, Intel or NVIDIA GPU with a Vulkan 1.2-capable driver |
+| Linux · Vulkan | `GhostReel_x.y.z_amd64_vulkan.AppImage` | AMD, Intel or NVIDIA GPU with a Vulkan 1.2-capable driver |
 | **macOS 14+ · Apple Silicon** | `GhostReel_x.y.z_aarch64.dmg` | MLX vision/chat, Metal Whisper, self-signed |
 | **macOS 12+ · Intel** | `GhostReel_x.y.z_x64.dmg` | llama.cpp / Whisper with Metal, self-signed |
 | **CLI only** | `ghostreel-cli-*.zip` / `.tar.gz` | same helpers and ffmpeg, no desktop app |
@@ -367,8 +369,8 @@ and consumed over HTTPS — no external update server required.
 ## Build from source
 
 Requirements: **Rust** (stable), **Node.js 22**, the [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/)
-and **ffmpeg** on `PATH` for development. GPU helpers need the **CUDA Toolkit 12.x** (and MSVC on
-Windows). On macOS, install the Xcode command-line tools (`xcode-select --install`)
+and **ffmpeg** on `PATH` for development. For GPU helpers, install the **CUDA Toolkit 12.x**
+or the **Vulkan SDK** (including glslc and SPIRV-Headers); Windows also needs MSVC. On macOS, install the Xcode command-line tools (`xcode-select --install`)
 and CMake (`brew install cmake`); native helpers use Metal automatically.
 On Apple Silicon, also install Python 3.12 for **building** the frozen MLX helper:
 `GHOSTREEL_MLX_PYTHON=python3.12 scripts/build-mlx.sh`. Installers bundle Python and MLX;
@@ -390,9 +392,23 @@ npm run bundle:windows                 # NSIS installer (on Windows)
 npm run bundle:macos                   # .app + DMG (on macOS; ad-hoc signed locally)
 ```
 
-CI builds Linux, Windows and native Apple Silicon / Intel macOS installers on every `v*`
-tag (`.github/workflows/release.yml`). macOS updater archives use separate asset names
-and `darwin-aarch64` / `darwin-x86_64` entries in `latest.json`.
+CI builds CUDA and Vulkan variants for Linux/Windows, plus native Apple Silicon / Intel
+macOS installers on every `v*` tag (`.github/workflows/release.yml`). Vulkan assets include
+`_vulkan` in their filenames. Updates preserve the installed backend using separate
+`linux-x86_64-vulkan` / `windows-x86_64-vulkan` entries in `latest.json`; existing CUDA
+and macOS updater targets stay compatible.
+
+Master builds warm separate Rust and compiled-helper caches for each OS/backend. Exact
+helper cache hits skip native compilation and Vulkan SDK setup. Cache keys include helper
+sources, vendored bindings, external locked dependencies, workspace build settings, Rust/C++
+toolchains, runner image, and GPU SDK version; workspace version bumps reuse the helpers.
+SDK downloads and npm dependencies are cached too. Tags restore the default branch's
+caches; master saves them for reuse across releases.
+
+To build Vulkan helpers locally, set up the Vulkan SDK environment, then run
+`GHOSTREEL_GPU=vulkan scripts/build-helpers.sh` before the normal bundle command.
+For a Vulkan app that preserves its backend on update, also set
+`GHOSTREEL_UPDATER_TARGET=linux-x86_64-vulkan` (or `windows-x86_64-vulkan`) when bundling.
 
 ### Apple Silicon models
 

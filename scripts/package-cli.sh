@@ -75,9 +75,10 @@ Quick start:
   ./ghostreel --help
 
 GPU Acceleration:
-  - An NVIDIA driver on the host system is required for GPU acceleration.
+  - CUDA builds need an NVIDIA driver 570+; CUDA runtime libraries are bundled.
+  - Vulkan builds need a Vulkan 1.2-capable AMD, Intel or NVIDIA GPU driver.
   - Bundled CUDA runtime libraries in lib/ are discovered via RUNPATH ($ORIGIN/lib).
-  - If no compatible NVIDIA GPU or driver is detected, GhostReel falls back to CPU execution.
+  - Install the matching GPU driver for the backend shipped in this bundle.
 EOF
 
 # Package tarball

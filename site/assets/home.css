@@ -343,9 +343,9 @@ h1 em { font-style:normal; background:linear-gradient(100deg,var(--accent) 10%,v
 .asset-choice { border:0; margin:0; padding:0; min-width:0; }
 .asset-choice legend,.download-card .asset-legend { padding:0; min-height:0; line-height:1.4; margin-bottom:7px; color:var(--faint); font-size:13px; letter-spacing:1px; text-transform:uppercase; }
 .asset-options { display:flex; gap:6px; }
-.asset-options label { flex:1; position:relative; }
+.asset-options label { flex:1; position:relative; display:flex; }
 .asset-options input { position:absolute; opacity:0; inset:0; margin:0; cursor:pointer; }
-.asset-options label span { display:block; padding:9px 6px; border:1px solid var(--line); border-radius:7px; text-align:center; color:var(--muted); font-size:15px; line-height:1.2; transition:background .2s,border-color .2s,color .2s; }
+.asset-options label span { display:flex; align-items:center; justify-content:center; width:100%; padding:9px 6px; border:1px solid var(--line); border-radius:7px; text-align:center; color:var(--muted); font-size:15px; line-height:1.2; transition:background .2s,border-color .2s,color .2s; }
 .asset-options label:hover span { color:var(--text); border-color:#2fd6c866; }
 .asset-options input:checked + span { color:#dcfbf7; border-color:#2fd6c8aa; background:#2fd6c81c; }
 .asset-options input:focus-visible + span { outline:2px solid var(--accent); outline-offset:2px; }

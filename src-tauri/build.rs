@@ -1,4 +1,5 @@
 fn main() {
+    println!("cargo:rerun-if-env-changed=GHOSTREEL_UPDATER_TARGET");
     fail_if_the_checkout_moved();
     tauri_build::build()
 }

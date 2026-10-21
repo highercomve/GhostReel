@@ -19,6 +19,8 @@ or the [GitHub releases](https://github.com/highercomve/GhostReel/releases).
 | --- | --- | --- |
 | Windows 10/11 | `GhostReel_x.y.z_x64-setup.exe` | NVIDIA driver 570+ for the GPU (the CUDA 12.8 runtime is bundled) |
 | Linux | `GhostReel_x.y.z_amd64.AppImage` | NVIDIA driver 570+ for the GPU |
+| Windows 10/11 · Vulkan | `GhostReel_x.y.z_x64_vulkan-setup.exe` | AMD, Intel or NVIDIA GPU with a Vulkan 1.2-capable driver |
+| Linux · Vulkan | `GhostReel_x.y.z_amd64_vulkan.AppImage` | AMD, Intel or NVIDIA GPU with a Vulkan 1.2-capable driver |
 | macOS 14+ · Apple Silicon | `GhostReel_x.y.z_aarch64.dmg` | MLX for vision and chat, Metal for Whisper |
 | macOS 12+ · Intel | `GhostReel_x.y.z_x64.dmg` | llama.cpp and Whisper with Metal |
 
@@ -38,7 +40,8 @@ GhostReel checks for new releases on the **Status** page. Click **Check for
 updates**: when a newer version is available you see the release notes and a
 **Download and install** button. Once the download finishes, **Restart to
 finish** applies the update. Updates are signed, and the app checks them with
-a public key embedded in it.
+a public key embedded in it. CUDA and Vulkan installations keep their GPU backend
+when updating. To switch backend, download and install the other variant.
 
 # Set up the models
 
@@ -269,7 +272,8 @@ Your videos are only read, never modified or copied.
 
 Requirements: Rust (stable), Node.js 22, the
 [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/) and ffmpeg on
-`PATH`. GPU helpers need the CUDA Toolkit 12.x (and MSVC on Windows). On macOS,
+`PATH`. GPU helpers need the CUDA Toolkit 12.x or the Vulkan SDK (including glslc
+and SPIRV-Headers); Windows also needs MSVC. On macOS,
 install the Xcode command-line tools and CMake; native helpers use Metal
 automatically.
 
@@ -281,6 +285,8 @@ cargo test --workspace                 # core tests (no GPU, no servers)
 cargo run -p ghostreel-cli -- doctor   # the ghostreel CLI
 npx tauri dev                          # desktop app with hot reload
 scripts/build-helpers.sh               # ghostreel-asr + ghostreel-llm (CUDA if the toolkit is present)
+# Or, with the Vulkan SDK environment set up:
+GHOSTREEL_GPU=vulkan scripts/build-helpers.sh
 ```
 
 See the [README](https://github.com/highercomve/GhostReel#build-from-source)

@@ -214,7 +214,7 @@ function main() {
       );
       process.exit(1);
     } else if (stagedCudaLibs.size === 0) {
-      console.log('CPU build: no CUDA libs staged');
+      console.log('No CUDA runtime libraries needed for this backend');
     } else {
       for (const [soname, realPath] of stagedCudaLibs.entries()) {
         const dest = join(libDir, soname);
@@ -291,7 +291,7 @@ function main() {
         copyFileSync(filePath, join(libDir, file));
       }
     } else {
-      console.log('CPU build: no CUDA libs staged');
+      console.log('No CUDA runtime libraries needed for this backend');
     }
   }
 

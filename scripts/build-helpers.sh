@@ -23,6 +23,7 @@ elif [ "$want" = metal ] || { [ "$want" = auto ] && [ "$(uname -s)" = Darwin ]; 
   export GGML_NATIVE=OFF
 elif [ "$want" = vulkan ]; then
   features=(--features vulkan)
+  export GGML_NATIVE=OFF
 fi
 # Full-parallel CUDA builds of whisper.cpp exhaust RAM (see plan §11).
 export CMAKE_BUILD_PARALLEL_LEVEL="${CMAKE_BUILD_PARALLEL_LEVEL:-4}"

@@ -1,6 +1,6 @@
 name: Release
 
-# Build the GhostReel bundles (CUDA helpers included) and publish them to ONE GitHub Release,
+# Build the GhostReel bundles (CUDA and Vulkan helpers included) and publish them to ONE GitHub Release,
 # the same shape as GhostPen's release.yml:
 #   1. create-release  -> one draft release for the tag (reused on re-runs)
 #   2. linux-x64 / windows-x64 / macos -> build and upload their bundles into that draft by id
@@ -22,6 +22,7 @@ on:
       - master
     paths:
       - 'crates/**'
+      - 'vendor/llama-cpp-2/**'
       - 'src-tauri/**'
       - 'Cargo.lock'
       - 'Cargo.toml'
@@ -45,6 +46,7 @@ concurrency:
   cancel-in-progress: ${{ github.ref_type == 'tag' || github.event_name == 'workflow_dispatch' }}
 
 env:
+  VULKAN_VERSION: '1.4.328.1'
   # 'true' for a release (a tag or a manual run), 'false' for a cache run on master.
   RELEASE: ${{ github.ref_type == 'tag' || github.event_name == 'workflow_dispatch' }}
 
@@ -90,9 +92,9 @@ jobs:
               owner: context.repo.owner, repo: context.repo.repo,
               tag_name: tag, target_commitish: context.sha, name: `GhostReel ${tag}`,
               body: [
-                `**Windows:** \`GhostReel_*_x64-setup.exe\` · **Linux:** \`.AppImage\` · **macOS:** \`.dmg\` (Apple Silicon / Intel). **CLI bundles:** available in the [build artifacts](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}).`,
+                `**Windows:** \`GhostReel_*-setup.exe\` · **Linux:** \`.AppImage\` · **macOS:** \`.dmg\` (Apple Silicon / Intel). **CLI bundles:** available in the [build artifacts](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}).`,
                 "",
-                "Linux/Windows GPU acceleration needs an NVIDIA driver 570+ (CUDA 12.8 runtime is bundled). Apple Silicon uses MLX for vision/chat and Metal Whisper (macOS 14+); Intel uses llama.cpp/Whisper (macOS 12+). On first start open **Models** and download the models.",
+                "Linux/Windows offer CUDA (NVIDIA driver 570+, CUDA runtime bundled) and Vulkan (AMD, Intel or NVIDIA with a Vulkan 1.2-capable driver). Vulkan downloads have `_vulkan` in their filenames. Apple Silicon uses MLX for vision/chat and Metal Whisper (macOS 14+); Intel uses llama.cpp/Whisper (macOS 12+). On first start open **Models** and download the models.",
                 "",
                 "macOS builds use a self-signed certificate. Drag GhostReel to Applications; on first launch approve it in System Settings → Privacy & Security → Open Anyway.",
                 ...(notes ? ["", "---", "", notes] : []),
@@ -103,16 +105,22 @@ jobs:
   # Default to GitHub's runners: unlimited and free on a public repo. The CUDA helpers are cached,
   # so a release is ~20 min there; pick the blacksmith runner only when a helper rebuild needs speed.
   linux-x64:
-    name: linux-x64
+    name: linux-x64-${{ matrix.backend }}
     needs: create-release
     # Also when create-release is skipped (a cache run).
     if: ${{ !cancelled() && needs.create-release.result != 'failure' }}
     runs-on: ${{ github.event.inputs.runner == 'blacksmith' && 'blacksmith-16vcpu-ubuntu-2204' || 'ubuntu-22.04' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [cuda, vulkan]
     timeout-minutes: 240
     env:
       CMAKE_CUDA_ARCHITECTURES: "86;89"
       CMAKE_BUILD_PARALLEL_LEVEL: ${{ github.event.inputs.runner == 'blacksmith' && '16' || '4' }}
-      GHOSTREEL_GPU: cuda
+      GHOSTREEL_GPU: ${{ matrix.backend }}
+      GHOSTREEL_UPDATER_TARGET: ${{ matrix.backend == 'vulkan' && 'linux-x86_64-vulkan' || 'linux-x86_64' }}
+      GGML_NATIVE: OFF
     steps:
       - name: Free disk space
         run: |
@@ -138,9 +146,11 @@ jobs:
             wget \
             file \
             xz-utils \
+            libvulkan1
 
       # Jimver pin v0.2.24 checked to exist; CUDA 12.8 ships .so.12 / 64_12.dll runtimes
       - name: Install CUDA Toolkit
+        if: matrix.backend == 'cuda'
         uses: Jimver/cuda-toolkit@v0.2.24
         with:
           cuda: "12.8.1"
@@ -157,7 +167,7 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: linux-cuda
+          shared-key: linux-${{ matrix.backend }}
           save-if: ${{ github.ref == 'refs/heads/master' }}
 
       - name: Setup Node.js
@@ -169,23 +179,41 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
-      # The CUDA helpers take most of the build time: reuse them until their code, Cargo.lock,
-      # the CUDA version or the GPU architectures change.
-      # Only the llama.cpp / whisper.cpp crate versions matter for the helpers, not the whole
-      # Cargo.lock (a version bump of the workspace would otherwise rebuild them every release).
+      # Exact binary cache: include transitive dependencies and toolchains, but ignore
+      # workspace release-version bumps so tags can reuse master's compiled helpers.
       - name: Helper dependency hash
         id: helper-deps
         shell: bash
-        run: echo "hash=$(grep -A1 -E '^name = "(llama-cpp-2|llama-cpp-sys-2|whisper-rs|whisper-rs-sys)"$' Cargo.lock | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+        run: echo "hash=$(node scripts/helper-cache-key.mjs)" >> "$GITHUB_OUTPUT"
 
-      - name: Restore CUDA helpers
+      - name: Restore compiled helpers
         id: helpers
         uses: actions/cache/restore@v4
         with:
           path: |
             target/release/ghostreel-asr
             target/release/ghostreel-llm
-          key: helpers-linux-x64-cuda12.8.1-${{ env.CMAKE_CUDA_ARCHITECTURES }}-${{ hashFiles('crates/ghostreel-asr/**', 'crates/ghostreel-llm/**', 'vendor/llama-cpp-2/**', 'scripts/build-helpers.sh') }}-${{ steps.helper-deps.outputs.hash }}
+          key: helpers-v2-linux-x64-${{ matrix.backend }}-${{ matrix.backend == 'cuda' && '12.8.1' || env.VULKAN_VERSION }}-${{ env.CMAKE_CUDA_ARCHITECTURES }}-${{ hashFiles('crates/ghostreel-asr/**', 'crates/ghostreel-llm/**', 'vendor/llama-cpp-2/**', 'scripts/build-helpers.sh', 'scripts/helper-cache-key.mjs') }}-${{ steps.helper-deps.outputs.hash }}
+
+      - name: Cache Vulkan SDK download
+        if: matrix.backend == 'vulkan' && steps.helpers.outputs.cache-hit != 'true'
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/vulkan-download
+          key: vulkan-sdk-linux-${{ env.VULKAN_VERSION }}
+
+      - name: Install Vulkan SDK
+        if: matrix.backend == 'vulkan' && steps.helpers.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/vulkan-download" "$RUNNER_TEMP/vulkan-sdk"
+          archive="$RUNNER_TEMP/vulkan-download/sdk.tar.xz"
+          [ -s "$archive" ] || curl --fail --location --retry 3 "https://sdk.lunarg.com/sdk/download/$VULKAN_VERSION/linux/vulkan_sdk.tar.xz" -o "$archive"
+          tar -xJf "$archive" -C "$RUNNER_TEMP/vulkan-sdk" --strip-components=1
+          sdk="$RUNNER_TEMP/vulkan-sdk/x86_64"
+          echo "VULKAN_SDK=$sdk" >> "$GITHUB_ENV"
+          echo "$sdk/bin" >> "$GITHUB_PATH"
+          echo "LD_LIBRARY_PATH=$sdk/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
 
       - name: Build native helpers
         if: steps.helpers.outputs.cache-hit != 'true'
@@ -193,7 +221,7 @@ jobs:
         env:
           JOBS: ${{ github.event.inputs.runner == 'blacksmith' && '16' || '4' }}
 
-      - name: Save CUDA helpers
+      - name: Save compiled helpers
         if: steps.helpers.outputs.cache-hit != 'true' && github.ref == 'refs/heads/master'
         uses: actions/cache/save@v4
         with:
@@ -209,7 +237,7 @@ jobs:
         run: node scripts/fetch-sidecars.mjs
 
       - name: Stage helpers
-        run: node scripts/stage-helpers.mjs --cuda
+        run: node scripts/stage-helpers.mjs ${{ matrix.backend == 'cuda' && '--cuda' || '' }}
 
       - name: Helper diagnostics
         run: |
@@ -228,11 +256,16 @@ jobs:
       - name: Build Tauri bundles
         if: env.RELEASE == 'true'
         run: |
-          stub=$(find "$CUDA_PATH" -path '*stubs/libcuda.so' | head -n1)
-          test -n "$stub" || { echo "::error::CUDA libcuda.so stub not found under $CUDA_PATH"; exit 1; }
-          mkdir -p "$RUNNER_TEMP/cuda-stub"
-          ln -sf "$stub" "$RUNNER_TEMP/cuda-stub/libcuda.so.1"
-          export LD_LIBRARY_PATH="$RUNNER_TEMP/cuda-stub${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          if [ "$GHOSTREEL_GPU" = cuda ]; then
+            stub=$(find "$CUDA_PATH" -path '*stubs/libcuda.so' | head -n1)
+            test -n "$stub" || { echo "::error::CUDA libcuda.so stub not found under $CUDA_PATH"; exit 1; }
+            mkdir -p "$RUNNER_TEMP/cuda-stub"
+            ln -sf "$stub" "$RUNNER_TEMP/cuda-stub/libcuda.so.1"
+            export LD_LIBRARY_PATH="$RUNNER_TEMP/cuda-stub${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          else
+            # Package the system loader, not SDK libraries or a vendor driver.
+            unset LD_LIBRARY_PATH
+          fi
           npx tauri build --config src-tauri/tauri.bundle.json --bundles appimage --verbose
         env:
           NO_STRIP: "true"
@@ -242,6 +275,14 @@ jobs:
       - name: Fix AppImage (drop driver libs, dedupe CUDA libs, repack)
         if: env.RELEASE == 'true'
         run: scripts/fix-appimage.sh
+
+      - name: Name Vulkan AppImage
+        if: env.RELEASE == 'true' && matrix.backend == 'vulkan'
+        run: |
+          for img in target/release/bundle/appimage/*.AppImage; do
+            mv "$img" "${img%.AppImage}_vulkan.AppImage"
+            rm -f "$img.sig"
+          done
 
       # Repacking changes the file, so Tauri's signature from the build no longer matches: sign again.
       - name: Re-sign the AppImage for the updater
@@ -263,7 +304,7 @@ jobs:
         if: env.RELEASE == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: ghostreel-linux-x64
+          name: ghostreel-linux-x64-${{ matrix.backend }}
           path: |
             target/release/bundle/appimage/*.AppImage
             target/dist/*.tar.gz
@@ -311,33 +352,40 @@ jobs:
           url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/${assetName}"
           mkdir -p target/updater
           jq -n --arg s "$sig" --arg u "$url" \
-            '{platform: "linux-x86_64", signature: $s, url: $u}' > target/updater/updater-linux.json
-          cat target/updater/updater-linux.json
+            '{platform: "${{ env.GHOSTREEL_UPDATER_TARGET }}", signature: $s, url: $u}' > target/updater/updater-linux-${{ matrix.backend }}.json
+          cat target/updater/updater-linux-${{ matrix.backend }}.json
 
       - name: Upload updater snippet
         if: env.RELEASE == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: updater-linux
-          path: target/updater/updater-linux.json
+          name: updater-linux-${{ matrix.backend }}
+          path: target/updater/updater-linux-${{ matrix.backend }}.json
 
   windows-x64:
-    name: windows-x64
+    name: windows-x64-${{ matrix.backend }}
     needs: create-release
     # Also when create-release is skipped (a cache run).
     if: ${{ !cancelled() && needs.create-release.result != 'failure' }}
     runs-on: ${{ github.event.inputs.runner == 'blacksmith' && 'blacksmith-16vcpu-windows-2025' || 'windows-2022' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [cuda, vulkan]
     timeout-minutes: 240
     env:
       CMAKE_CUDA_ARCHITECTURES: "86;89"
       CMAKE_BUILD_PARALLEL_LEVEL: ${{ github.event.inputs.runner == 'blacksmith' && '16' || '4' }}
-      GHOSTREEL_GPU: cuda
+      GHOSTREEL_GPU: ${{ matrix.backend }}
+      GHOSTREEL_UPDATER_TARGET: ${{ matrix.backend == 'vulkan' && 'windows-x86_64-vulkan' || 'windows-x86_64' }}
+      GGML_NATIVE: OFF
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
 
       # Jimver pin v0.2.24 checked to exist; CUDA 12.8 ships .so.12 / 64_12.dll runtimes
       - name: Install CUDA Toolkit
+        if: matrix.backend == 'cuda'
         uses: Jimver/cuda-toolkit@v0.2.24
         with:
           cuda: "12.8.1"
@@ -361,7 +409,7 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: windows-cuda
+          shared-key: windows-${{ matrix.backend }}
           save-if: ${{ github.ref == 'refs/heads/master' }}
 
       - name: Setup Node.js
@@ -373,34 +421,54 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
-      # Reuse the CUDA helpers until their code, Cargo.lock, CUDA or the GPU architectures change.
-      # Only the llama.cpp / whisper.cpp crate versions matter for the helpers, not the whole
-      # Cargo.lock (a version bump of the workspace would otherwise rebuild them every release).
+      # Exact binary cache, separate for each backend; workspace version bumps are ignored.
       - name: Helper dependency hash
         id: helper-deps
         shell: bash
-        run: echo "hash=$(grep -A1 -E '^name = "(llama-cpp-2|llama-cpp-sys-2|whisper-rs|whisper-rs-sys)"$' Cargo.lock | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+        run: echo "hash=$(node scripts/helper-cache-key.mjs)" >> "$GITHUB_OUTPUT"
 
-      - name: Restore CUDA helpers
+      - name: Restore compiled helpers
         id: helpers
         uses: actions/cache/restore@v4
         with:
           path: |
             target/release/ghostreel-asr.exe
             target/release/ghostreel-llm.exe
-          key: helpers-windows-x64-cuda12.8.1-${{ env.CMAKE_CUDA_ARCHITECTURES }}-${{ hashFiles('crates/ghostreel-asr/**', 'crates/ghostreel-llm/**', 'vendor/llama-cpp-2/**', 'scripts/build-helpers.sh') }}-${{ steps.helper-deps.outputs.hash }}
+          key: helpers-v2-windows-x64-${{ matrix.backend }}-${{ matrix.backend == 'cuda' && '12.8.1' || env.VULKAN_VERSION }}-${{ env.CMAKE_CUDA_ARCHITECTURES }}-${{ hashFiles('crates/ghostreel-asr/**', 'crates/ghostreel-llm/**', 'vendor/llama-cpp-2/**', 'scripts/build-helpers.sh', 'scripts/helper-cache-key.mjs') }}-${{ steps.helper-deps.outputs.hash }}
+
+      - name: Cache Vulkan SDK download
+        if: matrix.backend == 'vulkan' && steps.helpers.outputs.cache-hit != 'true'
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/vulkan-download
+          key: vulkan-sdk-windows-${{ env.VULKAN_VERSION }}
+
+      - name: Install Vulkan SDK
+        if: matrix.backend == 'vulkan' && steps.helpers.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force "$env:RUNNER_TEMP/vulkan-download" | Out-Null
+          $installer = "$env:RUNNER_TEMP/vulkan-download/sdk.exe"
+          if (-not (Test-Path $installer)) {
+            curl.exe --fail --location --retry 3 "https://sdk.lunarg.com/sdk/download/$env:VULKAN_VERSION/windows/vulkansdk-windows-X64-$env:VULKAN_VERSION.exe" -o $installer
+            if ($LASTEXITCODE -ne 0) { throw "Vulkan SDK download failed" }
+          }
+          $process = Start-Process -FilePath $installer -ArgumentList '--accept-licenses --default-answer --confirm-command install' -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "Vulkan SDK install failed: $($process.ExitCode)" }
+          "VULKAN_SDK=C:/VulkanSDK/$env:VULKAN_VERSION" >> $env:GITHUB_ENV
+          "C:/VulkanSDK/$env:VULKAN_VERSION/Bin" >> $env:GITHUB_PATH
 
       - name: Build helper ghostreel-asr
         if: steps.helpers.outputs.cache-hit != 'true'
         shell: pwsh
-        run: cargo build -j ${{ github.event.inputs.runner == 'blacksmith' && '16' || '4' }} --release -p ghostreel-asr --features cuda
+        run: cargo build -j ${{ github.event.inputs.runner == 'blacksmith' && '16' || '4' }} --release -p ghostreel-asr --features ${{ matrix.backend }}
 
       - name: Build helper ghostreel-llm
         if: steps.helpers.outputs.cache-hit != 'true'
         shell: pwsh
-        run: cargo build -j ${{ github.event.inputs.runner == 'blacksmith' && '16' || '4' }} --release -p ghostreel-llm --features cuda
+        run: cargo build -j ${{ github.event.inputs.runner == 'blacksmith' && '16' || '4' }} --release -p ghostreel-llm --features ${{ matrix.backend }}
 
-      - name: Save CUDA helpers
+      - name: Save compiled helpers
         if: steps.helpers.outputs.cache-hit != 'true' && github.ref == 'refs/heads/master'
         uses: actions/cache/save@v4
         with:
@@ -417,7 +485,7 @@ jobs:
         run: node scripts/fetch-sidecars.mjs
 
       - name: Stage helpers
-        run: node scripts/stage-helpers.mjs --cuda
+        run: node scripts/stage-helpers.mjs ${{ matrix.backend == 'cuda' && '--cuda' || '' }}
 
       - name: Build the app (cache run)
         if: env.RELEASE != 'true'
@@ -428,6 +496,16 @@ jobs:
         run: npx tauri build --config src-tauri/tauri.bundle.json --bundles nsis
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+
+      - name: Name Vulkan installer and signature
+        if: env.RELEASE == 'true' && matrix.backend == 'vulkan'
+        shell: pwsh
+        run: |
+          Get-ChildItem target/release/bundle/nsis/*-setup.exe | ForEach-Object {
+            $dest = $_.FullName -replace '-setup.exe$', '_vulkan-setup.exe'
+            Move-Item $_.FullName $dest
+            if (Test-Path "$($_.FullName).sig") { Move-Item "$($_.FullName).sig" "$dest.sig" }
+          }
 
       - name: Package Windows CLI zip
         if: env.RELEASE == 'true'
@@ -454,7 +532,7 @@ jobs:
         if: env.RELEASE == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: ghostreel-windows-x64
+          name: ghostreel-windows-x64-${{ matrix.backend }}
           path: |
             target/release/bundle/nsis/*.exe
             target/dist/ghostreel-cli-windows-x64.zip
@@ -473,9 +551,12 @@ jobs:
           foreach ($f in $files) {
             for ($i = 1; $i -le 3; $i++) {
               Write-Host "uploading $($f.Name) ($([math]::Round($f.Length/1MB)) MB), attempt $i"
-              $job = Start-Job { gh release upload $using:env:TAG $using:f.FullName --clobber --repo $using:env:GITHUB_REPOSITORY }
+              $job = Start-Job {
+                gh release upload $using:env:TAG $using:f.FullName --clobber --repo $using:env:GITHUB_REPOSITORY
+                if ($LASTEXITCODE -ne 0) { throw "release upload failed" }
+              }
               if (-not (Wait-Job $job -Timeout 1200)) { Stop-Job $job; Write-Host "upload timed out" }
-              Receive-Job $job | Out-Host
+              Receive-Job $job -ErrorAction Continue | Out-Host
               if ($job.State -eq "Completed") { break }
               if ($i -eq 3) { throw "upload of $($f.Name) failed" }
               Start-Sleep -Seconds 15
@@ -500,16 +581,16 @@ jobs:
           if (Test-Path $sigFile) { $sig = Get-Content $sigFile -Raw | ForEach-Object { $_.Trim() } }
           $url = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$env:TAG/$($exe.Name)"
           New-Item -ItemType Directory -Force -Path target/updater | Out-Null
-          $snippet = [ordered]@{ platform = "windows-x86_64"; signature = $sig; url = $url }
-          $snippet | ConvertTo-Json | Set-Content target/updater/updater-windows.json
-          Get-Content target/updater/updater-windows.json
+          $snippet = [ordered]@{ platform = $env:GHOSTREEL_UPDATER_TARGET; signature = $sig; url = $url }
+          $snippet | ConvertTo-Json | Set-Content target/updater/updater-windows-${{ matrix.backend }}.json
+          Get-Content target/updater/updater-windows-${{ matrix.backend }}.json
 
       - name: Upload updater snippet
         if: env.RELEASE == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: updater-windows
-          path: target/updater/updater-windows.json
+          name: updater-windows-${{ matrix.backend }}
+          path: target/updater/updater-windows-${{ matrix.backend }}.json
 
   macos:
     name: macos-${{ matrix.arch }}
@@ -693,14 +774,16 @@ jobs:
         if: needs.linux-x64.result == 'success'
         uses: actions/download-artifact@v4
         with:
-          name: updater-linux
+          pattern: updater-linux-*
+          merge-multiple: true
           path: updater-snippets
 
       - name: Download Windows updater snippet
         if: needs.windows-x64.result == 'success'
         uses: actions/download-artifact@v4
         with:
-          name: updater-windows
+          pattern: updater-windows-*
+          merge-multiple: true
           path: updater-snippets
 
       - name: Download macOS updater snippets
@@ -729,7 +812,7 @@ jobs:
           fi
           # A published update must include signed payloads for every supported platform.
           printf '%s' "$platforms" | jq -e '
-            (keys | sort) == (["darwin-aarch64", "darwin-x86_64", "linux-x86_64", "windows-x86_64"] | sort)
+            (keys | sort) == (["darwin-aarch64", "darwin-x86_64", "linux-x86_64", "windows-x86_64", "linux-x86_64-vulkan", "windows-x86_64-vulkan"] | sort)
             and all(.[]; (.signature | length) > 0 and (.url | startswith("https://github.com/")))
           ' >/dev/null
           jq -n --arg v "$version" --arg n "$notes" --arg d "$pub_date" --argjson p "$platforms" \

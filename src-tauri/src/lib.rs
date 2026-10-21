@@ -1397,10 +1397,16 @@ pub fn run() {
     #[cfg(target_os = "linux")]
     apply_wayland_webkit_workaround();
 
+    // CI pins Vulkan bundles to their own signed updater payloads.
+    let mut updater = tauri_plugin_updater::Builder::new();
+    if let Some(target) = option_env!("GHOSTREEL_UPDATER_TARGET") {
+        updater = updater.target(target);
+    }
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
-        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(updater.build())
         .plugin(tauri_plugin_process::init())
         .manage(SearchState::default())
         .manage(tokio::sync::OnceCell::<media::MediaServer>::new())

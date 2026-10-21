@@ -10,11 +10,15 @@
   const os = /Win/i.test(navigator.userAgent) ? 'windows' : /Mac/i.test(navigator.userAgent) ? 'macos' : 'linux';
 
   // What an asset is, from the file names release.yml publishes:
+  // Vulkan assets add _vulkan before .AppImage or -setup.exe.
   // GhostReel_<v>_amd64.AppImage, GhostReel_<v>_x64-setup.exe, GhostReel_<v>_aarch64.dmg / _x64.dmg.
   // Updater payloads (.sig, .app.tar.gz, latest.json) are not offered.
   function describe(name) {
-    if (/\.AppImage$/i.test(name)) return { os:'linux', label:'AppImage · x86-64', specs:[['Package','AppImage'],['GPU','NVIDIA CUDA']], priority:0 };
-    if (/-setup\.exe$/i.test(name)) return { os:'windows', label:'Windows installer (.exe)', specs:[['Package','Installer (.exe)'],['GPU','NVIDIA CUDA']], priority:0 };
+    const backend = /_vulkan(?:-setup\.exe|\.AppImage)$/i.test(name) ? 'vulkan' : 'cuda';
+    const gpu = backend === 'vulkan' ? 'Vulkan · AMD, Intel, NVIDIA' : 'CUDA · NVIDIA';
+    const priority = backend === 'vulkan' ? 1 : 0;
+    if (/\.AppImage$/i.test(name)) return { os:'linux', backend, label:'AppImage · x86-64 · ' + gpu, specs:[['Package','AppImage'],['GPU',gpu]], priority };
+    if (/-setup\.exe$/i.test(name)) return { os:'windows', backend, label:'Windows installer (.exe) · ' + gpu, specs:[['Package','Installer (.exe)'],['GPU',gpu]], priority };
     if (/aarch64\.dmg$/i.test(name)) return { os:'macos', arch:'arm', label:'macOS disk image · Apple Silicon', priority:0 };
     if (/x64\.dmg$/i.test(name)) return { os:'macos', arch:'intel', label:'macOS disk image · Intel', priority:1 };
     return null;
@@ -81,6 +85,19 @@
       link.set(items.find(i => i.arch === arch) || items[0]);
     });
   }
+  function gpuPicker(list, items, os) {
+    fixed(list, 'Package', items[0].specs[0][1]);
+    const options = [['cuda', 'CUDA · NVIDIA'], ['vulkan', 'Vulkan · AMD / Intel / NVIDIA']]
+      .filter(([backend]) => items.some(item => item.backend === backend));
+    const picker = choice('GPU backend', os + '-gpu', options);
+    const link = downloadLink(items[0]);
+    list.append(picker, link);
+    picker.querySelector('input').checked = true;
+    picker.addEventListener('change', () => {
+      const backend = picker.querySelector('input:checked').value;
+      link.set(items.find(item => item.backend === backend));
+    });
+  }
   function retry(message) {
     version.textContent = message;
     cards.forEach(card => {
@@ -132,18 +149,19 @@
           return;
         }
         if (target === 'macos' && assets.macos.length > 1) return macPicker(list, assets.macos);
+        if (target !== 'macos' && assets[target].length > 1) return gpuPicker(list, assets[target], target);
         const asset = assets[target][0];
         (asset.specs || [['Package', asset.label]]).forEach(([title, value]) => fixed(list, title, value));
         list.append(downloadLink(asset));
       });
       const preferred = assets[os][0];
       if (preferred && primary) {
-        // A Mac's chip can't be read reliably from the browser: on a Mac with two
-        // builds, the button goes to the card where the visitor picks one.
-        const pick = os === 'macos' && assets.macos.length > 1;
+        // The browser cannot reliably detect GPU support or Mac architecture.
+        // Let visitors choose when their platform has multiple builds.
+        const pick = assets[os].length > 1;
         primary.href = pick ? '#download' : preferred.url;
         primary.firstChild.textContent = 'Download for ' + ({linux:'Linux',windows:'Windows',macos:'macOS'}[os]) + ' ';
-        primary.title = pick ? 'Apple Silicon or Intel' : preferred.label + ' · ' + size(preferred.bytes);
+        primary.title = pick ? (os === 'macos' ? 'Apple Silicon or Intel' : 'Choose CUDA or Vulkan') : preferred.label + ' · ' + size(preferred.bytes);
       }
     } catch(error) {
       console.warn('Could not load GhostReel release assets:', error);

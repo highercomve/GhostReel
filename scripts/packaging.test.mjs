@@ -39,7 +39,9 @@ async function fixture(t, target) {
   const manifest = { ffmpeg: { targets: { [target]: config } } };
   const save = () => writeFile(join(root, 'scripts/sidecars.json'), JSON.stringify(manifest));
   await save();
-  const run = script => exec(process.execPath, [join(root, 'scripts', script), '--target', target], { cwd: root });
+  const run = (script, env = {}) => exec(process.execPath, [join(root, 'scripts', script), '--target', target], {
+    cwd: root, env: { ...process.env, ...env },
+  });
   return { root, files, config, save, run, requests: () => requests };
 }
 
@@ -76,6 +78,27 @@ for (const target of ['aarch64-apple-darwin', 'x86_64-apple-darwin']) {
   });
 }
 
+test('Windows Vulkan staging removes stale CUDA runtimes and bundles both helpers', async t => {
+  const target = 'x86_64-pc-windows-msvc';
+  const f = await fixture(t, target);
+  await f.run('fetch-sidecars.mjs');
+  await mkdir(join(f.root, 'target/release'), { recursive: true });
+  await mkdir(join(f.root, 'src-tauri/lib'), { recursive: true });
+  await writeFile(join(f.root, 'src-tauri/lib/cudart64_12.dll'), 'stale CUDA runtime');
+  for (const helper of ['ghostreel-asr', 'ghostreel-llm']) {
+    await writeFile(join(f.root, 'target/release', `${helper}.exe`), 'Vulkan helper');
+  }
+  await f.run('stage-helpers.mjs', { GHOSTREEL_GPU: 'vulkan', CUDA_PATH: '/unused-cuda' });
+  await assert.rejects(stat(join(f.root, 'src-tauri/lib/cudart64_12.dll')), { code: 'ENOENT' });
+  for (const helper of ['ghostreel-asr', 'ghostreel-llm']) {
+    assert.equal(await readFile(join(f.root, 'src-tauri/binaries', `${helper}-${target}.exe`), 'utf8'), 'Vulkan helper');
+  }
+  const overlay = JSON.parse(await readFile(join(f.root, 'src-tauri/tauri.bundle.json'), 'utf8'));
+  assert.ok(overlay.bundle.externalBin.includes('binaries/ghostreel-asr'));
+  assert.ok(overlay.bundle.externalBin.includes('binaries/ghostreel-llm'));
+  assert.equal(overlay.bundle.resources['lib/'], './');
+});
+
 test('reject a standalone download with the wrong checksum before staging it', async t => {
   const target = 'aarch64-apple-darwin';
   const f = await fixture(t, target);
@@ -103,24 +126,26 @@ test('extract a checksum-verified executable ZIP without losing its target suffi
   await assert.rejects(stat(join(f.root, 'target/sidecar-cache', `extract-ffmpeg-${target}`)), { code: 'ENOENT' });
 });
 
-test('Metal helper builds enable the backend for both packages and portable CPU fallback', async t => {
-  const root = await mkdtemp(join(tmpdir(), 'ghostreel-metal-'));
-  t.after(() => rm(root, { recursive: true, force: true }));
-  await mkdir(join(root, 'scripts'));
-  await mkdir(join(root, 'bin'));
-  await copyFile(new URL('build-helpers.sh', import.meta.url), join(root, 'scripts/build-helpers.sh'));
-  const cargo = join(root, 'bin/cargo');
-  await writeFile(cargo, '#!/bin/sh\nprintf "%s|%s\\n" "$GGML_NATIVE" "$*" >> "$BUILD_LOG"\n');
-  await chmod(cargo, 0o755);
-  const log = join(root, 'build.log');
-  await exec('bash', [join(root, 'scripts/build-helpers.sh')], {
-    env: { ...process.env, PATH: `${join(root, 'bin')}:${process.env.PATH}`, GHOSTREEL_GPU: 'metal', BUILD_LOG: log },
+for (const backend of ['metal', 'vulkan']) {
+  test(`${backend} helper builds enable both packages and portable CPU fallback`, async t => {
+    const root = await mkdtemp(join(tmpdir(), 'ghostreel-gpu-'));
+    t.after(() => rm(root, { recursive: true, force: true }));
+    await mkdir(join(root, 'scripts'));
+    await mkdir(join(root, 'bin'));
+    await copyFile(new URL('build-helpers.sh', import.meta.url), join(root, 'scripts/build-helpers.sh'));
+    const cargo = join(root, 'bin/cargo');
+    await writeFile(cargo, '#!/bin/sh\nprintf "%s|%s\\n" "$GGML_NATIVE" "$*" >> "$BUILD_LOG"\n');
+    await chmod(cargo, 0o755);
+    const log = join(root, 'build.log');
+    await exec('bash', [join(root, 'scripts/build-helpers.sh')], {
+      env: { ...process.env, PATH: `${join(root, 'bin')}:${process.env.PATH}`, GHOSTREEL_GPU: backend, BUILD_LOG: log },
+    });
+    const lines = (await readFile(log, 'utf8')).trim().split('\n');
+    assert.equal(lines.length, 2);
+    assert.match(lines[0], new RegExp(`^OFF\\|.*-p ghostreel-asr --features ${backend}$`));
+    assert.match(lines[1], new RegExp(`^OFF\\|.*-p ghostreel-llm --features ${backend}$`));
   });
-  const lines = (await readFile(log, 'utf8')).trim().split('\n');
-  assert.equal(lines.length, 2);
-  assert.match(lines[0], /^OFF\|.*-p ghostreel-asr --features metal$/);
-  assert.match(lines[1], /^OFF\|.*-p ghostreel-llm --features metal$/);
-});
+}
 
 test('check-macos-sidecars verifies arch and system dependencies', async t => {
   const root = await mkdtemp(join(tmpdir(), 'ghostreel-check-macos-'));

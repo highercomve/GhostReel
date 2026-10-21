@@ -3,6 +3,30 @@
 All notable changes to GhostReel. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [SemVer](https://semver.org/) while the project is 0.x (minor = features, patch = fixes).
 
+## [0.13.0] — 2026-10-21
+
+### Added
+
+- Vulkan builds for Windows and Linux alongside CUDA, supporting compatible AMD, Intel
+  and NVIDIA GPUs with a Vulkan 1.2-capable driver. Both speech and vision/chat helpers
+  use the selected backend; Vulkan installers have `_vulkan` in their filenames.
+- GPU backend selectors on the website's download cards, with direct links and file sizes
+  for each available variant. Install and source-build notes describe the Vulkan requirements.
+
+### Improved
+
+- CI caches compiled helpers separately by platform/backend and reuses them across release
+  version bumps. Keys track helper sources, vendored bindings, transitive locked dependencies,
+  toolchains, build settings and SDK versions. Vulkan SDK downloads are also cached, and
+  exact helper cache hits skip native compilation and SDK setup.
+- Signed updates preserve the installed CUDA or Vulkan backend using separate updater targets.
+- Vulkan helper builds use portable CPU fallback settings, and staging removes stale CUDA
+  runtimes before packaging a Vulkan build.
+
+### Fixed
+
+- Windows release upload failures now trigger the existing retry handling.
+
 ## [0.12.0] — 2026-10-21
 
 ### Added
@@ -789,7 +813,8 @@ is and the editor cuts around the shaky stretches; camera originals play in the 
 
 See the git history: `git log v0.1.5`.
 
-[Unreleased]: https://github.com/highercomve/GhostReel/compare/v0.12.0...HEAD
+[Unreleased]: https://github.com/highercomve/GhostReel/compare/v0.13.0...HEAD
+[0.13.0]: https://github.com/highercomve/GhostReel/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/highercomve/GhostReel/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/highercomve/GhostReel/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/highercomve/GhostReel/compare/v0.9.0...v0.10.0
