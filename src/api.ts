@@ -508,6 +508,39 @@ export interface PurgeStats {
 /** `purge`: also delete keyframes, previews and the index of footage no other project uses. */
 export const removeProject = (projectId: number, purge = false) =>
   call<PurgeStats>("remove_project", { projectId, purge });
+// Mirrors ghostreel-core's storage module.
+export type StorageKind = "proxies" | "keyframes" | "previews" | "chat_images" | "exports" | "temp";
+export type StorageUsage = Record<StorageKind, number>;
+export interface ProjectStorage {
+  project_id: number;
+  name: string;
+  videos: number;
+  usage: StorageUsage;
+  /** Part of `usage` that belongs to footage other projects use too. */
+  shared: number;
+}
+export interface StorageReport {
+  data_dir: string;
+  total: number;
+  usage: StorageUsage;
+  models: number;
+  database: number;
+  other: number;
+  /** Files no project uses: footage no project watches, deleted scripts and chats, scratch. */
+  unused: StorageUsage;
+  unused_videos: number;
+  projects: ProjectStorage[];
+}
+export interface CleanStats {
+  files_deleted: number;
+  bytes_freed: number;
+  videos: number;
+}
+export const storageReport = () => call<StorageReport>("storage_report");
+/** `unused` ignores `kinds` and removes everything nothing uses. Video files are never touched. */
+export const cleanStorage = (scope: "all" | "project" | "unused", kinds: StorageKind[], projectId?: number) =>
+  call<CleanStats>("clean_storage", { scope, projectId: projectId ?? null, kinds });
+export const compactDatabase = () => call<number>("compact_database");
 export const projectView = (projectId: number) => call<ProjectView>("project_view", { projectId });
 export const addFolder = (projectId: number, path: string, recursive = true) =>
   call<void>("add_folder", { projectId, path, recursive });
@@ -536,7 +569,13 @@ export const fpsLabel = (num: number, den: number) =>
   FPS_PRESETS.find((p) => p.num === num && p.den === den)?.label ?? (num / den).toFixed(3);
 
 export const humanSize = (bytes: number) =>
-  bytes >= 1e9 ? `${(bytes / 1e9).toFixed(1)} GB` : `${Math.round(bytes / 1e6)} MB`;
+  bytes >= 1e9
+    ? `${(bytes / 1e9).toFixed(1)} GB`
+    : bytes >= 1e6
+      ? `${Math.round(bytes / 1e6)} MB`
+      : bytes > 0
+        ? `${Math.max(1, Math.round(bytes / 1e3))} KB`
+        : "0 MB";
 
 export const humanDuration = (s: number) => {
   const t = Math.round(s);

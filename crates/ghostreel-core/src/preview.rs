@@ -810,10 +810,13 @@ pub fn playback_proxy_path(data_dir: &Path, content_hash: &str) -> PathBuf {
     playback_proxy_path_for_size(data_dir, content_hash, 768)
 }
 
+/// What sets current playback proxies apart from older formats, which nothing reads any more.
+pub const PLAYBACK_PROXY_TAG: &str = "-playback-v2-";
+
 pub fn playback_proxy_path_for_size(data_dir: &Path, content_hash: &str, long_side: u32) -> PathBuf {
     let long_side = long_side.clamp(256, 3840);
     let hex = content_hash.rsplit(':').next().unwrap_or(content_hash);
-    data_dir.join("proxies").join(&hex[..2.min(hex.len())]).join(format!("{hex}-playback-v2-{long_side}.mp4"))
+    data_dir.join("proxies").join(&hex[..2.min(hex.len())]).join(format!("{hex}{PLAYBACK_PROXY_TAG}{long_side}.mp4"))
 }
 
 /// Whether a browser engine can be expected to play this file as it is: 8-bit 4:2:0 H.264 at

@@ -135,6 +135,33 @@ enum Command {
         #[command(subcommand)]
         action: ModelsAction,
     },
+    /// Show the disk space GhostReel uses (overall and per project) and clean it up.
+    Storage {
+        #[command(subcommand)]
+        action: Option<StorageAction>,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum StorageAction {
+    /// Delete cache files. Video files are never touched.
+    Clean {
+        /// Only this project's footage, scripts and chats.
+        #[arg(long, short)]
+        project: Option<String>,
+        /// Kinds to delete (comma-separated: proxies, keyframes, previews, chat_images, exports, temp).
+        /// Default: proxies, previews, temp — everything rebuilt on demand.
+        #[arg(long, value_delimiter = ',')]
+        kind: Option<Vec<String>>,
+        /// Instead: delete everything no project uses, including the index of footage no project
+        /// watches any more.
+        #[arg(long, conflicts_with_all = ["project", "kind"])]
+        unused: bool,
+    },
+    /// Shrink the library database after deletions.
+    Compact,
 }
 
 #[derive(Subcommand)]
@@ -422,6 +449,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             Ok(if report.blockers().is_empty() { ExitCode::SUCCESS } else { ExitCode::from(2) })
         }
         Command::Project { action } => project_cmd(&paths, action),
+        Command::Storage { action, json } => storage_cmd(&paths, action, json),
         Command::Folder { action } => folder_cmd(&paths, action),
         Command::Index { project, watch, retry_failed, json, redo, stages, skip, no_transcribe } => {
             index_cmd(
@@ -835,6 +863,74 @@ fn project_cmd(paths: &Paths, action: ProjectAction) -> anyhow::Result<ExitCode>
             }
             db.remove_project(p.id)?;
             println!("removed project '{}'{}", p.name, if purge { "" } else { " (indexed data kept)" });
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn storage_cmd(paths: &Paths, action: Option<StorageAction>, json: bool) -> anyhow::Result<ExitCode> {
+    use ghostreel_core::storage::{self, Kind, Scope, Usage};
+    let mut db = open_db(paths)?;
+    let size = |b: u64| human_size(b as i64);
+    match action {
+        None => {
+            let r = storage::report(&db, &paths.data_dir)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&r)?);
+                return Ok(ExitCode::SUCCESS);
+            }
+            let line = |u: &Usage| {
+                format!(
+                    "proxies {}, keyframes {}, previews {}, chat images {}, exports {}",
+                    size(u.proxies),
+                    size(u.keyframes),
+                    size(u.previews),
+                    size(u.chat_images),
+                    size(u.exports)
+                )
+            };
+            println!("{}: {}", r.data_dir.display(), size(r.total));
+            println!("  caches   {} ({})", size(r.usage.total()), line(&r.usage));
+            println!("  models   {}", size(r.models));
+            println!("  database {}", size(r.database));
+            println!("  temp     {}", size(r.usage.temp));
+            println!("  other    {}", size(r.other));
+            println!(
+                "  unused   {} ({} videos no project watches; ghostreel storage clean --unused)",
+                size(r.unused.total()),
+                r.unused_videos
+            );
+            for p in &r.projects {
+                println!("\n{} — {} videos, {}", p.name, p.videos, size(p.usage.total()));
+                println!("  {}", line(&p.usage));
+                if p.shared > 0 {
+                    println!("  {} of it is footage other projects use too", size(p.shared));
+                }
+            }
+        }
+        Some(StorageAction::Clean { project, kind, unused }) => {
+            let kinds = match kind {
+                Some(k) => k.iter().map(|k| Kind::parse(k)).collect::<Result<Vec<_>, _>>()?,
+                None => Kind::CACHES.to_vec(),
+            };
+            let scope = match (unused, project) {
+                (true, _) => Scope::Unused,
+                (false, Some(name)) => Scope::Project(db.require_project(&name)?.id),
+                (false, None) => Scope::All,
+            };
+            let s = storage::clean(&mut db, &paths.data_dir, scope, &kinds)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&s)?);
+            } else {
+                println!("deleted {} files, {} freed", s.files_deleted, size(s.bytes_freed));
+                if s.videos > 0 {
+                    println!("forgot the index of {} videos no project watches", s.videos);
+                }
+            }
+        }
+        Some(StorageAction::Compact) => {
+            let saved = storage::compact(&db, &paths.db_file())?;
+            println!("database compacted, {} saved", size(saved));
         }
     }
     Ok(ExitCode::SUCCESS)

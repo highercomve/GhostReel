@@ -17,6 +17,7 @@ use ghostreel_core::paths::Paths;
 use ghostreel_core::probe::{self, Resolution};
 use ghostreel_core::projects::{Folder, NewProject, PipelineConfig, Project};
 use ghostreel_core::runtime;
+use ghostreel_core::storage;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, State};
 
@@ -97,6 +98,41 @@ fn remove_project(project_id: i64, purge: bool) -> CmdResult<ghostreel_core::pro
     let stats = if purge { db.purge_project_data(&p.data_dir, project_id).map_err(err)? } else { Default::default() };
     db.remove_project(project_id).map_err(err)?;
     Ok(stats)
+}
+
+/// How much space GhostReel uses on disk, overall and per project.
+#[tauri::command]
+async fn storage_report() -> CmdResult<storage::Report> {
+    tokio::task::spawn_blocking(|| storage::report(&open_db()?, &paths()?.data_dir).map_err(err)).await.map_err(err)?
+}
+
+/// `scope`: `all`, `project` (with `project_id`) or `unused` (ignores `kinds`). `kinds`: proxies,
+/// keyframes, previews, chat_images, exports, temp. Video files are never touched.
+#[tauri::command]
+async fn clean_storage(scope: String, project_id: Option<i64>, kinds: Vec<String>) -> CmdResult<storage::CleanStats> {
+    tokio::task::spawn_blocking(move || {
+        let scope = match (scope.as_str(), project_id) {
+            ("all", _) => storage::Scope::All,
+            ("unused", _) => storage::Scope::Unused,
+            ("project", Some(id)) => storage::Scope::Project(id),
+            _ => return Err(format!("unknown scope '{scope}'")),
+        };
+        let kinds = kinds.iter().map(|k| storage::Kind::parse(k)).collect::<Result<Vec<_>, _>>().map_err(err)?;
+        storage::clean(&mut open_db()?, &paths()?.data_dir, scope, &kinds).map_err(err)
+    })
+    .await
+    .map_err(err)?
+}
+
+/// Shrink the library database after deletions. Returns the bytes saved.
+#[tauri::command]
+async fn compact_database() -> CmdResult<u64> {
+    tokio::task::spawn_blocking(|| {
+        let p = paths()?;
+        storage::compact(&open_db()?, &p.db_file()).map_err(err)
+    })
+    .await
+    .map_err(err)?
 }
 
 #[derive(Serialize)]
@@ -1419,6 +1455,9 @@ pub fn run() {
             plan_organize_project,
             execute_organize_project,
             remove_project,
+            storage_report,
+            clean_storage,
+            compact_database,
             project_view,
             add_folder,
             remove_folder,

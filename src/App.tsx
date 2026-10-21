@@ -4,12 +4,13 @@ import ActivityPage from "./ActivityPage";
 import ModelsPage from "./ModelsPage";
 import ProjectPage from "./ProjectPage";
 import StatusPage from "./StatusPage";
+import StoragePage from "./StoragePage";
 import { useUpdater } from "./UpdaterPanel";
 import { onEvent } from "./events";
 import SettingsPage from "./SettingsPage";
 import { isActive, useQueue } from "./useQueue";
 
-type Page = { kind: "status" } | { kind: "models" } | { kind: "settings" } | { kind: "activity" } | { kind: "project"; id: number; openVideo?: { videoId: number; t: number } };
+type Page = { kind: "status" } | { kind: "models" } | { kind: "settings" } | { kind: "storage" } | { kind: "activity" } | { kind: "project"; id: number; openVideo?: { videoId: number; t: number } };
 
 function NewProject({ onCreated, onCancel }: { onCreated: (id: number) => void; onCancel: () => void }) {
   const [name, setName] = useState("");
@@ -181,6 +182,12 @@ export default function App() {
           Models
         </button>
         <button
+          className={`nav-item ${page.kind === "storage" ? "active" : ""}`}
+          onClick={() => setPage({ kind: "storage" })}
+        >
+          Storage
+        </button>
+        <button
           className={`nav-item ${page.kind === "settings" ? "active" : ""}`}
           onClick={() => setPage({ kind: "settings" })}
         >
@@ -198,6 +205,8 @@ export default function App() {
           <StatusPage updater={updater} />
         ) : page.kind === "models" ? (
           <ModelsPage />
+        ) : page.kind === "storage" ? (
+          <StoragePage onChanged={refresh} />
         ) : page.kind === "settings" ? (
           <SettingsPage />
         ) : page.kind === "activity" ? (

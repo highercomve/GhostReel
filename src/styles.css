@@ -3308,3 +3308,37 @@ pre.cli-test-result { background: var(--panel, #171a21); border: 1px solid var(-
 @media (max-width: 850px) { .selection-hint { flex-basis: 100%; margin-left: 0; } }
 
 .folder-actions { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; }
+
+/* ---- storage ---------------------------------------------------------------------------- */
+
+.storage-table td.num,
+.storage-table th.num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.storage-table .bar-col {
+  width: 30%;
+  min-width: 80px;
+}
+
+.storage-table td.actions {
+  text-align: right;
+  width: 1%;
+}
+
+.storage-bar > div {
+  min-width: 0;
+}
+
+.storage-actions {
+  margin-top: 8px;
+}
+
+.storage-project {
+  margin-bottom: 12px;
+}
+
+.storage-unused {
+  margin-top: 12px;
+}

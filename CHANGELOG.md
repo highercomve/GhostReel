@@ -3,6 +3,22 @@
 All notable changes to GhostReel. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [SemVer](https://semver.org/) while the project is 0.x (minor = features, patch = fixes).
 
+## [0.12.0] — 2026-10-21
+
+### Added
+
+- Storage page (and `ghostreel storage`): how much space proxies, keyframes, script previews,
+  chat images, exports, models and the database take, overall and per project. Each kind can be
+  cleared everywhere or for one project, "Clear all caches" removes what is rebuilt on demand,
+  "Clean up unused" removes files nothing uses (footage no project watches, deleted scripts and
+  chats, playback proxies in the pre-0.9 format), the database can be compacted, and a project
+  can be deleted together with everything made for it.
+
+### Fixed
+
+- Deleting a project with its indexed data now also removes its playback proxies and chat
+  images, and reports the space its keyframes freed.
+
 ## [0.11.0] — 2026-10-15
 
 ### Added
@@ -773,7 +789,9 @@ is and the editor cuts around the shaky stretches; camera originals play in the 
 
 See the git history: `git log v0.1.5`.
 
-[Unreleased]: https://github.com/highercomve/GhostReel/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/highercomve/GhostReel/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/highercomve/GhostReel/compare/v0.11.0...v0.12.0
+[0.11.0]: https://github.com/highercomve/GhostReel/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/highercomve/GhostReel/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/highercomve/GhostReel/compare/v0.8.1...v0.9.0
 [0.8.1]: https://github.com/highercomve/GhostReel/compare/v0.8.0...v0.8.1

@@ -393,6 +393,12 @@ async fn dispatch(app: &AppHandle, cmd: &str, args: Value) -> Result<Value, Stri
             let (project_id, purge) = args!(args; project_id: i64, purge: bool);
             ok(crate::remove_project(project_id, purge)?)
         }
+        "storage_report" => ok(crate::storage_report().await?),
+        "clean_storage" => {
+            let (scope, project_id, kinds) = args!(args; scope: String, project_id: Option<i64>, kinds: Vec<String>);
+            ok(crate::clean_storage(scope, project_id, kinds).await?)
+        }
+        "compact_database" => ok(crate::compact_database().await?),
         "project_view" => {
             let (project_id,) = args!(args; project_id: i64);
             ok(crate::project_view(project_id)?)
