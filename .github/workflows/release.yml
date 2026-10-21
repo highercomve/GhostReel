@@ -147,7 +147,7 @@ jobs:
             wget \
             file \
             xz-utils \
-            libvulkan1
+            libvulkan-dev
 
       # Jimver pin v0.2.24 checked to exist; CUDA 12.8 ships .so.12 / 64_12.dll runtimes
       - name: Install CUDA Toolkit
@@ -196,9 +196,10 @@ jobs:
             target/release/ghostreel-llm
           key: helpers-v2-linux-x64-${{ matrix.backend }}-${{ matrix.backend == 'cuda' && '12.8.1' || env.VULKAN_VERSION }}-${{ env.CMAKE_CUDA_ARCHITECTURES }}-${{ hashFiles('crates/ghostreel-asr/**', 'crates/ghostreel-llm/**', 'vendor/llama-cpp-2/**', 'scripts/build-helpers.sh', 'scripts/helper-cache-key.mjs') }}-${{ steps.helper-deps.outputs.hash }}
 
-      - name: Cache Vulkan SDK download
+      - name: Restore Vulkan SDK download
+        id: sdk-download
         if: matrix.backend == 'vulkan' && steps.helpers.outputs.cache-hit != 'true'
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: ${{ runner.temp }}/vulkan-download
           key: vulkan-sdk-linux-${{ env.VULKAN_VERSION }}
@@ -215,6 +216,14 @@ jobs:
           echo "VULKAN_SDK=$sdk" >> "$GITHUB_ENV"
           echo "$sdk/bin" >> "$GITHUB_PATH"
           echo "LD_LIBRARY_PATH=$sdk/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+
+      # Save before compiling: even a failed native build can reuse the SDK download.
+      - name: Save Vulkan SDK download
+        if: matrix.backend == 'vulkan' && steps.helpers.outputs.cache-hit != 'true' && steps.sdk-download.outputs.cache-hit != 'true' && github.ref == 'refs/heads/master'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/vulkan-download
+          key: ${{ steps.sdk-download.outputs.cache-primary-key }}
 
       - name: Build native helpers
         if: steps.helpers.outputs.cache-hit != 'true'
@@ -450,9 +459,10 @@ jobs:
             target/release/ghostreel-llm.exe
           key: helpers-v2-windows-x64-${{ matrix.backend }}-${{ matrix.backend == 'cuda' && '12.8.1' || env.VULKAN_VERSION }}-${{ env.CMAKE_CUDA_ARCHITECTURES }}-${{ hashFiles('crates/ghostreel-asr/**', 'crates/ghostreel-llm/**', 'vendor/llama-cpp-2/**', 'scripts/build-helpers.sh', 'scripts/helper-cache-key.mjs') }}-${{ steps.helper-deps.outputs.hash }}
 
-      - name: Cache Vulkan SDK download
+      - name: Restore Vulkan SDK download
+        id: sdk-download
         if: matrix.backend == 'vulkan' && steps.helpers.outputs.cache-hit != 'true'
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: ${{ runner.temp }}/vulkan-download
           key: vulkan-sdk-windows-${{ env.VULKAN_VERSION }}
@@ -471,6 +481,14 @@ jobs:
           if ($process.ExitCode -ne 0) { throw "Vulkan SDK install failed: $($process.ExitCode)" }
           "VULKAN_SDK=C:/VulkanSDK/$env:VULKAN_VERSION" >> $env:GITHUB_ENV
           "C:/VulkanSDK/$env:VULKAN_VERSION/Bin" >> $env:GITHUB_PATH
+
+      # Save before compiling: even a failed native build can reuse the SDK download.
+      - name: Save Vulkan SDK download
+        if: matrix.backend == 'vulkan' && steps.helpers.outputs.cache-hit != 'true' && steps.sdk-download.outputs.cache-hit != 'true' && github.ref == 'refs/heads/master'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/vulkan-download
+          key: ${{ steps.sdk-download.outputs.cache-primary-key }}
 
       - name: Build helper ghostreel-asr
         if: steps.helpers.outputs.cache-hit != 'true'
