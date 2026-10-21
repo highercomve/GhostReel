@@ -918,6 +918,7 @@ async fn run_transcribe_jobs(
     on_event(Event::Progress(tracker.snapshot(None)));
 
     let (mut done, mut failed) = (0, 0);
+    let mut transcriber = stt::Transcriber::new(&engine);
     for (video_id, path) in jobs {
         if opts.cancelled() {
             break;
@@ -926,17 +927,18 @@ async fn run_transcribe_jobs(
         set_job(db, video_id, STAGE, "running", None)?;
         on_event(Event::JobStarted { video_id, stage: STAGE.into(), path: path.clone() });
         let mut credited = 0.0f64;
-        let result = stt::transcribe(&engine, &rt.ffmpeg, &path, duration, |secs| {
-            let secs = secs.min(duration);
-            if secs > credited {
-                tracker.advance(phase, (secs - credited).round() as u64);
-                credited = secs.round();
-            }
-            if tracker.should_emit() {
-                on_event(Event::Progress(tracker.snapshot(Some(path.clone()))));
-            }
-        })
-        .await;
+        let result = transcriber
+            .transcribe(&rt.ffmpeg, &path, duration, |secs| {
+                let secs = secs.min(duration);
+                if secs > credited {
+                    tracker.advance(phase, (secs - credited).round() as u64);
+                    credited = secs.round();
+                }
+                if tracker.should_emit() {
+                    on_event(Event::Progress(tracker.snapshot(Some(path.clone()))));
+                }
+            })
+            .await;
         match result {
             Ok(t) => {
                 store_transcript(db, video_id, &t)?;
@@ -951,7 +953,18 @@ async fn run_transcribe_jobs(
                     let _ = db.set_audio_track(video_id, track);
                     if let Some(track) = track {
                         let spans: Vec<(f64, f64)> = t.segments.iter().map(|s| (s.start, s.end)).collect();
-                        let levels = crate::audio::segment_levels(&rt.ffmpeg, &path, track, &spans).await;
+                        let levels = if tracks == 1
+                            && track == 0
+                            && crate::audio::track_channels(&rt.ffprobe, &path, track).await == Some(1)
+                        {
+                            if let Some(pcm) = transcriber.decoded_audio() {
+                                crate::audio::segment_levels_pcm(pcm, &spans).await
+                            } else {
+                                crate::audio::segment_levels(&rt.ffmpeg, &path, track, &spans).await
+                            }
+                        } else {
+                            crate::audio::segment_levels(&rt.ffmpeg, &path, track, &spans).await
+                        };
                         let flags = crate::audio::off_mic_flags(&levels, crate::audio::OFF_MIC_MARGIN_DB);
                         let rows: Vec<(f64, Option<bool>)> = spans.iter().map(|(a, _)| *a).zip(flags).collect();
                         let _ = db.set_off_mic(video_id, &rows);
@@ -979,6 +992,7 @@ async fn run_transcribe_jobs(
         }
         on_event(Event::Progress(tracker.snapshot(Some(path))));
     }
+    transcriber.shutdown().await;
     Ok((done, failed))
 }
 
@@ -2488,7 +2502,7 @@ echo '{"streams":[{"codec_type":"video","codec_name":"h264","width":1920,"height
         let asr = tmp.path().join("asr");
         std::fs::write(
             &asr,
-            "#!/bin/sh\ncat > /dev/null\necho '{\"type\":\"loaded\"}'\necho '{\"type\":\"progress\",\"percent\":100}'\necho '{\"type\":\"segment\",\"start\":0.5,\"end\":2.5,\"text\":\"hello world\",\"no_speech\":0.1}'\necho '{\"type\":\"done\",\"language\":\"en\",\"audio_s\":3}'\n",
+            "#!/bin/sh\nread -r request\necho '{\"type\":\"loaded\"}'\necho '{\"type\":\"progress\",\"percent\":100}'\necho '{\"type\":\"segment\",\"start\":0.5,\"end\":2.5,\"text\":\"hello world\",\"no_speech\":0.1}'\necho '{\"type\":\"done\",\"language\":\"en\",\"audio_s\":3}'\n",
         )
         .unwrap();
         std::fs::set_permissions(&asr, std::fs::Permissions::from_mode(0o755)).unwrap();

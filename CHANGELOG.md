@@ -3,6 +3,20 @@
 All notable changes to GhostReel. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [SemVer](https://semver.org/) while the project is 0.x (minor = features, patch = fixes).
 
+## [0.13.2] — 2026-10-21
+
+### Improved
+
+- Indexing talks to one persistent Whisper worker instead of starting `ghostreel-asr` for
+  every video, so the model loads once per run rather than on each clip. When transcription
+  fails, the worker is released and the schedule falls back to the isolated helper it used
+  before, without leaking GPU memory.
+- Off-mic level measurement reads the audio the transcription decode already produced
+  (mono tracks), instead of seeking the source with a separate ffmpeg per transcript line.
+  On a 96-video project that stage went from 17 s to 0.6 s with identical off-mic flags.
+- Speech levels now measure each stereo channel's energy before mixing, so
+  opposite-phase channels can no longer cancel into a false "off-mic" reading.
+
 ## [0.13.1] — 2026-10-21
 
 ### Added
@@ -837,7 +851,8 @@ is and the editor cuts around the shaky stretches; camera originals play in the 
 
 See the git history: `git log v0.1.5`.
 
-[Unreleased]: https://github.com/highercomve/GhostReel/compare/v0.13.0...HEAD
+[Unreleased]: https://github.com/highercomve/GhostReel/compare/v0.13.2...HEAD
+[0.13.2]: https://github.com/highercomve/GhostReel/compare/v0.13.1...v0.13.2
 [0.13.1]: https://github.com/highercomve/GhostReel/compare/v0.13.0...v0.13.1
 [0.13.0]: https://github.com/highercomve/GhostReel/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/highercomve/GhostReel/compare/v0.11.0...v0.12.0

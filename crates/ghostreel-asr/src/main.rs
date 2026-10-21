@@ -13,7 +13,7 @@
 //! llama-cpp-2 each vendor ggml (duplicate symbols in one binary), and so the GPU memory is
 //! released for certain when transcription ends.
 
-use std::io::{Read, Write};
+use std::io::{BufRead, Read, Write};
 use std::process::ExitCode;
 
 use serde_json::json;
@@ -24,6 +24,7 @@ struct Args {
     language: String,
     threads: i32,
     cpu: bool,
+    serve: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -31,6 +32,7 @@ fn parse_args() -> Result<Args, String> {
     let mut language = "auto".to_string();
     let mut threads = std::thread::available_parallelism().map(|n| n.get() as i32).unwrap_or(4).min(8);
     let mut cpu = false;
+    let mut serve = false;
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -41,20 +43,21 @@ fn parse_args() -> Result<Args, String> {
             }
             // Force CPU inference (GPU out of memory, or no usable GPU).
             "--cpu" => cpu = true,
+            "--serve" => serve = true,
             "--version" => {
                 println!("ghostreel-asr {}", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
             }
             "-h" | "--help" => {
                 println!(
-                    "usage: ghostreel-asr --model <ggml-*.bin> [--language auto|en|es…] [--threads N] [--cpu] < pcm_f32le_16k_mono"
+                    "usage: ghostreel-asr --model <ggml-*.bin> [--language auto|en|es…] [--threads N] [--cpu] [--serve] < pcm_f32le_16k_mono"
                 );
                 std::process::exit(0);
             }
             other => return Err(format!("unknown argument {other}")),
         }
     }
-    Ok(Args { model: model.ok_or("--model is required")?, language, threads, cpu })
+    Ok(Args { model: model.ok_or("--model is required")?, language, threads, cpu, serve })
 }
 
 fn emit(v: serde_json::Value) {
@@ -65,14 +68,6 @@ fn emit(v: serde_json::Value) {
 
 fn run() -> Result<(), String> {
     let args = parse_args()?;
-
-    let mut raw = Vec::new();
-    std::io::stdin().read_to_end(&mut raw).map_err(|e| format!("reading audio from stdin: {e}"))?;
-    if raw.len() % 4 != 0 {
-        return Err("stdin is not f32le PCM (length not a multiple of 4)".into());
-    }
-    let samples: Vec<f32> = raw.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect();
-    let audio_s = samples.len() as f64 / 16_000.0;
 
     // whisper.cpp/ggml logs go to stderr as-is: GhostReel keeps the last lines to explain failures
     // (e.g. "CUDA error: out of memory").
@@ -86,6 +81,36 @@ fn run() -> Result<(), String> {
         .map_err(|e| format!("loading model {}: {e}", args.model))?;
     emit(json!({ "type": "loaded", "model": args.model, "gpu": gpu }));
 
+    if args.serve {
+        // One JSON request per decoded clip. Retain weights on the GPU, but use fresh decoder
+        // state for each request so language/context from one video cannot leak into the next.
+        for line in std::io::stdin().lock().lines() {
+            let result = (|| {
+                let line = line.map_err(|e| format!("reading request: {e}"))?;
+                let request: serde_json::Value =
+                    serde_json::from_str(&line).map_err(|e| format!("invalid request: {e}"))?;
+                let path = request["audio"].as_str().ok_or("request needs an audio path")?;
+                let raw = std::fs::read(path).map_err(|e| format!("reading decoded audio: {e}"))?;
+                transcribe(&ctx, &args, &raw)
+            })();
+            if let Err(error) = result {
+                emit(json!({ "type": "error", "error": error }));
+            }
+        }
+        Ok(())
+    } else {
+        let mut raw = Vec::new();
+        std::io::stdin().read_to_end(&mut raw).map_err(|e| format!("reading audio from stdin: {e}"))?;
+        transcribe(&ctx, &args, &raw)
+    }
+}
+
+fn transcribe(ctx: &WhisperContext, args: &Args, raw: &[u8]) -> Result<(), String> {
+    if !raw.len().is_multiple_of(4) {
+        return Err("audio is not f32le PCM (length not a multiple of 4)".into());
+    }
+    let samples: Vec<f32> = raw.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect();
+    let audio_s = samples.len() as f64 / 16_000.0;
     if samples.is_empty() {
         emit(json!({ "type": "done", "language": null, "audio_s": 0.0 }));
         return Ok(());

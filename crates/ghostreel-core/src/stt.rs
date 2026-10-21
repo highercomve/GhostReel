@@ -6,7 +6,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::Error;
 
@@ -84,6 +84,161 @@ pub async fn transcribe(
     };
     t.segments = collapse_repeats(std::mem::take(&mut t.segments));
     Ok(t)
+}
+
+/// One transcription stage owns one worker. Dropping the session releases its GPU allocation
+/// before frame descriptions start. Server backends retain their existing request protocol.
+pub struct Transcriber<'a> {
+    engine: &'a Engine,
+    worker: Option<LocalWorker>,
+    audio: Option<tempfile::NamedTempFile>,
+}
+
+impl<'a> Transcriber<'a> {
+    pub fn new(engine: &'a Engine) -> Self {
+        Self { engine, worker: None, audio: None }
+    }
+
+    /// Mono PCM from ffmpeg’s selected audio track, valid until the next request.
+    pub fn decoded_audio(&self) -> Option<&Path> {
+        self.audio.as_ref().map(|f| f.path())
+    }
+
+    /// Wait for process exit before another model claims the GPU. Drop still kills the worker
+    /// on cancellation/error paths where an async shutdown cannot run.
+    pub async fn shutdown(&mut self) {
+        if let Some(mut worker) = self.worker.take() {
+            let _ = worker.child.kill().await;
+            worker.stderr.abort();
+        }
+        self.audio = None;
+    }
+
+    pub async fn transcribe(
+        &mut self,
+        ffmpeg: &Path,
+        video: &Path,
+        duration_s: f64,
+        mut progress: impl FnMut(f64),
+    ) -> Result<Transcript, Error> {
+        self.audio = None;
+        let Engine::Local { asr_bin, model, language } = self.engine else {
+            return transcribe(self.engine, ffmpeg, video, duration_s, progress).await;
+        };
+        let audio = tempfile::Builder::new()
+            .prefix("ghostreel-audio-")
+            .suffix(".f32")
+            .tempfile()
+            .map_err(|e| Error::Stt(format!("temporary audio: {e}")))?;
+        let decode = crate::proc::command(ffmpeg)
+            .args(["-nostdin", "-v", "error", "-y", "-i"])
+            .arg(video)
+            .args(["-vn", "-ac", "1", "-ar", "16000", "-f", "f32le"])
+            .arg(audio.path())
+            .kill_on_drop(true)
+            .output()
+            .await
+            .map_err(|e| Error::Stt(format!("ffmpeg audio decode: {e}")))?;
+        if !decode.status.success() {
+            return Err(Error::Stt(format!("ffmpeg audio decode: {}", String::from_utf8_lossy(&decode.stderr))));
+        }
+        self.audio = Some(audio);
+        if self.worker.is_none() {
+            self.worker = Some(LocalWorker::start(asr_bin, model, language)?);
+        }
+        let result = self
+            .worker
+            .as_mut()
+            .unwrap()
+            .transcribe(self.audio.as_ref().unwrap().path(), duration_s, &mut progress)
+            .await;
+        match result {
+            Ok(mut t) => {
+                t.segments = collapse_repeats(t.segments);
+                Ok(t)
+            }
+            Err(error) => {
+                // Kill a failed worker before a retry, releasing any GPU memory it owns.
+                self.shutdown().await;
+                tracing::warn!("persistent whisper failed, retrying with isolated helper: {error}");
+                transcribe(self.engine, ffmpeg, video, duration_s, progress).await
+            }
+        }
+    }
+}
+
+struct LocalWorker {
+    child: tokio::process::Child,
+    input: tokio::process::ChildStdin,
+    lines: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+    stderr: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for LocalWorker {
+    fn drop(&mut self) {
+        let _ = self.child.start_kill();
+        self.stderr.abort();
+    }
+}
+
+impl LocalWorker {
+    fn start(bin: &Path, model: &Path, language: &str) -> Result<Self, Error> {
+        let mut child = crate::proc::command(bin)
+            .arg("--model")
+            .arg(model)
+            .args(["--language", language, "--serve"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|e| Error::Stt(format!("cannot run {}: {e}", bin.display())))?;
+        let input = child.stdin.take().ok_or_else(|| Error::Stt("asr stdin unavailable".into()))?;
+        let output = child.stdout.take().ok_or_else(|| Error::Stt("asr stdout unavailable".into()))?;
+        let errors = child.stderr.take();
+        // Drain stderr continuously: ggml can otherwise fill its pipe and stall inference.
+        let stderr = tokio::spawn(async move {
+            if let Some(errors) = errors {
+                let mut lines = BufReader::new(errors).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    tracing::debug!("whisper: {line}");
+                }
+            }
+        });
+        Ok(Self { child, input, lines: BufReader::new(output).lines(), stderr })
+    }
+
+    async fn transcribe(
+        &mut self,
+        audio: &Path,
+        duration_s: f64,
+        progress: &mut impl FnMut(f64),
+    ) -> Result<Transcript, Error> {
+        let request =
+            serde_json::to_vec(&serde_json::json!({ "audio": audio })).map_err(|e| Error::Stt(e.to_string()))?;
+        self.input.write_all(&request).await.map_err(|e| Error::Stt(e.to_string()))?;
+        self.input.write_all(b"\n").await.map_err(|e| Error::Stt(e.to_string()))?;
+        self.input.flush().await.map_err(|e| Error::Stt(e.to_string()))?;
+        let mut out = Transcript::default();
+        while let Some(line) = self.lines.next_line().await.map_err(|e| Error::Stt(e.to_string()))? {
+            match serde_json::from_str::<AsrLine>(&line) {
+                Ok(AsrLine::Progress { percent }) => progress(duration_s * percent.clamp(0.0, 100.0) / 100.0),
+                Ok(AsrLine::Segment { start, end, text, no_speech }) => {
+                    if no_speech.unwrap_or(0.0) <= MAX_NO_SPEECH && !text.trim().is_empty() {
+                        out.segments.push(Segment { start, end, text: text.trim().into() });
+                    }
+                }
+                Ok(AsrLine::Done { language }) => {
+                    out.language = language;
+                    progress(duration_s);
+                    return Ok(out);
+                }
+                Ok(AsrLine::Error { error }) => return Err(Error::Stt(error)),
+                _ => {}
+            }
+        }
+        Err(Error::Stt("Whisper worker exited before completing the clip".into()))
+    }
 }
 
 fn normalize(text: &str) -> String {
@@ -322,6 +477,9 @@ enum AsrLine {
     Done {
         language: Option<String>,
     },
+    Error {
+        error: String,
+    },
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -401,6 +559,7 @@ async fn transcribe_local(
                 done = true;
             }
             Ok(AsrLine::Loaded { gpu }) => used_gpu = gpu,
+            Ok(AsrLine::Error { error }) => return Err(Error::Stt(error)),
             Err(_) => {}
         }
     }
@@ -426,6 +585,41 @@ async fn transcribe_local(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn persistent_worker_reuses_process_across_requests() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("worker");
+        let starts = tmp.path().join("starts");
+        std::fs::write(
+            &bin,
+            format!(
+                r#"#!/bin/sh
+echo started >> '{}'
+echo '{{"type":"loaded","gpu":true}}'
+while IFS= read -r request; do
+ echo '{{"type":"segment","start":0,"end":1,"text":"hello"}}'
+ echo '{{"type":"done","language":"en"}}'
+done
+"#,
+                starts.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut worker = LocalWorker::start(&bin, Path::new("model"), "auto").unwrap();
+        let pid = worker.child.id().unwrap();
+        for _ in 0..2 {
+            let t = worker.transcribe(Path::new("audio.f32"), 1.0, &mut |_| {}).await.unwrap();
+            assert_eq!(t.segments, vec![seg(0.0, 1.0, "hello")]);
+            assert_eq!(t.language.as_deref(), Some("en"));
+            assert_eq!(worker.child.id(), Some(pid));
+        }
+        assert_eq!(std::fs::read_to_string(starts).unwrap().lines().count(), 1);
+        drop(worker);
+    }
 
     fn seg(start: f64, end: f64, text: &str) -> Segment {
         Segment { start, end, text: text.into() }
