@@ -6,11 +6,7 @@
 .layout = "page.shtml",
 ---
 
-```=html
-<a id="install"></a>
-```
-
-# Install
+# [Install]($heading.id('install'))
 
 Download the file for your system from the [download section](https://ghostreel.foreachdeveloper.com/#download)
 or the [GitHub releases](https://github.com/highercomve/GhostReel/releases).
@@ -34,7 +30,7 @@ or the [GitHub releases](https://github.com/highercomve/GhostReel/releases).
 
 ffmpeg and ffprobe are bundled, so there is nothing else to install.
 
-## Updates
+## [Updates]($heading.id('updates'))
 
 GhostReel checks for new releases on the **Status** page. Click **Check for
 updates**: when a newer version is available you see the release notes and a
@@ -43,7 +39,7 @@ finish** applies the update. Updates are signed, and the app checks them with
 a public key embedded in it. CUDA and Vulkan installations keep their GPU backend
 when updating. To switch backend, download and install the other variant.
 
-# Set up the models
+# [Set up the models]($heading.id('set-up-the-models'))
 
 On first start, open **Models** and download what you need:
 
@@ -68,7 +64,7 @@ Frame descriptions and the script chat are configured separately: describing
 a keyframe is a short prompt plus one image, while the chat needs room for
 search results and a whole draft.
 
-## Where each model runs
+## [Where each model runs]($heading.id('where-each-model-runs'))
 
 Each capability (speech, vision and chat, embeddings) is set to **Auto**,
 **This computer** or **Server** on the **Models** page:
@@ -85,7 +81,7 @@ to the local helper otherwise. `ghostreel doctor` shows what would be used and
 why. Running against servers you already have means the same GPU never holds
 a model twice.
 
-## A coding-agent CLI instead of a model
+## [A coding-agent CLI instead of a model]($heading.id('a-coding-agent-cli-instead-of-a-model'))
 
 No GPU headroom for a vision model? Point a capability at a coding-agent CLI
 you already have (**claude**, **agy** or **opencode**) on the Models page
@@ -104,7 +100,7 @@ keyframe, so check the cost for your library first; the Models page has a
 **Test one call** button that checks the setup and the latency before you
 index.
 
-# Index your footage
+# [Index your footage]($heading.id('index-your-footage'))
 
 1. **New project**: a name, a frame rate and a resolution (used for timeline
    exports).
@@ -120,11 +116,7 @@ which you can configure) and describes each one (subject, setting, shot and
 on-screen text), embeds everything for search, and measures camera movement
 and handheld tremor so shaky stretches can be avoided.
 
-```=html
-<a id="search"></a>
-```
-
-# Search
+# [Search]($heading.id('search'))
 
 Search the project in your own words: *people talking about the park*, *for
 sale sign*, or text that appears on screen. Keyword search (SQLite FTS5) and
@@ -132,7 +124,7 @@ semantic search (embeddinggemma vectors in sqlite-vec) are merged into
 **moments**. Click a hit to play from that moment; click a video to see its
 keyframes and its transcript, and click a transcript line to jump there.
 
-## Search selected footage
+## [Search selected footage]($heading.id('search-selected-footage'))
 
 In a project's **Library**, check videos to search just those files.
 Shift-click a checkbox for a range, Ctrl/⌘-click rows to add or remove files,
@@ -144,11 +136,7 @@ Choose a watched folder under **Search in**, or click **Search here** beside
 its path, to restrict both the library and search to that folder's videos,
 including its subfolders. Keyword and semantic search both honor these scopes.
 
-```=html
-<a id="scripts"></a>
-```
-
-# Script a video
+# [Script a video]($heading.id('scripts'))
 
 Open the **Scripts** tab and describe the video you want, for example *a 60
 second promo about the neighbourhood using the interviews*. The model explores
@@ -163,17 +151,13 @@ new version.
 - Local script agents get a budget of research tool calls (30 by default),
   adjustable in Settings or right in the chat composer.
 
-## Reference edits
+## [Reference edits]($heading.id('reference-edits'))
 
 Mark a finished video (for example, an edit someone already made by hand) as a
 **reference**: the chat studies its length, pacing and structure, but never
 uses it as footage. You can also remove a video from a project's library.
 
-```=html
-<a id="export"></a>
-```
-
-# Preview and export
+# [Preview and export]($heading.id('export'))
 
 **Render preview** renders a low-res preview of any script version, with
 titles and narration burned in. Then export:
@@ -183,11 +167,7 @@ titles and narration burned in. Then export:
 - **Export .otio**: an OpenTimelineIO timeline.
 - **Export MP4**: a video file to send as a quick demo.
 
-```=html
-<a id="mcp"></a>
-```
-
-# Command line
+# [Command line]($heading.id('mcp'))
 
 The `ghostreel` command line shares the app's core and covers indexing,
 search, transcripts, scripts, exports and models. It is built from the
@@ -207,7 +187,7 @@ ghostreel config set frames.max_interval_s 5 && ghostreel index -p "Greet Mag" -
 
 Run `ghostreel --help` for everything else.
 
-## For AI agents (MCP)
+## [For AI agents (MCP)]($heading.id('for-ai-agents-mcp'))
 
 `ghostreel mcp` speaks the [Model Context Protocol](https://modelcontextprotocol.io)
 on stdio, so an agent can index footage, search it and build an edit. Register
@@ -244,7 +224,7 @@ pending → `search`, `get_transcript` and `get_video` to learn the footage →
 footage the tools reported: `save_script` returns an error per clip that
 doesn't (and still saves the version, so it can be fixed).
 
-# Where things are
+# [Where things are]($heading.id('where-things-are'))
 
 Everything lives in one folder: `~/.ghostreel/` (`%USERPROFILE%\.ghostreel\`
 on Windows). `GHOSTREEL_HOME` moves it.
@@ -257,7 +237,7 @@ on Windows). `GHOSTREEL_HOME` moves it.
 | `proxies/`, `previews/` | preview renders (safe to delete; regenerated) |
 | `models/` | downloaded models |
 
-## Privacy
+## [Privacy]($heading.id('privacy'))
 
 Your videos are only read, never modified or copied.
 
@@ -268,7 +248,7 @@ Your videos are only read, never modified or copied.
 - With a **coding-agent CLI**, that tool receives the frames or prompts for the
   capability you gave it.
 
-# Build from source
+# [Build from source]($heading.id('build-from-source'))
 
 Requirements: Rust (stable), Node.js 22, the
 [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/) and ffmpeg on
