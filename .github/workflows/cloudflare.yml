@@ -45,6 +45,12 @@ jobs:
           fi
           cat site/assets/release.json
 
+      # Browsers keep the scripts and styles for hours (max-age=14400), so give
+      # them new URLs on every deploy: the layouts carry ?v=<date> by hand, and a
+      # change made the same day would otherwise reach visitors hours late.
+      - name: Version the asset URLs
+        run: sed -i "s/?v=[0-9a-f]*'/?v=${GITHUB_SHA::8}'/g" site/layouts/*.shtml site/layouts/templates/*.shtml
+
       # Not Zine's default public/: that is the desktop app's Vite static folder.
       - name: Build site
         run: zine release --output site-public
