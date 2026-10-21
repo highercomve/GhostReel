@@ -1,9 +1,8 @@
 name: Cloudflare Pages
 
+# Deployed after each release, from the release tag, so the guide describes the app people
+# can download. Run it by hand to publish a site-only fix: from master, or from a tag.
 on:
-  push:
-    branches: [master]
-    paths: ['site/**', 'zine.ziggy', '.github/workflows/cloudflare.yml']
   workflow_dispatch:
 
 permissions:
@@ -33,8 +32,7 @@ jobs:
           echo "/tmp" >> "$GITHUB_PATH"
 
       # The download buttons read this snapshot instead of calling GitHub's
-      # API from every visitor's browser (60 requests/hour per IP). The
-      # Release workflow runs this workflow again after each release.
+      # API from every visitor's browser (60 requests/hour per IP).
       - name: Cache the latest release
         env:
           GH_TOKEN: ${{ github.token }}

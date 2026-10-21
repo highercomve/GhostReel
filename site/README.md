@@ -23,9 +23,14 @@ The output goes to `site-public/` (gitignored), not Zine's default `public/`:
 `public/` is the desktop app's Vite static folder.
 
 The site is served at https://ghostreel.foreachdeveloper.com/ from Cloudflare
-Pages. `.github/workflows/cloudflare.yml` builds and deploys it on every push to
-`master` that touches `site/` or `zine.ziggy`.
+Pages. Pushing to `master` doesn't deploy it: after publishing a release, the
+Release workflow runs `.github/workflows/cloudflare.yml` on the release tag, so
+the guide describes the app people can download. To publish a site-only fix
+between releases, run it by hand:
+
+```sh
+gh workflow run cloudflare.yml --ref master
+```
 
 The download buttons read `site/assets/release.json`, a snapshot of the latest
-GitHub release. The Cloudflare workflow refreshes it on every build, and the
-Release workflow rebuilds the site after publishing a release.
+GitHub release, which the Cloudflare workflow refreshes on every build.
