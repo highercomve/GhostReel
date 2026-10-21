@@ -288,13 +288,25 @@ agent can index footage, search it and build an edit. Register it once:
 }
 ```
 
-(Claude Code: `claude mcp add ghostreel -- ghostreel mcp`. Add `"env": {"GHOSTREEL_HOME": "/path"}`
-to work on a different library.)
+Or let the agent's own command add it:
+
+| Agent | Command |
+|---|---|
+| Claude Code | `claude mcp add --scope user ghostreel -- ghostreel mcp` |
+| Codex | `codex mcp add ghostreel -- ghostreel mcp`, then set `tool_timeout_sec = 1800` under `[mcp_servers.ghostreel]` (the 60 s default is shorter than `index` and `draft_script` take) |
+| Antigravity | `agy mcp add ghostreel ghostreel mcp` |
+| OpenCode | `opencode mcp add --global ghostreel -- ghostreel mcp` |
+
+Claude Desktop, Cursor, Gemini CLI and most other clients take the JSON above in their own
+settings file; give the full path to `ghostreel` where the client doesn't read your shell's
+`PATH`. Add `"env": {"GHOSTREEL_HOME": "/path"}` to work on a different library. The
+[guide](https://ghostreel.foreachdeveloper.com/guide/#for-ai-agents-mcp) has the details for each.
+
 
 | Tool | What it does |
 |---|---|
 | `doctor` | ffmpeg, GPU, database, models and which AI backends would be used |
-| `list_projects` · `create_project` | projects with their indexing progress; create one (fps/size = export timeline) |
+| `list_projects` · `create_project` · `delete_project` | projects with their indexing progress; create one (fps/size = export timeline); delete one (video files are never touched) |
 | `add_folder` | watch a footage folder (whole tree; editor render/cache folders are skipped) |
 | `index` · `index_status` | run pending indexing for up to `max_seconds` (resumable — call again while work is pending), or just report progress |
 | `search` | hybrid keyword + meaning search; returns moments with `video_id` and timestamps |
@@ -302,7 +314,9 @@ to work on a different library.)
 | `list_scripts` · `get_script` | script versions of a project |
 | `draft_script` | let GhostReel's editing model draft or revise a script from the footage (minutes) |
 | `save_script` | save your own script JSON as a new version; returns the issues found |
+| `preview_script` | render a preview MP4 of a script version and return its path |
 | `export_script` | write `fcp_xml` (Premiere Pro) or `otio` |
+| `get_settings` · `set_settings` | read or change the model settings (same keys as `ghostreel config set`) |
 | `set_video_role` | take a video out of the library (`removed`) or keep it as a `reference` edit |
 
 Typical run: `create_project` → `add_folder` → `index` until nothing is pending → `search` /

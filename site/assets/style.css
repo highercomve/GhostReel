@@ -132,6 +132,7 @@ code, pre { font-family: var(--mono); }
 .doc-lead { font-size: 19px; color: var(--muted); margin: 0 0 32px; }
 .prose .content h1, .prose h2 { font-size: 26px; letter-spacing: -0.025em; margin: 48px 0 12px; border-top: 1px solid var(--border); padding-top: 28px; }
 .prose .content h2, .prose h3 { font-size: 19px; letter-spacing: -0.01em; margin: 32px 0 8px; }
+.prose .content h3 { font-size: 16.5px; letter-spacing: 0; margin: 26px 0 6px; }
 .prose p, .prose li { color: color-mix(in srgb, var(--text) 88%, transparent); }
 .prose ul, .prose ol { padding-left: 1.3em; }
 .prose li { margin: 4px 0; }

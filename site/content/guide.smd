@@ -190,39 +190,125 @@ Run `ghostreel --help` for everything else.
 ## [For AI agents (MCP)]($heading.id('for-ai-agents-mcp'))
 
 `ghostreel mcp` speaks the [Model Context Protocol](https://modelcontextprotocol.io)
-on stdio, so an agent can index footage, search it and build an edit. Register
-it once:
+on stdio, so an AI agent can index footage, search it and build an edit for
+you. It works on the same library as the app (`~/.ghostreel/`), so the agent
+sees your projects, and the scripts it saves show up in the **Scripts** tab.
+Indexing, frame descriptions and `draft_script` use the models set on the
+**Models** page.
+
+The agent starts `ghostreel mcp` itself; you only register it once. If
+`ghostreel` is not on your `PATH`, use the full path to the binary instead,
+for example `/home/you/.local/bin/ghostreel` or
+`C:\Users\you\ghostreel\ghostreel.exe`. To work on another library, set
+`GHOSTREEL_HOME` for the server, as shown for each agent below.
+
+### [Claude Code]($heading.id('mcp-claude-code'))
+
+```
+claude mcp add --scope user ghostreel -- ghostreel mcp
+```
+
+`--scope user` makes it available in every project; leave it out to add it to
+the current project only. Add `-e GHOSTREEL_HOME=/path` before `--` to use
+another library. Run `/mcp` in a session to check that it is connected.
+
+### [Claude Desktop]($heading.id('mcp-claude-desktop'))
+
+Open **Settings → Developer → Edit Config** and add GhostReel to
+`claude_desktop_config.json`, then restart Claude:
 
 ```
 {
   "mcpServers": {
-    "ghostreel": { "command": "ghostreel", "args": ["mcp"] }
+    "ghostreel": { "command": "/full/path/to/ghostreel", "args": ["mcp"] }
   }
 }
 ```
 
-In Claude Code: `claude mcp add ghostreel -- ghostreel mcp`. Add
-`"env": {"GHOSTREEL_HOME": "/path"}` to work on a different library.
+The desktop app does not read your shell's `PATH`, so give the full path.
+
+### [Codex]($heading.id('mcp-codex'))
+
+```
+codex mcp add ghostreel -- ghostreel mcp
+```
+
+This writes `~/.codex/config.toml`. Codex stops a tool call after 60 seconds by
+default, which is shorter than `index` and `draft_script` take, so raise the
+limit there:
+
+```
+[mcp_servers.ghostreel]
+command = "ghostreel"
+args = ["mcp"]
+tool_timeout_sec = 1800
+# env = { GHOSTREEL_HOME = "/path" }
+```
+
+### [Antigravity (agy)]($heading.id('mcp-antigravity'))
+
+```
+agy mcp add ghostreel ghostreel mcp
+```
+
+Flags go before the name, so use `agy mcp add --env GHOSTREEL_HOME=/path
+ghostreel ghostreel mcp` for another library. `agy mcp list` shows whether it
+is enabled.
+
+### [OpenCode]($heading.id('mcp-opencode'))
+
+```
+opencode mcp add --global ghostreel -- ghostreel mcp
+```
+
+Without `--global` it goes into the current project's config. In
+`opencode.json` it looks like this:
+
+```
+{
+  "mcp": {
+    "ghostreel": { "type": "local", "command": ["ghostreel", "mcp"], "enabled": true }
+  }
+}
+```
+
+### [Other agents]($heading.id('mcp-other'))
+
+Most other MCP clients (Cursor, Gemini CLI, LM Studio, Zed and others) take
+the same `mcpServers` entry as Claude Desktop, in their own settings file.
+Add `"env": {"GHOSTREEL_HOME": "/path"}` next to `"args"` to use another
+library.
+
+### [What the agent can do]($heading.id('mcp-tools'))
 
 | Tool | What it does |
 | --- | --- |
 | `doctor` | ffmpeg, GPU, database, models and which AI backends would be used |
-| `list_projects` · `create_project` | projects with their indexing progress; create one |
+| `list_projects` · `create_project` · `delete_project` | projects with their indexing progress; create one; delete one (your video files are never touched) |
 | `add_folder` | watch a footage folder (the whole tree) |
-| `index` · `index_status` | run pending indexing for a while (resumable), or report progress |
+| `index` · `index_status` | run pending indexing for up to `max_seconds` (15 minutes by default; resumable), or report progress |
 | `search` | hybrid keyword and meaning search; returns moments with timestamps |
 | `get_transcript` · `get_video` | what people say, and what each keyframe shows |
 | `list_scripts` · `get_script` | script versions of a project |
-| `draft_script` | let GhostReel's editing model draft or revise a script |
+| `draft_script` | let GhostReel's editing model draft or revise a script (takes minutes) |
 | `save_script` | save your own script JSON as a new version; returns the issues found |
+| `preview_script` | render a preview MP4 of a script version and return its path |
 | `export_script` | write `fcp_xml` (Premiere Pro) or `otio` |
+| `get_settings` · `set_settings` | read or change the model settings, the same keys as `ghostreel config set` |
 | `set_video_role` | take a video out of the library, or keep it as a reference edit |
 
 A typical run: `create_project` → `add_folder` → `index` until nothing is
 pending → `search`, `get_transcript` and `get_video` to learn the footage →
-`draft_script` or `save_script` → `export_script`. Clips must lie inside
-footage the tools reported: `save_script` returns an error per clip that
-doesn't (and still saves the version, so it can be fixed).
+`draft_script` or `save_script` → `preview_script` → `export_script`. Clips
+must lie inside footage the tools reported: `save_script` returns an error per
+clip that doesn't (and still saves the version, so it can be fixed).
+
+You don't need to name the tools. Ask for the result, for example:
+
+- *Index ~/Videos/shoot in a new project called Greet Mag.*
+- *Find the moments where someone talks about the park, with timestamps.*
+- *Write a 60 second promo from the interviews, cover the voice-over with
+  b-roll, and export it for Premiere Pro.*
 
 # [Where things are]($heading.id('where-things-are'))
 
