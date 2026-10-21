@@ -309,20 +309,26 @@ settings file; give the full path to `ghostreel` where the client doesn't read y
 | `list_projects` · `create_project` · `delete_project` | projects with their indexing progress; create one (fps/size = export timeline); delete one (video files are never touched) |
 | `add_folder` | watch a footage folder (whole tree; editor render/cache folders are skipped) |
 | `index` · `index_status` | run pending indexing for up to `max_seconds` (resumable — call again while work is pending), or just report progress |
+| `list_videos` | one row per video: category (interview, broll, drone…), camera style, speech, keyframes and what it shows |
 | `search` | hybrid keyword + meaning search; returns moments with `video_id` and timestamps |
-| `get_transcript` · `get_video` | what people say, and what each keyframe shows |
+| `get_transcript` | timestamped speech of one or more videos; off-mic (interviewer) lines marked `[off]`, or dropped with `speech_only` |
+| `get_video` · `get_frames` | each keyframe's description and on-screen text; the keyframe pictures themselves (JPEG) |
+| `get_steadiness` | camera shake in a stretch of a video, a verdict, and the nearest steady stretch when it is shaky |
 | `list_scripts` · `get_script` | script versions of a project |
 | `draft_script` | let GhostReel's editing model draft or revise a script from the footage (minutes) |
-| `save_script` | save your own script JSON as a new version; returns the issues found |
+| `save_script` | save your own script JSON as a new version (`dry_run` only checks it); returns the issues found |
 | `preview_script` | render a preview MP4 of a script version and return its path |
 | `export_script` | write `fcp_xml` (Premiere Pro) or `otio` |
 | `get_settings` · `set_settings` | read or change the model settings (same keys as `ghostreel config set`) |
 | `set_video_role` | take a video out of the library (`removed`) or keep it as a `reference` edit |
 
-Typical run: `create_project` → `add_folder` → `index` until nothing is pending → `search` /
-`get_transcript` / `get_video` to learn the footage → `draft_script` or `save_script` →
-`export_script`. Clips must lie inside footage the tools reported: `save_script` returns an
-`error` issue per clip that doesn't (and still saves the version, so it can be fixed).
+Typical run: `create_project` → `add_folder` → `index` until nothing is pending →
+`list_videos` / `search` / `get_transcript` / `get_video` / `get_frames` to learn the footage →
+`draft_script` or `save_script` → `preview_script` / `export_script`. The agent can write the
+edit itself without GhostReel's chat model, checking its picks with `get_steadiness`. Clips must
+lie inside footage the tools reported: `save_script` returns an `error` issue per clip that
+doesn't and a warning per clip on a shaky stretch (and still saves the version, so it can be
+fixed; `dry_run` checks without saving).
 
 A script is plain JSON:
 
@@ -344,6 +350,10 @@ A script is plain JSON:
 
 `audio` is `source` (someone speaking) or `mute` (b-roll under narration). `narration` is the
 voice-over for that beat — about 2.5 words per second of its clips.
+
+A beat can also have a `bed`, `{ "video_id": 3, "in_s": 40.0, "out_s": 52.5 }`, whose audio
+runs under the whole beat: its clips should be `mute` and add up to the bed's length, so an
+interview answer plays over b-roll (a J-cut).
 
 ---
 

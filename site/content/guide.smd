@@ -287,21 +287,31 @@ library.
 | `list_projects` · `create_project` · `delete_project` | projects with their indexing progress; create one; delete one (your video files are never touched) |
 | `add_folder` | watch a footage folder (the whole tree) |
 | `index` · `index_status` | run pending indexing for up to `max_seconds` (15 minutes by default; resumable), or report progress |
+| `list_videos` | the library at a glance: one row per video with its category (interview, b-roll, drone…), camera, speech and what it shows |
 | `search` | hybrid keyword and meaning search; returns moments with timestamps |
-| `get_transcript` · `get_video` | what people say, and what each keyframe shows |
+| `get_transcript` | what people say, for one or several videos; interviewer lines are marked, or dropped |
+| `get_video` · `get_frames` | what each keyframe shows, as descriptions or as the pictures themselves |
+| `get_steadiness` | whether a stretch of a video is shaky, and the nearest steady stretch if it is |
 | `list_scripts` · `get_script` | script versions of a project |
 | `draft_script` | let GhostReel's editing model draft or revise a script (takes minutes) |
-| `save_script` | save your own script JSON as a new version; returns the issues found |
+| `save_script` | save your own script JSON as a new version, or only check it with `dry_run`; returns the issues found |
 | `preview_script` | render a preview MP4 of a script version and return its path |
 | `export_script` | write `fcp_xml` (Premiere Pro) or `otio` |
 | `get_settings` · `set_settings` | read or change the model settings, the same keys as `ghostreel config set` |
 | `set_video_role` | take a video out of the library, or keep it as a reference edit |
 
 A typical run: `create_project` → `add_folder` → `index` until nothing is
-pending → `search`, `get_transcript` and `get_video` to learn the footage →
-`draft_script` or `save_script` → `preview_script` → `export_script`. Clips
-must lie inside footage the tools reported: `save_script` returns an error per
-clip that doesn't (and still saves the version, so it can be fixed).
+pending → `list_videos`, `search`, `get_transcript`, `get_video` and
+`get_frames` to learn the footage → `draft_script` or `save_script` →
+`preview_script` → `export_script`.
+
+The agent can write the whole edit itself, without GhostReel's chat model:
+it reads the footage with the tools above, checks its picks with
+`get_steadiness`, and saves the script with `save_script`. A beat's `bed`
+lays an interview's audio under muted b-roll (a J-cut). Clips must lie inside
+footage the tools reported: `save_script` returns an error per clip that
+doesn't, and warns about clips on shaky stretches. It still saves the
+version, so it can be fixed; `dry_run` checks a script without saving it.
 
 You don't need to name the tools. Ask for the result, for example:
 
