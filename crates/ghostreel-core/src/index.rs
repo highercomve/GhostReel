@@ -987,13 +987,18 @@ pub struct TranscriptSegment {
     pub start: f64,
     pub end: f64,
     pub text: String,
+    /// Spoken away from the subject's mic (usually the interviewer's questions).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub off_mic: bool,
 }
 
 pub fn transcript(db: &Db, video_id: i64) -> Result<Vec<TranscriptSegment>, Error> {
-    let mut st =
-        db.conn.prepare("SELECT start_s, end_s, text FROM transcript_segments WHERE video_id = ?1 ORDER BY start_s")?;
-    let rows =
-        st.query_map([video_id], |r| Ok(TranscriptSegment { start: r.get(0)?, end: r.get(1)?, text: r.get(2)? }))?;
+    let mut st = db.conn.prepare(
+        "SELECT start_s, end_s, text, COALESCE(off_mic, 0) FROM transcript_segments WHERE video_id = ?1 ORDER BY start_s",
+    )?;
+    let rows = st.query_map([video_id], |r| {
+        Ok(TranscriptSegment { start: r.get(0)?, end: r.get(1)?, text: r.get(2)?, off_mic: r.get(3)? })
+    })?;
     Ok(rows.collect::<Result<_, _>>()?)
 }
 

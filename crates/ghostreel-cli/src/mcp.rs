@@ -62,9 +62,12 @@ pub async fn serve(paths: Paths) -> anyhow::Result<()> {
                     "tools/call" => {
                         let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
                         let args = params.get("arguments").cloned().unwrap_or(json!({}));
-                        let result = call_tool(&paths, &name, &args).await;
+                        let result = call_tool_content(&paths, &name, &args).await;
                         send(&match result {
-                            Ok(v) => json!({ "jsonrpc": "2.0", "id": id, "result": tool_result(&v, false) }),
+                            Ok(content) => json!({
+                                "jsonrpc": "2.0", "id": id,
+                                "result": { "content": content, "isError": false }
+                            }),
                             // Tool errors belong in the result, so the agent can read and fix them.
                             Err(e) => json!({
                                 "jsonrpc": "2.0", "id": id,
@@ -82,10 +85,19 @@ pub async fn serve(paths: Paths) -> anyhow::Result<()> {
 
 const INSTRUCTIONS: &str = "GhostReel indexes folders of video (speech transcripts, keyframe \
 descriptions, embeddings) and turns clips into an edit. Typical flow: create_project → add_folder \
-→ index (repeat until it reports no pending work) → search / get_transcript / get_video to learn \
-the footage → draft_script (the model picks the clips) or save_script (your own JSON) → \
-export_script. Clip in_s/out_s must lie inside real footage; save_script reports issues instead \
-of silently fixing them.";
+→ index (repeat until it reports no pending work) → learn the footage → write the script → \
+preview_script / export_script.
+
+You can edit without GhostReel's own model: list_videos gives the library at a glance (interviews \
+vs b-roll, speech, camera), get_transcript reads what people said (several videos at once, \
+interviewer lines marked or dropped), search finds moments by what is said or visible, get_video \
+lists a clip's keyframe descriptions and get_frames shows you the actual pictures; \
+get_steadiness tells you whether the stretch you picked is shaky and where the nearest steady one \
+is. Then write the script yourself with save_script (dry_run first to check it; it warns about \
+clips on shaky stretches); a beat's `bed` lays an interview's \
+audio under muted b-roll (a J-cut). draft_script instead hands the whole edit to GhostReel's local \
+chat model, which needs that model to fit on this machine. Clip in_s/out_s must lie inside real \
+footage; save_script reports issues instead of silently fixing them.";
 
 fn send(msg: &Value) {
     let mut out = std::io::stdout().lock();
@@ -200,23 +212,59 @@ fn tools() -> Vec<Value> {
             "inputSchema": obj(json!({ "project": project, "videos": { "type": "boolean", "description": "Include the video list" } }), &["project"]),
         }),
         json!({
+            "name": "list_videos",
+            "description": "A project's videos, one compact row each: id, file, duration, category (interview, broll, drone…), camera style, speech segments, keyframes and what the first keyframe shows. Start here to learn the footage.",
+            "inputSchema": obj(json!({
+                "project": project,
+                "category": { "type": "string", "description": "Only this category, e.g. interview or broll" },
+                "speech": { "type": "boolean", "description": "true: only videos with speech; false: only videos without" },
+            }), &["project"]),
+        }),
+        json!({
             "name": "search",
-            "description": "Search a project's footage by meaning and keywords (speech, on-screen text, what is visible). Returns moments with video_id and timestamps to cut from.",
+            "description": "Search a project's footage by meaning and keywords. Returns {mode, hits}: moments with video_id and timestamps to cut from. mode says whether meaning search ran; when the embedding model is unavailable it falls back to keywords and says so.",
             "inputSchema": obj(json!({
                 "project": project,
                 "query": { "type": "string" },
                 "limit": { "type": "integer", "description": "default 10" },
-                "kinds": { "type": "array", "items": { "type": "string", "enum": ["moment", "transcript", "frame"] } },
+                "kinds": {
+                    "type": "array",
+                    "items": { "type": "string", "enum": ["moment", "transcript", "frame"] },
+                    "description": "moment: what is visible (keyframe description) plus nearby speech; transcript: speech only; frame: on-screen text only. Default: all",
+                },
                 "keywords_only": { "type": "boolean", "description": "Skip the embedding model" },
             }), &["project", "query"]),
         }),
         json!({
             "name": "get_transcript",
-            "description": "Timestamped speech segments of a video, optionally limited to a range.",
+            "description": "Timestamped speech of one or more videos, optionally limited to a range. Lines spoken off the subject's mic (usually the interviewer) are marked [off], or dropped with speech_only.",
+            "inputSchema": obj(json!({
+                "video_id": { "type": "integer" },
+                "video_ids": { "type": "array", "items": { "type": "integer" }, "description": "Several videos at once (instead of video_id)" },
+                "start_s": { "type": "number" },
+                "end_s": { "type": "number" },
+                "speech_only": { "type": "boolean", "description": "default false: drop off-mic (interviewer) lines" },
+                "format": { "type": "string", "enum": ["text", "json"], "description": "default text: one 'start-end [off] text' line per segment" },
+            }), &[]),
+        }),
+        json!({
+            "name": "get_steadiness",
+            "description": "Is the camera shaking in a stretch of a video? From the motion measured at indexing: camera style, worst shake (jerk) and sway against the limits in use, the shaky stretches inside the range, and a verdict (steady / some shake / shaky: over half the range). When the range is shaky, the nearest steady stretch of the same length. Without a range, the whole video.",
             "inputSchema": obj(json!({
                 "video_id": { "type": "integer" },
                 "start_s": { "type": "number" },
                 "end_s": { "type": "number" },
+                "windows": { "type": "boolean", "description": "default false: also list every measured window in the range" },
+            }), &["video_id"]),
+        }),
+        json!({
+            "name": "get_frames",
+            "description": "Look at a video: returns the pictures themselves (JPEG) with their times and descriptions. Without times, keyframes spread across the whole video; with times, the keyframe nearest each time, or the exact frame when exact=true (decodes the source, which must be reachable).",
+            "inputSchema": obj(json!({
+                "video_id": { "type": "integer" },
+                "times": { "type": "array", "items": { "type": "number" }, "description": "Seconds into the video (at most 8)" },
+                "limit": { "type": "integer", "description": "Without times: how many keyframes (default 6, at most 8)" },
+                "exact": { "type": "boolean", "description": "default false: decode the exact frame instead of the nearest keyframe" },
             }), &["video_id"]),
         }),
         json!({
@@ -248,10 +296,11 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name": "save_script",
-            "description": "Save your own script as a new version. Clips must lie inside real footage; returns the issues found (errors mean the clip won't work).",
+            "description": "Save your own script as a new version. Clips must lie inside real footage; returns the issues found (errors mean the clip won't work). Beats play in order and a beat's clips play one after another. With a bed, the bed's audio runs under the whole beat and its clips should be audio \"mute\" and add up to the bed's length: an interview answer over b-roll.",
             "inputSchema": obj(json!({
                 "project": project,
-                "script": { "type": "object", "description": "{title, target_duration_s?, beats:[{id, purpose, narration?, on_screen_text?, clips:[{video_id, in_s, out_s, audio?}]}]}" },
+                "script": { "type": "object", "description": "{title, target_duration_s?, beats:[{id, purpose, narration?, on_screen_text?, notes?, bed?:{video_id, in_s, out_s, why?}, clips:[{video_id, in_s, out_s, audio?: \"source\"|\"mute\", why?}]}]}" },
+                "dry_run": { "type": "boolean", "description": "default false: only check it and report the issues, save nothing" },
             }), &["project", "script"]),
         }),
         json!({
@@ -324,6 +373,269 @@ fn arg_i64(args: &Value, key: &str) -> anyhow::Result<i64> {
 fn project(db: &Db, args: &Value) -> anyhow::Result<ghostreel_core::projects::Project> {
     let name = arg_str(args, "project")?;
     Ok(db.require_project(&name)?)
+}
+
+/// Most tools answer JSON, sent as one text block; `get_frames` answers pictures.
+async fn call_tool_content(paths: &Paths, name: &str, args: &Value) -> anyhow::Result<Vec<Value>> {
+    match name {
+        "get_frames" => frames_content(paths, args),
+        "get_transcript" if args.get("format").and_then(|v| v.as_str()).unwrap_or("text") == "text" => {
+            Ok(vec![json!({ "type": "text", "text": transcript_text(paths, args)? })])
+        }
+        _ => {
+            let v = call_tool(paths, name, args).await?;
+            Ok(tool_result(&v, false)["content"].as_array().cloned().unwrap_or_default())
+        }
+    }
+}
+
+/// Share of a clip that may be shaky before it counts as shaky, the line the chat pipeline uses
+/// to move clips.
+const SHAKY_SHARE: f64 = 0.5;
+
+fn round2(x: f64) -> f64 {
+    (x * 100.0).round() / 100.0
+}
+
+/// How steady `in_s..out_s` of a video is, judged with the script settings' limits; `None` when
+/// its motion was never measured.
+struct Steadiness {
+    camera: &'static str,
+    jerk_limit: f64,
+    sway_limit: f64,
+    worst_jerk: f64,
+    worst_sway: f64,
+    spans: Vec<(f64, f64)>,
+    shaky_s: f64,
+    /// When over half the range is shaky: start of the nearest steady stretch as long as the range.
+    steady_start: Option<f64>,
+    len: f64,
+}
+
+impl Steadiness {
+    fn measure(
+        windows: &[ghostreel_core::steadiness::Window],
+        cfg: &ghostreel_core::config::ScriptConfig,
+        in_s: f64,
+        out_s: f64,
+    ) -> Option<Self> {
+        use ghostreel_core::steadiness as st;
+        let inside: Vec<_> = windows.iter().filter(|w| w.end_s > in_s && w.start_s < out_s).collect();
+        if inside.is_empty() {
+            return None;
+        }
+        let jerk_limit = st::shake_limit(windows, cfg.max_shake_jerk, cfg.shake_relative);
+        let spans = st::shaky_spans_with_sway(windows, in_s, out_s, jerk_limit, cfg.max_sway);
+        // A fold from 0.0: an empty float `sum()` is -0.0.
+        let shaky_s = spans.iter().fold(0.0, |acc, (a, b)| acc + (b - a));
+        let len = (out_s - in_s).max(0.0);
+        let steady_start = (len > 0.0 && shaky_s > len * SHAKY_SHARE)
+            .then(|| st::steady_stretch_near(windows, in_s, len, jerk_limit, cfg.max_sway))
+            .flatten();
+        Some(Self {
+            camera: st::camera_style(windows).as_str(),
+            jerk_limit,
+            sway_limit: cfg.max_sway,
+            worst_jerk: inside.iter().map(|w| w.jerk).fold(0.0, f64::max),
+            worst_sway: inside.iter().map(|w| w.sway).fold(0.0, f64::max),
+            spans,
+            shaky_s,
+            steady_start,
+            len,
+        })
+    }
+
+    fn verdict(&self) -> &'static str {
+        if self.shaky_s <= 0.0 {
+            "steady"
+        } else if self.shaky_s > self.len * SHAKY_SHARE {
+            "shaky"
+        } else {
+            "some shake"
+        }
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "verdict": self.verdict(),
+            "camera": self.camera,
+            "shaky_s": round2(self.shaky_s),
+            "shaky_spans": self.spans.iter().map(|(a, b)| [round2(*a), round2(*b)]).collect::<Vec<_>>(),
+            "worst_jerk": round2(self.worst_jerk),
+            "jerk_limit": round2(self.jerk_limit),
+            "worst_sway": round2(self.worst_sway),
+            "sway_limit": round2(self.sway_limit),
+            "steady_alternative": self.steady_start.map(|s| [round2(s), round2(s + self.len)]),
+        })
+    }
+}
+
+/// Warnings for clips that sit mostly on shaky stretches, with where to move them.
+fn shake_issues(db: &Db, cfg: &ghostreel_core::config::ScriptConfig, s: &script::Script) -> Vec<script::Issue> {
+    let mut issues = Vec::new();
+    if cfg.max_shake_jerk <= 0.0 {
+        return issues;
+    }
+    for beat in &s.beats {
+        for (i, c) in beat.clips.iter().enumerate() {
+            let windows = db.motion_windows(c.video_id).unwrap_or_default();
+            let Some(st) = Steadiness::measure(&windows, cfg, c.in_s, c.out_s) else { continue };
+            if st.verdict() != "shaky" {
+                continue;
+            }
+            let fix = match st.steady_start {
+                Some(a) => format!("; nearest steady stretch {a:.1}–{:.1} s", a + st.len),
+                None => "; no steady stretch that long in this video".to_string(),
+            };
+            issues.push(script::Issue {
+                severity: script::IssueSeverity::Warning,
+                beat_id: Some(beat.id.clone()),
+                clip_index: Some(i),
+                message: format!(
+                    "shaky: video #{} {:.1}–{:.1} s shakes for {:.1} of {:.1} s{fix}",
+                    c.video_id, c.in_s, c.out_s, st.shaky_s, st.len
+                ),
+            });
+        }
+    }
+    issues
+}
+
+const MAX_FRAMES: usize = 8;
+/// Long side of a decoded frame, the same size the keyframes are stored at.
+const FRAME_LONG_SIDE: u32 = 768;
+
+fn transcript_ids(args: &Value) -> anyhow::Result<Vec<i64>> {
+    let mut ids: Vec<i64> = args
+        .get("video_ids")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_i64()).collect())
+        .unwrap_or_default();
+    if let Some(id) = args.get("video_id").and_then(|v| v.as_i64()) {
+        ids.insert(0, id);
+    }
+    anyhow::ensure!(!ids.is_empty(), "give video_id or video_ids");
+    Ok(ids)
+}
+
+/// The transcript segments asked for: in range, and without the interviewer if `speech_only`.
+fn transcript_segments(db: &Db, args: &Value, video_id: i64) -> anyhow::Result<Vec<index::TranscriptSegment>> {
+    let start = args.get("start_s").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let end = args.get("end_s").and_then(|v| v.as_f64()).unwrap_or(f64::MAX);
+    let speech_only = args.get("speech_only").and_then(|v| v.as_bool()).unwrap_or(false);
+    Ok(index::transcript(db, video_id)?
+        .into_iter()
+        .filter(|s| s.end > start && s.start < end && !(speech_only && s.off_mic))
+        .collect())
+}
+
+fn transcript_text(paths: &Paths, args: &Value) -> anyhow::Result<String> {
+    let db = open_db(paths)?;
+    let mut out = String::new();
+    for id in transcript_ids(args)? {
+        let file = video_file_name(&db, id);
+        out.push_str(&format!("=== video {id} ({file})\n"));
+        let segs = transcript_segments(&db, args, id)?;
+        if segs.is_empty() {
+            out.push_str("(no speech)\n");
+        }
+        for s in segs {
+            let off = if s.off_mic { " [off]" } else { "" };
+            out.push_str(&format!("{:.2}-{:.2}{off} {}\n", s.start, s.end, s.text.trim()));
+        }
+    }
+    Ok(out)
+}
+
+fn video_file_name(db: &Db, video_id: i64) -> String {
+    db.conn
+        .query_row("SELECT MIN(path) FROM video_files WHERE video_id = ?1", [video_id], |r| {
+            r.get::<_, Option<String>>(0)
+        })
+        .ok()
+        .flatten()
+        .and_then(|p| PathBuf::from(p).file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_default()
+}
+
+/// The `description` field of a keyframe's description JSON.
+fn frame_description(json: Option<&str>) -> Option<String> {
+    json.and_then(|j| serde_json::from_str::<Value>(j).ok())
+        .and_then(|v| v.get("description").and_then(|d| d.as_str()).map(str::to_string))
+}
+
+/// One frame of the source at `t_s`, decoded by ffmpeg and scaled to the keyframe size.
+fn decode_frame(source: &std::path::Path, t_s: f64) -> anyhow::Result<Vec<u8>> {
+    let ffmpeg = doctor::locate("ffmpeg").context("ffmpeg not found")?;
+    let scale = format!("scale=w={FRAME_LONG_SIDE}:h={FRAME_LONG_SIDE}:force_original_aspect_ratio=decrease");
+    let out = ghostreel_core::proc::std_command(ffmpeg)
+        .args(["-v", "error", "-ss", &format!("{t_s:.3}"), "-i"])
+        .arg(source)
+        .args(["-frames:v", "1", "-vf", &scale, "-q:v", "4", "-f", "image2pipe", "-vcodec", "mjpeg", "-"])
+        .output()
+        .context("cannot run ffmpeg")?;
+    anyhow::ensure!(
+        out.status.success() && !out.stdout.is_empty(),
+        "ffmpeg could not decode {} at {t_s:.2}s: {}",
+        source.display(),
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+    Ok(out.stdout)
+}
+
+fn frames_content(paths: &Paths, args: &Value) -> anyhow::Result<Vec<Value>> {
+    use base64::Engine as _;
+    let db = open_db(paths)?;
+    let video_id = arg_i64(args, "video_id")?;
+    let frames = index::frames(&db, &paths.data_dir, video_id)?;
+    let exact = args.get("exact").and_then(|v| v.as_bool()).unwrap_or(false);
+    let times: Vec<f64> = args
+        .get("times")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|t| t.as_f64()).take(MAX_FRAMES).collect())
+        .unwrap_or_default();
+
+    // (time asked for, keyframe nearest to it)
+    let picks: Vec<(f64, Option<&index::FrameRow>)> = if times.is_empty() {
+        anyhow::ensure!(!frames.is_empty(), "video {video_id} has no keyframes yet; pass times with exact=true");
+        let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(6).clamp(1, MAX_FRAMES as u64) as usize;
+        let step = frames.len().div_ceil(limit).max(1);
+        frames.iter().step_by(step).map(|f| (f.t_s, Some(f))).collect()
+    } else {
+        times
+            .iter()
+            .map(|&t| (t, frames.iter().min_by(|a, b| (a.t_s - t).abs().total_cmp(&(b.t_s - t).abs()))))
+            .collect()
+    };
+
+    let source = if exact { Some(index::video_by_id(&db, video_id, 0.0, 0.0, 0.0)?.path) } else { None };
+    let mut content = Vec::new();
+    for (t, nearest) in picks {
+        let description = nearest.and_then(|f| frame_description(f.description.as_deref()));
+        let (shown_t, jpeg) = match (&source, nearest) {
+            (Some(src), _) => (t, decode_frame(src, t)?),
+            (None, Some(f)) => {
+                (f.t_s, std::fs::read(&f.path).with_context(|| format!("cannot read keyframe {}", f.path.display()))?)
+            }
+            (None, None) => anyhow::bail!("video {video_id} has no keyframes yet; use exact=true"),
+        };
+        let mut caption = format!("video {video_id} at {shown_t:.2}s");
+        if let Some(f) = nearest {
+            if exact || (f.t_s - t).abs() > 0.01 {
+                caption.push_str(&format!(" (nearest keyframe {:.2}s)", f.t_s));
+            }
+            if let Some(d) = &description {
+                caption.push_str(&format!(": {d}"));
+            }
+        }
+        content.push(json!({ "type": "text", "text": caption }));
+        content.push(json!({
+            "type": "image",
+            "data": base64::engine::general_purpose::STANDARD.encode(&jpeg),
+            "mimeType": "image/jpeg",
+        }));
+    }
+    Ok(content)
 }
 
 async fn call_tool(paths: &Paths, name: &str, args: &Value) -> anyhow::Result<Value> {
@@ -428,29 +740,106 @@ async fn call_tool(paths: &Paths, name: &str, args: &Value) -> anyhow::Result<Va
                 .and_then(|v| v.as_array())
                 .map(|a| a.iter().filter_map(|k| k.as_str().map(str::to_string)).collect::<Vec<_>>());
             let mut embedder = None;
+            let mut mode = json!("keywords (asked for)");
             if !args.get("keywords_only").and_then(|v| v.as_bool()).unwrap_or(false) {
                 let config = Config::load(&paths.config_file).unwrap_or_default();
                 let setup = runtime::resolve_embed(paths, &config).await;
                 match runtime::start_embedder(&setup, |_, _| {}).await {
-                    Ok(e) => embedder = Some(e),
-                    Err(why) => eprintln!("mcp: meaning search unavailable ({why}); keywords only"),
+                    Ok(e) => {
+                        embedder = Some(e);
+                        mode = json!("meaning + keywords");
+                    }
+                    Err(why) => mode = json!(format!("keywords only: meaning search unavailable ({why})")),
                 }
             }
             let opts =
                 ghostreel_core::search::SearchOptions { project_id: Some(p.id), limit, kinds, ..Default::default() };
             let hits = ghostreel_core::search::search(&db, &paths.data_dir, &query, embedder.as_mut(), &opts).await?;
-            Ok(serde_json::to_value(hits)?)
+            Ok(json!({ "mode": mode, "hits": hits }))
+        }
+        "list_videos" => {
+            let db = open_db(paths)?;
+            let p = project(&db, args)?;
+            let category = args.get("category").and_then(|v| v.as_str());
+            let speech = args.get("speech").and_then(|v| v.as_bool());
+            let mut first_desc = db.conn.prepare(
+                "SELECT description_json FROM frames
+                  WHERE video_id = ?1 AND description_json IS NOT NULL ORDER BY t_s LIMIT 1",
+            )?;
+            let cfg = Config::load(&paths.config_file).unwrap_or_default().script;
+            let mut rows = Vec::new();
+            for v in index::videos_with_shake(&db, Some(p.id), cfg.max_shake_jerk, cfg.shake_relative, cfg.max_sway)? {
+                if category.is_some_and(|c| c != v.category) || speech.is_some_and(|s| s != (v.segments > 0)) {
+                    continue;
+                }
+                let desc: Option<String> = first_desc.query_map([v.id], |r| r.get(0))?.next().transpose()?;
+                let shows = frame_description(desc.as_deref()).map(|d| {
+                    if d.chars().count() > 120 { format!("{}…", d.chars().take(120).collect::<String>()) } else { d }
+                });
+                rows.push(json!({
+                    "id": v.id,
+                    "file": v.path.file_name().map(|n| n.to_string_lossy().into_owned()),
+                    "duration_s": v.duration_s.map(|d| (d * 10.0).round() / 10.0),
+                    "category": v.category,
+                    "tag": v.category_tag,
+                    "camera": v.camera,
+                    "shaky_s": v.steadiness_measured.then(|| (v.shaky_s * 10.0).round() / 10.0),
+                    "speech_segments": v.segments,
+                    "keyframes": v.frames,
+                    "shows": shows,
+                }));
+            }
+            Ok(json!({ "project": p.name, "videos": rows.len(), "rows": rows }))
+        }
+        "get_steadiness" => {
+            let db = open_db(paths)?;
+            let video_id = arg_i64(args, "video_id")?;
+            let windows = db.motion_windows(video_id)?;
+            let duration = windows.last().map(|w| w.end_s).unwrap_or(0.0);
+            let start = args.get("start_s").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let end = args.get("end_s").and_then(|v| v.as_f64()).unwrap_or(duration);
+            anyhow::ensure!(end > start, "end_s must be after start_s");
+            let cfg = Config::load(&paths.config_file).unwrap_or_default().script;
+            let Some(st) = Steadiness::measure(&windows, &cfg, start, end) else {
+                return Ok(json!({
+                    "video_id": video_id,
+                    "range": [start, end],
+                    "verdict": "not measured",
+                    "next": "the steadiness stage has not run for this video (index it), or the range is outside the video",
+                }));
+            };
+            let mut out = json!({ "video_id": video_id, "range": [round2(start), round2(end)] });
+            if let (Value::Object(o), Value::Object(r)) = (&mut out, st.to_json()) {
+                o.extend(r);
+            }
+            if args.get("windows").and_then(|v| v.as_bool()).unwrap_or(false) {
+                out["windows"] = json!(
+                    windows
+                        .iter()
+                        .filter(|w| w.end_s > start && w.start_s < end)
+                        .map(|w| json!({
+                            "start_s": round2(w.start_s),
+                            "end_s": round2(w.end_s),
+                            "jerk": round2(w.jerk),
+                            "sway": round2(w.sway),
+                            "motion": round2(w.motion),
+                        }))
+                        .collect::<Vec<_>>()
+                );
+            }
+            Ok(out)
         }
         "get_transcript" => {
             let db = open_db(paths)?;
-            let video_id = arg_i64(args, "video_id")?;
-            let start = args.get("start_s").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let end = args.get("end_s").and_then(|v| v.as_f64()).unwrap_or(f64::MAX);
-            let segs = index::transcript(&db, video_id)?
-                .into_iter()
-                .filter(|s| s.end > start && s.start < end)
-                .collect::<Vec<_>>();
-            Ok(serde_json::to_value(segs)?)
+            let ids = transcript_ids(args)?;
+            if let [id] = ids[..] {
+                return Ok(serde_json::to_value(transcript_segments(&db, args, id)?)?);
+            }
+            let mut out = serde_json::Map::new();
+            for id in ids {
+                out.insert(id.to_string(), serde_json::to_value(transcript_segments(&db, args, id)?)?);
+            }
+            Ok(Value::Object(out))
         }
         "get_video" => {
             let db = open_db(paths)?;
@@ -462,11 +851,7 @@ async fn call_tool(paths: &Paths, name: &str, args: &Value) -> anyhow::Result<Va
                 .iter()
                 .step_by(step)
                 .map(|f| {
-                    let desc = f
-                        .description
-                        .as_deref()
-                        .and_then(|j| serde_json::from_str::<Value>(j).ok())
-                        .and_then(|v| v.get("description").and_then(|d| d.as_str()).map(str::to_string));
+                    let desc = frame_description(f.description.as_deref());
                     json!({ "t_s": f.t_s, "description": desc, "visible_text": f.visible_text })
                 })
                 .collect();
@@ -518,9 +903,12 @@ async fn call_tool(paths: &Paths, name: &str, args: &Value) -> anyhow::Result<Va
             let mut s: script::Script =
                 serde_json::from_value(raw.clone()).context("script JSON does not match the schema")?;
             s.fill_from_project(&p);
-            let issues = script::validate(&db, p.id, &s)?;
+            let mut issues = script::validate(&db, p.id, &s)?;
+            let cfg = Config::load(&paths.config_file).unwrap_or_default().script;
+            issues.extend(shake_issues(&db, &cfg, &s));
             let errors = issues.iter().filter(|i| i.severity == script::IssueSeverity::Error).count();
-            let script_id = script::save_version(&db, p.id, &s, None)?;
+            let dry_run = args.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(false);
+            let script_id = if dry_run { None } else { Some(script::save_version(&db, p.id, &s, None)?) };
             Ok(json!({
                 "script_id": script_id,
                 "issues": issues,

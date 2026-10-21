@@ -1709,6 +1709,7 @@ name = "ghostreel-cli"
 version = "0.13.0"
 dependencies = [
  "anyhow",
+ "base64 0.23.1",
  "clap",
  "ghostreel-core",
  "serde_json",
