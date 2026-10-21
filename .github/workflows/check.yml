@@ -165,7 +165,7 @@ jobs:
         run: scripts/check-macos-sidecars.sh '${{ matrix.triple }}'
       - name: Test frozen MLX vision and chat
         if: matrix.arch == 'arm64'
-        timeout-minutes: 15
+        timeout-minutes: 25
         run: python3 scripts/smoke-mlx-runtime.py
       - name: Test core on macOS
         run: cargo test -p ghostreel-core

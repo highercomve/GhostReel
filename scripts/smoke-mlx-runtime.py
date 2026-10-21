@@ -29,19 +29,28 @@ def main():
         schema = {'type': 'object', 'properties': {'description': {'type': 'string'}},
                   'required': ['description'], 'additionalProperties': False}
         requests = [
-            {'id': 1, 'cmd': 'describe', 'image': str(image), 'prompt': 'Describe the image briefly.',
-             'schema': schema, 'max_tokens': 128},
-            {'id': 2, 'cmd': 'complete', 'prompt': 'Reply with the word ready.', 'max_tokens': 64},
+            {'id': 1, 'cmd': 'describe', 'image': str(image), 'prompt': 'Describe the image in one short sentence.',
+             'schema': schema, 'max_tokens': 64},
+            {'id': 2, 'cmd': 'complete', 'prompt': 'Reply with the word ready.', 'max_tokens': 16},
             {'id': 3, 'cmd': 'complete', 'prompt': 'Return JSON describing a red square.',
-             'schema': schema, 'max_tokens': 128},
+             'schema': schema, 'max_tokens': 64},
             {'id': 4, 'cmd': 'batch_describe', 'items': [
-                {'image': str(image), 'prompt': 'Describe the image briefly.', 'schema': schema, 'max_tokens': 128},
-                {'image': str(Path(tmp) / 'missing.ppm'), 'max_tokens': 128}]},
+                {'image': str(image), 'prompt': 'Describe the image in one short sentence.', 'schema': schema, 'max_tokens': 64},
+                {'image': str(Path(tmp) / 'missing.ppm'), 'max_tokens': 64}]},
         ]
         helper = root / 'src-tauri/binaries/ghostreel-mlx-aarch64-apple-darwin'
-        result = subprocess.run([str(helper), '--model-dir', str(model), '--ctx', '8192', '--kv-type', 'q4_0'],
-                                input='\n'.join(json.dumps(r) for r in requests) + '\n',
-                                text=True, capture_output=True, timeout=300)
+        # Standard hosted Apple Silicon runners have 7 GB RAM. Keep the smoke workload
+        # small while exercising the same Qwen 9B model distributed by the app.
+        try:
+            result = subprocess.run([str(helper), '--model-dir', str(model), '--ctx', '2048', '--kv-type', 'q4_0'],
+                                    input='\n'.join(json.dumps(r) for r in requests) + '\n',
+                                    text=True, capture_output=True, timeout=900)
+        except subprocess.TimeoutExpired as error:
+            for name, output in [('stdout', error.stdout), ('stderr', error.stderr)]:
+                if isinstance(output, bytes):
+                    output = output.decode('utf-8', errors='replace')
+                print(f"Frozen helper {name} before timeout:\n{output or '(empty)'}", flush=True)
+            raise
         if result.returncode:
             raise RuntimeError(f"MLX helper failed ({result.returncode}): {result.stderr}")
         replies = [json.loads(line) for line in result.stdout.splitlines()]
