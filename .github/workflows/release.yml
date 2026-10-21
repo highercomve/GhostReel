@@ -425,6 +425,12 @@ jobs:
           }
           ninja --version
           "CMAKE_GENERATOR=Ninja" >> $env:GITHUB_ENV
+          # Even Ninja's Windows resource compiler has MAX_PATH limits in llama.cpp's
+          # nested shader build. Cargo must emit short absolute paths, not just use a junction.
+          $shortTarget = "$($env:GITHUB_WORKSPACE.Substring(0, 2))/t"
+          New-Item -ItemType Directory -Force $shortTarget | Out-Null
+          New-Item -ItemType Junction -Path target -Target $shortTarget | Out-Null
+          "CARGO_TARGET_DIR=$shortTarget" >> $env:GITHUB_ENV
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -433,6 +439,8 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: windows-${{ matrix.backend }}
+          workspaces: ${{ matrix.backend == 'vulkan' && format('. -> {0}', env.CARGO_TARGET_DIR) || '. -> target' }}
+          cache-on-failure: ${{ matrix.backend == 'vulkan' }}
           save-if: ${{ github.ref == 'refs/heads/master' }}
 
       - name: Setup Node.js
