@@ -3,7 +3,28 @@
 All notable changes to GhostReel. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [SemVer](https://semver.org/) while the project is 0.x (minor = features, patch = fixes).
 
-## [0.13.0] — 2026-10-21
+## [0.13.1] — 2026-10-21
+
+### Added
+
+- MCP tools for agents that write the edit themselves, without GhostReel's chat model:
+  `list_videos` gives the library at a glance (category, camera, speech, what each video
+  shows), `get_frames` returns the keyframe pictures, and `get_steadiness` says whether a
+  stretch is shaky and where the nearest steady one is.
+- `get_transcript` reads several videos at once and marks off-mic (interviewer) lines, or
+  drops them. `save_script` takes `dry_run` to check a script without saving it, and a beat's
+  `bed` to lay an interview's audio under muted b-roll.
+- The guide explains how to add the MCP server to Claude Code, Claude Desktop, Codex,
+  Antigravity and OpenCode, and lists every tool.
+
+### Changed
+
+- `search` over MCP says when it fell back to keywords because the embedding model is
+  unavailable.
+- The website deploys after each release, from the release tag, instead of on every push,
+  so the guide describes the app people can download. Its headings can be linked, and the
+  "On this page" entries are links.
+
 
 ### Added
 
@@ -817,6 +838,7 @@ is and the editor cuts around the shaky stretches; camera originals play in the 
 See the git history: `git log v0.1.5`.
 
 [Unreleased]: https://github.com/highercomve/GhostReel/compare/v0.13.0...HEAD
+[0.13.1]: https://github.com/highercomve/GhostReel/compare/v0.13.0...v0.13.1
 [0.13.0]: https://github.com/highercomve/GhostReel/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/highercomve/GhostReel/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/highercomve/GhostReel/compare/v0.10.0...v0.11.0
