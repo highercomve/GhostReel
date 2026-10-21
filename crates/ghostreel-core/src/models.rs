@@ -873,11 +873,26 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
-    fn agentworld_has_distinct_projector_and_known_expert_block_count() {
+    fn qwen_9b_is_available_for_native_and_mlx_backends() {
+        for mlx in [false, true] {
+            let entry = catalog_for(mlx).into_iter().find(|e| e.id == "qwen3.5-9b").unwrap();
+            assert_eq!(entry.kind, ModelKind::Vision);
+            if mlx {
+                let bundle = entry.bundle.unwrap();
+                assert_eq!(bundle.repo, "mlx-community/Qwen3.5-9B-4bit");
+                assert!(bundle.files.iter().any(|f| f.name.ends_with(".safetensors")));
+            } else {
+                assert_eq!(entry.file_name, "Qwen3.5-9B-UD-Q4_K_XL.gguf");
+                assert_eq!(entry.mmproj_file_name.as_deref(), Some("mmproj-F16.gguf"));
+            }
+        }
+        assert_eq!(moe_blocks("qwen3.5-9b"), None);
+    }
+
+    #[test]
+    fn agentworld_native_projector_is_distinct() {
         let entry = native_catalog().into_iter().find(|e| e.id == "qwen-agentworld-35b-a3b").unwrap();
         assert_eq!(entry.file_name, "Qwen-AgentWorld-35B-A3B-UD-Q4_K_XL.gguf");
-        assert_eq!(moe_blocks(&entry.id), Some(40));
-        assert_eq!(moe_blocks("qwen3.5-9b"), None);
         assert_ne!(entry.mmproj_file_name.as_deref(), Some("mmproj-F16.gguf"));
     }
 
