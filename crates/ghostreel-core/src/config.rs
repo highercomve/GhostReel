@@ -990,7 +990,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         let cfg = Config::default();
-        assert_eq!(cfg.vision.local_model, crate::models::default_vision_model());
+        assert_eq!(cfg.vision.local_model, "qwen3.5-9b");
+        assert_eq!(cfg.chat_model().local_model, "qwen3.5-9b");
 
         std::fs::write(&path, "[vision]\nlocal_model = \"gemma-3-4b-it\"\n").unwrap();
         let loaded = Config::load(&path).unwrap();

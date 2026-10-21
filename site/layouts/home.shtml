@@ -84,7 +84,7 @@
     <div class="model-console-body"><div class="model-console-title"><div><small>MODELS</small><h3>One per capability</h3></div><span class="model-local-tag">● &nbsp; Local</span></div>
       <p class="model-console-intro">Defaults on Windows, Linux and Intel Macs</p>
       <div class="model-row active"><div class="model-row-mark">S</div><div><strong>Whisper large-v3-turbo</strong><span>Speech</span></div><small>1.6 GB</small><span class="model-state">This computer</span></div>
-      <div class="model-row"><div class="model-row-mark vision">V</div><div><strong>Bonsai-27B Q1_0</strong><span>Frame descriptions &amp; script chat</span></div><small>3.8 GB</small><span class="model-state">Auto</span></div>
+      <div class="model-row"><div class="model-row-mark vision">V</div><div><strong>Qwen3.5 9B</strong><span>Frame descriptions &amp; script chat</span></div><small>6.9 GB</small><span class="model-state">Auto</span></div>
       <div class="model-row"><div class="model-row-mark">E</div><div><strong>embeddinggemma-300M</strong><span>Search embeddings</span></div><small>334 MB</small><span class="model-state">Auto</span></div>
       <div class="model-console-footer"><span>✓ &nbsp; Runs inside GhostReel</span><span>ghostreel doctor shows why ↗</span></div>
     </div>

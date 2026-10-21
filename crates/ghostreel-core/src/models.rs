@@ -415,7 +415,7 @@ pub const fn uses_mlx() -> bool {
 }
 
 pub fn default_vision_model() -> &'static str {
-    if uses_mlx() { "qwen2.5-vl-3b" } else { "bonsai-27b" }
+    "qwen3.5-9b"
 }
 
 /// Migrate the previous default, which has no matching MLX model release.

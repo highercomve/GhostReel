@@ -816,7 +816,7 @@ export default function ModelsPage() {
           </thead>
           <tbody>
             {visionModels.map((m) => {
-              const isSelected = (ai?.vision.local_model ?? "bonsai-27b") === m.entry.id;
+              const isSelected = (ai?.vision.local_model ?? "qwen3.5-9b") === m.entry.id;
               const totalSize = m.entry.size_bytes + (m.entry.mmproj_size_bytes ?? 0);
               return (
                 <tr key={m.entry.id} className={isSelected && visionBackend !== "server" ? "selected-row" : ""}>

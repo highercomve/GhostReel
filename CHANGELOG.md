@@ -15,6 +15,9 @@ versions follow [SemVer](https://semver.org/) while the project is 0.x (minor = 
 
 ### Improved
 
+- Qwen3.5 9B is the default for frame descriptions and script chat on all platforms,
+  using GGUF with a projector on native backends and the pinned MLX bundle on Apple Silicon.
+  CI validates both Qwen variants.
 - CI caches compiled helpers separately by platform/backend and reuses them across release
   version bumps. Keys track helper sources, vendored bindings, transitive locked dependencies,
   toolchains, build settings and SDK versions. Vulkan SDK downloads are also cached, and

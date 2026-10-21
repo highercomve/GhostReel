@@ -10,7 +10,7 @@ import urllib.request
 def main():
     root = Path(__file__).resolve().parent.parent
     entry = next(e for e in json.loads((root / 'crates/ghostreel-core/src/mlx-models.json').read_text())
-                 if e['id'] == 'qwen2.5-vl-3b')
+                 if e['id'] == 'qwen3.5-9b')
     with tempfile.TemporaryDirectory(prefix='ghostreel-mlx-smoke-') as tmp:
         model = Path(tmp) / 'model'
         model.mkdir()

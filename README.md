@@ -88,7 +88,7 @@ ffmpeg/ffprobe are bundled. On first start open **Models** and download what you
 | Capability | Default model | Size | Alternatives |
 |---|---|---:|---|
 | Speech | Whisper `large-v3-turbo` | 1.6 GB | `small` (488 MB), quantized turbo q8_0 / q5_0 (874 / 574 MB), `.en` variants |
-| Frame descriptions & script chat | `Bonsai-27B` Q1_0 + projector | 3.8 GB | Qwen2.5-VL 7B (4.7 GB), Gemma 3 4B (2.5 GB), Qwen2.5-VL 3B (1.9 GB) |
+| Frame descriptions & script chat | Qwen3.5 9B | Native: 6.9 GB with projector; Apple Silicon: pinned MLX bundle | Qwen2.5-VL 7B/3B, Gemma 3 4B |
 | Search embeddings | `embeddinggemma-300M` Q8_0 | 334 MB | fixed, so indexes stay compatible between computers |
 
 GhostReel also picks up models you already have (GhostPen's whisper models, LM Studio) instead
@@ -416,8 +416,10 @@ Apple Silicon uses MLX for local frame descriptions and script chat. The Models 
 MLX versions of Qwen2.5-VL 3B/7B, Gemma 3 4B, and Qwen3.5 9B. Downloads are pinned to a
 Hugging Face revision and include every weight shard, tokenizer, and processor configuration.
 Interrupted downloads resume, and a model is only marked installed once every file is complete.
-The initial vision model is Qwen2.5-VL 3B; the old Bonsai default migrates to it because Bonsai
-has no matching MLX release in this catalog. Script chat retains its Qwen3.5 9B default.
+Qwen3.5 9B is the default for both frame descriptions and script chat on every platform.
+Apple Silicon uses its pinned MLX bundle; Linux, Windows and Intel Macs use the GGUF model
+and projector. The old Bonsai selection on Apple Silicon migrates to Qwen3.5 9B because
+Bonsai has no matching MLX release in this catalog.
 
 Whisper and embeddinggemma retain their existing model files and helpers. Intel Macs, Linux,
 and Windows retain GGUF for vision/chat. MLX processes frames serially to bound memory usage;
