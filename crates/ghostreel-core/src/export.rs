@@ -174,6 +174,7 @@ mod tests {
                     out_s: 4.0,
                     audio: script::Audio::Source,
                     why: None,
+                    tracks: None,
                 }],
                 notes: None,
                 bed: None,

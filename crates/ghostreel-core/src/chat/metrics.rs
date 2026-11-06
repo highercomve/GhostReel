@@ -231,7 +231,7 @@ mod tests {
     }
 
     fn clip(video_id: i64, in_s: f64, out_s: f64, audio: Audio) -> ScriptClip {
-        ScriptClip { video_id, in_s, out_s, audio, why: None }
+        ScriptClip { video_id, in_s, out_s, audio, why: None, tracks: None }
     }
 
     #[test]
@@ -313,7 +313,7 @@ mod tests {
             vec![beat(
                 "b1",
                 vec![clip(1, 0.0, 10.0, Audio::Mute), clip(2, 0.0, 20.0, Audio::Mute)],
-                Some(AudioBed { video_id: 1, in_s: 0.0, out_s: 30.0, why: None, inferred: true }),
+                Some(AudioBed { video_id: 1, in_s: 0.0, out_s: 30.0, why: None, inferred: true, tracks: None }),
             )],
             Some(30.0),
         );

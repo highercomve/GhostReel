@@ -10,7 +10,7 @@
 //! ← {"id":3,"ok":false,"error":"…"}
 //! ```
 //!
-//! Arguments: `--model <gguf> --mmproj <gguf>` (vision), `--embed-model <gguf>` (embeddings),
+//! Arguments: `--model <gguf>` (chat), optional `--mmproj <gguf>` (vision), `--embed-model <gguf>` (embeddings),
 //! `--ctx 8192`, `--ngl 999`, `--cpu`. The first stdout line is `{"ready":true,…}` once models load.
 //!
 //! Sampling with a JSON-schema grammar: sample from the unconstrained distribution, check the token
@@ -133,7 +133,7 @@ fn parse_args() -> Result<Args, String> {
             }
             "-h" | "--help" => {
                 println!(
-                    "usage: ghostreel-llm [--model m.gguf --mmproj p.gguf] [--embed-model e.gguf] [--ctx N] \
+                    "usage: ghostreel-llm [--model m.gguf [--mmproj p.gguf]] [--embed-model e.gguf] [--ctx N] \
 [--concurrency N] [--kv-type f16|q8_0|q4_0] [--flash-attn auto|on|off] [--cpu-moe N] [--threads N] [--mmap on|off] [--no-threadpool] [--ngl N|--cpu]"
                 );
                 std::process::exit(0);
@@ -141,11 +141,11 @@ fn parse_args() -> Result<Args, String> {
             other => return Err(format!("unknown argument {other}")),
         }
     }
-    if a.model.is_some() != a.mmproj.is_some() {
-        return Err("--model and --mmproj go together".into());
+    if a.mmproj.is_some() && a.model.is_none() {
+        return Err("--mmproj requires --model".into());
     }
     if a.model.is_none() && a.embed_model.is_none() {
-        return Err("nothing to load: pass --model/--mmproj and/or --embed-model".into());
+        return Err("nothing to load: pass --model and/or --embed-model".into());
     }
     Ok(a)
 }
@@ -203,7 +203,7 @@ fn reply(v: Value) {
 struct Vision<'a> {
     model: &'a LlamaModel,
     model_name: String,
-    mtmd: MtmdContext,
+    mtmd: Option<MtmdContext>,
     ctx: LlamaContext<'a>,
     n_batch: u32,
     concurrency: usize,
@@ -341,6 +341,7 @@ impl Vision<'_> {
     }
 
     fn batch_describe(&mut self, items: &[BatchDescribeItem]) -> Result<Vec<Value>, String> {
+        let mtmd = self.mtmd.as_ref().ok_or("this model has no image projector")?;
         let mut all_results = Vec::with_capacity(items.len());
         let chunk_size = self.concurrency.max(1);
 
@@ -373,7 +374,7 @@ impl Vision<'_> {
                 let prompt_str = item.prompt.as_deref().unwrap_or("Describe this image.");
                 let user_msg = format!("{marker}{prompt_str}");
                 let text = format_prompt_with_template(self.model, &user_msg);
-                let bitmap = match MtmdBitmap::from_file(&self.mtmd, &item.image, false) {
+                let bitmap = match MtmdBitmap::from_file(mtmd, &item.image, false) {
                     Ok(bm) => bm,
                     Err(e) => {
                         chunk_results[slot_idx] = Some(json!({
@@ -383,8 +384,7 @@ impl Vision<'_> {
                         continue;
                     }
                 };
-                let chunks = match self
-                    .mtmd
+                let chunks = match mtmd
                     .tokenize(MtmdInputText { text, add_special: true, parse_special: true }, &[&bitmap])
                 {
                     Ok(c) => c,
@@ -398,7 +398,7 @@ impl Vision<'_> {
                 };
                 let prompt_tokens = chunks.total_tokens();
                 let seq_id = slot_idx as i32;
-                let n_past = match chunks.eval_chunks(&self.mtmd, &self.ctx, 0, seq_id, self.n_batch as i32, true) {
+                let n_past = match chunks.eval_chunks(mtmd, &self.ctx, 0, seq_id, self.n_batch as i32, true) {
                     Ok(p) => p,
                     Err(e) => {
                         chunk_results[slot_idx] = Some(json!({
@@ -657,8 +657,9 @@ impl Vision<'_> {
         let mut text = completion_text(self.model, prompt, think);
 
         let bitmap = if let Some(img_path) = image {
-            let bm =
-                MtmdBitmap::from_file(&self.mtmd, img_path, false).map_err(|e| format!("image {img_path}: {e:?}"))?;
+            let mtmd = self.mtmd.as_ref().ok_or("this model has no image projector")?;
+            let bm = MtmdBitmap::from_file(mtmd, img_path, false)
+                .map_err(|e| format!("image {img_path}: {e:?}"))?;
             insert_image_marker(&mut text);
             Some(bm)
         } else {
@@ -669,13 +670,13 @@ impl Vision<'_> {
             self.cached_prompt.clear();
             self.prompt_checkpoint = None;
             self.ctx.clear_kv_cache();
-            let chunks = self
-                .mtmd
+            let mtmd = self.mtmd.as_ref().ok_or("this model has no image projector")?;
+            let chunks = mtmd
                 .tokenize(MtmdInputText { text, add_special: true, parse_special: true }, &[bitmap])
                 .map_err(|e| format!("tokenize: {e:?}"))?;
             ensure_room(chunks.total_tokens(), max_tokens, self.ctx.n_ctx() as usize)?;
             let n = chunks
-                .eval_chunks(&self.mtmd, &self.ctx, 0, 0, self.n_batch as i32, true)
+                .eval_chunks(mtmd, &self.ctx, 0, 0, self.n_batch as i32, true)
                 .map_err(|e| format!("prompt eval: {e:?}"))?;
             (chunks.total_tokens(), n)
         } else {
@@ -909,19 +910,20 @@ fn run() -> Result<(), String> {
     };
     let mut effective_ctx = args.ctx;
     let mut effective_kv = args.kv_type.clone();
-    let mut vision = match (&vision_model, &args.mmproj) {
-        (Some(model), Some(mmproj)) => {
-            let mtmd = MtmdContext::init_from_file(
-                mmproj,
-                model,
-                &MtmdContextParams {
-                    use_gpu: effective_ngl > 0,
-                    n_threads: args.threads,
-                    print_timings: false,
-                    ..Default::default()
-                },
-            )
-            .map_err(|e| format!("loading {mmproj}: {e:?}"))?;
+    let mut vision = match &vision_model {
+        Some(model) => {
+            let mtmd = args.mmproj.as_ref().map(|mmproj| {
+                MtmdContext::init_from_file(
+                    mmproj,
+                    model,
+                    &MtmdContextParams {
+                        use_gpu: effective_ngl > 0,
+                        n_threads: args.threads,
+                        print_timings: false,
+                        ..Default::default()
+                    },
+                ).map_err(|e| format!("loading {mmproj}: {e:?}"))
+            }).transpose()?;
             let n_batch = 512;
             let kv = match args.kv_type.as_str() {
                 "f16" => KvCacheType::F16,
@@ -1023,7 +1025,7 @@ fn run() -> Result<(), String> {
     let dim = embed_model.as_ref().map(|m| m.n_embd());
     reply(json!({
         "ready": true,
-        "vision": vision.is_some(),
+        "vision": vision.as_ref().is_some_and(|v| v.mtmd.is_some()),
         "embed_dim": dim,
         "ctx": effective_ctx,
         "concurrency": args.concurrency,
@@ -1058,15 +1060,18 @@ fn run() -> Result<(), String> {
                 (Some(v), Some(prompt)) => {
                     let text = completion_text(v.model, prompt, req.think.unwrap_or(false));
                     if let Some(path) = req.image.as_deref() {
-                        let bitmap =
-                            MtmdBitmap::from_file(&v.mtmd, path, false).map_err(|e| format!("image {path}: {e:?}"));
-                        bitmap.and_then(|bitmap| {
-                            let mut text = text;
-                            insert_image_marker(&mut text);
-                            v.mtmd
-                                .tokenize(MtmdInputText { text, add_special: true, parse_special: true }, &[&bitmap])
-                                .map(|chunks| json!({"tokens":chunks.total_tokens()}))
-                                .map_err(|e| format!("tokenize: {e:?}"))
+                        let mtmd = v.mtmd.as_ref().ok_or_else(|| "this model has no image projector".to_string());
+                        mtmd.and_then(|mtmd| {
+                            let bitmap =
+                                MtmdBitmap::from_file(mtmd, path, false).map_err(|e| format!("image {path}: {e:?}"));
+                            bitmap.and_then(|bitmap| {
+                                let mut text = text;
+                                insert_image_marker(&mut text);
+                                mtmd
+                                    .tokenize(MtmdInputText { text, add_special: true, parse_special: true }, &[&bitmap])
+                                    .map(|chunks| json!({"tokens":chunks.total_tokens()}))
+                                    .map_err(|e| format!("tokenize: {e:?}"))
+                            })
                         })
                     } else {
                         v.model

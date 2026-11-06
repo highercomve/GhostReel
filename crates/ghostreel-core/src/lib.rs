@@ -4,6 +4,7 @@
 //! database, AI server probing and the doctor report.
 
 pub mod audio;
+pub mod audio_tracks;
 pub mod chat;
 pub mod chunks;
 pub mod classify;

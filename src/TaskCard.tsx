@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { cancelTask, etaText, PHASE_LABELS, type ChatProgress, type Task } from "./api";
+import { ChevronDown, ChevronRight } from "lucide-react";
 import { onEvent } from "./events";
 
 const STATE_LABEL: Record<string, string> = {
@@ -57,6 +58,11 @@ function details(task: Task): [string, string][] {
     if (p.current) rows.push(["Now", p.current]);
   }
   rows.push(["Started", new Date((task.created_at < 1e11 ? task.created_at * 1000 : task.created_at)).toLocaleTimeString()]);
+  if (task.finished_at)
+    rows.push([
+      "Finished",
+      new Date(task.finished_at < 1e11 ? task.finished_at * 1000 : task.finished_at).toLocaleTimeString(),
+    ]);
   return rows;
 }
 
@@ -111,7 +117,7 @@ export default function TaskCard({ task, compact = false }: { task: Task; compac
         title={open ? "Hide details" : "Show details"}
       >
         <span className="label">
-          <span className="task-caret">{open ? "▾" : "▸"}</span> {taskLabel(task)}
+          <span className="task-caret">{open ? <ChevronDown size={14} strokeWidth={2} aria-hidden /> : <ChevronRight size={14} strokeWidth={2} aria-hidden />}</span> {taskLabel(task)}
         </span>
         <span className="muted small">
           {running && p ? (

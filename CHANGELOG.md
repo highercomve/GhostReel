@@ -3,6 +3,49 @@
 All notable changes to GhostReel. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [SemVer](https://semver.org/) while the project is 0.x (minor = features, patch = fixes).
 
+## [0.14.0] — 2026-11-06
+
+### Added
+
+- The Scripts tab is rebuilt as an editor workspace: a left panel with Cuts, Beats and Media,
+  a center live viewer (playback without rendering a single frame), a right inspector, and a
+  bottom zoomable timeline with filmstrip thumbnails, a frame ruler, target-length markers
+  and an overrun warning. Clips move, trim, split and copy on the timeline (drag or
+  keyboard), timecode fields accept `mm:ss.ff`, and `?` opens a shortcuts sheet.
+- Multi-track audio: every audio track a clip can play is its own timeline layer. A clip
+  chooses which of the file's tracks play, tracks can be muted or soloed, and a muted clip
+  keeps its block on the timeline so the silence reads as an undoable choice. Track sound
+  streams through the media route, per-track level meters show dB with silent stretches
+  flagged, and OTIO/FCP XML export carries the track choices.
+- Sonar chat logs: every turn, tool call and answer is stored per session
+  (`logs/chat/<session>.jsonl`), viewable in the app with a header per turn (backend, model,
+  tool), downloadable from the web UI, and clearable like the other storage kinds. API keys
+  are redacted from the log.
+- Script chat can run through a CLI agent (Codex and friends) as its brain: the agent's
+  models are listed on the Models page, tool rounds are capped (`max_tool_rounds`, clamped
+  to 100), and research tool calls are summarized under the answer instead of dumped raw.
+- The Models page discovers models installed by other apps (LM Studio and the configured
+  search roots) and can adopt them as the app's vision/chat model, with warnings when a
+  model has no image projector or is an embeddings-only file. An "Available models" section
+  lists downloadable rows directly instead of showing an empty body.
+- Search: a dedicated search window (`?window=search`) with per-hit match explanations,
+  cleaned excerpts (index labels and shot classifications dropped, repeated terms deduped,
+  adjacent match chips merged, truncation marked with an ellipsis) and "open in project"
+  badges on each hit. Substantive-only transcript lines filter out filler.
+- The Storage page counts chat logs alongside proxies, keyframes, previews, chat images,
+  exports and temp files, and can clean each kind separately.
+- The Status page reports each role's readiness (backend, model, capability) and points at
+  the Models page entry that resolves what is missing.
+
+### Improved
+
+- Editor polish from a ten-round design review: the inspector ends on a complete row
+  boundary, contains its destructive controls, and names every timeline audio cell even at
+  small window sizes; the remix of settings and version strings de-duplicates what the
+  Status page shows.
+- `ghostreel doctor` reports, per role, which model pattern is missing instead of one line
+  per failure, and names the selected whisper model file.
+
 ## [0.13.2] — 2026-10-21
 
 ### Improved
@@ -851,7 +894,8 @@ is and the editor cuts around the shaky stretches; camera originals play in the 
 
 See the git history: `git log v0.1.5`.
 
-[Unreleased]: https://github.com/highercomve/GhostReel/compare/v0.13.2...HEAD
+[Unreleased]: https://github.com/highercomve/GhostReel/compare/v0.14.0...HEAD
+[0.14.0]: https://github.com/highercomve/GhostReel/compare/v0.13.2...v0.14.0
 [0.13.2]: https://github.com/highercomve/GhostReel/compare/v0.13.1...v0.13.2
 [0.13.1]: https://github.com/highercomve/GhostReel/compare/v0.13.0...v0.13.1
 [0.13.0]: https://github.com/highercomve/GhostReel/compare/v0.12.0...v0.13.0

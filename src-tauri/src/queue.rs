@@ -88,7 +88,7 @@ pub struct Task {
 }
 
 type ChatSender = oneshot::Sender<Result<ChatTurnView, String>>;
-type ChatRequest = (String, Vec<String>, ChatSender);
+type ChatRequest = (String, Vec<String>, Option<i64>, ChatSender);
 
 #[derive(Default)]
 pub struct Queue {
@@ -145,10 +145,11 @@ impl Queue {
         message: String,
         images: Vec<String>,
         label: String,
+        script_id: Option<i64>,
         tx: oneshot::Sender<Result<ChatTurnView, String>>,
     ) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst) + 1;
-        self.chat_requests.lock().await.insert(id, (message, images, tx));
+        self.chat_requests.lock().await.insert(id, (message, images, script_id, tx));
         let mut tasks = self.tasks.lock().await;
         tasks.push_back(Task {
             id,
@@ -178,7 +179,7 @@ impl Queue {
             TaskState::Queued => {
                 t.state = TaskState::Cancelled;
                 t.finished_at = Some(ghostreel_core::projects::now());
-                if let Some((_, _, tx)) = self.chat_requests.lock().await.remove(&id) {
+                if let Some((_, _, _, tx)) = self.chat_requests.lock().await.remove(&id) {
                     let _ = tx.send(Err("task cancelled".into()));
                 }
             }
@@ -307,8 +308,10 @@ pub async fn worker(app: AppHandle) {
             TaskKind::Chat { project_id, session_id } => {
                 let req = queue.chat_requests.lock().await.remove(&id);
                 match req {
-                    Some((message, images, tx)) => {
-                        let res = run_chat(&app, id, project_id, session_id, message, images, cancel.clone()).await;
+                    Some((message, images, script_id, tx)) => {
+                        let res =
+                            run_chat(&app, id, project_id, session_id, message, images, script_id, cancel.clone())
+                                .await;
                         let outcome = match &res {
                             Ok(_) => Ok(TaskOutcome::Chat),
                             // Stop is not a failure: report it as the cancellation it is.
@@ -631,6 +634,7 @@ async fn run_chat(
     session_id: i64,
     message: String,
     images: Vec<String>,
+    script_id: Option<i64>,
     cancel: Arc<AtomicBool>,
 ) -> Result<ChatTurnView, String> {
     // Everything the model is sent and says during this turn goes to the chat's "Full log".
@@ -664,11 +668,9 @@ async fn run_chat(
     // tool rounds against the budget — and drafting is not: the model generates for minutes with
     // nothing to count, so the bar says so rather than inventing a number. Before this the bar was
     // never touched at all and sat at zero for the whole turn.
-    let round_budget = {
-        let configured = config.chat_model().max_tool_rounds;
-        if configured > 0 { configured } else { config.script.roomy_tool_rounds }
-    }
-    .max(1) as f64;
+    let configured_budget = config.chat_model().max_tool_rounds;
+    let round_budget = configured_budget.max(1) as f64;
+    let unlimited = configured_budget == 0;
     let mut rounds = 0u64;
     let started = std::time::Instant::now();
     let events_log = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -684,7 +686,13 @@ async fn run_chat(
             );
             // Research is capped at 0.8: the draft is still to come, and a bar that reaches the
             // end while the work continues is worse than one that stops short.
-            let fraction = if drafting { 0.85 } else { (rounds as f64 / round_budget).min(0.8) };
+            let fraction = if drafting {
+                0.85
+            } else if unlimited {
+                0.1
+            } else {
+                (rounds as f64 / round_budget).min(0.8)
+            };
             ghostreel_core::progress::Progress {
                 phase: if drafting { "drafting".into() } else { "researching".into() },
                 phase_done: rounds,
@@ -693,7 +701,7 @@ async fn run_chat(
                 eta_secs: None,
                 elapsed_secs: started.elapsed().as_secs_f64(),
                 current: None,
-                indeterminate: drafting,
+                indeterminate: drafting || unlimited,
             }
         };
 
@@ -703,7 +711,7 @@ async fn run_chat(
                 // Char-based: args often hold non-ASCII queries ("configuración").
                 let snippet =
                     if s.chars().count() > 40 { format!("{}…", s.chars().take(40).collect::<String>()) } else { s };
-                format!("{tool}: {snippet}")
+                if unlimited { format!("Researching · {rounds} lookups") } else { format!("{tool}: {snippet}") }
             }
             ghostreel_core::chat::ChatEvent::ToolFinished { tool, summary } => {
                 format!("{tool}: {summary}")
@@ -740,10 +748,17 @@ async fn run_chat(
         return Err("task cancelled".into());
     }
 
-    let turn_res =
-        ghostreel_core::chat::run_turn(&mut ctx, project_id, Some(session_id), &message, &images, &mut on_event)
-            .await
-            .map_err(|e| e.to_string())?;
+    let turn_res = ghostreel_core::chat::run_turn(
+        &mut ctx,
+        project_id,
+        Some(session_id),
+        &message,
+        &images,
+        script_id,
+        &mut on_event,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
 
     Ok(ChatTurnView {
         session_id: turn_res.session_id,

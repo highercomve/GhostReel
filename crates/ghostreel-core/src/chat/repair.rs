@@ -76,15 +76,25 @@ pub fn finish_script(
     // should have found nothing to do.
     let turns = super::end_on_turns(db, s, cfg);
     if turns > 0 {
-        note(&mut issues, format!("ended {turns} range(s) where the speaker stopped, before the reply over the top"));
+        note(&mut issues, format!(
+            "ended {} where the speaker stopped, before the reply over the top",
+            if turns == 1 { "one quote".to_string() } else { format!("{turns} quotes") },
+        ));
     }
     let mended = super::end_on_sentences(db, s, cfg);
     if mended > 0 {
-        note(&mut issues, format!("put {mended} range(s) back on whole sentences"));
+        note(&mut issues, if mended == 1 {
+            "restored one trimmed quote to its full sentence".to_string()
+        } else {
+            format!("restored {mended} trimmed quotes to their full sentences")
+        });
     }
     let shortened = super::trim_pictures_to_bed(s, cfg);
     if shortened > 0 {
-        note(&mut issues, format!("cut the pictures back to the voice in {shortened} beat(s)"));
+        note(&mut issues, format!(
+            "cut the pictures back to the voice in {}",
+            if shortened == 1 { "one beat".to_string() } else { format!("{shortened} beats") },
+        ));
     }
     let held = super::hold_the_last_picture(db, project_id, s, cfg);
     if held > 0.0 {

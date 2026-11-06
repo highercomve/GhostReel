@@ -1,0 +1,218 @@
+/* ---- Inspector (Clip / Beat / Cut tabs), beats outline, shortcuts sheet: Agent E ---- */
+
+/* Tabs in the inspector head, matching the left panel's tabs. */
+.insp-tabs { min-height: 34px; }
+.insp-tabs .nle-panel-tab:disabled { opacity: 0.4; cursor: default; }
+.nle-inspector .nle-inspector-body { padding: 10px 12px 14px 10px; }
+.nle-inspector .nle-insp-section { min-width: 0; }
+
+/* "hook · Purpose of the beat · clip 1 of 3 >" above the clip: a link to its beat. */
+.insp-crumb {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  min-width: 0;
+  padding: 4px 6px;
+  text-align: left;
+  font-weight: 500;
+  color: var(--muted);
+}
+.insp-crumb:hover:not(:disabled) { color: var(--text); }
+.insp-crumb-id {
+  flex: 0 0 auto;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+  color: var(--text);
+  font-size: 11px;
+  font-weight: 700;
+}
+.insp-crumb-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+.insp-crumb-pos { flex: 0 0 auto; font-size: 11px; white-space: nowrap; }
+.insp-beat-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+
+.nle-inspector .nle-insp-file { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.nle-inspector .nle-insp-file > svg { flex: 0 0 auto; color: var(--muted); }
+
+/* In / Out: label (drag to scrub), timecode, −1f +1f, set from playhead. */
+.insp-timecodes { display: flex; flex-direction: column; gap: 6px; }
+.tc-field {
+  display: grid;
+  grid-template-columns: 34px minmax(84px, 1fr) auto;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.tc-label {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--muted);
+  cursor: ew-resize;
+  user-select: none;
+  touch-action: none;
+  border-bottom: 1px dotted color-mix(in srgb, var(--muted) 70%, transparent);
+  justify-self: start;
+}
+.tc-label:hover { color: var(--text); }
+.tc-field.disabled .tc-label { cursor: default; }
+.tc-input {
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+  padding: 4px 6px;
+  font-family: ui-monospace, monospace;
+  font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+.tc-input.invalid { border-color: var(--bad); outline-color: var(--bad); }
+.tc-buttons { display: inline-flex; gap: 3px; }
+.tc-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 30px;
+  height: 26px;
+  padding: 0 5px;
+  font-size: 11px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.insp-tc-facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 14px;
+  font-size: 11px;
+  color: var(--muted);
+}
+.insp-tc-facts strong { font-family: ui-monospace, monospace; font-weight: 500; color: var(--text); font-variant-numeric: tabular-nums; }
+
+/* Clip sound: a real on/off switch, its state spelled out beside it. */
+.insp-switch-row { display: flex; align-items: center; gap: 8px; }
+.insp-switch-label { display: inline-flex; align-items: center; gap: 6px; flex: 1; font-size: 12.5px; color: var(--text); }
+.insp-switch {
+  position: relative;
+  flex: 0 0 auto;
+  width: 34px;
+  height: 20px;
+  padding: 0;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: color-mix(in srgb, var(--muted) 30%, var(--panel));
+}
+.insp-switch:hover:not(:disabled) { background: color-mix(in srgb, var(--muted) 40%, var(--panel)); }
+.insp-switch.on,
+.insp-switch.on:hover:not(:disabled) { background: var(--accent-solid, var(--accent)); border-color: var(--accent-solid, var(--accent)); }
+.insp-switch-knob {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.35);
+  transition: left 0.12s ease;
+}
+.insp-switch.on .insp-switch-knob { left: 16px; }
+.insp-switch-state { min-width: 44px; font-size: 12px; font-weight: 600; color: var(--text); }
+.insp-switch-state.off { color: var(--warn-text, var(--warn)); }
+
+/* Neutral actions in a row; Remove sits apart, below a rule. */
+.nle-inspector .nle-insp-actions { align-items: center; gap: 6px; }
+.nle-inspector .nle-insp-actions button { display: inline-flex; align-items: center; gap: 5px; }
+.insp-move { display: inline-flex; gap: 4px; margin-left: auto; }
+.insp-danger-row {
+  display: flex;
+  justify-content: flex-end;
+  padding-top: 8px;
+  margin-top: 2px;
+  border-top: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+}
+.insp-danger-row button { display: inline-flex; align-items: center; gap: 5px; }
+
+/* Narration is sound, on-screen text is the Titles lane: each carries its lane's colour. */
+.insp-field-label { display: inline-flex; align-items: center; gap: 5px; color: var(--text); font-weight: 600; }
+.insp-field-hint { font-weight: 400; color: var(--muted); }
+.insp-field-narration .insp-field-label > svg { color: var(--accent-2); }
+.insp-field-title .insp-field-label > svg { color: var(--warn-text, var(--warn)); }
+.nle-inspector .insp-field-narration textarea { border-left: 3px solid var(--accent-2); }
+.nle-inspector .insp-field-title input { border-left: 3px solid var(--warn); font-family: inherit; }
+.nle-inspector input,
+.nle-inspector textarea { font-family: inherit; }
+.nle-inspector .nle-insp-row button { display: inline-flex; align-items: center; gap: 5px; }
+
+.insp-target-note { font-size: 11.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.insp-target-note.over { color: var(--warn-text, var(--warn)); }
+.insp-chat-line { display: flex; align-items: center; gap: 6px; }
+
+/* Timeline head: icon buttons and the "Sonar is revising" note. */
+.nle-icon-btn { display: inline-flex; align-items: center; justify-content: center; height: 26px; }
+.nle-timeline-head .nle-ai-working-banner { display: inline-flex; align-items: center; gap: 6px; }
+
+/* Beats outline: two-line titles, the role as a chip, tools you can see and hit. */
+.nle-beats .nle-beat-id {
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+  color: var(--text);
+  font-size: 10.5px;
+}
+.nle-beats .nle-beat-purpose {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  white-space: normal;
+  line-height: 1.3;
+}
+.nle-beats .nle-beat-tools { gap: 1px; opacity: 0; }
+.nle-beats .nle-beat-list li:hover .nle-beat-tools,
+.nle-beats .nle-beat-list li.active .nle-beat-tools,
+.nle-beats .nle-beat-tools:focus-within { opacity: 1; }
+.nle-beats .nle-beat-tools button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border-radius: 5px;
+  color: var(--text);
+}
+.nle-beats .nle-beat-tools button:hover:not(:disabled) { background: color-mix(in srgb, var(--text) 10%, transparent); }
+.nle-beats .nle-beat-tools button.danger { color: var(--bad); }
+.nle-beats .nle-beat-tools button:disabled { opacity: 0.3; }
+.nle-beats .nle-panel-tools button { display: inline-flex; align-items: center; gap: 4px; }
+
+/* Shortcuts sheet: keys drawn as keycaps, mouse actions as words. */
+.nle-keys-sheet .nle-keys-cols { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px 28px; }
+.nle-keys-sheet .keys-note { margin: -4px 0 8px; font-size: 11.5px; color: var(--muted); }
+.nle-keys-sheet .nle-key-row { display: grid; grid-template-columns: 150px minmax(0, 1fr); align-items: center; gap: 12px; }
+.nle-key-keys { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; }
+.keycombo, .keycombo-alt, .keycombo-part { display: inline-flex; align-items: center; gap: 3px; }
+.keycombo-plus, .keycombo-or { font-size: 11px; color: var(--muted); }
+.keycombo-or { margin: 0 2px; }
+kbd.keycap {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 22px;
+  height: 22px;
+  padding: 0 6px;
+  box-sizing: border-box;
+  border: 1px solid var(--border);
+  border-bottom-width: 2px;
+  border-radius: 5px;
+  background: var(--bg);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 11.5px;
+  font-weight: 600;
+  line-height: 1;
+}
+.nle-keys-sheet .nle-key-row kbd.keycap { min-width: 22px; font-family: inherit; }
+.nle-mouse-action { font-size: 12px; color: var(--muted); font-style: italic; }
+@media (max-width: 900px) {
+  .nle-keys-sheet .nle-keys-cols { grid-template-columns: minmax(0, 1fr); }
+}

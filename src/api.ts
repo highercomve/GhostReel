@@ -267,6 +267,7 @@ export interface TranscriptSegment {
   start: number;
   end: number;
   text: string;
+  off_mic?: boolean;
 }
 
 /** The models a coding-agent CLI will accept; empty when it cannot say. */
@@ -461,13 +462,29 @@ export const openExternal = (path: string, t: number) => call<void>("open_extern
 /** What the player should load: the original, or a playable proxy built on first open. */
 export const videoPlayback = (videoId: number) => call<{ path: string; proxy: boolean }>("video_playback", { videoId });
 
-export const clock = (s: number) => {
-  const t = Math.max(0, Math.floor(s));
-  const h = Math.floor(t / 3600);
-  const m = Math.floor((t % 3600) / 60);
-  const sec = String(t % 60).padStart(2, "0");
-  return h ? `${h}:${String(m).padStart(2, "0")}:${sec}` : `${m}:${sec}`;
-};
+/** One audio stream of a file, as ffprobe sees it. */
+export interface AudioTrackInfo {
+  /** 0-based among the file's audio streams. */
+  index: number;
+  channels: number;
+  codec: string;
+  /** The stream's title or handler name, if it has one. */
+  label: string | null;
+  /** The track GhostReel plays when a clip doesn't choose. */
+  auto: boolean;
+}
+
+export const videoAudioTracks = (videoId: number) => call<AudioTrackInfo[]>("video_audio_tracks", { videoId });
+
+/** Mean volume in dB per audio track over a source range; -91 or lower is silence. */
+export const audioLevels = (videoId: number, inS: number, outS: number) =>
+  call<number[]>("audio_levels", { videoId, inS, outS });
+
+/** Path to one audio track extracted to a small playable file (cached by the backend). */
+export const audioTrackProxy = (videoId: number, track: number) =>
+  call<string>("audio_track_proxy", { videoId, track });
+
+export { formatDuration as clock } from "./timeFormat";
 
 export const fileName = (p: string) => p.split(/[\\/]/).pop() ?? p;
 
@@ -509,7 +526,7 @@ export interface PurgeStats {
 export const removeProject = (projectId: number, purge = false) =>
   call<PurgeStats>("remove_project", { projectId, purge });
 // Mirrors ghostreel-core's storage module.
-export type StorageKind = "proxies" | "keyframes" | "previews" | "chat_images" | "exports" | "temp";
+export type StorageKind = "proxies" | "keyframes" | "previews" | "chat_images" | "chat_logs" | "exports" | "temp";
 export type StorageUsage = Record<StorageKind, number>;
 export interface ProjectStorage {
   project_id: number;
@@ -594,6 +611,9 @@ export interface ScriptClip {
   in_s: number;
   out_s: number;
   audio?: "source" | "mute";
+  /** Source audio tracks to play (0-based among the file's audio streams). Absent = the file's
+   * automatic track; empty = silent. `audio: "mute"` silences the clip regardless. */
+  tracks?: number[];
   why?: string;
 }
 
@@ -605,6 +625,8 @@ export interface AudioBed {
   why?: string;
   /** True when the pipeline laid it rather than the editor asking for it. */
   inferred?: boolean;
+  /** Source audio tracks to play; absent = the file's automatic track, empty = silent. */
+  tracks?: number[];
 }
 
 export interface Beat {
@@ -737,7 +759,16 @@ export const chatTurn = (
   message: string,
   images?: string[],
   style?: ChatStyle,
-) => call<ChatTurnView>("chat_turn", { projectId, sessionId, message, images: images ?? [], style });
+  scriptId?: number | null,
+) =>
+  call<ChatTurnView>("chat_turn", {
+    projectId,
+    sessionId,
+    message,
+    images: images ?? [],
+    style,
+    scriptId: scriptId ?? null,
+  });
 
 /**
  * Build a cut by choosing instead of writing: Jev picks the quotes and the shots out of the index
@@ -766,12 +797,20 @@ export interface LogEntry {
   seq: number;
   ts_ms: number;
   session_id: number | null;
-  kind: "prompt" | "thinking" | "answer" | "helper" | "info";
+  kind: "prompt" | "thinking" | "answer" | "helper" | "tool" | "error" | "info";
   text: string;
 }
 
 export const chatLog = (sessionId: number, afterSeq: number) =>
   call<LogEntry[]>("chat_log", { sessionId, afterSeq });
+
+export async function openChatLog(sessionId: number) {
+  if (isDesktop) return call<void>("open_chat_log", { sessionId });
+  const a = document.createElement("a");
+  a.href = `/api/chat-log?session_id=${sessionId}`;
+  a.download = `${sessionId}.jsonl`;
+  a.click();
+}
 
 export const listScripts = (projectId: number) =>
   call<ScriptSummary[]>("list_scripts", { projectId });
@@ -781,6 +820,12 @@ export const getScript = (scriptId: number) =>
 
 export const saveScript = (projectId: number, script: Script, sessionId: number | null) =>
   call<SaveScriptView>("save_script", { projectId, script, sessionId });
+
+export const deleteScript = (scriptId: number) =>
+  call<boolean>("delete_script", { scriptId });
+
+export const deleteScriptCut = (projectId: number, title: string) =>
+  call<number>("delete_script_cut", { projectId, title });
 
 // ---- models management -------------------------------------------------------------------
 
@@ -808,6 +853,7 @@ export interface ModelStatus {
   installed_path: string | null;
   in_own_dir: boolean;
   partial_bytes: number | null;
+  external?: { name: string; quant: string | null; source: string; mmproj_path: string | null };
 }
 
 export interface ModelsStatusView {

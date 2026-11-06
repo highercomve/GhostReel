@@ -48,7 +48,7 @@ pub enum VisionSetup {
         helper: PathBuf,
         models_dir: PathBuf,
         model: crate::models::ModelSpec,
-        mmproj: crate::models::ModelSpec,
+        mmproj: Option<crate::models::ModelSpec>,
         found: Vec<PathBuf>,
         /// Context window / KV cache / flash attention for this capability.
         runtime: crate::vision::HelperRuntime,
@@ -326,6 +326,28 @@ async fn resolve_llm_with(
         Target::Unavailable => return VisionSetup::Unavailable(resolution.reason),
         Target::Local => {}
     }
+    if cfg.local_model.starts_with("external:") {
+        let Some(status) = models::external_model(&cfg.local_model) else {
+            return VisionSetup::Unavailable(format!("local model file is missing: '{}'", cfg.local_model));
+        };
+        if status.entry.kind != models::ModelKind::Vision {
+            return VisionSetup::Unavailable("embedding models cannot be used for vision or chat".into());
+        }
+        let mmproj = status.external.as_ref().and_then(|e| e.mmproj_path.clone());
+        if matches!(cap, Capability::Vision) && mmproj.is_none() {
+            return VisionSetup::Unavailable("this local model has no image projector; use it for script chat".into());
+        }
+        let Some(helper) = locate_helper("ghostreel-llm") else {
+            return VisionSetup::Unavailable("local model helper ghostreel-llm not found".into());
+        };
+        let mut found = vec![status.installed_path.unwrap()];
+        if let Some(p) = &mmproj { found.push(p.clone()); }
+        return VisionSetup::Local {
+            helper, models_dir: models::effective_models_dir(paths, config), model: status.entry.spec(),
+            mmproj: mmproj.map(|p| models::ModelSpec { file_name: p.to_string_lossy().into_owned(), url: String::new() }),
+            found, runtime: cfg.into(),
+        };
+    }
     if models::uses_mlx() {
         let Some(entry) = models::find_entry(&cfg.local_model).filter(|e| e.bundle.is_some()) else {
             return VisionSetup::Unavailable(format!("unknown vision model '{}'", cfg.local_model));
@@ -354,7 +376,7 @@ async fn resolve_llm_with(
     let models_dir = models::effective_models_dir(paths, config);
     let roots = models::search_roots(&models_dir, &config.models.search_paths);
     let found = [&model, &mmproj].iter().filter_map(|s| models::find(&roots, &s.file_name)).collect();
-    VisionSetup::Local { helper, models_dir, model, mmproj, found, runtime: cfg.into() }
+    VisionSetup::Local { helper, models_dir, model, mmproj: Some(mmproj), found, runtime: cfg.into() }
 }
 
 pub async fn resolve_stt(paths: &Paths, config: &Config) -> SttSetup {
@@ -379,12 +401,9 @@ async fn resolve_stt_with(paths: &Paths, config: &Config, svc: Option<&GhostServ
         Target::Unavailable => return SttSetup::Unavailable(resolution.reason),
         Target::Local => {}
     }
-    let model = if cfg.model.trim().eq_ignore_ascii_case("auto") {
-        auto_whisper_model(&crate::doctor::nvidia_gpus().await).to_string()
-    } else {
-        cfg.model.clone()
-    };
     let models_dir = models::effective_models_dir(paths, config);
+    let roots = models::search_roots(&models_dir, &config.models.search_paths);
+    let model = crate::doctor::selected_whisper_model(&cfg.model, &crate::doctor::nvidia_gpus().await, &roots);
     local_stt(&models_dir, &config.models.search_paths, &model)
 }
 
@@ -519,7 +538,7 @@ mod tests {
         match setup {
             VisionSetup::Local { model, mmproj, .. } => {
                 assert_eq!(model.file_name, "Bonsai-27B-Q1_0.gguf");
-                assert_eq!(mmproj.file_name, "Bonsai-27B-mmproj-Q8_0.gguf");
+                assert_eq!(mmproj.unwrap().file_name, "Bonsai-27B-mmproj-Q8_0.gguf");
             }
             other => panic!("expected Local, got {other:?}"),
         }
@@ -530,10 +549,34 @@ mod tests {
         match setup {
             VisionSetup::Local { model, mmproj, .. } => {
                 assert_eq!(model.file_name, "gemma-3-4b-it-Q4_K_M.gguf");
-                assert_eq!(mmproj.file_name, "gemma-3-4b-it-mmproj-f16.gguf");
+                assert_eq!(mmproj.unwrap().file_name, "gemma-3-4b-it-mmproj-f16.gguf");
             }
             other => panic!("expected Local, got {other:?}"),
         }
+
+        let model_path = dir.path().join("Custom-Q4_K_M.gguf");
+        let projector_path = dir.path().join("mmproj.gguf");
+        std::fs::write(&model_path, b"model").unwrap();
+        std::fs::write(&projector_path, b"projector").unwrap();
+        cfg.vision.local_model = format!("external:{}", model_path.display());
+        for cap in [Capability::Vision, Capability::Chat] {
+            match resolve_llm_with(&paths, &cfg, &cfg.vision, None, cap).await {
+                VisionSetup::Local { model, mmproj, found, .. } => {
+                    assert_eq!(PathBuf::from(model.file_name), model_path);
+                    assert_eq!(PathBuf::from(mmproj.unwrap().file_name), projector_path);
+                    assert_eq!(found, vec![model_path.clone(), projector_path.clone()]);
+                }
+                other => panic!("expected external Local, got {other:?}"),
+            }
+        }
+        std::fs::remove_file(&projector_path).unwrap();
+        assert!(matches!(resolve_llm_with(&paths, &cfg, &cfg.vision, None, Capability::Vision).await,
+            VisionSetup::Unavailable(why) if why.contains("no image projector")));
+        assert!(matches!(resolve_llm_with(&paths, &cfg, &cfg.vision, None, Capability::Chat).await,
+            VisionSetup::Local { mmproj: None, .. }));
+        std::fs::remove_file(&model_path).unwrap();
+        assert!(matches!(resolve_llm_with(&paths, &cfg, &cfg.vision, None, Capability::Chat).await,
+            VisionSetup::Unavailable(why) if why.contains("missing")));
 
         // Clean up env var
         unsafe {

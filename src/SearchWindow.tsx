@@ -1,4 +1,5 @@
 import MediaImage from "./MediaImage";
+import { cleanSearchSnippet, matchedTerms } from "./searchSnippet";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   clock,
@@ -12,6 +13,7 @@ import {
   videoDetails,
   VideoRow,
 } from "./api";
+import { Clapperboard, ExternalLink, Folder, Play, Search, X } from "lucide-react";
 import { emitEvent } from "./events";
 import VideoPanel from "./VideoPanel";
 
@@ -31,6 +33,21 @@ function Snippet({ text }: { text: string }) {
 }
 
 type KindFilter = "all" | "moment" | "transcript" | "frame";
+
+function explainSearchMatch(h: Hit, query: string): string {
+  const matchedWords = matchedTerms(h.snippet);
+  const terms = matchedWords.join(", ");
+  const kinds = [...new Set(h.kinds)];
+  const sources = kinds.map((kind) => kind === "moment" ? "picture" : kind === "frame" ? "on-screen text" : kind === "transcript" ? "speech" : null).filter((source): source is Exclude<typeof source, null> => source !== null);
+  const visualConstraint = /\b(drone|aerial|overhead|wide shot|close[- ]?up|panoramic)\b/i.test(query);
+  const hasPicture = h.kinds.some((kind) => kind === "moment" || kind === "frame");
+  const evidence = terms ? ` ${terms}` : " this query";
+  const reason = sources.length === 1
+    ? `${sources[0][0].toUpperCase()}${sources[0].slice(1)} matches${evidence}`
+    : sources.length > 1 ? `Matched in ${sources.slice(0, -1).join(", ")} and ${sources[sources.length - 1]}` : "Footage matches this query";
+  const constraint = query.match(/\b(drone|aerial|overhead|wide shot|close[- ]?up|panoramic)\b/i)?.[0];
+  return visualConstraint && !hasPicture && constraint ? `${reason}; no picture match for '${constraint}'` : reason;
+}
 
 export default function SearchWindow() {
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
@@ -180,12 +197,12 @@ export default function SearchWindow() {
       <header className="search-window-header">
         <div className="header-title-row">
           <div className="title-with-badge">
-            <span className="search-icon">🔍</span>
+            <span className="search-icon"><Search size={18} strokeWidth={2} aria-hidden /></span>
             <h1>Search Material</h1>
-            <span className="global-badge">Global</span>
           </div>
+          <span className="global-badge">Global</span>
           <div className="search-shortcut-hint">
-            Press <kbd>/</kbd> to focus, <kbd>Esc</kbd> to clear
+            Press <kbd>/</kbd> to focus · <kbd>Esc</kbd> to clear
           </div>
         </div>
         <p className="search-subhead">
@@ -194,12 +211,12 @@ export default function SearchWindow() {
 
         <form className="search-window-form" onSubmit={onSearchSubmit}>
           <div className="search-input-wrapper">
-            <span className="input-search-icon">🔎</span>
+            <span className="input-search-icon"><Search size={16} strokeWidth={2} aria-hidden /></span>
             <input
               ref={inputRef}
               autoFocus
               type="text"
-              placeholder="Search across all projects: “unboxing the board”, “sunset over ocean”, on-screen text…"
+              placeholder="Search footage, e.g. “unboxing”"
               value={query}
               onChange={(e) => {
                 setQuery(e.target.value);
@@ -215,7 +232,7 @@ export default function SearchWindow() {
               <button
                 type="button"
                 className="clear-search-btn"
-                title="Clear"
+                title="Clear search (Esc)"
                 onClick={() => {
                   ++searchRequest.current;
                   setSearching(false);
@@ -224,11 +241,11 @@ export default function SearchWindow() {
                   inputRef.current?.focus();
                 }}
               >
-                ×
+                <X size={16} strokeWidth={2} aria-hidden />
               </button>
             )}
           </div>
-          <button type="submit" className="search-submit-btn" disabled={searching || !query.trim()}>
+          <button type="submit" className="search-submit-btn primary" disabled={searching || !query.trim()}>
             {searching ? "Searching…" : "Search"}
           </button>
         </form>
@@ -241,7 +258,7 @@ export default function SearchWindow() {
               value={selectedProjectId ?? ""}
               onChange={(e) => onProjectChange(e.target.value ? Number(e.target.value) : null)}
             >
-              <option value="">All Projects ({projects.length})</option>
+              <option value="">All projects ({projects.length})</option>
               {projects.map(({ project }) => (
                 <option key={project.id} value={project.id}>
                   {project.name}
@@ -297,11 +314,12 @@ export default function SearchWindow() {
                 <strong>Preview:</strong> {fileName(previewVideo.path)}
               </div>
               <button
+                type="button"
                 className="ghost small close-preview-btn"
                 onClick={() => { ++previewRequest.current; setLoadingPreviewId(null); setPreviewVideo(null); }}
                 title="Close preview (Esc)"
               >
-                ✕ Close Preview
+                <X size={14} strokeWidth={2} aria-hidden /> Close preview
               </button>
             </div>
             <VideoPanel
@@ -316,7 +334,7 @@ export default function SearchWindow() {
       <main className="search-window-results">
         {hits === null && !searching && (
           <div className="search-empty-state">
-            <div className="empty-icon">🎬</div>
+            <div className="empty-icon"><Clapperboard size={34} strokeWidth={1.75} aria-hidden /></div>
             <h3>Discover material across your library</h3>
             <p className="muted">
               GhostReel indexes scenes, spoken words, and text inside videos across every project.
@@ -370,12 +388,14 @@ export default function SearchWindow() {
                 {filteredHits.map((h, i) => {
                   const defaultProj = h.projects && h.projects.length > 0 ? h.projects[0] : null;
                   const isCurrentPreview = previewVideo?.id === h.video_id;
+                  const matchExplanation = explainSearchMatch(h, query);
 
                   return (
                     <div
                       key={i}
                       className={`card search-hit-card ${isCurrentPreview ? "active-preview" : ""}`}
                       onClick={() => handleOpenPreview(h)}
+                      title={isCurrentPreview ? "Currently previewing this moment" : "Click card to preview this moment here"}
                     >
                       <div className="hit-thumbnail-container">
                         {h.frame ? (
@@ -383,7 +403,15 @@ export default function SearchWindow() {
                         ) : (
                           <div className="noframe media-image-placeholder" role="img" aria-label="No thumbnail available">No thumbnail available</div>
                         )}
-                        <span className="thumbnail-play-overlay">▶</span>
+                        {isCurrentPreview ? (
+                          <span className="active-preview-badge">
+                            <Play size={12} strokeWidth={2.5} aria-hidden /> Previewing
+                          </span>
+                        ) : (
+                          <span className="thumbnail-play-overlay" title="Click to preview">
+                            <Play size={16} strokeWidth={2} aria-hidden />
+                          </span>
+                        )}
                         <span className="thumbnail-timecode">
                           {clock(h.start_s)}–{clock(h.end_s)}
                         </span>
@@ -402,42 +430,53 @@ export default function SearchWindow() {
                                 title={`Belongs to project: ${p.name}. Click to view in project.`}
                                 onClick={(e) => handleOpenInProject(p.id, h, e)}
                               >
-                                📁 {p.name}
+                                <Folder size={12} strokeWidth={2} aria-hidden /> {p.name}
                               </span>
                             ))}
                           </div>
                         </div>
 
                         <div className="hit-snippet">
-                          <Snippet text={h.snippet} />
+                          <Snippet text={cleanSearchSnippet(h.snippet)} />
                         </div>
+                        <div className="search-match-explanation" aria-label={`Why this result matched: ${matchExplanation}`}>{matchExplanation}</div>
 
                         <div className="hit-footer">
                           <div className="hit-tags">
-                            {h.kinds.map((k) => (
-                              <span key={k} className="tag kind-tag">
-                                {k === "moment" ? "picture" : k === "frame" ? "on screen" : "speech"}
-                              </span>
-                            ))}
-                            {h.matched_by.map((m) => (
-                              <span key={m} className="tag matched-by-tag">
-                                {m}
-                              </span>
-                            ))}
+                            {h.kinds.map((k) => {
+                              const label = k === "moment" ? "picture" : k === "frame" ? "on screen" : "speech";
+                              const tooltip =
+                                k === "moment"
+                                  ? "Visual scene description match"
+                                  : k === "frame"
+                                    ? "On-screen text (OCR) match"
+                                    : "Spoken transcript match";
+                              return (
+                                <span key={k} className="tag kind-tag" title={tooltip}>
+                                  {label}
+                                </span>
+                              );
+                            })}
                           </div>
 
                           <div className="hit-actions">
                             <button
                               type="button"
-                              className="ghost small hit-action-btn"
-                              title="Preview clip here"
+                              className={`small hit-action-btn ${isCurrentPreview ? "active-preview-btn" : ""}`}
+                              title={isCurrentPreview ? "Currently previewing this moment" : "Preview clip in the embedded player"}
                               disabled={loadingPreviewId === h.video_id}
                               onClick={(e) => {
                                 e.stopPropagation();
                                 handleOpenPreview(h);
                               }}
                             >
-                              {loadingPreviewId === h.video_id ? "Loading…" : "▶ Preview"}
+                              {loadingPreviewId === h.video_id ? (
+                                "Loading…"
+                              ) : isCurrentPreview ? (
+                                <><Play size={14} strokeWidth={2} aria-hidden /> Previewing</>
+                              ) : (
+                                <><Play size={14} strokeWidth={2} aria-hidden /> Preview</>
+                              )}
                             </button>
                             <button
                               type="button"
@@ -445,16 +484,16 @@ export default function SearchWindow() {
                               title="Open in external video player"
                               onClick={(e) => handleOpenExternal(h, e)}
                             >
-                              ↗ Open External
+                              <ExternalLink size={14} strokeWidth={2} aria-hidden /> Open externally
                             </button>
                             {defaultProj && (
                               <button
                                 type="button"
-                                className="ghost small hit-action-btn primary-action"
-                                title={`Open this clip in project "${defaultProj.name}"`}
+                                className="ghost small hit-action-btn"
+                                title={`Open project "${defaultProj.name}" at this moment`}
                                 onClick={(e) => handleOpenInProject(defaultProj.id, h, e)}
                               >
-                                Go to Project
+                                Open in project
                               </button>
                             )}
                           </div>

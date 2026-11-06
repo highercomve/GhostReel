@@ -24,3 +24,7 @@ __pycache__/
 
 # Website build output (zine release --output site-public)
 site-public/
+
+# Local review and automation artifacts
+.playwright-mcp/
+.agents/design-council/

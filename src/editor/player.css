@@ -1,0 +1,189 @@
+/* Live viewer. The stage is always dark (like a monitor), so its overlays use fixed light text;
+   everything outside the stage uses the theme variables. */
+
+.lp { display: flex; flex-direction: column; flex: 1; min-height: 0; outline: none; }
+.lp:focus-visible .lp-stage { box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--accent) 70%, transparent); }
+
+.lp-stage { overflow: hidden; outline: none; cursor: pointer; container-type: size; }
+.lp-stage.is-fullscreen { background: #000; }
+
+/* A/B pair stacked: the hidden one keeps decoding the next clip so the swap shows a frame at once. */
+.lp-stage .lp-video {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  opacity: 0;
+  pointer-events: none;
+}
+.lp-stage .lp-video[data-on="1"] { opacity: 1; }
+
+.lp-overlay-center {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 20px;
+  text-align: center;
+  color: #d6d6e2;
+  z-index: 3;
+}
+.lp-preparing { background: rgba(10, 10, 14, 0.72); cursor: default; }
+.lp-preparing progress { width: min(260px, 70%); }
+.lp-hint { font-size: 12px; color: #9a9aac; max-width: 420px; }
+
+.lp-chip {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  max-width: calc(100% - 16px);
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.55);
+  color: #e8e8f0;
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  opacity: 0.75;
+  transition: opacity 0.15s;
+}
+.lp-stage:hover .lp-chip { opacity: 1; }
+.lp-chip-beat { font-weight: 600; color: #fff; }
+.lp-chip-bed {
+  padding: 0 5px;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--accent-2) 55%, transparent);
+  color: #fff;
+}
+
+/* Lower third, sized off the stage so it reads the same in fullscreen. */
+.lp-title {
+  position: absolute;
+  left: 5%;
+  bottom: 18%;
+  z-index: 2;
+  max-width: 70%;
+  padding: 0.35em 0.8em;
+  border-left: 4px solid var(--accent);
+  background: rgba(0, 0, 0, 0.62);
+  color: #fff;
+  font-size: clamp(13px, 3.2cqh, 34px);
+  font-weight: 600;
+  line-height: 1.25;
+  pointer-events: none;
+}
+.lp-subtitle {
+  position: absolute;
+  left: 50%;
+  bottom: 5%;
+  z-index: 2;
+  transform: translateX(-50%);
+  max-width: 86%;
+  padding: 0.2em 0.6em;
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.7);
+  color: #fff;
+  font-size: clamp(12px, 2.6cqh, 28px);
+  line-height: 1.3;
+  text-align: center;
+  pointer-events: none;
+}
+/* One row at every width: secondary controls fold into the ⋯ menu instead of wrapping. */
+.lp-transport { flex-wrap: nowrap; container-type: inline-size; min-width: 0; }
+.lp-transport .nle-transport-buttons,
+.lp-transport .nle-transport-render { flex-wrap: nowrap; min-width: 0; }
+.lp-transport .nle-tbtn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 30px;
+  height: 28px;
+  padding: 0 6px;
+  font-size: 13px;
+  font-weight: 600;
+}
+.lp-transport .nle-tbtn.play { width: 36px; }
+.lp-timecode {
+  min-width: 0;
+  margin-left: 8px;
+  padding: 2px 6px;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  background: none;
+  color: var(--text);
+  font-weight: 500;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.lp-timecode:hover { border-color: var(--border); background: none; }
+.lp-secondary { display: flex; align-items: center; gap: 4px; }
+.lp-more { display: none; }
+.lp-more > summary.nle-tbtn { display: inline-flex; padding: 0 6px; border: 1px solid transparent; }
+.lp-more[open] > summary.nle-tbtn { border-color: var(--border); }
+.lp-more .nle-menu-list { min-width: 230px; }
+.lp-more .nle-menu-list button { display: flex; align-items: center; gap: 8px; }
+.lp-more-state { margin-left: auto; font-size: 11.5px; color: var(--muted); }
+.lp-more button[aria-checked="true"] .lp-more-state { color: var(--accent); font-weight: 600; }
+.lp-more-rates { display: flex; gap: 2px; padding: 2px 4px 4px; }
+.lp-more-rates button { flex: 1; justify-content: center; padding: 4px 0 !important; font-size: 12px !important; text-align: center !important; }
+.lp-more-rates button.on { background: color-mix(in srgb, var(--accent) 18%, transparent) !important; color: var(--text); font-weight: 700; }
+.lp-more-note { padding: 4px 8px 2px; }
+@container (max-width: 600px) {
+  .lp-secondary { display: none; }
+  .lp-more { display: block; }
+}
+@container (max-width: 430px) {
+  .lp-minor, .lp-total { display: none !important; }
+}
+.lp-rate {
+  padding: 2px 4px;
+  font-size: 12px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--panel);
+  color: var(--text);
+}
+.lp-toggle { font-size: 12px; color: var(--muted); }
+.lp-toggle.on {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 50%, transparent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+
+/* Live | Rendered switch in the viewer header. */
+.lp-mode { display: inline-flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+.lp-mode button {
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  padding: 2px 10px;
+  font-size: 12px;
+  color: var(--muted);
+  cursor: pointer;
+}
+.lp-mode button + button { border-left: 1px solid var(--border); }
+.lp-mode button:hover:not(.active) { background: color-mix(in srgb, var(--accent) 10%, transparent); color: var(--text); }
+.lp-mode button.active { background: var(--accent); color: #fff; font-weight: 600; }
+
+/* Agent 1 — preview-only safe margins and full mode labels. */
+.lp-mode { flex-shrink: 0; }
+.lp-mode button { white-space: nowrap; overflow: visible; flex-shrink: 0; }
+.lp-safe-guides { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); width: min(100cqw, calc(100cqh * var(--lp-aspect))); height: min(100cqh, calc(100cqw / var(--lp-aspect))); pointer-events: none; z-index: 2; color: var(--text); }
+.lp-action-safe, .lp-title-safe { position: absolute; border: 1px solid var(--text); opacity: 0.65; }
+.lp-action-safe { inset: 3.5%; }
+.lp-title-safe { inset: 5%; border-style: dashed; }
+.lp-safe-guides span { position: absolute; font-size: 10px; line-height: 14px; padding: 0 4px; background: var(--bg); }
+.lp-action-safe span { top: 0; left: 0; }
+.lp-title-safe span { bottom: 0; right: 0; }
+.lp-chip { opacity: 1; background: var(--bg); color: var(--text); }
+.lp-chip-beat { color: var(--text); flex-shrink: 0; }
+.lp-chip > span:not(.lp-chip-beat) { overflow: hidden; text-overflow: ellipsis; }

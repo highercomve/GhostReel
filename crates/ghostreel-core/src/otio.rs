@@ -472,9 +472,15 @@ pub fn resolve_media_for_script(
 ) -> Result<HashMap<i64, ResolvedMedia>, Error> {
     let mut resolved_map = HashMap::new();
 
-    for beat in &script.beats {
-        for clip in &beat.clips {
-            if resolved_map.contains_key(&clip.video_id) {
+    // Pictures and beds alike: a J-cut's voice usually comes from an interview that never
+    // appears on screen, and an unresolved bed used to be dropped without a word.
+    let video_ids = script
+        .beats
+        .iter()
+        .flat_map(|b| b.clips.iter().map(|c| c.video_id).chain(b.bed.iter().map(|bed| bed.video_id)));
+    for video_id in video_ids {
+        {
+            if resolved_map.contains_key(&video_id) {
                 continue;
             }
 
@@ -489,7 +495,7 @@ pub fn resolve_media_for_script(
                    AND NOT EXISTS (SELECT 1 FROM project_exclusions x WHERE x.project_id = pf.project_id AND x.video_id = vf.video_id)",
             )?;
 
-            let rows = st.query_map(params![project_id, clip.video_id], |r| {
+            let rows = st.query_map(params![project_id, video_id], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, Option<f64>>(1)?,
@@ -505,7 +511,7 @@ pub fn resolve_media_for_script(
             }
 
             if candidates.is_empty() {
-                return Err(Error::NotFound(format!("a file for video #{} in this project's folders", clip.video_id)));
+                return Err(Error::NotFound(format!("a file for video #{} in this project's folders", video_id)));
             }
 
             // Prefer a path that exists on disk
@@ -521,15 +527,15 @@ pub fn resolve_media_for_script(
             let content_hash = chosen.4.clone();
 
             resolved_map.insert(
-                clip.video_id,
+                video_id,
                 ResolvedMedia {
-                    video_id: clip.video_id,
+                    video_id: video_id,
                     path,
                     duration_s,
                     has_audio,
                     fps,
                     content_hash,
-                    audio_track: db.audio_track(clip.video_id).unwrap_or(0),
+                    audio_track: db.audio_track(video_id).unwrap_or(0),
                 },
             );
         }
@@ -606,5 +612,51 @@ mod tests {
         let expected: serde_json::Value = serde_json::from_str(expected_str).unwrap();
 
         assert_eq!(timeline, expected);
+    }
+}
+
+#[cfg(test)]
+mod bed_media_tests {
+    use super::*;
+    use crate::projects::NewProject;
+    use rusqlite::params;
+
+    /// A J-cut's voice often comes from an interview that is never on screen: its file must be
+    /// resolved too, or the render drops the bed and the beat plays silent.
+    #[test]
+    fn resolves_bed_sources_that_are_not_pictures() {
+        let mut db = Db::open_in_memory().unwrap();
+        let project = db.create_project(&NewProject::named("beds")).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let folder = db.add_folder(project.id, dir.path(), true).unwrap();
+        for (id, name) in [(1, "broll.mp4"), (2, "interview.mp4")] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, b"x").unwrap();
+            db.conn
+                .execute(
+                    "INSERT INTO videos(id, content_hash, size, duration_s, fps, vfr) VALUES (?1, ?2, 1, 60.0, 30.0, 0)",
+                    params![id, format!("h{id}")],
+                )
+                .unwrap();
+            db.conn
+                .execute(
+                    "INSERT INTO video_files(video_id, folder_id, path, size, mtime, last_seen) VALUES (?1, ?2, ?3, 1, 0, 0)",
+                    params![id, folder.id, path.to_str().unwrap()],
+                )
+                .unwrap();
+        }
+        let script: Script = serde_json::from_value(serde_json::json!({
+            "title": "t",
+            "beats": [{
+                "id": "b1",
+                "purpose": "montage",
+                "clips": [{ "video_id": 1, "in_s": 0.0, "out_s": 4.0, "audio": "mute" }],
+                "bed": { "video_id": 2, "in_s": 10.0, "out_s": 14.0 }
+            }]
+        }))
+        .unwrap();
+        let media = resolve_media_for_script(&db, project.id, &script, Fps::new(30, 1)).unwrap();
+        assert!(media.contains_key(&1), "picture source resolved");
+        assert!(media.contains_key(&2), "bed source resolved");
     }
 }

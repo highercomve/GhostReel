@@ -577,8 +577,15 @@ mod tests {
                 purpose: "Show what she is talking about".into(),
                 narration: None,
                 on_screen_text: None,
-                clips: vec![ScriptClip { video_id: 2, in_s: 0.0, out_s: 4.0, audio: Audio::Mute, why: None }],
-                bed: Some(AudioBed { video_id: 1, in_s: 0.0, out_s: 4.0, why: None, inferred: true }),
+                clips: vec![ScriptClip {
+                    video_id: 2,
+                    in_s: 0.0,
+                    out_s: 4.0,
+                    audio: Audio::Mute,
+                    why: None,
+                    tracks: None,
+                }],
+                bed: Some(AudioBed { video_id: 1, in_s: 0.0, out_s: 4.0, why: None, inferred: true, tracks: None }),
                 notes: None,
             }],
         }
@@ -828,7 +835,8 @@ mod tests {
             .unwrap();
 
         let mut script = bedded_script();
-        script.beats[0].clips[0] = ScriptClip { video_id: 1, in_s: 20.0, out_s: 30.0, audio: Audio::Mute, why: None };
+        script.beats[0].clips[0] =
+            ScriptClip { video_id: 1, in_s: 20.0, out_s: 30.0, audio: Audio::Mute, why: None, tracks: None };
         let s = state(&db, &script, None, &JevConfig::default());
 
         let seen = s["beats"][0]["seen"].as_array().unwrap();

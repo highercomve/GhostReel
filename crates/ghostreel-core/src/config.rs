@@ -739,7 +739,7 @@ impl Config {
                 "flash_attn" => llm.flash_attn = value.to_string(),
                 "cpu_moe_layers" => llm.cpu_moe_layers = num(key, value)?,
                 "think" => llm.think = flag(value),
-                "max_tool_rounds" => llm.max_tool_rounds = num(key, value)?,
+                "max_tool_rounds" => llm.max_tool_rounds = num::<u32>(key, value)?.min(100),
                 "describe_concurrency" => llm.describe_concurrency = num(key, value)?,
                 other => return Err(format!("unknown config key '{section}.{other}'")),
             }
@@ -867,8 +867,10 @@ impl Config {
                 let mut config: Self =
                     toml::from_str(&text).map_err(|e| Error::Config(format!("{}: {e}", path.display())))?;
                 config.vision.local_model = crate::models::platform_vision_model(&config.vision.local_model).into();
+                config.vision.max_tool_rounds = config.vision.max_tool_rounds.min(100);
                 if let Some(chat) = &mut config.chat_model {
                     chat.local_model = crate::models::platform_vision_model(&chat.local_model).into();
+                    chat.max_tool_rounds = chat.max_tool_rounds.min(100);
                 }
                 Ok(config)
             }
@@ -893,6 +895,21 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loading_clamps_research_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[chat_model]\nmax_tool_rounds = 250\n").unwrap();
+        assert_eq!(Config::load(&path).unwrap().chat_model().max_tool_rounds, 100);
+    }
+
+    #[test]
+    fn setting_clamps_research_limit() {
+        let mut cfg = Config::default();
+        cfg.set_key("chat_model.max_tool_rounds", "250").unwrap();
+        assert_eq!(cfg.chat_model().max_tool_rounds, 100);
+    }
 
     #[test]
     fn describe_and_chat_have_their_own_model_settings() {

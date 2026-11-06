@@ -1,0 +1,51 @@
+/* ---- Inspector: the clip's audio tracks ---- */
+.at-section { display: flex; flex-direction: column; gap: 3px; }
+.at-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) 58px 22px;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 4px;
+  border-radius: 4px;
+  font-size: 11px;
+  color: var(--muted);
+}
+.at-row.on { background: color-mix(in srgb, var(--good) 12%, transparent); color: var(--text); }
+.at-check { display: flex; align-items: center; gap: 4px; cursor: pointer; }
+.at-check input { margin: 0; }
+.at-name { font-weight: 600; color: var(--text); }
+.at-desc { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.at-auto { color: var(--accent); }
+.at-level {
+  position: relative;
+  padding-bottom: 3px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  font-size: 10.5px;
+}
+.at-level.silent { color: var(--warn-text); }
+.at-bar {
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  height: 2px;
+  border-radius: 1px;
+  background: var(--good);
+}
+.at-play {
+  width: 22px;
+  height: 20px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--panel);
+  color: var(--text);
+  font-size: 9px;
+  line-height: 1;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.at-play:hover { border-color: var(--accent); }
+.at-foot { display: flex; align-items: center; justify-content: space-between; gap: 6px; margin-top: 2px; }

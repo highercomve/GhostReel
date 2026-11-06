@@ -438,6 +438,7 @@ async fn main() -> ExitCode {
 
 async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     let paths = Paths::resolve()?;
+    ghostreel_core::llmlog::init(&paths.data_dir);
     match cli.command {
         Command::Doctor { json } => {
             let report = doctor::run(&paths).await;
@@ -881,11 +882,12 @@ fn storage_cmd(paths: &Paths, action: Option<StorageAction>, json: bool) -> anyh
             }
             let line = |u: &Usage| {
                 format!(
-                    "proxies {}, keyframes {}, previews {}, chat images {}, exports {}",
+                    "proxies {}, keyframes {}, previews {}, chat images {}, chat logs {}, exports {}",
                     size(u.proxies),
                     size(u.keyframes),
                     size(u.previews),
                     size(u.chat_images),
+                    size(u.chat_logs),
                     size(u.exports)
                 )
             };
@@ -982,15 +984,21 @@ async fn script_cmd(paths: &Paths, action: ScriptAction) -> anyhow::Result<ExitC
             // stopped, and then on a whole sentence.
             let turns = ghostreel_core::chat::end_on_turns(&db, &mut script, &script_cfg);
             if turns > 0 {
-                println!("  [info] ended {turns} range(s) where the speaker stopped, before the reply over the top");
+                println!("  [info] ended {} where the speaker stopped, before the reply over the top",
+                    if turns == 1 { "one quote".to_string() } else { format!("{turns} quotes") });
             }
             let mended = ghostreel_core::chat::end_on_sentences(&db, &mut script, &script_cfg);
             if mended > 0 {
-                println!("  [info] put {mended} range(s) back on whole sentences");
+                println!("  [info] {}", if mended == 1 {
+                    "restored one trimmed quote to its full sentence".to_string()
+                } else {
+                    format!("restored {mended} trimmed quotes to their full sentences")
+                });
             }
             let shortened = ghostreel_core::chat::trim_pictures_to_bed(&mut script, &script_cfg);
             if shortened > 0 {
-                println!("  [info] cut the pictures back to the voice in {shortened} beat(s)");
+                println!("  [info] cut the pictures back to the voice in {}",
+                    if shortened == 1 { "one beat".to_string() } else { format!("{shortened} beats") });
             }
             let held = ghostreel_core::chat::hold_the_last_picture(&db, p.id, &mut script, &script_cfg);
             if held > 0.0 {
@@ -1366,7 +1374,8 @@ async fn script_cmd(paths: &Paths, action: ScriptAction) -> anyhow::Result<ExitC
                 }
             };
 
-            let res = ghostreel_core::chat::run_turn(&mut ctx, p.id, session, &message, &images, &mut on_event).await?;
+            let res =
+                ghostreel_core::chat::run_turn(&mut ctx, p.id, session, &message, &images, None, &mut on_event).await?;
 
             println!("\n{}\n", res.reply);
             println!("Session: #{}", res.session_id);

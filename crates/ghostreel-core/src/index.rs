@@ -1343,8 +1343,8 @@ async fn start_describer(
         }
         VisionSetup::Local { helper, models_dir, model, mmproj, found, runtime } => {
             let mut paths = Vec::new();
-            for spec in [model, mmproj] {
-                if let Some(p) = found.iter().find(|p| p.file_name().is_some_and(|n| n == spec.file_name.as_str())) {
+            for spec in std::iter::once(model).chain(mmproj.iter()) {
+                if let Some(p) = found.iter().find(|p| p == &std::path::Path::new(&spec.file_name) || p.file_name().is_some_and(|n| n == spec.file_name.as_str())) {
                     paths.push(p.clone());
                     continue;
                 }
@@ -1367,7 +1367,7 @@ async fn start_describer(
             }
             let models = LocalModels {
                 helper: helper.clone(),
-                vision: Some((paths[0].clone(), paths[1].clone())),
+                vision: Some((paths[0].clone(), paths.get(1).cloned())),
                 embed: None,
                 cpu: false,
                 runtime: runtime.clone(),
@@ -2598,7 +2598,7 @@ done
                 helper,
                 models_dir: tmp.path().join("models"),
                 model,
-                mmproj,
+                mmproj: Some(mmproj),
                 found: vec![fake_model, fake_mmproj],
                 runtime: Default::default(),
             },

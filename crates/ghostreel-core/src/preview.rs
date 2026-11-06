@@ -28,6 +28,9 @@ pub struct PlannedSegment {
     /// camera mic, lavs, tracks left silent — and the first is a guess.
     #[serde(default)]
     pub audio_track: u32,
+    /// Tracks the script chose for this audio (see `ScriptClip::tracks`); None = `audio_track`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tracks: Option<Vec<u32>>,
 }
 
 /// The sound running under a beat: where it sits on the preview timeline and where it comes from.
@@ -42,6 +45,9 @@ pub struct BedSpan {
     /// Where the beat starts on the preview timeline.
     pub timeline_start_s: f64,
     pub audio_track: u32,
+    /// Tracks the script chose for this audio (see `ScriptClip::tracks`); None = `audio_track`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tracks: Option<Vec<u32>>,
 }
 
 /// A beat's span on the preview timeline for on-screen titles and narration captions.
@@ -141,14 +147,15 @@ pub fn proxy_dimensions(w: u32, h: u32) -> (u32, u32) {
 /// Content hashes look like `b3e:<hex>`; characters that aren't valid in file names everywhere
 /// (`:` on Windows) are replaced with `-`.
 pub fn proxy_file_name(content_hash: &str, in_s: f64, out_s: f64, fps: Fps, w: u32, h: u32) -> String {
-    proxy_file_name_with_audio(content_hash, in_s, out_s, fps, w, h, false, 0.0)
+    proxy_file_name_with_audio(content_hash, in_s, out_s, fps, w, h, false, 0.0, None)
 }
 
 /// [`proxy_file_name`], distinguished also by how the audio was treated.
 ///
 /// A proxy holds encoded audio, so two clips that differ only in levelling or fade are different
 /// files. Without this a rendered clip kept whatever audio it was first built with, and changing
-/// the setting appeared to do nothing.
+/// the setting appeared to do nothing. A clip's own track selection (`tracks`) is part of the
+/// name too; `None` (the automatic track) leaves the name as it always was.
 #[allow(clippy::too_many_arguments)]
 pub fn proxy_file_name_with_audio(
     content_hash: &str,
@@ -159,13 +166,61 @@ pub fn proxy_file_name_with_audio(
     h: u32,
     normalized: bool,
     fade_s: f64,
+    tracks: Option<&[u32]>,
 ) -> String {
     let hash: String =
         content_hash.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' }).collect();
     let in_ms = (in_s * 1000.0).round() as i64;
     let out_ms = (out_s * 1000.0).round() as i64;
-    let audio = format!("{}{}", if normalized { "n" } else { "r" }, (fade_s * 1000.0).round() as i64);
+    let mut audio = format!("{}{}", if normalized { "n" } else { "r" }, (fade_s * 1000.0).round() as i64);
+    if let Some(tracks) = tracks {
+        let mut sorted = tracks.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        audio.push_str("_t");
+        audio.push_str(&sorted.iter().map(u32::to_string).collect::<Vec<_>>().join("-"));
+    }
     format!("{hash}_{in_ms}_{out_ms}_{}_{}_{w}x{h}_{audio}.mp4", fps.num, fps.den)
+}
+
+/// The source tracks a clip or bed plays: its own choice, without repeats or tracks the file does
+/// not have (when the count is known), else the automatic track. Empty = silent.
+pub fn effective_tracks(tracks: Option<&[u32]>, auto_track: u32, stream_count: Option<u32>) -> Vec<u32> {
+    let Some(tracks) = tracks else { return vec![auto_track] };
+    let mut out: Vec<u32> = Vec::with_capacity(tracks.len());
+    for &t in tracks {
+        if stream_count.is_none_or(|n| t < n) && !out.contains(&t) {
+            out.push(t);
+        }
+    }
+    out
+}
+
+/// ffmpeg arguments that take the audio of input 0 from `tracks` and run it through `af`. One
+/// track is a plain map; several are summed first (`normalize=0`: each keeps its own level, as
+/// they would on a mixer). `tracks` must not be empty.
+pub fn audio_map_args(tracks: &[u32], af: &str) -> Vec<String> {
+    match tracks {
+        [one] => vec!["-map".into(), format!("0:a:{one}"), "-af".into(), af.into()],
+        many => {
+            let inputs: String = many.iter().map(|t| format!("[0:a:{t}]")).collect();
+            let graph = format!("{inputs}amix=inputs={}:normalize=0:dropout_transition=0,{af}[mixa]", many.len());
+            vec!["-filter_complex".into(), graph, "-map".into(), "[mixa]".into()]
+        }
+    }
+}
+
+/// How many audio streams a file has, from its header. `None` when ffprobe is missing or fails;
+/// callers then trust the indexes they were given.
+fn audio_stream_count(ffprobe: Option<&Path>, path: &Path) -> Option<u32> {
+    let out = crate::proc::std_command(ffprobe?)
+        .args(["-v", "error", "-select_streams", "a", "-show_entries", "stream=index", "-of", "csv=p=0"])
+        .arg(path)
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).lines().filter(|l| !l.trim().is_empty()).count() as u32)
 }
 
 /// Snap clip duration to whole frames at the project sequence fps:
@@ -201,6 +256,7 @@ pub fn plan_segments(script: &Script, media: &HashMap<i64, ResolvedMedia>) -> Re
                 mute: clip.audio == Audio::Mute || beat.bed.is_some(),
                 has_audio: res.has_audio,
                 audio_track: res.audio_track,
+                tracks: clip.tracks.clone(),
             });
 
             timeline_start_s += dur;
@@ -255,6 +311,7 @@ pub fn plan_bed_spans(
             out_s: bed.out_s,
             timeline_start_s: first.timeline_start_s,
             audio_track: res.audio_track,
+            tracks: bed.tracks.clone(),
         });
     }
     beds
@@ -419,7 +476,22 @@ pub fn render_preview(
     }
 
     let beat_spans = plan_beat_spans(&stored.script, &segments);
-    let bed_spans = plan_bed_spans(&stored.script, &segments, &media);
+    // Only explicit track choices need the stream count, so files are probed lazily, once each.
+    let ffprobe = crate::doctor::locate("ffprobe");
+    let mut stream_counts: HashMap<i64, Option<u32>> = HashMap::new();
+    let mut stream_count = |video_id: i64, path: &Path| {
+        *stream_counts.entry(video_id).or_insert_with(|| audio_stream_count(ffprobe.as_deref(), path))
+    };
+    // A bed whose chosen tracks are all silent (or missing) lays nothing: its pictures are muted
+    // already, so the beat simply plays silent.
+    let bed_spans: Vec<(BedSpan, Vec<u32>)> = plan_bed_spans(&stored.script, &segments, &media)
+        .into_iter()
+        .filter_map(|bed| {
+            let count = if bed.tracks.is_some() { stream_count(bed.video_id, &bed.path) } else { None };
+            let chosen = effective_tracks(bed.tracks.as_deref(), bed.audio_track, count);
+            (!chosen.is_empty()).then_some((bed, chosen))
+        })
+        .collect();
     let encoder = pick_encoder(ffmpeg);
 
     let proxies_dir = data_dir.join("proxies");
@@ -463,6 +535,9 @@ pub fn render_preview(
             proxy_h,
             opts.normalize_audio,
             opts.audio_fade_s,
+            // A silent segment is cached as "no tracks": sharing a name with the same range's
+            // sounding version replayed whichever one was built first after a mute toggle.
+            if seg.mute { Some(&[]) } else { seg.tracks.as_deref() },
         );
         let p_path = proxies_dir.join(p_name);
 
@@ -523,8 +598,15 @@ pub fn render_preview(
             } else {
                 format!("{fades}apad")
             };
-            if !seg.mute && seg.has_audio {
-                cmd.args(["-map", "0:v:0", "-map", &format!("0:a:{}", seg.audio_track), "-af", &af]);
+            let chosen = if seg.mute || !seg.has_audio {
+                Vec::new()
+            } else {
+                let count = if seg.tracks.is_some() { stream_count(seg.video_id, &seg.path) } else { None };
+                effective_tracks(seg.tracks.as_deref(), seg.audio_track, count)
+            };
+            if !chosen.is_empty() {
+                cmd.args(["-map", "0:v:0"]);
+                cmd.args(audio_map_args(&chosen, &af));
             } else {
                 let null_audio = "anullsrc=r=48000:cl=stereo";
                 cmd.args(["-f", "lavfi", "-t", &dur_str, "-i", null_audio]);
@@ -621,7 +703,7 @@ pub fn render_preview(
     if bed_pass_needed {
         on_progress(0.87, "Laying audio beds…");
         let mut bed_files = Vec::new();
-        for (i, bed) in bed_spans.iter().enumerate() {
+        for (i, (bed, chosen)) in bed_spans.iter().enumerate() {
             let dur = (bed.out_s - bed.in_s).max(0.01);
             let wav = previews_dir.join(format!("bed_{}_{i}_{}.wav", stored.id, std::process::id()));
             let fade = opts.audio_fade_s.max(0.0).min(dur / 3.0);
@@ -656,7 +738,7 @@ pub fn render_preview(
             let out = crate::proc::std_command(ffmpeg)
                 .args(["-y", "-ss", &format!("{:.3}", bed.in_s), "-t", &format!("{dur:.3}"), "-i"])
                 .arg(&bed.path)
-                .args(["-map", &format!("0:a:{}", bed.audio_track), "-af", &af])
+                .args(audio_map_args(chosen, &af))
                 .args(["-ac", "2", "-ar", "48000", "-t", &format!("{dur:.3}"), "-c:a", "pcm_s16le"])
                 .arg(&wav)
                 .output()
@@ -1067,8 +1149,22 @@ mod tests {
                     narration: Some("Voice 1".into()),
                     on_screen_text: Some("Title 1".into()),
                     clips: vec![
-                        script::ScriptClip { video_id: 1, in_s: 0.0, out_s: 1.0, audio: Audio::Source, why: None },
-                        script::ScriptClip { video_id: 2, in_s: 2.0, out_s: 3.51, audio: Audio::Mute, why: None },
+                        script::ScriptClip {
+                            video_id: 1,
+                            in_s: 0.0,
+                            out_s: 1.0,
+                            audio: Audio::Source,
+                            why: None,
+                            tracks: None,
+                        },
+                        script::ScriptClip {
+                            video_id: 2,
+                            in_s: 2.0,
+                            out_s: 3.51,
+                            audio: Audio::Mute,
+                            why: None,
+                            tracks: None,
+                        },
                     ],
                     notes: None,
                     bed: None,
@@ -1084,6 +1180,7 @@ mod tests {
                         out_s: 7.0,
                         audio: Audio::Source,
                         why: None,
+                        tracks: None,
                     }],
                     notes: None,
                     bed: None,
@@ -1175,11 +1272,76 @@ mod tests {
     /// carries encoded audio, and reusing one silently kept the old levelling and fade.
     #[test]
     fn audio_treatment_gives_a_proxy_its_own_name() {
-        let plain = proxy_file_name_with_audio("h", 0.0, 1.0, Fps::new(25, 1), 960, 540, false, 0.0);
-        let faded = proxy_file_name_with_audio("h", 0.0, 1.0, Fps::new(25, 1), 960, 540, false, 0.12);
-        let levelled = proxy_file_name_with_audio("h", 0.0, 1.0, Fps::new(25, 1), 960, 540, true, 0.12);
+        let plain = proxy_file_name_with_audio("h", 0.0, 1.0, Fps::new(25, 1), 960, 540, false, 0.0, None);
+        let faded = proxy_file_name_with_audio("h", 0.0, 1.0, Fps::new(25, 1), 960, 540, false, 0.12, None);
+        let levelled = proxy_file_name_with_audio("h", 0.0, 1.0, Fps::new(25, 1), 960, 540, true, 0.12, None);
         assert_ne!(plain, faded);
         assert_ne!(faded, levelled);
+    }
+
+    /// A clip's track choice changes its sound, so it changes the proxy; the automatic track
+    /// keeps the old name, and order or repeats in the choice don't matter.
+    #[test]
+    fn track_selection_gives_a_proxy_its_own_name() {
+        let name =
+            |t: Option<&[u32]>| proxy_file_name_with_audio("h", 0.0, 1.0, Fps::new(25, 1), 960, 540, false, 0.0, t);
+        assert_eq!(name(None), "h_0_1000_25_1_960x540_r0.mp4");
+        assert_eq!(name(Some(&[0, 1])), "h_0_1000_25_1_960x540_r0_t0-1.mp4");
+        assert_eq!(name(Some(&[1, 0, 1])), name(Some(&[0, 1])));
+        assert_ne!(name(Some(&[0])), name(None));
+        assert_ne!(name(Some(&[])), name(Some(&[0])));
+    }
+
+    #[test]
+    fn effective_tracks_drop_repeats_and_missing_streams() {
+        assert_eq!(effective_tracks(None, 2, Some(4)), vec![2]);
+        assert_eq!(effective_tracks(Some(&[1, 0, 1]), 2, Some(4)), vec![1, 0]);
+        assert_eq!(effective_tracks(Some(&[0, 5]), 0, Some(4)), vec![0]);
+        assert_eq!(effective_tracks(Some(&[5]), 0, Some(4)), Vec::<u32>::new());
+        assert_eq!(effective_tracks(Some(&[5]), 0, None), vec![5]);
+        assert!(effective_tracks(Some(&[]), 0, Some(4)).is_empty());
+    }
+
+    #[test]
+    fn several_tracks_are_mixed_before_the_audio_chain() {
+        assert_eq!(audio_map_args(&[1], "apad"), ["-map", "0:a:1", "-af", "apad"]);
+        assert_eq!(
+            audio_map_args(&[0, 1], "afade=t=in:st=0:d=0.100,apad"),
+            [
+                "-filter_complex",
+                "[0:a:0][0:a:1]amix=inputs=2:normalize=0:dropout_transition=0,afade=t=in:st=0:d=0.100,apad[mixa]",
+                "-map",
+                "[mixa]"
+            ]
+        );
+    }
+
+    #[test]
+    fn planned_segments_and_beds_carry_the_track_choice() {
+        let script: Script = serde_json::from_value(serde_json::json!({
+            "title": "t", "beats": [{
+                "id": "b1", "purpose": "p",
+                "clips": [{"video_id": 1, "in_s": 0.0, "out_s": 2.0, "tracks": [0, 1]}],
+                "bed": {"video_id": 1, "in_s": 5.0, "out_s": 7.0, "tracks": []}
+            }]
+        }))
+        .unwrap();
+        let media = HashMap::from([(
+            1,
+            ResolvedMedia {
+                video_id: 1,
+                path: PathBuf::from("/x.mxf"),
+                duration_s: 60.0,
+                has_audio: true,
+                fps: Fps::new(25, 1),
+                content_hash: "h".into(),
+                audio_track: 1,
+            },
+        )]);
+        let segs = plan_segments(&script, &media).unwrap();
+        assert_eq!(segs[0].tracks, Some(vec![0, 1]));
+        let beds = plan_bed_spans(&script, &segs, &media);
+        assert_eq!(beds[0].tracks, Some(vec![]));
     }
 
     #[test]
@@ -1360,6 +1522,7 @@ mod tests {
                         out_s: 2.5,
                         audio: Audio::Source,
                         why: None,
+                        tracks: None,
                     }],
                     notes: None,
                     bed: None,
@@ -1375,6 +1538,7 @@ mod tests {
                         out_s: 1.5,
                         audio: Audio::Source,
                         why: None,
+                        tracks: None,
                     }],
                     notes: None,
                     bed: None,

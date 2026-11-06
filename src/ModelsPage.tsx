@@ -1,37 +1,41 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { Check, ChevronDown, Download, Trash2, X } from "lucide-react";
 import {
-  cliModels,
   cancelTask,
   enqueueModelDownload,
+  etaText,
   getAiSettings,
   humanSize,
   modelsStatus,
   openModelsDir,
   probeBackends,
   removeModel,
-  scoreMeter,
-  serverModels,
   setAiSettings,
   setWhisperModel,
   type AiSettings,
   type AiSettingsPatch,
   type BackendsResolution,
   type Backend,
+  type CliSettings,
   type ModelStatus,
   type ModelsStatusView,
   type Resolution,
+  type Task,
   type VisionSettings,
   type VisionSettingsPatch,
   testCliAgent,
 } from "./api";
 import { onEvent } from "./events";
 import { useQueue } from "./useQueue";
+import ModelSelect from "./editor/ModelSelect";
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
-function probeLabel(r: Resolution): { text: string; cls: string } {
+/** The chosen model, for "Using: <model> · <where>" summaries. */
+function probeLabel(r: Resolution, model?: string): { text: string; cls: string; title?: string } {
+  const raw = r.reason.trim();
   if (r.target === "server" && r.probe) {
-    const m = r.probe.model ? ` · ${r.probe.model}` : "";
+    const m = r.probe.model || model;
     const host = (() => {
       try {
         return new URL(r.probe.url).host;
@@ -39,15 +43,54 @@ function probeLabel(r: Resolution): { text: string; cls: string } {
         return r.probe.url;
       }
     })();
-    return { text: `Now using: server${m} @ ${host}`, cls: "probe-ok" };
+    return { text: `Using: ${m || "the server"} · server @ ${host}`, cls: "probe-ok" };
   }
   if (r.target === "local") {
-    return { text: r.reason || "Now using: this computer", cls: "probe-ok" };
+    // "backend = local" and friends are raw config echoes, not copy — the summary says it in words.
+    const note = /^backend\s*=/.test(raw) || raw === "server not probed" ? undefined : raw;
+    // Without a known model the "where" is the whole answer; "this computer · this computer" reads
+    // as a bug. With one, name the model first (the same pattern the server route uses).
+    const text = model ? `Using: ${model} · this computer` : "Using: this computer";
+    return { text, cls: "probe-ok", title: note };
   }
   if (r.target === "unavailable") {
-    return { text: r.reason || "Unavailable", cls: "probe-bad" };
+    const but = raw.match(/^backend\s*=\s*server\s+but\s+([\s\S]+)$/);
+    return { text: but ? `The server can't do this job: ${but[1]}` : raw || "Not available", cls: "probe-bad" };
   }
-  return { text: r.reason || "", cls: "" };
+  return { text: raw, cls: "" };
+}
+
+/** Configured CLI tool ids stay plain in settings; the UI once names each tool. */
+const CLI_TOOL_LABELS: Record<string, string> = {
+  claude: "Claude",
+  agy: "agy",
+  opencode: "OpenCode",
+  codex: "Codex",
+};
+
+type Summary = { text: string; cls: string; title?: string };
+
+/** "Using:" for a CLI agent selection — derived from the card's own Tool/Model controls,
+ *  so the summary can never contradict the selected route. */
+function cliSummary(cli: CliSettings): Summary {
+  const tool = CLI_TOOL_LABELS[cli.tool] ?? cli.tool;
+  const model = cli.model || "the tool's default model";
+  return cli.installed
+    ? { text: `Using: ${tool} (CLI) · ${model}`, cls: "probe-ok" }
+    : { text: `Using: ${tool} (CLI) · ${model} — not installed yet`, cls: "probe-bad" };
+}
+
+/**
+ * The "Using:" line for one section, derived from the visible selection: a CLI backend names the
+ * tool; auto that fell back to this computer says so instead of silently claiming the server route.
+ */
+function sectionSummary(r: Resolution, opts: { model?: string; cli?: CliSettings } = {}): Summary {
+  if (r.backend === "cli" && opts.cli) return cliSummary(opts.cli);
+  const item = probeLabel(r, opts.model);
+  if (r.backend === "auto" && r.target === "local" && /server not usable/.test(r.reason)) {
+    return { ...item, text: `${item.text} · (auto — the server was not usable)` };
+  }
+  return item;
 }
 
 // ─── segmented control ────────────────────────────────────────────────────────
@@ -70,64 +113,35 @@ function CliAgentFields({
 }) {
   const [testing, setTesting] = useState(false);
   const [result, setResult] = useState<string | null>(null);
-  // What this tool says it can run. Fetched when the tool changes rather than kept in the app:
-  // every one of these catalogues moves without us.
-  const [cliModelList, setCliModelList] = useState<string[]>([]);
-  useEffect(() => {
-    let cancelled = false;
-    setCliModelList([]);
-    cliModels(cfg.cli.tool)
-      .then((m) => {
-        if (!cancelled) setCliModelList(m);
-      })
-      .catch(() => {});
-    return () => {
-      cancelled = true;
-    };
-  }, [cfg.cli.tool]);
   const perFrame = capability === "vision";
   return (
     <>
       <div className="settings-fields">
         <div className="settings-field">
           <label>Tool</label>
-          <select value={cfg.cli.tool} onChange={(e) => onPatch({ cli: { tool: e.currentTarget.value } })}>
-            <option value="claude">claude</option>
+          <select
+            value={cfg.cli.tool}
+            title="agy is short for the Agenty CLI; the other tools run under their own accounts or bills"
+            onChange={(e) => onPatch({ cli: { tool: e.currentTarget.value } })}
+          >
+            <option value="claude">Claude</option>
             <option value="agy">agy</option>
-            <option value="opencode">opencode</option>
-            <option value="codex">codex</option>
+            <option value="opencode">OpenCode</option>
+            <option value="codex">Codex</option>
           </select>
           <span className={cfg.cli.installed ? "good-text small" : "bad-text small"}>
-            {cfg.cli.installed ? "found on this computer" : "not found — install it or set a full path"}
+            {cfg.cli.installed ? "Found on this computer." : "Not found — install it or set a full path"}
           </span>
         </div>
         <div className="settings-field">
           <label>Model</label>
-          {cliModelList.length > 0 ? (
-            // The tool told us what it has. Its own default stays available, and a model it did
-            // not list is still shown, so switching tools never silently discards a setting.
-            <select
-              value={cfg.cli.model}
-              onChange={(e) => onPatch({ cli: { model: e.currentTarget.value } })}
-            >
-              <option value="">— the tool's default —</option>
-              {!cliModelList.includes(cfg.cli.model) && cfg.cli.model && (
-                <option value={cfg.cli.model}>{cfg.cli.model} (not in its list)</option>
-              )}
-              {cliModelList.map((m) => (
-                <option key={m} value={m}>
-                  {m}
-                </option>
-              ))}
-            </select>
-          ) : (
-            <input
-              type="text"
-              defaultValue={cfg.cli.model}
-              placeholder="— the tool's default —"
-              onChange={(e) => onPatch({ cli: { model: e.currentTarget.value } })}
-            />
-          )}
+          <ModelSelect
+            kind="cli"
+            tool={cfg.cli.tool}
+            value={cfg.cli.model}
+            placeholder="— the tool's default —"
+            onChange={(model) => onPatch({ cli: { model } })}
+          />
         </div>
         {perFrame && (
           <div className="settings-field">
@@ -149,8 +163,8 @@ function CliAgentFields({
       </div>
       <p className="muted small">
         {perFrame
-          ? "One call per keyframe. claude bills per call (about $0.04 a frame here, so a 1500 frame library runs into tens of dollars); agy and opencode spend their own quota instead."
-          : "A handful of calls per script — far cheaper than describing every frame. claude bills per call; agy and opencode spend their own quota."}
+          ? "One call per keyframe. Claude bills per call (about $0.04 per frame here, so a 1,500-frame library runs into tens of dollars); agy (the Agenty CLI) and OpenCode instead run under their own accounts, so hours of indexing cost nothing extra."
+          : "A handful of calls per script — far cheaper than describing every frame. Claude bills per call; agy (the Agenty CLI) and OpenCode run under their own accounts."}
       </p>
       <div className="row">
         <button
@@ -223,7 +237,7 @@ function LocalRuntimeFields({
           <option value="off">off</option>
         </select>
       </div>}
-      <div className="settings-field">
+      <div className="settings-field check">
         <label>Think first</label>
         <input type="checkbox" checked={cfg.think} onChange={(e) => onPatch({ think: e.currentTarget.checked })} />
         <span className="muted small">
@@ -252,6 +266,288 @@ function BackendSegmented({ value, onChange, withCli = false }: SegmentedProps) 
   );
 }
 
+// ─── model list (GhostPen-style) ─────────────────────────────────────────────
+
+/** The app a model file outside GhostReel's folder was found in. */
+const externalOrigin = (path: string): string => {
+  const lower = path.toLowerCase();
+  if (lower.includes("ghostpen")) return "GhostPen";
+  if (lower.includes("lmstudio") || lower.includes("lm-studio") || lower.includes("lm studio"))
+    return "LM Studio";
+  if (lower.includes("ollama")) return "Ollama";
+  return "another app";
+};
+
+/** A catalog note as a sentence: "recommended — …" becomes the Recommended badge plus the rest. */
+const modelQuant = (m: ModelStatus): string | undefined =>
+  m.external?.quant ?? m.entry.file_name.match(/(?:^|[-.])((?:i?q|pq)\d[\w]*|bf16|f16|f32)(?=[-.]|$)/i)?.[1]?.toLowerCase();
+
+const noteInfo = (m: ModelStatus): { recommended: boolean; text: string } => {
+  let note = m.entry.note.trim();
+  let recommended = false;
+  const found = note.match(/^recommended\s*[—–-]\s*(.*)$/i);
+  if (found) {
+    recommended = true;
+    note = found[1];
+  }
+  return { recommended, text: note.charAt(0).toUpperCase() + note.slice(1) };
+};
+
+/** A 1-5 score as five small bar segments. */
+function ScoreMeter({ label, value }: { label: string; value: number }) {
+  return (
+    <span className="mp-meter-item">
+      {label}
+      <span
+        className="mp-meter"
+        role="img"
+        aria-label={`${label} ${value} of 5`}
+        title={`${label}: ${value} of 5`}
+      >
+        {[1, 2, 3, 4, 5].map((i) => (
+          <i key={i} className={i <= value ? "on" : ""} />
+        ))}
+      </span>
+    </span>
+  );
+}
+
+/** One model row: name, size, badges, meters, note — one action on the right. */
+function ModelRow(props: {
+  m: ModelStatus;
+  /** A running or queued download for this model, if any. */
+  task?: Task;
+  /** The row is the chosen model: an accent border instead of radio buttons. */
+  selected?: boolean;
+  onUse?: () => void;
+  sizeText: string;
+  note: string;
+  recommended?: boolean;
+  readsImages?: boolean;
+  /** A quiet badge such as "English-only". */
+  dimBadge?: string;
+  /** Muted extra line, e.g. "From LM Studio, reused". */
+  origin?: string;
+  onDownload: () => void;
+  onRemove: () => void;
+}) {
+  const { m, task } = props;
+  const [confirmRemove, setConfirmRemove] = useState(false);
+  const pct = task && task.progress ? Math.min(100, Math.round(task.progress.fraction * 100)) : 0;
+  const partialPct = m.partial_bytes && m.entry.size_bytes
+    ? Math.round((m.partial_bytes / m.entry.size_bytes) * 100)
+    : 0;
+  const eta = task && task.progress?.eta_secs != null ? etaText(task.progress.eta_secs) : null;
+  return (
+    <div className={`mp-row${props.selected ? " active" : ""}`} title={m.installed_path ?? undefined}>
+      <div className="mp-info">
+        <div className="mp-name">
+          <span className="mp-title">{m.external?.name ?? m.entry.id}</span>
+          <span className="muted small">{props.sizeText}</span>
+          {/* The row's real state, next to the matching action on the right. */}
+          {task ? (
+            <span className="mp-badge busy">{task.state === "queued" ? "Queued" : "Downloading"}</span>
+          ) : m.installed_path ? (
+            props.selected ? null : (
+              <span className="mp-badge good">Downloaded</span>
+            )
+          ) : m.partial_bytes ? (
+            <span className="mp-badge dim">Partial · {partialPct}%</span>
+          ) : (
+            <span className="mp-badge dim">Not downloaded</span>
+          )}
+          {props.recommended && <span className="mp-badge rec">Recommended</span>}
+          {props.readsImages && <span className="mp-badge good">Reads images</span>}
+          {props.dimBadge && <span className="mp-badge dim">{props.dimBadge}</span>}
+        </div>
+        <div className="mp-meta">
+          {!m.external && <ScoreMeter label="Speed" value={m.entry.speed} />}
+          {!m.external && <ScoreMeter label="Quality" value={m.entry.accuracy} />}
+          <span className="mp-note">{props.note}</span>
+        </div>
+        {props.origin && <div className="muted small">{props.origin}</div>}
+        {task && (
+          <div className="mp-progress">
+            <div className="mp-bar">
+              <div style={{ width: `${task.state === "running" ? Math.max(4, pct) : 0}%` }} />
+            </div>
+            <span className="muted small">
+              {task.state === "queued"
+                ? "Queued, waiting…"
+                : `Downloading ${pct}%${eta ? ` · about ${eta} left` : ""}`}
+            </span>
+          </div>
+        )}
+      </div>
+      <div className="mp-actions">
+        {task ? (
+          <button
+            className="small"
+            onClick={() => cancelTask(task.id)}
+            title="Cancel the download (keeps the partial file)"
+          >
+            <X size={14} strokeWidth={2} aria-hidden /> Cancel
+          </button>
+        ) : m.installed_path ? (
+          <>
+            {props.selected ? (
+              <span className="mp-state" title="This model is chosen for this section">
+                <Check size={15} strokeWidth={2} aria-hidden /> In use
+              </span>
+            ) : props.onUse ? (
+              <button className="small" onClick={props.onUse}>
+                Use
+              </button>
+            ) : null}
+            {m.in_own_dir && !m.external &&
+              (confirmRemove ? (
+                <>
+                  <button className="ghost small" onClick={() => setConfirmRemove(false)}>
+                    Keep
+                  </button>
+                  <button
+                    className="danger small"
+                    onClick={() => {
+                      setConfirmRemove(false);
+                      props.onRemove();
+                    }}
+                  >
+                    <Trash2 size={14} strokeWidth={2} aria-hidden /> Remove?
+                  </button>
+                </>
+              ) : (
+                <button
+                  className="ghost small danger"
+                  onClick={() => setConfirmRemove(true)}
+                  title="Delete from GhostReel's models folder"
+                >
+                  <Trash2 size={14} strokeWidth={2} aria-hidden /> Remove
+                </button>
+              ))}
+          </>
+        ) : m.partial_bytes ? (
+          <>
+            <button className="small" onClick={props.onDownload} title="Resume download">
+              <Download size={14} strokeWidth={2} aria-hidden /> Resume ({partialPct}%)
+            </button>
+            <button
+              className="ghost small danger"
+              onClick={props.onRemove}
+              title="Discard the partial file"
+            >
+              <Trash2 size={14} strokeWidth={2} aria-hidden /> Clear
+            </button>
+          </>
+        ) : (
+          <button className="small" onClick={props.onDownload} title="Download this model">
+            <Download size={14} strokeWidth={2} aria-hidden /> Download
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/** "Available models" card: one row per model, plus a collapsible list of models found in other apps. */
+function ModelListCard(props: {
+  main: ModelStatus[];
+  /** Models installed in another app's folder ("Found in LM Studio"). */
+  others: ModelStatus[];
+  /** Select this model id for the section; omit when the section has no choice (embeddings, server mode). */
+  onUse?: (id: string) => void;
+  selectedId?: string;
+  /** Rows show the green "Reads images" badge (frame descriptions list). */
+  readsImages?: boolean;
+  /** The download task for a model id, if one is running or queued. */
+  taskFor: (id: string) => Task | undefined;
+  onDownload: (id: string) => void;
+  onRemove: (id: string) => void;
+}) {
+  const { main, others } = props;
+  const primary = main
+    .filter((m) => Boolean(m.installed_path) || m.entry.id === props.selectedId)
+    .sort((a, b) => Number(b.entry.id === props.selectedId) - Number(a.entry.id === props.selectedId));
+  const catalog = main.filter((m) => !primary.includes(m));
+  // Nothing installed yet: offer the downloadable rows directly instead of an empty
+  // "Available models" body above a collapsed catalog. Sources that need no file of their own
+  // (a server, a CLI tool) show only the other-app rows, or nothing at all.
+  const listed = primary.length > 0 ? primary : catalog;
+  const rest = primary.length > 0 ? catalog : [];
+  const apps =
+    others.length > 0
+      ? [...new Set(others.map((o) => o.external?.source ?? externalOrigin(o.installed_path ?? "")))]
+      : [];
+  const row = (m: ModelStatus, selected: boolean) => {
+    const info = noteInfo(m);
+    // The VRAM column is gone: mention GPU memory when the note itself doesn't.
+    let note = info.text;
+    if (props.readsImages && m.entry.vram_mb && !/(GB|MB|VRAM|RAM)/.test(note)) {
+      const gb =
+        m.entry.vram_mb >= 1024 ? `${(m.entry.vram_mb / 1024).toFixed(0)} GB` : `${m.entry.vram_mb} MB`;
+      note = `${note.replace(/\.$/, "")}. Needs about ${gb} of GPU memory.`;
+    }
+    return (
+      <ModelRow
+        key={m.entry.id}
+        m={m}
+        task={props.taskFor(m.entry.id)}
+        selected={selected}
+        onUse={props.onUse ? () => props.onUse!(m.entry.id) : undefined}
+        sizeText={humanSize(m.entry.size_bytes + (m.entry.mmproj_size_bytes ?? 0))}
+        note={note}
+        recommended={info.recommended}
+        readsImages={Boolean(m.entry.mmproj_file_name)}
+        dimBadge={m.entry.languages === "english" ? "English-only" : undefined}
+        origin={
+          m.installed_path && !m.in_own_dir
+            ? `From ${m.external?.source ?? externalOrigin(m.installed_path)}${modelQuant(m) ? ` · ${modelQuant(m)}` : ""}`
+            : undefined
+        }
+        onDownload={() => props.onDownload(m.entry.id)}
+        onRemove={() => props.onRemove(m.entry.id)}
+      />
+    );
+  };
+  return (
+    <div className="card mp-list-card">
+      {listed.length > 0 && (
+        <>
+          <div className="mp-list-head">Available models</div>
+          <div className="mp-list">
+            {listed.map((m) => row(m, Boolean(props.selectedId && props.selectedId === m.entry.id)))}
+          </div>
+        </>
+      )}
+      {rest.length > 0 && (
+        <details className="mp-others mp-catalog">
+          <summary>
+            <ChevronDown size={15} strokeWidth={2} aria-hidden />
+            <span>Browse other models ({rest.length})</span>
+          </summary>
+          <div className="mp-list mp-others-body">
+            {rest.map((m) => row(m, false))}
+          </div>
+        </details>
+      )}
+      {others.length > 0 && (
+        <details
+          className="mp-others"
+          open={Boolean(props.selectedId && others.some((o) => o.entry.id === props.selectedId))}
+        >
+          <summary>
+            <ChevronDown size={15} strokeWidth={2} aria-hidden />
+            <span>Models from other apps ({others.length})</span>
+            <span className="muted small">{apps.join(", ")}</span>
+          </summary>
+          <div className="mp-list mp-others-body">
+            {others.map((m) => row(m, Boolean(props.selectedId && props.selectedId === m.entry.id)))}
+          </div>
+        </details>
+      )}
+    </div>
+  );
+}
+
 // ─── main component ───────────────────────────────────────────────────────────
 
 export default function ModelsPage() {
@@ -260,12 +556,6 @@ export default function ModelsPage() {
   const [resolution, setResolution] = useState<BackendsResolution | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-
-  // Server model lists per section (fetched on demand)
-  const [sttServerModels, setSttServerModels] = useState<string[]>([]);
-  const [visionServerModels, setVisionServerModels] = useState<string[]>([]);
-  const [embedServerModels, setEmbedServerModels] = useState<string[]>([]);
-  const [fetchingServerModels, setFetchingServerModels] = useState<Record<string, boolean>>({});
 
   // API-key masked display
   const [apiKeyInput, setApiKeyInput] = useState("");
@@ -308,26 +598,6 @@ export default function ModelsPage() {
     [],
   );
 
-  const fetchServerModelList = useCallback(
-    async (
-      url: string,
-      setter: (list: string[]) => void,
-      key: string,
-    ) => {
-      if (!url) return;
-      setFetchingServerModels((p) => ({ ...p, [key]: true }));
-      try {
-        const list = await serverModels(url);
-        setter(list);
-      } catch {
-        setter([]);
-      } finally {
-        setFetchingServerModels((p) => ({ ...p, [key]: false }));
-      }
-    },
-    [],
-  );
-
   // ─── model actions ──────────────────────────────────────────────────────────
 
   const handleDownload = async (modelId: string) => {
@@ -351,120 +621,13 @@ export default function ModelsPage() {
 
   // ─── model status cells ─────────────────────────────────────────────────────
 
-  const renderStatus = (m: ModelStatus) => {
-    const activeTask = tasks.find(
+  const downloadTask = (modelId: string): Task | undefined =>
+    tasks.find(
       (t) =>
         t.kind.type === "download_model" &&
-        t.kind.model_id === m.entry.id &&
+        t.kind.model_id === modelId &&
         (t.state === "running" || t.state === "queued"),
     );
-
-    if (activeTask) {
-      if (activeTask.state === "running") {
-        const pct = Math.round((activeTask.progress?.fraction ?? 0) * 100);
-        return (
-          <div className="status-cell">
-            <span className="status-badge downloading">Downloading {pct}%</span>
-            <div className="meter small-meter">
-              <div style={{ width: `${Math.max(4, pct)}%` }} />
-            </div>
-          </div>
-        );
-      }
-      return <span className="status-badge queued">Queued</span>;
-    }
-
-    if (m.installed_path) {
-      if (m.in_own_dir) {
-        return (
-          <span className="status-badge installed" title={m.installed_path}>
-            Installed
-          </span>
-        );
-      }
-      const lower = m.installed_path.toLowerCase();
-      const origin = lower.includes("ghostpen")
-        ? "GhostPen"
-        : lower.includes("lmstudio")
-          ? "LM Studio"
-          : "external";
-      return (
-        <span className="status-badge external" title={m.installed_path}>
-          Found in {origin}
-        </span>
-      );
-    }
-
-    if (m.partial_bytes) {
-      return (
-        <span className="status-badge partial">
-          Partial ({humanSize(m.partial_bytes)})
-        </span>
-      );
-    }
-
-    return <span className="status-badge not-installed">Not installed</span>;
-  };
-
-  const renderActions = (m: ModelStatus) => {
-    const activeTask = tasks.find(
-      (t) =>
-        t.kind.type === "download_model" &&
-        t.kind.model_id === m.entry.id &&
-        (t.state === "running" || t.state === "queued"),
-    );
-
-    if (activeTask) {
-      return (
-        <button
-          className="ghost small"
-          onClick={() => cancelTask(activeTask.id)}
-          title="Cancel download (keeps partial file)"
-        >
-          Cancel
-        </button>
-      );
-    }
-
-    if (m.installed_path && m.in_own_dir) {
-      return (
-        <button
-          className="ghost small danger"
-          onClick={() => handleRemove(m.entry.id)}
-          title="Delete from GhostReel's models folder"
-        >
-          Remove
-        </button>
-      );
-    }
-
-    if (m.installed_path && !m.in_own_dir) {
-      return <span className="muted small">Reused</span>;
-    }
-
-    if (m.partial_bytes) {
-      return (
-        <div className="button-group">
-          <button className="small" onClick={() => handleDownload(m.entry.id)} title="Resume download">
-            Resume
-          </button>
-          <button
-            className="ghost small danger"
-            onClick={() => handleRemove(m.entry.id)}
-            title="Discard partial file"
-          >
-            Clear
-          </button>
-        </div>
-      );
-    }
-
-    return (
-      <button className="small" onClick={() => handleDownload(m.entry.id)}>
-        Download
-      </button>
-    );
-  };
 
   // ─── debounced URL setter ───────────────────────────────────────────────────
 
@@ -479,15 +642,81 @@ export default function ModelsPage() {
   const visionModels = data?.models.filter((m) => m.entry.kind === "vision") ?? [];
   const embeddingModels = data?.models.filter((m) => m.entry.kind === "embedding") ?? [];
 
+  /** "Total downloaded: 24.1 GB across 3 models" — the disk story in one line at the top,
+   *  with models reused from other apps called out, so the total reconciles with Storage
+   *  (which only counts files inside GhostReel's folder). */
+  const installedModels = data?.models.filter((m) => m.installed_path) ?? [];
+  const externalModels = installedModels.filter((m) => !m.in_own_dir);
+  const modelSize = (m: ModelStatus) => m.entry.size_bytes + (m.entry.mmproj_size_bytes ?? 0);
+  const totalBytes = installedModels.reduce((n, m) => n + modelSize(m), 0);
+  const externalBytes = externalModels.reduce((n, m) => n + modelSize(m), 0);
+  let totalSummary: string | null = null;
+  if (data) {
+    if (installedModels.length === 0) {
+      totalSummary = "No models downloaded yet.";
+    } else if (externalModels.length > 0) {
+      const apps = [...new Set(externalModels.map((m) => m.external?.source ?? externalOrigin(m.installed_path ?? "")))].join(" and ");
+      totalSummary = `Total downloaded: ${humanSize(totalBytes)} across ${installedModels.length} model${installedModels.length === 1 ? "" : "s"} (${humanSize(externalBytes)} reused from ${apps}).`;
+    } else {
+      totalSummary = `Total downloaded: ${humanSize(totalBytes)} across ${installedModels.length} model${installedModels.length === 1 ? "" : "s"}.`;
+    }
+  }
+
+  /** Installed in GhostReel's own folder (or not downloaded) vs. reused from another app. */
+  const splitModels = (list: ModelStatus[]) => ({
+    main: list.filter((m) => !m.installed_path || m.in_own_dir),
+    others: list.filter((m) => m.installed_path && !m.in_own_dir),
+  });
+
   const ai = aiSettings;
   const sttBackend = ai?.stt.backend ?? "auto";
   const visionBackend = ai?.vision.backend ?? "auto";
   const embedBackend = ai?.embed.backend ?? "auto";
 
-  const sttProbe = resolution ? probeLabel(resolution.stt) : null;
-  const visionProbe = resolution ? probeLabel(resolution.vision) : null;
-  const chatProbe = resolution?.chat ? probeLabel(resolution.chat) : null;
-  const embedProbe = resolution ? probeLabel(resolution.embeddings) : null;
+  /** whisper section data for the GhostPen-style list. */
+  const stt = splitModels(whisperModels);
+  const sttSelected = ai?.stt.model ?? "auto";
+  const useWhisper = (id: string) => {
+    applyPatch({ stt: { model: id } });
+    setWhisperModel(id).catch(() => null);
+  };
+
+  /** frame descriptions section data; selecting is hidden while the server backend answers. */
+  const vis = splitModels(visionModels.filter((m) => !m.external || m.entry.mmproj_file_name));
+  const chatModels = splitModels(visionModels);
+  const visSelectionOff = visionBackend === "server";
+  const visSelected = ai?.vision.local_model ?? "qwen3.5-9b";
+  const useVision = (id: string) => applyPatch({ vision: { local_model: id } });
+
+  /** embeddings section data; the model is fixed, no selection. */
+  const emb = splitModels(embeddingModels);
+
+  /** "Using: <model> · <where>" summary per section — derived from each card's visible selection,
+   *  with the raw probe text kept for the tooltip. */
+  /** "Using: <model> · <where>" summary per section — derived from each card's visible selection,
+   *  with the raw probe text kept for the tooltip. With the automatic speech model, the actually
+   *  loaded whisper model names the summary once it is known. */
+  const sttAutoLoaded = sttSelected === "auto" && resolution?.stt.target === "local"
+    ? data?.current_whisper_model
+    : undefined;
+  const sttSummary = resolution
+    ? sectionSummary(resolution.stt, { model: sttSelected === "auto" ? sttAutoLoaded ?? "Auto" : sttSelected })
+    : null;
+  const visionSummary = resolution
+    ? sectionSummary(resolution.vision, visSelectionOff ? { model: undefined } : { model: visSelected, cli: ai?.vision.cli })
+    : null;
+  const chatSummary = resolution?.chat
+    ? sectionSummary(resolution.chat,
+        ai?.chat_model.backend === "server"
+          ? { model: undefined }
+          : { model: ai?.chat_model.local_model, cli: ai?.chat_model.cli })
+    : null;
+  // Embeddings have no choice of model (adding one would break compatibility between computers),
+  // so the summary names the single file that is actually in use instead of only the location.
+  // Only an installed file is named; an absent one is not "in use".
+  const embedFile = (emb.main.find((m) => Boolean(m.installed_path)) ?? emb.others[0])?.entry.file_name;
+  const embedModel = embedFile?.replace(/\.gguf$/i, "") ?? undefined;
+  const embedSummary = resolution ? sectionSummary(resolution.embeddings, { model: embedModel }) : null;
 
   // ─── render ─────────────────────────────────────────────────────────────────
 
@@ -515,12 +744,17 @@ export default function ModelsPage() {
 
       {data && (
         <div className="card models-dir-card">
-          <div className="card-head">
-            <div>
+          <div className="card-head" style={{ gap: "12px" }}>
+            <div style={{ minWidth: 0 }}>
               <div className="label">Models directory</div>
               <div className="muted small path">{data.dir}</div>
+              {totalSummary && <div className="muted small">{totalSummary}</div>}
             </div>
-            <button className="ghost small" onClick={openModelsDir}>
+            <button
+              className="ghost small"
+              onClick={openModelsDir}
+              style={{ whiteSpace: "nowrap", flexShrink: 0 }}
+            >
               Open folder
             </button>
           </div>
@@ -535,9 +769,24 @@ export default function ModelsPage() {
           <div>
             <BackendSegmented
               value={sttBackend}
-              onChange={(b) => applyPatch({ stt: { backend: b } })}
+              onChange={(b) => {
+                // The section's single "Auto" lives here: automatic backend and automatic model.
+                if (b === "auto") {
+                  applyPatch({ stt: { backend: "auto", model: "auto" } });
+                  setWhisperModel("auto").catch(() => null);
+                } else {
+                  applyPatch({ stt: { backend: b } });
+                }
+              }}
             />
           </div>
+
+          {ai.stt.model === "auto" && (
+            <p className="muted small">
+              The speech model is picked automatically: large-v3-turbo on a GPU with 6&nbsp;GB free,
+              otherwise small. Nothing to download until it runs the first time.
+            </p>
+          )}
 
           {(sttBackend === "server" || sttBackend === "auto") && (
             <div className="settings-fields">
@@ -550,117 +799,42 @@ export default function ModelsPage() {
                   onBlur={(e) => debouncedUrlPatch("stt.url", { stt: { url: e.currentTarget.value } })}
                   onChange={(e) => debouncedUrlPatch("stt.url", { stt: { url: e.currentTarget.value } })}
                 />
-                <button
-                  className="ghost small"
-                  disabled={!!fetchingServerModels["stt"]}
-                  onClick={() => fetchServerModelList(ai.stt.url, setSttServerModels, "stt")}
-                >
-                  {fetchingServerModels["stt"] ? "…" : "Refresh"}
-                </button>
               </div>
-              {sttServerModels.length > 0 && (
-                <div className="settings-field">
-                  <label>Model</label>
-                  <select
-                    value={ai.stt.model}
-                    onChange={(e) => applyPatch({ stt: { model: e.currentTarget.value } })}
-                  >
-                    {sttServerModels.map((m) => (
-                      <option key={m} value={m}>
-                        {m}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-              )}
+              <div className="settings-field">
+                <label>Model</label>
+                <ModelSelect
+                  kind="server"
+                  url={ai.stt.url}
+                  value={ai.stt.model}
+                  onChange={(model) => applyPatch({ stt: { model } })}
+                />
+              </div>
             </div>
           )}
 
-          {sttProbe && (
-            <div className="probe-status">
-              <span className={sttProbe.cls}>{sttProbe.text}</span>
+          {sttSummary && (
+            <div className="probe-status" title={sttSummary.title}>
+              <span className={sttSummary.cls}>{sttSummary.text}</span>
             </div>
           )}
         </div>
       )}
 
-      {/* whisper model table */}
-      <div className="card whisper-config-card">
-        <div className="whisper-auto-row">
-          <label className="radio-label">
-            <input
-              type="radio"
-              name="whisper-select"
-              value="auto"
-              checked={(ai?.stt.model ?? "auto") === "auto"}
-              onChange={() => {
-                applyPatch({ stt: { model: "auto" } });
-                setWhisperModel("auto").catch(() => null);
-              }}
-            />
-            <span className="radio-text">
-              <strong>Auto</strong> — large-v3-turbo on ≥6 GB NVIDIA GPU, otherwise small (recommended)
-            </span>
-          </label>
-        </div>
-      </div>
-
-      <div className="card table-card">
-        <table className="models-table">
-          <thead>
-            <tr>
-              <th className="col-radio">Use</th>
-              <th>Model</th>
-              <th>Size</th>
-              <th>Speed</th>
-              <th>Accuracy</th>
-              <th>Note</th>
-              <th>Status</th>
-              <th className="col-action">Action</th>
-            </tr>
-          </thead>
-          <tbody>
-            {whisperModels.map((m) => {
-              const isSelected = (ai?.stt.model ?? "auto") === m.entry.id;
-              return (
-                <tr key={m.entry.id} className={isSelected ? "selected-row" : ""}>
-                  <td className="col-radio">
-                    <input
-                      type="radio"
-                      name="whisper-select"
-                      value={m.entry.id}
-                      checked={isSelected}
-                      onChange={() => {
-                        applyPatch({ stt: { model: m.entry.id } });
-                        setWhisperModel(m.entry.id).catch(() => null);
-                      }}
-                      title={`Use ${m.entry.id} for transcription`}
-                    />
-                  </td>
-                  <td>
-                    <div className="model-name">
-                      <strong>{m.entry.id}</strong>
-                      {m.entry.languages === "english" && (
-                        <span className="pill en-pill">English-only</span>
-                      )}
-                    </div>
-                  </td>
-                  <td className="col-size">{humanSize(m.entry.size_bytes)}</td>
-                  <td className="col-meter" title={`Speed ${m.entry.speed}/5`}>
-                    <span className="score-meter">{scoreMeter(m.entry.speed)}</span>
-                  </td>
-                  <td className="col-meter" title={`Accuracy ${m.entry.accuracy}/5`}>
-                    <span className="score-meter">{scoreMeter(m.entry.accuracy)}</span>
-                  </td>
-                  <td className="muted small col-note">{m.entry.note}</td>
-                  <td>{renderStatus(m)}</td>
-                  <td className="col-action">{renderActions(m)}</td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
-      </div>
+      {/* whisper model list: the stored "auto" marks the model the app actually loads — there is no
+          separate Auto row, the section's Auto lives in the switches above */}
+      <ModelListCard
+        main={stt.main}
+        others={stt.others}
+        selectedId={
+          sttSelected === "auto"
+            ? data?.current_whisper_model
+            : sttSelected
+        }
+        onUse={useWhisper}
+        taskFor={downloadTask}
+        onDownload={handleDownload}
+        onRemove={handleRemove}
+      />
 
       {/* ── Frame descriptions (indexing) ── */}
       <h2>Frame descriptions</h2>
@@ -728,30 +902,17 @@ export default function ModelsPage() {
                   onBlur={(e) => debouncedUrlPatch("vision.url", { vision: { url: e.currentTarget.value } })}
                   onChange={(e) => debouncedUrlPatch("vision.url", { vision: { url: e.currentTarget.value } })}
                 />
-                <button
-                  className="ghost small"
-                  disabled={!!fetchingServerModels["vision"]}
-                  onClick={() => fetchServerModelList(ai.vision.url, setVisionServerModels, "vision")}
-                >
-                  {fetchingServerModels["vision"] ? "…" : "Refresh"}
-                </button>
               </div>
-              {visionServerModels.length > 0 && (
-                <div className="settings-field">
-                  <label>Model</label>
-                  <select
-                    value={ai.vision.model}
-                    onChange={(e) => applyPatch({ vision: { model: e.currentTarget.value } })}
-                  >
-                    <option value="">— server default —</option>
-                    {visionServerModels.map((m) => (
-                      <option key={m} value={m}>
-                        {m}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-              )}
+              <div className="settings-field">
+                <label>Model</label>
+                <ModelSelect
+                  kind="server"
+                  url={ai.vision.url}
+                  value={ai.vision.model}
+                  placeholder="— server default —"
+                  onChange={(model) => applyPatch({ vision: { model } })}
+                />
+              </div>
               <div className="settings-field">
                 <label>API key</label>
                 <input
@@ -784,9 +945,9 @@ export default function ModelsPage() {
             />
           )}
 
-          {visionProbe && (
-            <div className="probe-status">
-              <span className={visionProbe.cls}>{visionProbe.text}</span>
+          {visionSummary && (
+            <div className="probe-status" title={visionSummary.title}>
+              <span className={visionSummary.cls}>{visionSummary.text}</span>
             </div>
           )}
         </div>
@@ -794,73 +955,21 @@ export default function ModelsPage() {
 
       {visionModels.some((m) => Boolean(m.entry.bundle)) && (
         <p className="muted small">
-          Apple Silicon uses MLX for vision and chat. Downloads include the complete model folder;
-          Whisper and embeddings keep their existing models.
+          Recommended vision and chat models use MLX on Apple Silicon. Downloads include the complete model folder.
+          Other-app GGUF models use the native llama.cpp helper.
         </p>
       )}
-      {/* vision model table */}
-      <div className="card table-card">
-        <table className="models-table vision-table">
-          <thead>
-            <tr>
-              {visionBackend !== "server" && <th className="col-radio">Use</th>}
-              <th>Model</th>
-              <th>Size</th>
-              <th>{visionModels.some((m) => Boolean(m.entry.bundle)) ? "Memory" : "VRAM"}</th>
-              <th>Speed</th>
-              <th>Accuracy</th>
-              <th>Note</th>
-              <th>Status</th>
-              <th className="col-action">Action</th>
-            </tr>
-          </thead>
-          <tbody>
-            {visionModels.map((m) => {
-              const isSelected = (ai?.vision.local_model ?? "qwen3.5-9b") === m.entry.id;
-              const totalSize = m.entry.size_bytes + (m.entry.mmproj_size_bytes ?? 0);
-              return (
-                <tr key={m.entry.id} className={isSelected && visionBackend !== "server" ? "selected-row" : ""}>
-                  {visionBackend !== "server" && (
-                    <td className="col-radio">
-                      <input
-                        type="radio"
-                        name="vision-select"
-                        value={m.entry.id}
-                        checked={isSelected}
-                        onChange={() => applyPatch({ vision: { local_model: m.entry.id } })}
-                        title={`Use ${m.entry.id} for vision`}
-                      />
-                    </td>
-                  )}
-                  <td>
-                    <div className="model-name">
-                      <strong>{m.entry.id}</strong>
-                      {m.entry.mmproj_file_name && (
-                        <span className="pill" title={`Model + projector: ${m.entry.file_name}, ${m.entry.mmproj_file_name}`}>
-                          model + projector
-                        </span>
-                      )}
-                    </div>
-                  </td>
-                  <td className="col-size">{humanSize(totalSize)}</td>
-                  <td className="col-size">
-                    {m.entry.vram_mb != null ? `${m.entry.vram_mb >= 1024 ? `${(m.entry.vram_mb / 1024).toFixed(0)} GB` : `${m.entry.vram_mb} MB`}` : "—"}
-                  </td>
-                  <td className="col-meter" title={`Speed ${m.entry.speed}/5`}>
-                    <span className="score-meter">{scoreMeter(m.entry.speed)}</span>
-                  </td>
-                  <td className="col-meter" title={`Accuracy ${m.entry.accuracy}/5`}>
-                    <span className="score-meter">{scoreMeter(m.entry.accuracy)}</span>
-                  </td>
-                  <td className="muted small col-note">{m.entry.note}</td>
-                  <td>{renderStatus(m)}</td>
-                  <td className="col-action">{renderActions(m)}</td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
-      </div>
+      {/* vision model list; selection only when this computer answers (local/auto) */}
+      <ModelListCard
+        main={vis.main}
+        others={vis.others}
+        selectedId={visSelectionOff ? undefined : visSelected}
+        onUse={visSelectionOff ? undefined : useVision}
+        readsImages
+        taskFor={downloadTask}
+        onDownload={handleDownload}
+        onRemove={handleRemove}
+      />
 
       {/* ── Script chat ── */}
       <h2>Script chat</h2>
@@ -892,13 +1001,12 @@ export default function ModelsPage() {
               </div>
               <div className="settings-field">
                 <label>Model</label>
-                <input
-                  type="text"
-                  defaultValue={ai.chat_model.model}
+                <ModelSelect
+                  kind="server"
+                  url={ai.chat_model.url}
+                  value={ai.chat_model.model}
                   placeholder="— server default —"
-                  onChange={(e) =>
-                    debouncedUrlPatch("chat_model.model", { chat_model: { model: e.currentTarget.value } })
-                  }
+                  onChange={(model) => applyPatch({ chat_model: { model } })}
                 />
               </div>
             </div>
@@ -923,12 +1031,12 @@ export default function ModelsPage() {
                   >
                     {visionModels.map((m) => (
                       <option key={m.entry.id} value={m.entry.id}>
-                        {m.entry.id}
+                        {m.external?.name ?? m.entry.id}{m.external?.quant ? ` · ${m.external.quant}` : ""}
                         {m.installed_path ? "" : " (not downloaded)"}
                       </option>
                     ))}
                   </select>
-                  <span className="muted small">Download it in the table above.</span>
+                  <span className="muted small">Choose an installed model or download one below.</span>
                 </div>
               </div>
               <LocalRuntimeFields
@@ -940,13 +1048,23 @@ export default function ModelsPage() {
             </>
           )}
 
-          {chatProbe && (
-            <div className="probe-status">
-              <span className={chatProbe.cls}>{chatProbe.text}</span>
+          {chatSummary && (
+            <div className="probe-status" title={chatSummary.title}>
+              <span className={chatSummary.cls}>{chatSummary.text}</span>
             </div>
           )}
         </div>
       )}
+
+      <ModelListCard
+        main={chatModels.main}
+        others={chatModels.others}
+        selectedId={ai?.chat_model.backend === "server" || ai?.chat_model.backend === "cli" ? undefined : ai?.chat_model.local_model}
+        onUse={ai?.chat_model.backend === "server" || ai?.chat_model.backend === "cli" ? undefined : (id) => applyPatch({ chat_model: { local_model: id } })}
+        taskFor={downloadTask}
+        onDownload={handleDownload}
+        onRemove={handleRemove}
+      />
 
       {/* ── Search embeddings ── */}
       <h2>Search embeddings</h2>
@@ -971,76 +1089,37 @@ export default function ModelsPage() {
                   onBlur={(e) => debouncedUrlPatch("embed.url", { embed: { url: e.currentTarget.value } })}
                   onChange={(e) => debouncedUrlPatch("embed.url", { embed: { url: e.currentTarget.value } })}
                 />
-                <button
-                  className="ghost small"
-                  disabled={!!fetchingServerModels["embed"]}
-                  onClick={() => fetchServerModelList(ai.embed.url, setEmbedServerModels, "embed")}
-                >
-                  {fetchingServerModels["embed"] ? "…" : "Refresh"}
-                </button>
               </div>
-              {embedServerModels.length > 0 && (
-                <div className="settings-field">
-                  <label>Model</label>
-                  <select value={ai.embed.model} onChange={(e) => applyPatch({ embed: { model: e.currentTarget.value } })}>
-                    {embedServerModels.map((m) => (
-                      <option key={m} value={m}>
-                        {m}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-              )}
+              <div className="settings-field">
+                <label>Model</label>
+                <ModelSelect
+                  kind="server"
+                  url={ai.embed.url}
+                  value={ai.embed.model}
+                  onChange={(model) => applyPatch({ embed: { model } })}
+                />
+              </div>
             </div>
           )}
 
-          {embedProbe && (
-            <div className="probe-status">
-              <span className={embedProbe.cls}>{embedProbe.text}</span>
+          {embedSummary && (
+            <div className="probe-status" title={embedSummary.title}>
+              <span className={embedSummary.cls}>{embedSummary.text}</span>
             </div>
           )}
         </div>
       )}
 
-      <div className="card table-card">
-        <table className="models-table">
-          <thead>
-            <tr>
-              <th>Model</th>
-              <th>Size</th>
-              <th>Speed</th>
-              <th>Accuracy</th>
-              <th>Note</th>
-              <th>Status</th>
-              <th className="col-action">Action</th>
-            </tr>
-          </thead>
-          <tbody>
-            {embeddingModels.map((m) => (
-              <tr key={m.entry.id}>
-                <td>
-                  <div className="model-name">
-                    <strong>{m.entry.id}</strong>
-                    <span className="pill">Embedding</span>
-                  </div>
-                </td>
-                <td className="col-size">{humanSize(m.entry.size_bytes)}</td>
-                <td className="col-meter" title={`Speed ${m.entry.speed}/5`}>
-                  <span className="score-meter">{scoreMeter(m.entry.speed)}</span>
-                </td>
-                <td className="col-meter" title={`Accuracy ${m.entry.accuracy}/5`}>
-                  <span className="score-meter">{scoreMeter(m.entry.accuracy)}</span>
-                </td>
-                <td className="muted small col-note">{m.entry.note}</td>
-                <td>{renderStatus(m)}</td>
-                <td className="col-action">{renderActions(m)}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
+      {/* embedding model list; the model is fixed, so rows only manage downloads */}
+      <ModelListCard
+        main={emb.main}
+        others={emb.others}
+        taskFor={downloadTask}
+        onDownload={handleDownload}
+        onRemove={handleRemove}
+      />
       <div className="embed-locked-note">
-        The embedding model is fixed to keep search indexes compatible between computers (AGENTS.md rule 3).
+        The embedding model is fixed so search indexes stay compatible between computers.
       </div>
     </main>
   );

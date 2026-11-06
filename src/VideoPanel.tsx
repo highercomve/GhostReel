@@ -1,6 +1,8 @@
 import MediaImage from "./MediaImage";
 import type { SteadinessView } from "./api";
+import { formatDuration } from "./timeFormat";
 import { useEffect, useMemo, useRef, useState } from "react";
+import { ChevronRight, Music, Pause, Play } from "lucide-react";
 import {
   clock,
   fileName,
@@ -48,6 +50,7 @@ export default function VideoPanel({
   onExclude?: (role: "removed" | "reference") => void;
 }) {
   const player = useRef<HTMLVideoElement>(null);
+  const frameStrip = useRef<HTMLDivElement>(null);
   const [segments, setSegments] = useState<TranscriptSegment[] | null>(null);
   const [frames, setFrames] = useState<FrameRow[]>([]);
   const [steadiness, setSteadiness] = useState<SteadinessView | null>(null);
@@ -56,6 +59,7 @@ export default function VideoPanel({
   const [now, setNow] = useState(0);
   const [playError, setPlayError] = useState(false);
   const [src, setSrc] = useState<string | null>(null);
+  const [isPlaying, setIsPlaying] = useState(false);
   const pendingSeek = useRef<number | null>(null);
 
   useEffect(() => {
@@ -139,6 +143,14 @@ export default function VideoPanel({
   const shown = (segments ?? []).map((s, i) => ({ s, i })).filter(({ s }) => !q || s.text.toLowerCase().includes(q));
   const active = frames.find((f) => f.id === activeFrame);
   const d = active ? parseDescription(active) : null;
+  const duration = player.current?.duration || video.duration_s || 0;
+  const timeLabel = formatDuration;
+  const togglePlayback = () => {
+    const element = player.current;
+    if (!element) return;
+    if (element.paused) element.play().catch(() => {});
+    else element.pause();
+  };
 
   return (
     <section className="card video-panel">
@@ -148,7 +160,11 @@ export default function VideoPanel({
           {video.category && <span className={`tag cat-badge cat-${video.category}`}>{video.category}</span>}
           {video.category_tag && (
             <span className="tag cat-badge cat-tag" title={`Detected tag: ${video.category_tag}`}>
-              {video.category_tag === "music" ? "🎵 Music" : video.category_tag}
+              {video.category_tag === "music" ? (
+                <span className="icon-text"><Music size={12} strokeWidth={2} aria-hidden /> Music</span>
+              ) : (
+                video.category_tag
+              )}
             </span>
           )}
           {video.language && <span className="tag">{video.language.toUpperCase()}</span>}
@@ -167,7 +183,7 @@ export default function VideoPanel({
                 Use as reference edit
               </button>
               <button
-                className="ghost small danger"
+                className="ghost small danger video-remove-library"
                 title="Stop using this video in search and scripts (the file is not deleted)"
                 onClick={() => onExclude("removed")}
               >
@@ -181,11 +197,12 @@ export default function VideoPanel({
         </span>
       </div>
 
+      <div className="video-panel-content">
+      <div className="video-panel-visual">
       <div className="player-wrap">
         <video
           ref={player}
           src={src ?? undefined}
-          controls
           preload="metadata"
           onLoadedMetadata={(e) => {
             if (pendingSeek.current != null) {
@@ -195,6 +212,8 @@ export default function VideoPanel({
             }
           }}
           onTimeUpdate={(e) => setNow(e.currentTarget.currentTime)}
+          onPlay={() => setIsPlaying(true)}
+          onPause={() => setIsPlaying(false)}
           onError={() => { if (src && !preparing) setPlayError(true); }}
         />
         {preparing && !src && (
@@ -221,8 +240,18 @@ export default function VideoPanel({
           </div>
         )}
       </div>
+      <div className="video-mini-transport">
+        <button type="button" className="ghost small icon-text" onClick={togglePlayback} disabled={!src} aria-label={isPlaying ? "Pause video" : "Play video"} title={isPlaying ? "Pause" : "Play"}>
+          {isPlaying ? <Pause size={15} strokeWidth={2} /> : <Play size={15} strokeWidth={2} />}{isPlaying ? "Pause" : "Play"}
+        </button>
+        <span className="video-time-readout" aria-live="off">{timeLabel(now)} / {timeLabel(duration)}</span>
+        <input type="range" min={0} max={duration || 1} step={0.1} value={Math.min(now, duration || 1)} aria-label="Seek video"
+          onChange={(event) => { const time = Number(event.target.value); if (player.current) player.current.currentTime = time; setNow(time); }} />
+      </div>
 
       {video.duration_s != null && steadiness && steadiness.windows.length > 0 && (
+        <div className="shake-bar-group">
+        <div className="video-section-label">Camera steadiness · red marks shakier moments</div>
         <div
           className="shake-bar"
           title={
@@ -244,9 +273,13 @@ export default function VideoPanel({
           ))}
           <span className="playhead" style={{ left: `${(now / video.duration_s!) * 100}%` }} />
         </div>
+        </div>
       )}
       {frames.length > 0 && (
-        <div className="frame-strip">
+        <>
+        <div className="video-section-label">Keyframes · click to jump</div>
+        <div className={`frame-strip-wrap${frames.length > 4 ? " has-next" : ""}`}>
+        <div className="frame-strip" ref={frameStrip}>
           {frames.map((f) => (
             <figure
               key={f.id}
@@ -261,6 +294,15 @@ export default function VideoPanel({
             </figure>
           ))}
         </div>
+        {frames.length > 4 && <button type="button" className="frame-strip-next ghost" aria-label="Scroll to later keyframes" title="More keyframes" onClick={() => {
+          const strip = frameStrip.current;
+          const firstTile = strip?.firstElementChild as HTMLElement | null;
+          if (!strip || !firstTile) return;
+          const gap = Number.parseFloat(getComputedStyle(strip).columnGap) || 0;
+          strip.scrollBy({ left: firstTile.getBoundingClientRect().width + gap, behavior: "smooth" });
+        }}><ChevronRight size={16} strokeWidth={2} aria-hidden="true" /></button>}
+        </div>
+        </>
       )}
       {active && d && (
         <div className="frame-detail">
@@ -296,6 +338,8 @@ export default function VideoPanel({
         </div>
       )}
 
+      </div>
+      <aside className="video-panel-transcript" aria-label="Transcript">
       {segments && segments.length > 0 && (
         <input placeholder="Find in transcript…" value={filter} onChange={(e) => setFilter(e.target.value)} />
       )}
@@ -316,6 +360,8 @@ export default function VideoPanel({
           {shown.length === 0 && <div className="muted">No match.</div>}
         </div>
       )}
+      </aside>
+      </div>
     </section>
   );
 }

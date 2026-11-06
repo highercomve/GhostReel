@@ -49,6 +49,12 @@ pub struct ToolCallRecord {
     pub summary: String,
 }
 
+fn log_tool_record(record: &ToolCallRecord) {
+    let text = serde_json::to_string(record).unwrap_or_default();
+    crate::llmlog::push("tool", &text);
+    if record.summary.starts_with("error:") { crate::llmlog::push("error", text); }
+}
+
 /// A stored chat session.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ChatSession {
@@ -168,15 +174,15 @@ impl ChatBackend {
             }
             crate::runtime::VisionSetup::Local { helper, models_dir, model, mmproj, found, runtime } => {
                 let mut paths = Vec::with_capacity(2);
-                for spec in [model, mmproj] {
-                    if let Some(p) = found.iter().find(|p| p.file_name().is_some_and(|n| n == spec.file_name.as_str()))
+                for spec in std::iter::once(model).chain(mmproj.iter()) {
+                    if let Some(p) = found.iter().find(|p| p == &std::path::Path::new(&spec.file_name) || p.file_name().is_some_and(|n| n == spec.file_name.as_str()))
                     {
                         paths.push(p.clone());
                     } else {
                         paths.push(crate::models::download(spec, models_dir, |_, _| {}).await?);
                     }
                 }
-                let vision = Some((paths[0].clone(), paths[1].clone()));
+                let vision = Some((paths[0].clone(), paths.get(1).cloned()));
                 let models = crate::vision::LocalModels {
                     helper: helper.clone(),
                     vision,
@@ -207,7 +213,7 @@ pub struct ChatContext {
     pub embedder: Option<Embedder>,
     /// Custom editing instructions (Settings); `None`/empty = [`DEFAULT_EDITOR_PROMPT`].
     pub system_prompt: Option<String>,
-    /// `chat_model.max_tool_rounds`; 0 = the backend's own default.
+    /// `chat_model.max_tool_rounds`; 0 = unlimited (subject to the internal safety ceiling).
     pub max_tool_rounds: u32,
     /// The `[script]` settings: clip lengths, target tolerances, narration pace, research budget.
     pub script: crate::config::ScriptConfig,
@@ -216,6 +222,10 @@ pub struct ChatContext {
     /// Set by Stop. Checked between tool rounds and before every model call, so a turn ends
     /// within a round instead of after the whole draft.
     pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+}
+
+fn tool_round_budget(configured: u32) -> u32 {
+    if configured == 0 { 500 } else { configured.min(100) }
 }
 
 /// Returned when a turn is stopped; the caller reports it as cancelled, not as a failure.
@@ -902,7 +912,7 @@ async fn fit_local_prompt(
         if tokens.saturating_add(output) <= context as usize {
             if dropped {
                 crate::llmlog::push(
-                    "chat",
+                    "info",
                     format!(
                         "Compacted old exchanges: {tokens} prompt + {output} output tokens in a {context}-token window"
                     ),
@@ -1907,6 +1917,7 @@ pub fn hold_the_last_picture(db: &Db, project_id: i64, script: &mut Script, cfg:
                 out_s: shot.t_s + cfg.closing_hold_s,
                 audio: crate::script::Audio::Mute,
                 why: Some(CLOSING_PICTURE.into()),
+                tracks: None,
             });
             return cfg.closing_hold_s;
         }
@@ -2525,7 +2536,8 @@ pub fn build_system_prompt(
     if let Some(draft) = latest_script_json {
         prompt.push_str(&format!(
             "\nCurrent script draft from this session:\n{}\n\
-             When the user asks for changes, revise this draft accordingly.\n",
+             When the user asks for changes, revise this draft accordingly. \
+             Note: This draft may contain deliberate manual edits from the user — treat them as intentional and preserve them unless the user explicitly requests changes to them.\n",
             draft
         ));
     }
@@ -3256,6 +3268,7 @@ pub fn set_session_style(db: &Db, session_id: i64, style: ChatStyle) -> Result<(
 /// link (the schema sets their `session_id` to NULL): a script is a deliverable, a chat is not.
 pub fn delete_session(db: &Db, session_id: i64) -> Result<bool, Error> {
     let n = db.conn.execute("DELETE FROM chat_sessions WHERE id = ?1", [session_id])?;
+    if n > 0 { crate::llmlog::delete(session_id); }
     Ok(n > 0)
 }
 
@@ -3413,24 +3426,10 @@ pub async fn run_turn(
     session_id: Option<i64>,
     message: &str,
     images: &[String],
+    baseline_script_id: Option<i64>,
     on_event: &mut (dyn FnMut(ChatEvent) + Send),
 ) -> Result<TurnResult, Error> {
     let turn_started = std::time::Instant::now();
-    let mut inference = Vec::new();
-    if let ChatBackend::Local { helper, .. } = &mut ctx.backend {
-        helper.take_inference();
-    }
-    let project = ctx.db.project(project_id)?;
-    // A configured budget wins; otherwise the backend decides how much research it can afford.
-    // Captured before the backend is borrowed, so every arm can check it.
-    let cancel_flag = ctx.cancel.clone();
-    let cancelled = move || cancel_flag.as_ref().is_some_and(|c| c.load(std::sync::atomic::Ordering::SeqCst));
-    let rounds_budget = match (ctx.max_tool_rounds, &ctx.backend) {
-        (n, _) if n > 0 => n,
-        (_, ChatBackend::Local { .. }) => ctx.script.local_tool_rounds,
-        _ => ctx.script.roomy_tool_rounds,
-    };
-
     let (session_id, is_new_session) = match session_id {
         Some(id) => (id, false),
         None => {
@@ -3439,6 +3438,93 @@ pub async fn run_turn(
             (sid, true)
         }
     };
+
+    let _log_session = crate::llmlog::session(session_id);
+    if let ChatBackend::Server { api_key, .. } = &ctx.backend {
+        crate::llmlog::redact_secret(api_key);
+    }
+    crate::llmlog::redact_secret(&ctx.jev.api_key);
+    let (backend, model, tool, think) = match &ctx.backend {
+        ChatBackend::Server { model, .. } => ("server", model.as_str(), None, false),
+        ChatBackend::Local { helper, think, .. } => ("local", helper.model_name(), None, *think),
+        ChatBackend::Cli(agent) => ("cli", agent.cfg.model.as_str(), Some(agent.cfg.tool.as_str()), false),
+    };
+    let logged_baseline = baseline_script_id.or_else(|| {
+        ctx.db
+            .conn
+            .query_row("SELECT id FROM scripts WHERE session_id = ?1 ORDER BY id DESC LIMIT 1", [session_id], |r| {
+                r.get::<_, i64>(0)
+            })
+            .ok()
+    });
+    crate::llmlog::push(
+        "info",
+        json!({
+            "event": "turn_start", "started_at_ms": crate::llmlog::timestamp(),
+            "session_id": session_id, "project_id": project_id, "backend": backend,
+            "model": model, "tool": tool, "max_tool_rounds": ctx.max_tool_rounds,
+            "think": think, "ctx_tokens": ctx.backend.window_tokens(),
+            "mode": if ctx.script.style.broll { "broll" } else { "documentary" },
+            "method": "run_turn", "style": ctx.script.style, "settings": ctx.script,
+            "message": message, "baseline_script_id": logged_baseline,
+        })
+        .to_string(),
+    );
+    let mut rounds_used = 0u32;
+    let result = run_turn_inner(
+        ctx,
+        project_id,
+        session_id,
+        is_new_session,
+        message,
+        images,
+        baseline_script_id,
+        on_event,
+        &mut rounds_used,
+    )
+    .await;
+    match &result {
+        Ok(turn) => {
+            let version = turn.script_id.and_then(|id| crate::script::load(&ctx.db, id).ok()).map(|s| s.version);
+            crate::llmlog::push(
+                "info",
+                json!({ "event": "turn_end", "duration_ms": turn_started.elapsed().as_millis(),
+                "rounds_used": rounds_used, "saved_script_id": turn.script_id, "version": version,
+                "issues_count": turn.issues.len() })
+                .to_string(),
+            );
+        }
+        Err(error) => {
+            crate::llmlog::push("error", error.to_string());
+            crate::llmlog::push("info", json!({ "event": "turn_end", "duration_ms": turn_started.elapsed().as_millis(),
+                "rounds_used": rounds_used, "status": "error", "saved_script_id": null, "version": null, "issues_count": 0 }).to_string());
+        }
+    }
+    result
+}
+
+async fn run_turn_inner(
+    ctx: &mut ChatContext,
+    project_id: i64,
+    session_id: i64,
+    is_new_session: bool,
+    message: &str,
+    images: &[String],
+    baseline_script_id: Option<i64>,
+    on_event: &mut (dyn FnMut(ChatEvent) + Send),
+    rounds_used: &mut u32,
+) -> Result<TurnResult, Error> {
+    let turn_started = std::time::Instant::now();
+    let mut inference = Vec::new();
+    if let ChatBackend::Local { helper, .. } = &mut ctx.backend {
+        helper.take_inference();
+    }
+    let project = ctx.db.project(project_id)?;
+    // Zero means unlimited; cap pathological non-terminating tool loops at 500 rounds.
+    // Other stop conditions (cancellation, memoization, and context limits) still apply.
+    let cancel_flag = ctx.cancel.clone();
+    let cancelled = move || cancel_flag.as_ref().is_some_and(|c| c.load(std::sync::atomic::Ordering::SeqCst));
+    let rounds_budget = tool_round_budget(ctx.max_tool_rounds);
 
     let saved_image_paths = persist_chat_images(&ctx.data_dir, session_id, images);
     let image_strings: Vec<String> = saved_image_paths.iter().map(|p| p.to_string_lossy().to_string()).collect();
@@ -3451,6 +3537,14 @@ pub async fn run_turn(
     let mut memo = ToolMemo::default();
     let mut prior_messages = Vec::new();
     let mut latest_script_json = None;
+    let mut baseline_script: Option<Script> = None;
+
+    // Explicit baseline script_id has top priority (handles multi-cut, sessionless cuts, or revision of specific versions)
+    if let Some(sid) = baseline_script_id {
+        if let Ok(stored) = crate::script::load(&ctx.db, sid) {
+            baseline_script = Some(stored.script);
+        }
+    }
 
     if !is_new_session {
         prior_messages = messages(&ctx.db, session_id)?;
@@ -3461,25 +3555,32 @@ pub async fn run_turn(
                 }
             }
         }
-        let stored_json: Option<String> = ctx
-            .db
-            .conn
-            .query_row(
-                "SELECT script_json FROM scripts WHERE session_id = ?1 ORDER BY version DESC LIMIT 1",
-                [session_id],
-                |r| r.get(0),
-            )
-            .ok();
-        if let Some(ref json_str) = stored_json
-            && let Ok(prev_script) = serde_json::from_str::<Script>(json_str)
-        {
-            for beat in &prev_script.beats {
-                for clip in &beat.clips {
-                    grounding.add(clip.video_id, clip.in_s, clip.out_s);
-                }
+        // Fall back to latest script from this session if no explicit baseline was given
+        if baseline_script.is_none() {
+            let stored_json: Option<String> = ctx
+                .db
+                .conn
+                .query_row(
+                    "SELECT script_json FROM scripts WHERE session_id = ?1 ORDER BY id DESC LIMIT 1",
+                    [session_id],
+                    |r| r.get(0),
+                )
+                .ok();
+            if let Some(ref json_str) = stored_json
+                && let Ok(prev_script) = serde_json::from_str::<Script>(json_str)
+            {
+                baseline_script = Some(prev_script);
             }
         }
-        latest_script_json = stored_json;
+    }
+
+    if let Some(ref prev_script) = baseline_script {
+        for beat in &prev_script.beats {
+            for clip in &beat.clips {
+                grounding.add(clip.video_id, clip.in_s, clip.out_s);
+            }
+        }
+        latest_script_json = serde_json::to_string_pretty(prev_script).ok();
     }
 
     // Write down what was asked before doing any of it. Everything used to be stored when the turn
@@ -3648,6 +3749,7 @@ pub async fn run_turn(
                     break;
                 }
                 tool_rounds += 1;
+                *rounds_used += 1;
                 let mut body = json!({
                     "messages": req_messages,
                     // A tool call is short, but a model that reasons first spends the same budget
@@ -3665,6 +3767,7 @@ pub async fn run_turn(
                 // window (llama-server ignores it; it was started with its own).
                 body["options"] = json!({ "num_ctx": *ctx_tokens });
 
+                crate::llmlog::push("prompt", body.to_string());
                 let mut req = client.post(format!("{}/v1/chat/completions", url.trim_end_matches('/'))).json(&body);
                 if !api_key.is_empty() {
                     req = req.bearer_auth(api_key.as_str());
@@ -3678,6 +3781,9 @@ pub async fn run_turn(
                 }
 
                 let v: Value = resp.json().await.map_err(|e| Error::Vision(format!("bad response JSON: {e}")))?;
+                let logged_message = &v["choices"][0]["message"];
+                if let Some(thinking) = logged_message["reasoning_content"].as_str() { crate::llmlog::push("thinking", thinking); }
+                crate::llmlog::push("answer", logged_message.to_string());
                 inference.push(crate::inference::InferenceCall::from_response(
                     &v,
                     "server",
@@ -3759,7 +3865,9 @@ pub async fn run_turn(
 
                     let empty = is_empty_search(&tool_name, &summary);
                     let was_search = tool_name.starts_with("search");
-                    tool_records.push(ToolCallRecord { tool: tool_name, args: tool_args, summary });
+                    let record = ToolCallRecord { tool: tool_name, args: tool_args, summary };
+                    log_tool_record(&record);
+                    tool_records.push(record);
 
                     if empty {
                         empty_searches += 1;
@@ -3808,6 +3916,7 @@ pub async fn run_turn(
             }
             final_body["options"] = json!({ "num_ctx": *ctx_tokens });
 
+            crate::llmlog::push("prompt", final_body.to_string());
             let mut req = client.post(format!("{}/v1/chat/completions", url.trim_end_matches('/'))).json(&final_body);
             if !api_key.is_empty() {
                 req = req.bearer_auth(api_key.as_str());
@@ -3819,6 +3928,9 @@ pub async fn run_turn(
                 return Err(Error::Vision(format!("server HTTP error (final script): {err_text}")));
             }
             let v: Value = resp.json().await.map_err(|e| Error::Vision(format!("bad final JSON: {e}")))?;
+            let logged_message = &v["choices"][0]["message"];
+            if let Some(thinking) = logged_message["reasoning_content"].as_str() { crate::llmlog::push("thinking", thinking); }
+            crate::llmlog::push("answer", logged_message.to_string());
             inference.push(crate::inference::InferenceCall::from_response(
                 &v,
                 "server",
@@ -3847,6 +3959,7 @@ pub async fn run_turn(
                 Err(_) => Vec::new(),
             };
 
+            for issue in &redraft_reasons { crate::llmlog::push("info", format!("Validation: {}", issue.message)); }
             if !redraft_reasons.is_empty() && script_res.is_ok() {
                 // Retry once
                 on_event(ChatEvent::Drafting);
@@ -3863,15 +3976,21 @@ pub async fn run_turn(
                 }));
                 final_body["messages"] = json!(req_messages);
 
+                crate::llmlog::push("prompt", final_body.to_string());
                 let mut retry_req =
                     client.post(format!("{}/v1/chat/completions", url.trim_end_matches('/'))).json(&final_body);
                 if !api_key.is_empty() {
                     retry_req = retry_req.bearer_auth(api_key.as_str());
                 }
                 let retry_started = std::time::Instant::now();
-                if let Ok(retry_resp) = retry_req.send().await
-                    && let Ok(rv) = retry_resp.json::<Value>().await
-                {
+                let retry_response = async {
+                    retry_req.send().await?.json::<Value>().await
+                }.await;
+                if let Err(error) = &retry_response { crate::llmlog::push("error", format!("Optional redraft: {error}")); }
+                if let Ok(rv) = retry_response {
+                    let logged_message = &rv["choices"][0]["message"];
+                    if let Some(thinking) = logged_message["reasoning_content"].as_str() { crate::llmlog::push("thinking", thinking); }
+                    crate::llmlog::push("answer", logged_message.to_string());
                     inference.push(crate::inference::InferenceCall::from_response(
                         &rv,
                         "server",
@@ -3977,6 +4096,7 @@ pub async fn run_turn(
                     return Err(Error::Invalid(CANCELLED.into()));
                 }
                 budget.calls += 1;
+                *rounds_used += 1;
                 // A tool action is short, but a model that reasons first spends the same budget on
                 // the thought — at the default 2048 it ran out mid-round and the turn died.
                 fit_local_prompt(
@@ -4092,7 +4212,9 @@ pub async fn run_turn(
                         research_evidence.record(&tool, &args, &res);
                         on_event(ChatEvent::ToolFinished { tool: tool.clone(), summary: summary.clone() });
                         let empty = is_empty_search(&tool, &summary);
-                        tool_records.push(ToolCallRecord { tool: tool.clone(), args: args.clone(), summary });
+                        let record = ToolCallRecord { tool: tool.clone(), args: args.clone(), summary };
+                        log_tool_record(&record);
+                        tool_records.push(record);
 
                         if empty {
                             empty_searches += 1;
@@ -4184,6 +4306,7 @@ pub async fn run_turn(
                 let mut reasons = check_grounding(&ctx.db, project_id, s, &grounding, &ctx.script);
                 reasons.extend(pacing_issues(s, enforce_target, &ctx.script));
                 reasons.extend(content_issues(&ctx.db, s, &ctx.script));
+                for issue in &reasons { crate::llmlog::push("info", format!("Validation: {}", issue.message)); }
                 if !reasons.is_empty() {
                     on_event(ChatEvent::Drafting);
                     let issue_text: Vec<String> = reasons.iter().map(|i| i.message.clone()).collect();
@@ -4208,7 +4331,7 @@ pub async fn run_turn(
                     )
                     .await;
                     if let Err(error) = &fits {
-                        crate::llmlog::push("chat", format!("Skipped optional redraft: {error}"));
+                        crate::llmlog::push("info", format!("Skipped optional redraft: {error}"));
                     }
                     if fits.is_ok()
                         && let Ok(retry_str) = helper
@@ -4264,7 +4387,9 @@ pub async fn run_turn(
                     budget.tools += 1;
                     research_evidence.record(inspection.tool, &args, &result);
                     on_event(ChatEvent::ToolFinished { tool: inspection.tool.into(), summary: summary.clone() });
-                    tool_records.push(ToolCallRecord { tool: inspection.tool.into(), args: args.clone(), summary });
+                    let record = ToolCallRecord { tool: inspection.tool.into(), args: args.clone(), summary };
+                    log_tool_record(&record);
+                    tool_records.push(record);
                     results.push_str(&format!("\n{} {args}:\n{result}\n", inspection.tool));
                 }
                 transcript.push_str(&format!(
@@ -4290,6 +4415,7 @@ pub async fn run_turn(
                 }
                 on_event(ChatEvent::Drafting);
                 budget.calls += 1;
+                *rounds_used += 1;
                 let reviewed = helper
                     .complete_full(&transcript, Some(local_final_action_schema(false)), script_token_budget, *think)
                     .await?;
@@ -4370,6 +4496,7 @@ pub async fn run_turn(
                     return Err(Error::Invalid(CANCELLED.into()));
                 }
                 tool_rounds += 1;
+                *rounds_used += 1;
                 // The first round carries the whole transcript; after that the tool continues its
                 // own conversation and hears only what is new. Re-sending everything each round
                 // grows quadratically — on this project's library agy timed out on round one.
@@ -4429,7 +4556,9 @@ pub async fn run_turn(
                         };
                         on_event(ChatEvent::ToolFinished { tool: tool.clone(), summary: summary.clone() });
                         let empty = is_empty_search(&tool, &summary);
-                        tool_records.push(ToolCallRecord { tool: tool.clone(), args: args.clone(), summary });
+                        let record = ToolCallRecord { tool: tool.clone(), args: args.clone(), summary };
+                        log_tool_record(&record);
+                        tool_records.push(record);
 
                         if empty {
                             empty_searches += 1;
@@ -4520,6 +4649,10 @@ pub async fn run_turn(
                         issues.push(Issue { severity: IssueSeverity::Warning, beat_id: None, clip_index: None,
                             message: format!("research incomplete: {} shot/transcript range(s) in the saved edit were not fully inspected; review them before export", missing.len()) });
                     }
+                }
+                // Pin cut title to baseline script title on revision to prevent AI from accidentally splitting cuts
+                if let Some(ref base) = baseline_script {
+                    s.title = base.title.clone();
                 }
                 let sid = save_version(&ctx.db, project_id, &s, Some(session_id))?;
                 script_id = Some(sid);
@@ -4639,6 +4772,7 @@ pub async fn run_turn(
     for note in [repair_note.as_ref(), judge_note.as_ref(), research_note.as_ref()].into_iter().flatten() {
         stored_reply.push_str("\n\n");
         stored_reply.push_str(note);
+        crate::llmlog::push("info", note);
     }
     ctx.db.conn.execute(
         "INSERT INTO chat_messages(session_id, role, content, tool_calls_json, created_at)
@@ -4649,6 +4783,9 @@ pub async fn run_turn(
     // Update chat_sessions updated_at
     ctx.db.conn.execute("UPDATE chat_sessions SET updated_at = ?1 WHERE id = ?2", params![now_ts, session_id])?;
 
+    for issue in &issues {
+        crate::llmlog::push(if issue.severity == IssueSeverity::Error { "error" } else { "info" }, &issue.message);
+    }
     Ok(TurnResult { session_id, reply, script_id, script: parsed_script, issues, tool_calls: tool_records, judgement })
 }
 
@@ -4844,6 +4981,7 @@ pub fn lay_audio_beds(db: &Db, s: &mut Script, cfg: &crate::config::ScriptConfig
             out_s: end,
             why: None,
             inferred: true,
+            tracks: None,
         });
         for c in &mut beat.clips {
             c.audio = crate::script::Audio::Mute;
@@ -4865,6 +5003,13 @@ pub fn lay_audio_beds(db: &Db, s: &mut Script, cfg: &crate::config::ScriptConfig
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zero_research_limit_uses_unlimited_safety_budget() {
+        assert_eq!(tool_round_budget(0), 500);
+        assert_eq!(tool_round_budget(7), 7);
+        assert_eq!(tool_round_budget(200), 100);
+    }
 
     #[test]
     fn local_compaction_keeps_rules_brief_latest_evidence_and_tool_pairs() {
@@ -4901,7 +5046,7 @@ mod tests {
             purpose: "p".into(),
             narration: None,
             on_screen_text: None,
-            clips: vec![ScriptClip { video_id: 1, in_s, out_s, audio: Audio::Source, why: None }],
+            clips: vec![ScriptClip { video_id: 1, in_s, out_s, audio: Audio::Source, why: None, tracks: None }],
             bed: None,
             notes: None,
         };
@@ -4944,8 +5089,15 @@ mod tests {
                 narration: None,
                 on_screen_text: None,
                 // Muted pictures under somebody else's voice: what they say is irrelevant.
-                clips: vec![ScriptClip { video_id: 1, in_s: 1.0, out_s: 6.0, audio: Audio::Mute, why: None }],
-                bed: Some(AudioBed { video_id: 1, in_s: 10.0, out_s: 18.0, why: None, inferred: true }),
+                clips: vec![ScriptClip {
+                    video_id: 1,
+                    in_s: 1.0,
+                    out_s: 6.0,
+                    audio: Audio::Mute,
+                    why: None,
+                    tracks: None,
+                }],
+                bed: Some(AudioBed { video_id: 1, in_s: 10.0, out_s: 18.0, why: None, inferred: true, tracks: None }),
                 notes: None,
             }],
         };
@@ -4987,7 +5139,14 @@ mod tests {
             purpose: format!("beat {id}"),
             narration: None,
             on_screen_text: None,
-            clips: vec![ScriptClip { video_id: 1, in_s: 0.0, out_s: secs, audio: Audio::Source, why: None }],
+            clips: vec![ScriptClip {
+                video_id: 1,
+                in_s: 0.0,
+                out_s: secs,
+                audio: Audio::Source,
+                why: None,
+                tracks: None,
+            }],
             bed: None,
             notes: None,
         };
@@ -5020,7 +5179,14 @@ mod tests {
             purpose: "p".into(),
             narration: None,
             on_screen_text: None,
-            clips: vec![ScriptClip { video_id: 1, in_s: 0.0, out_s: 90.0, audio: Audio::Source, why: None }],
+            clips: vec![ScriptClip {
+                video_id: 1,
+                in_s: 0.0,
+                out_s: 90.0,
+                audio: Audio::Source,
+                why: None,
+                tracks: None,
+            }],
             bed: None,
             notes: None,
         };
@@ -5072,7 +5238,14 @@ mod tests {
                 )
                 .unwrap();
         }
-        let clip = |in_s: f64, out_s: f64| ScriptClip { video_id: 1, in_s, out_s, audio: Audio::Source, why: None };
+        let clip = |in_s: f64, out_s: f64| ScriptClip {
+            video_id: 1,
+            in_s,
+            out_s,
+            audio: Audio::Source,
+            why: None,
+            tracks: None,
+        };
         let mut script = Script {
             title: "t".into(),
             target_duration_s: Some(60.0),
@@ -5152,8 +5325,15 @@ mod tests {
                 narration: None,
                 on_screen_text: None,
                 notes: None,
-                clips: vec![ScriptClip { video_id: 1, in_s: 10.0, out_s: 20.0, audio: Audio::Mute, why: None }],
-                bed: Some(AudioBed { video_id: 1, in_s: 10.0, out_s: 20.0, why: None, inferred: true }),
+                clips: vec![ScriptClip {
+                    video_id: 1,
+                    in_s: 10.0,
+                    out_s: 20.0,
+                    audio: Audio::Mute,
+                    why: None,
+                    tracks: None,
+                }],
+                bed: Some(AudioBed { video_id: 1, in_s: 10.0, out_s: 20.0, why: None, inferred: true, tracks: None }),
             }],
         };
         let held = hold_the_last_picture(&db, project.id, &mut script, &sc());
@@ -5232,7 +5412,7 @@ mod tests {
                 on_screen_text: None,
                 notes: None,
                 clips: vec![],
-                bed: Some(AudioBed { video_id: 100, in_s: 72.0, out_s: 82.0, why: None, inferred: true }),
+                bed: Some(AudioBed { video_id: 100, in_s: 72.0, out_s: 82.0, why: None, inferred: true, tracks: None }),
             }],
         };
         assert_eq!(end_on_turns(&db, &mut script, &sc()), 1, "the handover is there to be found");
@@ -5274,7 +5454,14 @@ mod tests {
                 narration: None,
                 on_screen_text: None,
                 notes: None,
-                clips: vec![ScriptClip { video_id: 7, in_s: 0.0, out_s: 13.0, audio: Audio::Source, why: None }],
+                clips: vec![ScriptClip {
+                    video_id: 7,
+                    in_s: 0.0,
+                    out_s: 13.0,
+                    audio: Audio::Source,
+                    why: None,
+                    tracks: None,
+                }],
                 bed: None,
             }],
         };
@@ -5304,7 +5491,7 @@ mod tests {
             narration: None,
             on_screen_text: None,
             notes: None,
-            clips: vec![ScriptClip { video_id: 1, in_s, out_s, audio: Audio::Source, why: None }],
+            clips: vec![ScriptClip { video_id: 1, in_s, out_s, audio: Audio::Source, why: None, tracks: None }],
             bed: None,
         };
         let script_of = |b: Beat| Script {
@@ -5466,7 +5653,7 @@ mod tests {
             cancel: None,
         };
 
-        let res = run_turn(&mut ctx, p.id, None, "a 40 second teaser", &[], &mut |_| {}).await;
+        let res = run_turn(&mut ctx, p.id, None, "a 40 second teaser", &[], None, &mut |_| {}).await;
         assert!(res.is_err(), "the turn fails without a server");
 
         let asked: String = ctx
@@ -5519,8 +5706,15 @@ mod tests {
                 narration: None,
                 on_screen_text: None,
                 notes: None,
-                clips: vec![ScriptClip { video_id: 1, in_s: 0.0, out_s: 6.0, audio: Audio::Mute, why: None }],
-                bed: Some(AudioBed { video_id: 1, in_s: 10.0, out_s: 30.0, why: None, inferred: true }),
+                clips: vec![ScriptClip {
+                    video_id: 1,
+                    in_s: 0.0,
+                    out_s: 6.0,
+                    audio: Audio::Mute,
+                    why: None,
+                    tracks: None,
+                }],
+                bed: Some(AudioBed { video_id: 1, in_s: 10.0, out_s: 30.0, why: None, inferred: true, tracks: None }),
             }],
         };
         clamp_beds_to_beats(&db, &mut script, &sc());
@@ -5595,9 +5789,9 @@ mod tests {
                 notes: None,
                 // Her face for 4 s, then two pictures of what she is describing.
                 clips: vec![
-                    ScriptClip { video_id: 1, in_s: 10.0, out_s: 14.0, audio: Audio::Source, why: None },
-                    ScriptClip { video_id: 2, in_s: 0.0, out_s: 5.0, audio: Audio::Mute, why: None },
-                    ScriptClip { video_id: 2, in_s: 20.0, out_s: 25.0, audio: Audio::Mute, why: None },
+                    ScriptClip { video_id: 1, in_s: 10.0, out_s: 14.0, audio: Audio::Source, why: None, tracks: None },
+                    ScriptClip { video_id: 2, in_s: 0.0, out_s: 5.0, audio: Audio::Mute, why: None, tracks: None },
+                    ScriptClip { video_id: 2, in_s: 20.0, out_s: 25.0, audio: Audio::Mute, why: None, tracks: None },
                 ],
                 bed: None,
             }],
@@ -5643,8 +5837,8 @@ mod tests {
                 on_screen_text: None,
                 notes: None,
                 clips: vec![
-                    ScriptClip { video_id: 2, in_s: 0.0, out_s: 3.0, audio: Audio::Mute, why: None },
-                    ScriptClip { video_id: 1, in_s: 14.0, out_s: 20.0, audio: Audio::Source, why: None },
+                    ScriptClip { video_id: 2, in_s: 0.0, out_s: 3.0, audio: Audio::Mute, why: None, tracks: None },
+                    ScriptClip { video_id: 1, in_s: 14.0, out_s: 20.0, audio: Audio::Source, why: None, tracks: None },
                 ],
                 bed: None,
             }],
@@ -5674,8 +5868,15 @@ mod tests {
                 narration: None,
                 on_screen_text: None,
                 notes: None,
-                clips: vec![ScriptClip { video_id: 1, in_s: 0.0, out_s: 5.0, audio: Audio::Mute, why: None }],
-                bed: Some(AudioBed { video_id: 1, in_s: 40.0, out_s: 50.0, why: None, inferred: false }),
+                clips: vec![ScriptClip {
+                    video_id: 1,
+                    in_s: 0.0,
+                    out_s: 5.0,
+                    audio: Audio::Mute,
+                    why: None,
+                    tracks: None,
+                }],
+                bed: Some(AudioBed { video_id: 1, in_s: 40.0, out_s: 50.0, why: None, inferred: false, tracks: None }),
             }],
         };
         let issues = lay_audio_beds(&db, &mut script, &sc());
@@ -5731,7 +5932,14 @@ mod tests {
                 narration: Some("some words".into()),
                 on_screen_text: None,
                 notes: None,
-                clips: vec![ScriptClip { video_id: 1, in_s: 0.5, out_s: 4.7, audio: Audio::Mute, why: None }],
+                clips: vec![ScriptClip {
+                    video_id: 1,
+                    in_s: 0.5,
+                    out_s: 4.7,
+                    audio: Audio::Mute,
+                    why: None,
+                    tracks: None,
+                }],
                 bed: None,
             }],
         };
@@ -5813,7 +6021,7 @@ for line in sys.stdin:
         std::fs::set_permissions(&helper_path, std::fs::Permissions::from_mode(0o755)).unwrap();
         let helper = crate::vision::LocalLlm::start(&crate::vision::LocalModels {
             helper: helper_path,
-            vision: Some(("model".into(), "projector".into())),
+            vision: Some(("model".into(), Some("projector".into()))),
             embed: None,
             cpu: true,
             runtime: Default::default(),
@@ -5840,7 +6048,7 @@ for line in sys.stdin:
             cancel: None,
         };
         let result =
-            run_turn(&mut ctx, p.id, None, "Create a 5 second community video", &[], &mut |_| {}).await.unwrap();
+            run_turn(&mut ctx, p.id, None, "Create a 5 second community video", &[], None, &mut |_| {}).await.unwrap();
         assert!(result.script_id.is_some());
         assert_eq!(result.tool_calls.len(), 3, "two planning replies must leave room for actual inspections");
         assert!(result.tool_calls.iter().any(|t| t.tool == "get_video" && t.args["video_id"] == 2));
@@ -5906,7 +6114,14 @@ for line in sys.stdin:
 
         // The model opened nothing, so nothing is grounded by tool results.
         let grounding = Grounding::default();
-        let clip = |in_s: f64, out_s: f64| ScriptClip { video_id: 1, in_s, out_s, audio: Audio::Mute, why: None };
+        let clip = |in_s: f64, out_s: f64| ScriptClip {
+            video_id: 1,
+            in_s,
+            out_s,
+            audio: Audio::Mute,
+            why: None,
+            tracks: None,
+        };
         let mut script = Script {
             title: "t".into(),
             target_duration_s: None,
@@ -5992,7 +6207,14 @@ for line in sys.stdin:
     #[test]
     fn pacing_redraft_and_trim() {
         use crate::script::{Audio, Beat, ScriptClip};
-        let clip = |in_s: f64, out_s: f64| ScriptClip { video_id: 1, in_s, out_s, audio: Audio::Source, why: None };
+        let clip = |in_s: f64, out_s: f64| ScriptClip {
+            video_id: 1,
+            in_s,
+            out_s,
+            audio: Audio::Source,
+            why: None,
+            tracks: None,
+        };
         let mut s = Script {
             title: "t".into(),
             target_duration_s: Some(20.0),
@@ -6132,7 +6354,8 @@ for line in sys.stdin:
         for t in [20.0, 105.0] {
             db.conn.execute("INSERT INTO frames(video_id, t_s, description_json) VALUES (1, ?1, '{}')", [t]).unwrap();
         }
-        let clip = |in_s: f64, out_s: f64, audio| ScriptClip { video_id: 1, in_s, out_s, audio, why: None };
+        let clip =
+            |in_s: f64, out_s: f64, audio| ScriptClip { video_id: 1, in_s, out_s, audio, why: None, tracks: None };
         let script = Script {
             title: "t".into(),
             target_duration_s: None,
@@ -6146,7 +6369,14 @@ for line in sys.stdin:
                 on_screen_text: None,
                 clips: vec![clip(22.0, 30.0, Audio::Mute), clip(100.0, 108.0, Audio::Source)],
                 notes: None,
-                bed: Some(AudioBed { video_id: 1, in_s: 100.0, out_s: 110.0, why: None, inferred: false }),
+                bed: Some(AudioBed {
+                    video_id: 1,
+                    in_s: 100.0,
+                    out_s: 110.0,
+                    why: None,
+                    inferred: false,
+                    tracks: None,
+                }),
             }],
         };
 
@@ -6231,7 +6461,14 @@ for line in sys.stdin:
             )
             .unwrap();
         db.conn.execute("INSERT INTO frames(video_id, t_s, description_json) VALUES (1, 20.0, '{}')", []).unwrap();
-        let clip = |in_s: f64, out_s: f64| ScriptClip { video_id: 1, in_s, out_s, audio: Audio::Source, why: None };
+        let clip = |in_s: f64, out_s: f64| ScriptClip {
+            video_id: 1,
+            in_s,
+            out_s,
+            audio: Audio::Source,
+            why: None,
+            tracks: None,
+        };
         let beat = |id: &str, narration: Option<&str>, clips| Beat {
             id: id.into(),
             purpose: "p".into(),
@@ -6406,8 +6643,15 @@ for line in sys.stdin:
                 narration: None,
                 on_screen_text: None,
                 notes: None,
-                clips: vec![ScriptClip { video_id: 1, in_s: 10.0, out_s: 20.0, audio: Audio::Mute, why: None }],
-                bed: Some(AudioBed { video_id: 1, in_s: 10.0, out_s: 20.0, why: None, inferred: true }),
+                clips: vec![ScriptClip {
+                    video_id: 1,
+                    in_s: 10.0,
+                    out_s: 20.0,
+                    audio: Audio::Mute,
+                    why: None,
+                    tracks: None,
+                }],
+                bed: Some(AudioBed { video_id: 1, in_s: 10.0, out_s: 20.0, why: None, inferred: true, tracks: None }),
             }],
         };
 
@@ -6433,7 +6677,7 @@ for line in sys.stdin:
             notes: None,
             // A beat that ends on someone speaking: the case a hold is for. A last picture that
             // is already silent has ended the piece by itself and is left alone.
-            clips: vec![ScriptClip { video_id: 1, in_s: 10.0, out_s, audio: Audio::Source, why: None }],
+            clips: vec![ScriptClip { video_id: 1, in_s: 10.0, out_s, audio: Audio::Source, why: None, tracks: None }],
             bed: None,
         };
         let script_of = |b: Beat| Script {
@@ -6480,10 +6724,10 @@ for line in sys.stdin:
                 notes: None,
                 // Her face, then a cutaway: 14.5 s of picture over 11.9 s of voice.
                 clips: vec![
-                    ScriptClip { video_id: 1, in_s: 0.0, out_s: 10.5, audio: Audio::Mute, why: None },
-                    ScriptClip { video_id: 2, in_s: 0.0, out_s: 4.0, audio: Audio::Mute, why: None },
+                    ScriptClip { video_id: 1, in_s: 0.0, out_s: 10.5, audio: Audio::Mute, why: None, tracks: None },
+                    ScriptClip { video_id: 2, in_s: 0.0, out_s: 4.0, audio: Audio::Mute, why: None, tracks: None },
                 ],
-                bed: Some(AudioBed { video_id: 1, in_s: 0.0, out_s: 11.9, why: None, inferred: true }),
+                bed: Some(AudioBed { video_id: 1, in_s: 0.0, out_s: 11.9, why: None, inferred: true, tracks: None }),
             }],
         };
 
@@ -6515,11 +6759,11 @@ for line in sys.stdin:
                 notes: None,
                 // 40 s of pictures over 8 s of voice.
                 clips: vec![
-                    ScriptClip { video_id: 1, in_s: 0.0, out_s: 8.0, audio: Audio::Mute, why: None },
-                    ScriptClip { video_id: 2, in_s: 0.0, out_s: 16.0, audio: Audio::Mute, why: None },
-                    ScriptClip { video_id: 3, in_s: 0.0, out_s: 16.0, audio: Audio::Mute, why: None },
+                    ScriptClip { video_id: 1, in_s: 0.0, out_s: 8.0, audio: Audio::Mute, why: None, tracks: None },
+                    ScriptClip { video_id: 2, in_s: 0.0, out_s: 16.0, audio: Audio::Mute, why: None, tracks: None },
+                    ScriptClip { video_id: 3, in_s: 0.0, out_s: 16.0, audio: Audio::Mute, why: None, tracks: None },
                 ],
-                bed: Some(AudioBed { video_id: 1, in_s: 0.0, out_s: 8.0, why: None, inferred: true }),
+                bed: Some(AudioBed { video_id: 1, in_s: 0.0, out_s: 8.0, why: None, inferred: true, tracks: None }),
             }],
         };
         assert_eq!(trim_pictures_to_bed(&mut script, &sc()), 0, "the cut is not thrown away");
@@ -6546,10 +6790,10 @@ for line in sys.stdin:
                 // 12 s of picture over 7 s of voice: a tail worth taking, but not enough give in
                 // the two shots to reach it without one of them going.
                 clips: vec![
-                    ScriptClip { video_id: 1, in_s: 0.0, out_s: 8.0, audio: Audio::Mute, why: None },
-                    ScriptClip { video_id: 2, in_s: 0.0, out_s: 4.0, audio: Audio::Mute, why: None },
+                    ScriptClip { video_id: 1, in_s: 0.0, out_s: 8.0, audio: Audio::Mute, why: None, tracks: None },
+                    ScriptClip { video_id: 2, in_s: 0.0, out_s: 4.0, audio: Audio::Mute, why: None, tracks: None },
                 ],
-                bed: Some(AudioBed { video_id: 1, in_s: 0.0, out_s: 7.0, why: None, inferred: true }),
+                bed: Some(AudioBed { video_id: 1, in_s: 0.0, out_s: 7.0, why: None, inferred: true, tracks: None }),
             }],
         };
 
@@ -6579,8 +6823,15 @@ for line in sys.stdin:
                 narration: Some("a line read across the whole beat".into()),
                 on_screen_text: None,
                 notes: None,
-                clips: vec![ScriptClip { video_id: 2, in_s: 0.0, out_s: 12.0, audio: Audio::Mute, why: None }],
-                bed: Some(AudioBed { video_id: 1, in_s: 0.0, out_s: 4.0, why: None, inferred: true }),
+                clips: vec![ScriptClip {
+                    video_id: 2,
+                    in_s: 0.0,
+                    out_s: 12.0,
+                    audio: Audio::Mute,
+                    why: None,
+                    tracks: None,
+                }],
+                bed: Some(AudioBed { video_id: 1, in_s: 0.0, out_s: 4.0, why: None, inferred: true, tracks: None }),
             }],
         };
         assert_eq!(trim_pictures_to_bed(&mut script, &sc()), 0);
@@ -6618,10 +6869,10 @@ for line in sys.stdin:
                 on_screen_text: None,
                 notes: None,
                 clips: vec![
-                    ScriptClip { video_id: 1, in_s: 10.0, out_s: 20.0, audio: Audio::Mute, why: None },
-                    ScriptClip { video_id: 2, in_s: 0.0, out_s: 15.0, audio: Audio::Mute, why: None },
+                    ScriptClip { video_id: 1, in_s: 10.0, out_s: 20.0, audio: Audio::Mute, why: None, tracks: None },
+                    ScriptClip { video_id: 2, in_s: 0.0, out_s: 15.0, audio: Audio::Mute, why: None, tracks: None },
                 ],
-                bed: Some(AudioBed { video_id: 1, in_s: 10.0, out_s: 28.4, why: None, inferred: true }),
+                bed: Some(AudioBed { video_id: 1, in_s: 10.0, out_s: 28.4, why: None, inferred: true, tracks: None }),
             }],
         };
 
@@ -6661,8 +6912,15 @@ for line in sys.stdin:
                 on_screen_text: None,
                 notes: None,
                 // Only 12 s of pictures.
-                clips: vec![ScriptClip { video_id: 1, in_s: 10.0, out_s: 22.0, audio: Audio::Mute, why: None }],
-                bed: Some(AudioBed { video_id: 1, in_s: 10.0, out_s: 22.0, why: None, inferred: true }),
+                clips: vec![ScriptClip {
+                    video_id: 1,
+                    in_s: 10.0,
+                    out_s: 22.0,
+                    audio: Audio::Mute,
+                    why: None,
+                    tracks: None,
+                }],
+                bed: Some(AudioBed { video_id: 1, in_s: 10.0, out_s: 22.0, why: None, inferred: true, tracks: None }),
             }],
         };
 
@@ -6812,7 +7070,7 @@ for line in sys.stdin:
             cancel: None,
         };
 
-        let res = run_turn(&mut ctx, p.id, None, "a 5 second teaser", &[], &mut |_| {}).await.unwrap();
+        let res = run_turn(&mut ctx, p.id, None, "a 5 second teaser", &[], None, &mut |_| {}).await.unwrap();
         let script = res.script.expect("a script");
         assert_eq!(script.title, "first", "the worse redraft was kept");
         assert!(
@@ -6974,9 +7232,10 @@ for line in sys.stdin:
             cancel: None,
         };
 
-        let res = run_turn(&mut ctx, p.id, None, "Create a 5s teaser about unboxing", &[], &mut |e| events.push(e))
-            .await
-            .unwrap();
+        let res =
+            run_turn(&mut ctx, p.id, None, "Create a 5s teaser about unboxing", &[], None, &mut |e| events.push(e))
+                .await
+                .unwrap();
 
         assert!(res.script_id.is_some());
         let script = res.script.unwrap();
@@ -7106,7 +7365,7 @@ for line in sys.stdin:
             cancel: None,
         };
 
-        let res = run_turn(&mut ctx, p.id, None, "Make video", &[], &mut |_| {}).await.unwrap();
+        let res = run_turn(&mut ctx, p.id, None, "Make video", &[], None, &mut |_| {}).await.unwrap();
 
         // The clip was not grounded in tool results -> dropped -> no beats left -> script_id None
         assert_eq!(res.script_id, None);
@@ -7117,7 +7376,7 @@ for line in sys.stdin:
     fn run_turn_future_is_send() {
         fn assert_send<T: Send>(_: T) {}
         let _ = |ctx: &mut ChatContext, mut cb: Box<dyn FnMut(ChatEvent) + Send>| {
-            assert_send(run_turn(ctx, 1, None, "test", &[], &mut *cb));
+            assert_send(run_turn(ctx, 1, None, "test", &[], None, &mut *cb));
         };
     }
 

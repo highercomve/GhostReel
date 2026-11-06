@@ -189,6 +189,7 @@ async fn start(
     let router = Router::new()
         .route("/api/call", post(call))
         .route("/api/events", get(events_stream))
+        .route("/api/chat-log", get(download_chat_log))
         .route("/media", get(media))
         .fallback(asset)
         .layer(middleware::from_fn_with_state(ctx.clone(), basic_auth))
@@ -297,6 +298,24 @@ async fn media(Query(q): Query<MediaQuery>, req: Request) -> Response {
     // ServeFile handles Range/If-Range/HEAD, which seeking in a <video> needs.
     match tower_http::services::ServeFile::new(&q.path).oneshot(req).await {
         Ok(r) => r.into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct ChatLogQuery { session_id: i64 }
+
+async fn download_chat_log(Query(q): Query<ChatLogQuery>, req: Request) -> Response {
+    let Ok(paths) = Paths::resolve() else { return StatusCode::INTERNAL_SERVER_ERROR.into_response(); };
+    let path = paths.data_dir.join("logs/chat").join(format!("{}.jsonl", q.session_id));
+    match tower_http::services::ServeFile::new(path).oneshot(req).await {
+        Ok(r) => {
+            let mut response = r.into_response();
+            response.headers_mut().insert(header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{}.jsonl\"", q.session_id).parse().unwrap());
+            response.headers_mut().insert(header::CONTENT_TYPE, "application/x-ndjson".parse().unwrap());
+            response
+        }
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
@@ -549,15 +568,28 @@ async fn dispatch(app: &AppHandle, cmd: &str, args: Value) -> Result<Value, Stri
             let (video_id,) = args!(args; video_id: i64);
             ok(crate::video_playback(video_id).await?)
         }
+        "video_audio_tracks" => {
+            let (video_id,) = args!(args; video_id: i64);
+            ok(crate::video_audio_tracks(video_id).await?)
+        }
+        "audio_levels" => {
+            let (video_id, in_s, out_s) = args!(args; video_id: i64, in_s: f64, out_s: f64);
+            ok(crate::audio_levels(video_id, in_s, out_s).await?)
+        }
+        "audio_track_proxy" => {
+            let (video_id, track) = args!(args; video_id: i64, track: u32);
+            ok(crate::audio_track_proxy(video_id, track).await?)
+        }
         "video_frames" => {
             let (video_id,) = args!(args; video_id: i64);
             ok(crate::video_frames(video_id)?)
         }
         "chat_turn" => {
-            let (project_id, session_id, message, images, style) = args!(args;
+            let (project_id, session_id, message, images, style, script_id) = args!(args;
                 project_id: i64, session_id: Option<i64>, message: String, images: Option<Vec<String>>,
-                style: Option<ghostreel_core::script::ChatStyle>);
-            ok(crate::chat_turn(app.clone(), queue(), project_id, session_id, message, images, style).await?)
+                style: Option<ghostreel_core::script::ChatStyle>, script_id: Option<i64>);
+            ok(crate::chat_turn(app.clone(), queue(), project_id, session_id, message, images, style, script_id)
+                .await?)
         }
         "chat_sessions" => {
             let (project_id,) = args!(args; project_id: i64);
@@ -587,6 +619,14 @@ async fn dispatch(app: &AppHandle, cmd: &str, args: Value) -> Result<Value, Stri
             let (project_id, script, session_id) = args!(args;
                 project_id: i64, script: Script, session_id: Option<i64>);
             ok(crate::save_script(project_id, script, session_id)?)
+        }
+        "delete_script" => {
+            let (script_id,) = args!(args; script_id: i64);
+            ok(crate::delete_script(script_id)?)
+        }
+        "delete_script_cut" => {
+            let (project_id, title) = args!(args; project_id: i64, title: String);
+            ok(crate::delete_script_cut(project_id, title)?)
         }
         "web_status" => ok(crate::web_status(app.state::<WebServer>())?),
         // Changing who can reach the server is left to someone at the machine.

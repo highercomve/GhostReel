@@ -1,4 +1,6 @@
 import MediaImage from "./MediaImage";
+import { cleanSearchSnippet, matchedTerms } from "./searchSnippet";
+import { Check, ChevronDown, Folder, FolderTree, Music, Pencil, Plus, Settings, TriangleAlert, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ask, open } from "@tauri-apps/plugin-dialog";
 import {
@@ -22,6 +24,8 @@ import {
   renameProject,
   search,
   setVideoCategory,
+  videoFrames,
+  videoTranscript,
   CATEGORIES,
   type Hit,
   type ProjectView,
@@ -36,7 +40,7 @@ import OrganizeModal from "./OrganizeModal";
 import { useVideoSelection } from "./useVideoSelection";
 
 function SpeechCell({ v, transcribeEnabled }: { v: VideoRow; transcribeEnabled?: boolean }) {
-  if (v.segments > 0) return <span className="good-text">{v.language ? v.language.toUpperCase() : "✓"}</span>;
+  if (v.segments > 0) return <span className="good-text">{v.language ? v.language.toUpperCase() : <Check size={14} strokeWidth={2} aria-label="Has speech" />}</span>;
   switch (v.transcribe) {
     case "skipped":
       return <span className="muted">{v.has_audio ? "skipped" : "no audio"}</span>;
@@ -56,37 +60,93 @@ function CategoryCell({
   v: VideoRow;
   onCategoryChange: (newCategory: string) => void;
 }) {
+  const [open, setOpen] = useState(false);
   const current = CATEGORIES.find((c) => c.id === v.category) ?? {
     id: v.category,
     label: v.category,
     folder: v.category,
-    icon: "📁",
   };
 
   return (
     <div className="cat-cell" onClick={(e) => e.stopPropagation()}>
-      <select
-        value={v.category}
-        onChange={(e) => onCategoryChange(e.target.value)}
-        className={`cat-select cat-${v.category}`}
-        title={`Category: ${current.label} (${v.category_source === "manual" ? "manual" : `${Math.round((v.category_confidence || 0) * 100)}% confidence`})`}
-      >
-        {CATEGORIES.map((cat) => (
-          <option key={cat.id} value={cat.id}>
-            {cat.icon} {cat.label}
-          </option>
-        ))}
-      </select>
+      <button type="button" className={`cat-select cat-${v.category}`} aria-haspopup="listbox" aria-expanded={open}
+        onClick={() => setOpen((value) => !value)}
+        title={`Category: ${current.label} (${v.category_source === "manual" ? "manual" : `${Math.round((v.category_confidence || 0) * 100)}% confidence`})`}>{current.label}</button>
+      {open && <div className="library-category-menu" role="listbox" aria-label="Choose category">
+        {CATEGORIES.map((cat) => <button type="button" role="option" aria-selected={cat.id === v.category} key={cat.id}
+          className={cat.id === v.category ? "selected" : ""} onClick={() => { setOpen(false); if (cat.id !== v.category) onCategoryChange(cat.id); }}>{cat.label}</button>)}
+      </div>}
       {v.category_tag && (
         <span
           className="cat-subtag"
           title={`Detected tag: ${v.category_tag}`}
         >
-          {v.category_tag === "music" ? "🎵 music" : v.category_tag}
+          {v.category_tag === "music" ? (
+            <span className="icon-text">
+              <Music size={12} strokeWidth={2} aria-hidden="true" /> music
+            </span>
+          ) : (
+            v.category_tag
+          )}
         </span>
       )}
     </div>
   );
+}
+
+const libraryFrameCache = new Map<number, { path: string | null; description: string }>();
+function resultReason(h: Hit, query: string): string {
+  const terms = matchedTerms(h.snippet);
+  const evidenceTerms = [...new Map(terms.map((term) => [term.toLocaleLowerCase(), term])).values()];
+  const visualConstraint = /\b(drone|aerial|overhead|wide shot|close[- ]?up|panoramic)\b/i.test(query);
+  const hasPicture = h.kinds.some((kind) => kind === "moment" || kind === "frame");
+  const kinds = [...new Set(h.kinds)];
+  const names = kinds.map((kind) => kind === "moment" ? "picture" : kind === "frame" ? "on-screen text" : kind === "transcript" ? "speech" : null).filter((name): name is Exclude<typeof name, null> => name !== null);
+  const evidence = evidenceTerms.length ? ` ${evidenceTerms.join(", ")}` : " this query";
+  const reason = names.length === 1
+    ? `${names[0][0].toUpperCase()}${names[0].slice(1)} matches${evidence}`
+    : names.length > 1 ? `Matched in ${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}` : "Footage matches this query";
+  const constraint = query.match(/\b(drone|aerial|overhead|wide shot|close[- ]?up|panoramic)\b/i)?.[0];
+  return visualConstraint && !hasPicture && constraint ? `${reason}; no picture match for '${constraint}'` : reason;
+}
+
+function isSubstantiveTranscriptLine(line: string): boolean {
+  const words = line.match(/[\p{L}\p{N}]+/gu) ?? [];
+  if (words.length < 4) return false;
+  return !/\b(?:hi|hello|hey|okay|ok|um|uh|can you hear|do you hear|test(?:ing)? audio|check(?:ing)? (?:the )?(?:camera|mic|audio)|set(?:ting)? up (?:the )?(?:camera|shot)|look at me|look into the camera|tell me your name|what(?:'s| is) your name|one two three|i don'?t see|whatever you feel comfortable|what do you do|tell me your whole name|tell me about yourself)\b/i.test(line)
+    && !/^\s*(?:who|what|when|where|why|how|could you|can you|would you)\b[^.!?]*\?\s*$/i.test(line);
+}
+
+function LibraryThumbnail({ videoId, children }: { videoId: number; children: React.ReactNode }) {
+  const host = useRef<HTMLSpanElement>(null);
+  const [item, setItem] = useState(() => libraryFrameCache.get(videoId));
+  useEffect(() => {
+    if (item) return;
+    const element = host.current;
+    if (!element) return;
+    const observer = new IntersectionObserver((entries) => {
+      if (!entries.some((entry) => entry.isIntersecting)) return;
+      observer.disconnect();
+      Promise.all([videoFrames(videoId).catch(() => []), videoTranscript(videoId).catch(() => [])]).then(([frames, transcript]) => {
+        const middle = frames.length ? frames[Math.floor((frames.length - 1) / 2)] : null;
+        const lines = transcript.filter((segment) => !segment.off_mic).map((segment) => segment.text.trim()).filter(Boolean);
+        const substantive = lines.filter(isSubstantiveTranscriptLine);
+        const identifying = substantive.find((line) => /\b(?:I['’]?m|I am|my name is)\s+[A-Z][\p{L}'’-]+/u.test(line));
+        const usefulLine = identifying ?? substantive[0] ?? lines[0] ?? "";
+        let sceneDescription = "";
+        if (middle?.description) {
+          try { sceneDescription = JSON.parse(middle.description).description ?? ""; } catch { sceneDescription = ""; }
+        }
+        const description = usefulLine || sceneDescription;
+        const result = { path: middle?.path ?? null, description };
+        libraryFrameCache.set(videoId, result);
+        setItem(result);
+      });
+    }, { rootMargin: "160px" });
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [videoId, item]);
+  return <span className="library-visual-cell"><span ref={host} className="library-thumb" title={item?.description}>{item?.path ? <MediaImage path={item.path} alt="" loading="lazy" /> : <span aria-hidden="true" />}</span><span className="video-name-copy">{children}{item?.description && <span className="video-description" title={item.description}>{item.description}</span>}</span></span>;
 }
 
 /** "…the [compute] module…" → highlighted spans. */
@@ -123,6 +183,12 @@ export default function ProjectPage({ projectId, onChanged, openVideo }: {
   const panelRef = useRef<HTMLDivElement>(null);
   const tasks = useQueue();
   const searchInput = useRef<HTMLInputElement>(null);
+  const clearSearch = () => { setQuery(""); setSearchResult(null); setSearchingKey(null); searchInput.current?.focus(); };
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => { if (event.key === "Escape" && query) { event.preventDefault(); clearSearch(); } };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [query]);
   const scopeFolder = view?.folders.find((f) => f.id === folderId) ?? null;
   const folderVideos = useMemo(() => view?.videos.filter((v) =>
     folderId == null || v.folder_ids?.includes(folderId)) ?? [], [view, folderId]);
@@ -321,16 +387,49 @@ export default function ProjectPage({ projectId, onChanged, openVideo }: {
     if (navigationReady && openVideo) openAt(openVideo.videoId, openVideo.t);
   }, [navigationReady, openVideo]);
 
+  // Before the loading return: hooks must run on every render, data or not.
+  useEffect(() => {
+    window.dispatchEvent(new CustomEvent("ghostreel:editor-mode", { detail: tab === "scripts" }));
+    return () => { window.dispatchEvent(new CustomEvent("ghostreel:editor-mode", { detail: false })); };
+  }, [tab]);
+
   if (!view) return <main>{error ? <div className="banner bad">{error}</div> : <p className="muted">Loading…</p>}</main>;
 
   const { project: p, status: st } = view;
   const stage = (name: string) => st.stages.find((s) => s.stage === name);
   const selectedVideo = view.videos.find((v) => v.id === selected) ?? null;
 
+  const editorMode = tab === "scripts";
+  const statsLine = `${p.width}×${p.height} · ${fpsLabel(p.fps_num, p.fps_den)} fps · ${st.videos} videos · ${humanDuration(st.total_duration_s)} · ${humanSize(st.total_size)}`;
+  // In the editor the project header, the tabs and the actions share one slim row, so the cut
+  // gets the height; on the Library tab they keep their roomier two-row layout.
+  const tabs = (
+    <div className="tab-nav" role="tablist" aria-label="Project views">
+      <button
+        type="button"
+        role="tab"
+        aria-selected={tab === "library"}
+        className={`tab-btn ${tab === "library" ? "active" : ""}`}
+        onClick={() => setTab("library")}
+      >
+        Library
+      </button>
+      <button
+        type="button"
+        role="tab"
+        aria-selected={tab === "scripts"}
+        className={`tab-btn ${tab === "scripts" ? "active" : ""}`}
+        onClick={() => setTab("scripts")}
+      >
+        Scripts
+      </button>
+    </div>
+  );
+
   return (
-    <main className="project-workspace">
-      <header>
-        <div>
+    <main className={`project-workspace ${editorMode ? "editor-mode" : ""}`}>
+      <header className={editorMode ? "project-head-compact" : undefined}>
+        <div className="project-title-block" title={editorMode ? statsLine : undefined}>
           {editName != null ? (
             <form className="rename" onSubmit={onRename}>
               <input
@@ -343,24 +442,30 @@ export default function ProjectPage({ projectId, onChanged, openVideo }: {
             </form>
           ) : (
             <h1 className="editable" title="Click to rename" onClick={() => setEditName(p.name)}>
-              {p.name} <span className="edit-hint">✎</span>
+              {p.name}{" "}
+              <span className="edit-hint">
+                <Pencil size={14} strokeWidth={2} aria-hidden="true" />
+              </span>
             </h1>
           )}
-          <p className="muted">
-            {p.width}×{p.height} · {fpsLabel(p.fps_num, p.fps_den)} fps · {st.videos} videos ·{" "}
-            {humanDuration(st.total_duration_s)} · {humanSize(st.total_size)}
+          <p className="muted project-stats">
+            {editorMode ? `${st.videos} videos · ${humanDuration(st.total_duration_s)}` : statsLine}
           </p>
         </div>
+        {editorMode && tabs}
         <div className="header-actions">
           <div className="project-menu-container" ref={menuRef}>
             <button
               type="button"
-              className="ghost"
+              className={editorMode ? "ghost small" : "ghost"}
               onClick={() => setMenuOpen(!menuOpen)}
               aria-expanded={menuOpen}
               title="Project settings, video analysis & management"
             >
-              ⚙ Project ▾
+              <span className="icon-text">
+                <Settings size={14} strokeWidth={2} aria-hidden="true" /> Project
+                <ChevronDown size={14} strokeWidth={2} aria-hidden="true" />
+              </span>
             </button>
             {menuOpen && (
               <div className="project-menu">
@@ -522,30 +627,19 @@ export default function ProjectPage({ projectId, onChanged, openVideo }: {
             )}
           </div>
 
-          <button onClick={() => run(() => enqueueIndex(projectId))} disabled={!!queued || view.folders.length === 0}>
+          <button
+            className={editorMode ? "small" : "primary"}
+            onClick={() => run(() => enqueueIndex(projectId))}
+            disabled={!!queued || view.folders.length === 0}
+          >
             {running ? "Index again" : queued ? "Queued…" : "Index now"}
           </button>
         </div>
       </header>
 
-      <div className="tab-nav">
-        <button
-          type="button"
-          className={`tab-btn ${tab === "library" ? "active" : ""}`}
-          onClick={() => setTab("library")}
-        >
-          Library
-        </button>
-        <button
-          type="button"
-          className={`tab-btn ${tab === "scripts" ? "active" : ""}`}
-          onClick={() => setTab("scripts")}
-        >
-          Scripts
-        </button>
-      </div>
+      {!editorMode && tabs}
 
-      {tab === "scripts" ? (
+      {editorMode ? (
         <ScriptsPanel projectId={projectId} />
       ) : (
         <>
@@ -579,16 +673,17 @@ export default function ProjectPage({ projectId, onChanged, openVideo }: {
             if (!e.target.value.trim()) setSearchResult(null);
           }}
         />
-        <button type="submit" disabled={searching || !query.trim()}>
+        {query && <button type="button" className="ghost search-clear" onClick={clearSearch} aria-label="Clear search" title="Clear search (Esc)"><X size={15} strokeWidth={2} /></button>}
+        <button type="submit" className="primary" disabled={searching || !query.trim()}>
           {searching ? "Searching…" : "Search"}
         </button>
       </form>
-      {searchNote && <div className="muted small">{searchNote}</div>}
+      {hits && <div className="library-search-summary" role="status"><strong>Found {hits.length} {hits.length === 1 ? "moment" : "moments"}</strong>{searchNote && <span className="muted small">{searchNote}</span>}<span className="muted small">Esc to clear</span></div>}
       {hits && (
         <section className="hits">
           {hits.length === 0 && <div className="muted">No matches.</div>}
           {hits.map((h, i) => (
-            <div key={i} className="card hit" onClick={() => openAt(h.video_id, h.start_s)}>
+            <div key={i} className="card hit">
               {h.frame ? <MediaImage path={h.frame} alt="" loading="lazy" /> : <div className="noframe" />}
               <div className="hit-body">
                 <div className="hit-head">
@@ -598,7 +693,7 @@ export default function ProjectPage({ projectId, onChanged, openVideo }: {
                   </span>
                 </div>
                 <div className="small">
-                  <Snippet text={h.snippet} />
+                  <Snippet text={cleanSearchSnippet(h.snippet)} />
                 </div>
                 <div>
                   {h.kinds.map((k) => (
@@ -607,6 +702,8 @@ export default function ProjectPage({ projectId, onChanged, openVideo }: {
                     </span>
                   ))}
                 </div>
+                <div className="library-hit-reason">{resultReason(h, query)}</div>
+                <div className="hit-actions"><button type="button" className="small" onClick={() => openAt(h.video_id, h.start_s)}>Preview moment</button><button type="button" className="ghost small" onClick={() => openAt(h.video_id, 0)}>Open video</button></div>
               </div>
             </div>
           ))}
@@ -640,7 +737,13 @@ export default function ProjectPage({ projectId, onChanged, openVideo }: {
         {view.folders.length === 0 && <div className="muted">Add the folders that hold this project's footage.</div>}
         {view.folders.map((f) => (
           <div key={f.id} className="row folder">
-            <span className={f.available ? "" : "bad-text"}>{f.available ? "📁" : "⚠"}</span>
+            <span className={`icon-text ${f.available ? "muted" : "bad-text"}`}>
+              {f.available ? (
+                <Folder size={15} strokeWidth={2} aria-label="Folder" />
+              ) : (
+                <TriangleAlert size={15} strokeWidth={2} aria-label="Folder not available" />
+              )}
+            </span>
             <span className="path">
               {f.path}
               {!f.available && <span className="muted small"> — not available (drive unplugged?)</span>}
@@ -657,8 +760,8 @@ export default function ProjectPage({ projectId, onChanged, openVideo }: {
           </div>
         ))}
         <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap" }}>
-          <button className="ghost" onClick={onAddFolder}>
-            + Add folder
+          <button className="ghost icon-text" onClick={onAddFolder}>
+            <Plus size={15} strokeWidth={2} aria-hidden="true" /> Add folder
           </button>
           <button
             className="ghost"
@@ -666,7 +769,9 @@ export default function ProjectPage({ projectId, onChanged, openVideo }: {
             disabled={view.videos.length === 0 || !!running}
             title="Organize original video files into categorized subfolders on disk"
           >
-            🗂️ Organize folders…
+            <span className="icon-text">
+              <FolderTree size={15} strokeWidth={2} aria-hidden="true" /> Organize folders…
+            </span>
           </button>
         </div>
       </section>
@@ -675,10 +780,9 @@ export default function ProjectPage({ projectId, onChanged, openVideo }: {
         Videos
         <span className="muted small normal">
           {" "}
-          · {stage("probe")?.done ?? 0} ready ·{" "}
-          {p.pipeline?.transcribe ? `${stage("transcribe")?.done ?? 0} transcribed` : "transcription disabled"} ·{" "}
+          · {p.pipeline?.transcribe ? `${stage("transcribe")?.done ?? 0} of ${st.videos} transcribed${(st.videos - (stage("transcribe")?.done ?? 0)) > 0 ? ` · ${st.videos - (stage("transcribe")?.done ?? 0)} without speech` : ""}` : "transcription disabled"} ·{" "}
           {p.pipeline?.describe ? `${stage("describe")?.done ?? 0} described` : "descriptions disabled"} ·{" "}
-          {p.pipeline?.embed ? `${stage("embed")?.done ?? 0} searchable` : "search indexing disabled"}
+          {p.pipeline?.embed ? `${stage("embed")?.done ?? 0} searchable (speech and frame descriptions)` : "search indexing disabled"}
           {st.vfr_videos ? ` · ${st.vfr_videos} variable frame rate` : ""}
         </span>
       </h2>
@@ -702,7 +806,7 @@ export default function ProjectPage({ projectId, onChanged, openVideo }: {
                 className={`filter-pill cat-${cat.id} ${categoryFilter === cat.id ? "active" : ""}`}
                 onClick={() => setCategoryFilter(categoryFilter === cat.id ? null : cat.id)}
               >
-                {cat.icon} {cat.label} ({count})
+                {cat.label} ({count})
               </button>
             );
           })}
@@ -712,7 +816,7 @@ export default function ProjectPage({ projectId, onChanged, openVideo }: {
       <div className="video-selection-toolbar">
         <button type="button" className={`ghost small${selection.enabled ? " active" : ""}`}
           aria-pressed={selection.enabled} onClick={() => selection.setEnabled(!selection.enabled)}>Select videos</button>
-        <span className="small" role="status">{selectedIds.length ? `${selectedIds.length} selected` : "Select videos to narrow your search"}
+        <span className="small" role="status">{selectedIds.length ? `${selectedIds.length} selected` : ""}
           {hiddenSelected > 0 ? ` · ${hiddenSelected} hidden by category` : ""}</span>
         {selectedIds.length > 0 && <>
           <button type="button" className="ghost small" onClick={() => {
@@ -722,7 +826,7 @@ export default function ProjectPage({ projectId, onChanged, openVideo }: {
         </>}
         <span className="muted small selection-hint">{selection.enabled
           ? "Drag across rows · Ctrl/⌘ adds · Shift-click selects a range · Esc cancels a drag"
-          : "Use checkboxes or Ctrl/⌘-click · Shift-click selects a range"}</span>
+          : "Ctrl/⌘-click · Shift-click selects a range"}</span>
       </div>
       <section ref={selection.container} {...selection.pointer}
         className={`card video-library${selection.enabled ? " selection-mode" : ""}`}
@@ -740,11 +844,11 @@ export default function ProjectPage({ projectId, onChanged, openVideo }: {
                 <th className="video-name-heading">Name</th>
                 <th>Category</th>
                 <th>Length</th>
-                <th>Size</th>
-                <th>Format</th>
+                <th className="video-technical-heading">Size</th>
+                <th className="video-technical-heading">Format</th>
                 <th>Speech</th>
-                <th>Camera</th>
-                <th>Frames</th>
+                <th className="video-technical-heading">Camera</th>
+                <th className="video-technical-heading">Frames</th>
                 <th>State</th>
               </tr>
             </thead>
@@ -770,6 +874,7 @@ export default function ProjectPage({ projectId, onChanged, openVideo }: {
                       onChange={(e) => selection.toggle(v.id, !!(e.nativeEvent as MouseEvent).shiftKey)} />
                   </td>
                   <td className="name">
+                    <LibraryThumbnail videoId={v.id}>
                     {fileName(v.path)}
                     {v.copies > 1 && <span className="tag">×{v.copies}</span>}
                     {v.vfr && (
@@ -778,6 +883,7 @@ export default function ProjectPage({ projectId, onChanged, openVideo }: {
                       </span>
                     )}
                     {v.has_audio === false && <span className="tag">no audio</span>}
+                    </LibraryThumbnail>
                   </td>
                   <td>
                     <CategoryCell

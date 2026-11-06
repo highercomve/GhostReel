@@ -136,6 +136,10 @@ pub struct ScriptClip {
     pub audio: Audio,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub why: Option<String>,
+    /// Source audio tracks to play (0-based among the file's audio streams). None = the file's
+    /// automatic track (today's behaviour). Empty = silent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tracks: Option<Vec<u32>>,
 }
 
 /// The sound that runs under a beat while its pictures play.
@@ -154,6 +158,10 @@ pub struct AudioBed {
     /// True when the pipeline laid this bed rather than the editor asking for it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub inferred: bool,
+    /// Source audio tracks to play (0-based among the file's audio streams). None = the file's
+    /// automatic track (today's behaviour). Empty = silent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tracks: Option<Vec<u32>>,
 }
 
 impl AudioBed {
@@ -560,10 +568,44 @@ pub fn list(db: &Db, project_id: i64) -> Result<Vec<ScriptSummary>, Error> {
     Ok(result)
 }
 
+/// Delete a single script version by ID.
+pub fn delete(db: &Db, script_id: i64) -> Result<bool, Error> {
+    let n = db.conn.execute("DELETE FROM scripts WHERE id = ?1", [script_id])?;
+    Ok(n > 0)
+}
+
+/// Delete all versions of a script cut by title for a project.
+pub fn delete_cut(db: &Db, project_id: i64, title: &str) -> Result<usize, Error> {
+    let n = db
+        .conn
+        .execute("DELETE FROM scripts WHERE project_id = ?1 AND title = ?2", rusqlite::params![project_id, title])?;
+    Ok(n)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::projects::NewProject;
+
+    /// Old scripts have no `tracks`: they load as None and save without the key; a choice,
+    /// including "no tracks" (silent), survives the round trip.
+    #[test]
+    fn tracks_round_trip_and_absent_stays_absent() {
+        let clip: ScriptClip = serde_json::from_str(r#"{"video_id":1,"in_s":0,"out_s":2}"#).unwrap();
+        assert_eq!(clip.tracks, None);
+        assert!(!serde_json::to_string(&clip).unwrap().contains("tracks"));
+        let bed: AudioBed = serde_json::from_str(r#"{"video_id":1,"in_s":0,"out_s":2}"#).unwrap();
+        assert_eq!(bed.tracks, None);
+        assert!(!serde_json::to_string(&bed).unwrap().contains("tracks"));
+
+        let clip: ScriptClip = serde_json::from_str(r#"{"video_id":1,"in_s":0,"out_s":2,"tracks":[0,1]}"#).unwrap();
+        assert_eq!(clip.tracks, Some(vec![0, 1]));
+        let back: ScriptClip = serde_json::from_str(&serde_json::to_string(&clip).unwrap()).unwrap();
+        assert_eq!(back, clip);
+        let bed: AudioBed = serde_json::from_str(r#"{"video_id":1,"in_s":0,"out_s":2,"tracks":[]}"#).unwrap();
+        assert_eq!(bed.tracks, Some(vec![]));
+        assert!(serde_json::to_string(&bed).unwrap().contains(r#""tracks":[]"#));
+    }
 
     #[test]
     fn fps_deserialization_and_rational_rates() {
@@ -736,6 +778,7 @@ mod tests {
                             out_s: 4.0, // in >= out: Error
                             audio: Audio::Source,
                             why: None,
+                            tracks: None,
                         },
                         ScriptClip {
                             video_id: 999, // not found: Error
@@ -743,6 +786,7 @@ mod tests {
                             out_s: 5.0,
                             audio: Audio::Source,
                             why: None,
+                            tracks: None,
                         },
                     ],
                     notes: None,
@@ -759,6 +803,7 @@ mod tests {
                         out_s: 15.0, // exceeds duration (10s): Error
                         audio: Audio::Mute,
                         why: None,
+                        tracks: None,
                     }],
                     notes: None,
                     bed: None,
@@ -778,5 +823,61 @@ mod tests {
             issues.iter().any(|i| i.severity == IssueSeverity::Error && i.message.contains("exceeds video duration"))
         );
         assert!(issues.iter().any(|i| i.severity == IssueSeverity::Warning && i.message.contains("VFR")));
+    }
+
+    #[test]
+    fn multi_script_cut_versioning_and_deletion() {
+        let db = Db::open_in_memory().unwrap();
+        let project = db.create_project(&NewProject::named("Multi-Script Demo")).unwrap();
+
+        // 1. Cut A: Social Reel (sessionless starter)
+        let cut_a = Script {
+            title: "Social 30s Promo".into(),
+            target_duration_s: Some(30.0),
+            beats: vec![],
+            fps: None,
+            width: None,
+            height: None,
+        };
+        let a1 = save_version(&db, project.id, &cut_a, None).unwrap();
+        let s_a1 = load(&db, a1).unwrap();
+        assert_eq!(s_a1.version, 1);
+        assert_eq!(s_a1.session_id, None);
+
+        let a2 = save_version(&db, project.id, &cut_a, None).unwrap();
+        let s_a2 = load(&db, a2).unwrap();
+        assert_eq!(s_a2.version, 2);
+
+        // 2. Cut B: Documentary Cut
+        let cut_b = Script {
+            title: "Documentary 15m".into(),
+            target_duration_s: Some(900.0),
+            beats: vec![],
+            fps: None,
+            width: None,
+            height: None,
+        };
+        let b1 = save_version(&db, project.id, &cut_b, None).unwrap();
+        let s_b1 = load(&db, b1).unwrap();
+        assert_eq!(s_b1.version, 1);
+
+        let scripts = list(&db, project.id).unwrap();
+        assert_eq!(scripts.len(), 3);
+
+        // 3. Delete single version of Cut A (version 1)
+        let deleted_a1 = delete(&db, a1).unwrap();
+        assert!(deleted_a1);
+        assert!(load(&db, a1).is_err());
+        assert!(load(&db, a2).is_ok());
+
+        // 4. Delete entire cut B
+        let deleted_b = delete_cut(&db, project.id, "Documentary 15m").unwrap();
+        assert_eq!(deleted_b, 1);
+        assert!(load(&db, b1).is_err());
+
+        let remaining = list(&db, project.id).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].title, "Social 30s Promo");
+        assert_eq!(remaining[0].version, 2);
     }
 }

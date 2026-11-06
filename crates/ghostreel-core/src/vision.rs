@@ -221,7 +221,7 @@ impl Drop for HelperProcessGroup {
 #[derive(Debug, Clone)]
 pub struct LocalModels {
     pub helper: PathBuf,
-    pub vision: Option<(PathBuf, PathBuf)>,
+    pub vision: Option<(PathBuf, Option<PathBuf>)>,
     pub embed: Option<PathBuf>,
     pub cpu: bool,
     /// Context window, KV cache precision and flash attention for this helper. Frame descriptions
@@ -266,10 +266,13 @@ impl From<&crate::config::VisionConfig> for HelperRuntime {
 }
 
 impl LocalLlm {
+    pub fn model_name(&self) -> &str { &self.model_name }
+
     pub async fn start(m: &LocalModels) -> Result<Self, Error> {
         let mut cmd = crate::proc::command(&m.helper);
         if let Some((model, mmproj)) = &m.vision {
-            cmd.arg("--model").arg(model).arg("--mmproj").arg(mmproj);
+            cmd.arg("--model").arg(model);
+            if let Some(mmproj) = mmproj { cmd.arg("--mmproj").arg(mmproj); }
         }
         if let Some(e) = &m.embed {
             cmd.arg("--embed-model").arg(e);
@@ -770,7 +773,7 @@ echo '{"id":1,"ok":true,"tokens":17}'
         std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
         let mut llm = LocalLlm::start(&LocalModels {
             helper,
-            vision: Some(("m".into(), "p".into())),
+            vision: Some(("m".into(), Some("p".into()))),
             embed: None,
             cpu: true,
             runtime: Default::default(),
@@ -780,6 +783,37 @@ echo '{"id":1,"ok":true,"tokens":17}'
         .unwrap();
         assert_eq!(llm.ctx_tokens, Some(4096));
         assert_eq!(llm.prompt_tokens("use actual tokenizer", false, None).await.unwrap(), 17);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn launches_exact_external_model_with_optional_projector() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let helper = dir.path().join("helper");
+        std::fs::write(&helper, r#"#!/bin/sh
+printf '%s\n' "$@" > "$0.args"
+echo '{"ready":true}'
+cat >/dev/null
+"#).unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let model = dir.path().join("Other app/Custom-Q4_K_M.gguf");
+        let projector = dir.path().join("Other app/mmproj.gguf");
+        for mmproj in [None, Some(projector.clone())] {
+            let llm = LocalLlm::start(&LocalModels {
+                helper: helper.clone(), vision: Some((model.clone(), mmproj.clone())),
+                embed: None, cpu: true, runtime: Default::default(), concurrency: 1,
+            }).await.unwrap();
+            let args = std::fs::read_to_string(dir.path().join("helper.args")).unwrap();
+            let args: Vec<_> = args.lines().collect();
+            assert_eq!(&args[..2], &["--model", model.to_str().unwrap()]);
+            if mmproj.is_some() {
+                assert_eq!(&args[2..4], &["--mmproj", projector.to_str().unwrap()]);
+            } else {
+                assert!(!args.contains(&"--mmproj"));
+            }
+            drop(llm);
+        }
     }
 
     #[test]
@@ -883,7 +917,7 @@ done
         std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
         let models = LocalModels {
             helper,
-            vision: Some(("m".into(), "p".into())),
+            vision: Some(("m".into(), Some("p".into()))),
             embed: None,
             cpu: false,
             runtime: Default::default(),
@@ -929,7 +963,7 @@ done
         std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
         let models = LocalModels {
             helper,
-            vision: Some(("m".into(), "p".into())),
+            vision: Some(("m".into(), Some("p".into()))),
             embed: None,
             cpu: false,
             runtime: Default::default(),
@@ -966,7 +1000,7 @@ done
         std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
         let models = LocalModels {
             helper,
-            vision: Some(("m".into(), "p".into())),
+            vision: Some(("m".into(), Some("p".into()))),
             embed: None,
             cpu: false,
             runtime: Default::default(),

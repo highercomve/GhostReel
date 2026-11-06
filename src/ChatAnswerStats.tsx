@@ -1,4 +1,5 @@
 import type { ChatPerformance, InferenceCall } from "./api";
+import { formatSeconds } from "./sonarFormat";
 
 function summarize(calls: InferenceCall[]) {
   const groups = new Map<string, InferenceCall[]>();
@@ -18,25 +19,43 @@ function summarize(calls: InferenceCall[]) {
   });
 }
 
+/** A model name the backend actually reported, not a placeholder for one it didn't. */
+function realModel(model: string): boolean {
+  return Boolean(model.trim()) && !/not reported/i.test(model);
+}
+
+/**
+ * One muted line under an answer with only the values that were measured: model, speed, time.
+ * Anything unknown is left out rather than printed as "unavailable"; the full numbers sit in the
+ * tooltip and in Full log.
+ */
 export default function ChatAnswerStats({ performance }: { performance?: ChatPerformance | null }) {
-  if (!performance) {
-    return <div className="chat-answer-stats" title="Earlier answers did not record their model or timing.">Model / speed not recorded</div>;
+  if (!performance) return null;
+  const models = summarize(performance.calls);
+  const parts: string[] = [];
+  const details: string[] = [];
+  for (const m of models) {
+    if (realModel(m.model)) parts.push(m.model);
+    if (m.rate != null) parts.push(`${m.rate.toFixed(0)} tok/s${m.generation ? "" : " overall"}`);
+    details.push(
+      [
+        realModel(m.model) ? `${m.model} (${m.backend})` : m.backend,
+        m.output != null ? `${m.output.toLocaleString()} tokens` : null,
+        m.calls > 1 ? `${m.calls} model calls` : null,
+      ]
+        .filter(Boolean)
+        .join(", "),
+    );
   }
+  if (performance.elapsed_seconds > 0) parts.push(`Generated in ${formatSeconds(performance.elapsed_seconds)}`);
+  if (parts.length === 0) return null;
   return (
-    <div className="chat-answer-stats" aria-label="Answer model and performance">
-      {summarize(performance.calls).map((model) => (
-        <div className="chat-answer-stat-row" key={model.key}>
-          <span className="chat-answer-model" title={`${model.model} · ${model.backend}`}>{model.model}</span>
-          <span className="chat-answer-rate" title={model.generation
-            ? "Generated tokens divided by generation time; excludes prompt processing. Includes research and repair calls."
-            : "The provider did not report generation time. This overall rate includes prompt processing and request overhead."}>
-            {model.rate != null ? `${model.rate.toFixed(1)} tok/s${model.generation ? "" : " overall"}` : "Speed unavailable"}
-          </span>
-          {model.output != null && <span>{model.output.toLocaleString()} tokens</span>}
-          {model.calls > 1 && <span title="Primary-model requests including tool research and repairs">{model.calls} model calls</span>}
-        </div>
-      ))}
-      <span title="Complete answer time, including research, tool execution and validation">{performance.elapsed_seconds.toFixed(1)}s total</span>
+    <div
+      className="chat-answer-stats"
+      aria-label="Answer model and timing"
+      title={[...details, `${performance.elapsed_seconds.toFixed(1)} s total, research and checks included`].join("\n")}
+    >
+      {parts.join(" · ")}
     </div>
   );
 }

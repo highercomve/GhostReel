@@ -109,6 +109,17 @@ impl Report {
                 out.push(format!("{name}: {}", r.reason));
             }
         }
+        for (name, resolution, prefix) in [
+            ("vision", &self.vision, "vision"),
+            ("embeddings", &self.embeddings, "embeddings"),
+            ("stt", &self.stt, "whisper"),
+        ] {
+            if resolution.target == Target::Local && resolution.backend != Backend::Cli {
+                for model in self.models.iter().filter(|m| m.role.starts_with(prefix) && m.found.is_none()) {
+                    out.push(format!("{name}: {} is not installed", model.pattern));
+                }
+            }
+        }
         out
     }
 }
@@ -144,8 +155,8 @@ pub async fn run(paths: &Paths) -> Report {
         tokio::join!(tool("ffmpeg"), tool("ffprobe"), nvidia_gpus(), vision_probe, embed_probe, stt_probe);
 
     let models_dir = crate::models::effective_models_dir(paths, &config);
-    let mut search: Vec<PathBuf> = vec![models_dir.clone()];
-    search.extend(config.models.search_paths.iter().cloned());
+    let search = crate::models::search_roots(&models_dir, &config.models.search_paths);
+    let whisper_model = selected_whisper_model(&config.stt.model, &gpu, &search);
 
     let (vision_file, proj_file) = match crate::models::vision_pair(&config.vision.local_model) {
         Some((m, p)) => (m.file_name, p.file_name),
@@ -156,9 +167,20 @@ pub async fn run(paths: &Paths) -> Report {
         ("vision (local)".to_string(), vision_file),
         ("vision projector (local)".to_string(), proj_file),
         ("embeddings (local)".to_string(), "embeddinggemma-300M-Q8_0.gguf".to_string()),
-        ("whisper (local, GPU)".to_string(), "ggml-large-v3-turbo.bin".to_string()),
-        ("whisper (local, CPU)".to_string(), "ggml-small.bin".to_string()),
+        ("whisper (local)".to_string(), format!("ggml-{whisper_model}.bin")),
     ];
+
+    if config.vision.local_model.starts_with("external:") {
+        model_files.retain(|(role, _)| !role.starts_with("vision"));
+        if let Some(external) = crate::models::external_model(&config.vision.local_model) {
+            model_files.push(("vision (local)".into(), external.entry.file_name));
+            if let Some(projector) = external.entry.mmproj_file_name {
+                model_files.push(("vision projector (local)".into(), projector));
+            }
+        } else {
+            model_files.push(("vision (local)".into(), config.vision.local_model.trim_start_matches("external:").into()));
+        }
+    }
 
     let mlx_entry = crate::models::find_entry(&config.vision.local_model).filter(|e| e.bundle.is_some());
     if mlx_entry.is_some() {
@@ -167,7 +189,7 @@ pub async fn run(paths: &Paths) -> Report {
     let mut models: Vec<ModelFile> = model_files
         .into_iter()
         .map(|(role, pattern)| {
-            let found = find_file(&search, &pattern, 5);
+            let found = crate::models::find(&search, &pattern);
             ModelFile { role, pattern, found }
         })
         .collect();
@@ -236,6 +258,16 @@ pub async fn run(paths: &Paths) -> Report {
             svc_used.push("stt".into());
         }
     }
+    for (resolution, prefix) in [(&mut vision, "vision"), (&mut embeddings, "embeddings"), (&mut stt, "whisper")] {
+        if resolution.target == Target::Local && resolution.backend != Backend::Cli {
+            let files: Vec<_> = models.iter().filter(|m| m.role.starts_with(prefix)).collect();
+            resolution.reason = if files.iter().all(|m| m.found.is_some()) {
+                format!("Using {}", files.iter().map(|m| m.pattern.as_str()).collect::<Vec<_>>().join(" + "))
+            } else {
+                format!("Missing {}", files.iter().filter(|m| m.found.is_none()).map(|m| m.pattern.as_str()).collect::<Vec<_>>().join(" + "))
+            };
+        }
+    }
     let ghost_service = svc.map(|s| {
         let mut capabilities = Vec::new();
         if s.capabilities.chat {
@@ -285,6 +317,19 @@ pub struct LocalRuntimeInfo {
     pub describe_kv: String,
     pub chat_ctx: u32,
     pub chat_kv: String,
+}
+
+/// Auto prefers the hardware recommendation, then an installed acceptable alternative.
+/// Explicit choices remain explicit, including when their file is missing.
+pub(crate) fn selected_whisper_model(configured: &str, gpus: &[Gpu], roots: &[PathBuf]) -> String {
+    if !configured.trim().eq_ignore_ascii_case("auto") {
+        return configured.to_string();
+    }
+    let preferred = crate::runtime::auto_whisper_model(gpus);
+    std::iter::once(preferred.to_string())
+        .chain(crate::models::catalog().into_iter().filter(|m| m.kind == crate::models::ModelKind::Whisper).map(|m| m.id))
+        .find(|id| crate::models::whisper(id).ok().is_some_and(|spec| crate::models::find(roots, &spec.file_name).is_some()))
+        .unwrap_or_else(|| preferred.to_string())
 }
 
 fn db_status(path: &Path) -> DbStatus {
@@ -401,6 +446,7 @@ pub fn calculate_describe_concurrency(
 }
 
 /// Breadth-limited search for `file_name` under `roots` (model dirs are shallow trees).
+#[cfg(test)]
 fn find_file(roots: &[PathBuf], file_name: &str, max_depth: usize) -> Option<PathBuf> {
     fn walk(dir: &Path, name: &str, depth: usize) -> Option<PathBuf> {
         let entries = std::fs::read_dir(dir).ok()?;
@@ -458,7 +504,39 @@ mod tests {
         let r = run(&paths).await;
         assert!(r.db.ok, "{:?}", r.db.error);
         assert_eq!(r.vision.target, Target::Local);
-        assert!(r.blockers().iter().all(|b| !b.starts_with("vision") && !b.starts_with("stt")));
+        assert!(r.blockers().iter().all(|b| !b.contains("server")));
+    }
+
+    #[test]
+    fn whisper_alternatives_and_explicit_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let roots = vec![dir.path().to_path_buf()];
+        std::fs::write(dir.path().join("ggml-large-v3-turbo-q8_0.bin"), b"model").unwrap();
+        assert_eq!(selected_whisper_model("auto", &[], &roots), "large-v3-turbo-q8_0");
+        assert_eq!(selected_whisper_model("small", &[], &roots), "small");
+        std::fs::write(dir.path().join("ggml-small.bin"), b"model").unwrap();
+        assert_eq!(selected_whisper_model("auto", &[], &roots), "small");
+    }
+
+    #[tokio::test]
+    async fn readiness_requires_only_selected_files_and_skips_cli_models() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths { config_file: dir.path().join("config.toml"), data_dir: dir.path().join("data") };
+        let mut cfg = Config::default();
+        cfg.vision.backend = Backend::Cli;
+        cfg.embed.backend = Backend::Local;
+        cfg.stt.backend = Backend::Local;
+        cfg.stt.model = "large-v3-turbo-q8_0".into();
+        cfg.save(&paths.config_file).unwrap();
+        let mut report = run(&paths).await;
+        for model in &mut report.models {
+            if !model.role.starts_with("vision") { model.found = Some(dir.path().join(&model.pattern)); }
+        }
+        assert!(report.blockers().iter().all(|b| !b.starts_with("vision:") && !b.starts_with("stt:") && !b.starts_with("embeddings:")));
+        report.models.iter_mut().find(|m| m.role.starts_with("whisper")).unwrap().found = None;
+        assert!(report.blockers().iter().any(|b| b.contains("ggml-large-v3-turbo-q8_0.bin")));
+        report.stt.target = Target::Server;
+        assert!(report.blockers().iter().all(|b| !b.starts_with("stt:")));
     }
 
     #[test]

@@ -1,10 +1,12 @@
+import DurationField from "./editor/DurationField";
+import { fullTime } from "./editor/relativeTime";
 import MediaImage from "./MediaImage";
 import ChatAnswerStats from "./ChatAnswerStats";
 import { useEffect, useRef, useState } from "react";
+import { useMemo } from "react";
 import {
   getAiSettings,
   setAiSettings,
-  cliModels,
   modelsStatus,
   chatMessages,
   chatSessions,
@@ -12,7 +14,15 @@ import {
   chatTurn,
   buildScriptWithJev,
   listScripts,
+  saveScript,
+  getScript,
+  deleteScript, deleteScriptCut,
+  projectView,
+  clock,
+  fileName,
+  type Script,
   type AiSettings,
+  type VisionSettings,
   type ChatEvent,
   type ChatMessage,
   type ChatProgress,
@@ -26,12 +36,43 @@ import {
 } from "./api";
 import { onEvent } from "./events";
 import ChatLogModal from "./ChatLogModal";
-import ScriptEditor from "./ScriptEditor";
+import CutsPanel from "./editor/CutsPanel";
+import ModelSelect from "./editor/ModelSelect";
+import ScriptEditor, { type ScriptEditorHandle } from "./ScriptEditor";
 import TaskCard from "./TaskCard";
 import { useQueue } from "./useQueue";
+import {
+  Check,
+  ChevronDown,
+  ChevronLeft,
+  ChevronRight,
+  ChevronUp,
+  Clapperboard,
+  Copy,
+  FilePlus,
+  PanelRight,
+  Paperclip,
+  PictureInPicture2,
+  Plus,
+  Radar,
+  Settings2,
+  Sparkles,
+  SquarePen,
+  X,
+} from "lucide-react";
+import {
+  describeCall,
+  describeLiveStep,
+  describeResearch,
+  parseAnswer,
+  parseDraftHeader,
+} from "./sonarFormat";
 
 function cleanTitle(title: string | null | undefined): string {
   if (!title) return "Untitled chat";
+  // A chat opened from the New cut dialog is titled after its brief header.
+  const draft = parseDraftHeader(title.trim() + "\n");
+  if (draft) return `${draft.title} · target ${clock(draft.target_s)}`;
   const firstLine = title.split("\n")[0].trim();
   const cleaned = firstLine.replace(/^```[a-z]*\s*/i, "").replace(/[`"{}[\]]/g, "").trim();
   return cleaned.length > 55 ? cleaned.slice(0, 55) + "…" : cleaned || "Untitled chat";
@@ -46,50 +87,206 @@ function formatRelativeTime(timestamp: number): string {
   return `${Math.floor(diffSecs / 86400)}d ago`;
 }
 
-function formatToolCall(tc: ToolCallRecord): string {
-  let argSnippet = "";
-  if (tc.args) {
-    if (typeof tc.args === "string") {
-      argSnippet = `"${tc.args}"`;
-    } else if (tc.args.query) {
-      argSnippet = `"${tc.args.query}"`;
-    } else {
-      const firstVal = Object.values(tc.args)[0];
-      if (firstVal && (typeof firstVal === "string" || typeof firstVal === "number")) {
-        argSnippet = `"${firstVal}"`;
-      }
-    }
-  }
-  const summaryPart = tc.summary ? ` → ${tc.summary}` : "";
-  return `${tc.tool}${argSnippet ? ` ${argSnippet}` : ""}${summaryPart}`;
-}
-
 /** The three ways a brief becomes a cut, in the order they cost wall-clock time. */
 type Mode = "chat" | "jev" | "both";
 
-const MODES: { id: Mode; label: string; action: string; hint: string }[] = [
+const CLI_NAMES: Record<string, string> = { claude: "Claude", agy: "Agy", opencode: "OpenCode", codex: "Codex" };
+
+/** One plain line naming the engine, for the folded options. Never a URL. */
+function brainSummary(m: VisionSettings): string {
+  switch (m.backend) {
+    case "local":
+      return `Local · ${m.local_model}`;
+    case "server":
+      return m.model ? `Server · ${m.model}` : "Server model";
+    case "cli":
+      return `${CLI_NAMES[m.cli.tool] ?? m.cli.tool} (CLI)`;
+    default:
+      return "Auto engine";
+  }
+}
+
+const ENGINE_HINTS: Record<VisionSettings["backend"], string> = {
+  auto: "Uses the best engine that is available.",
+  local: "Runs a model on this computer.",
+  server: "Uses a model server you run; set its address below.",
+  cli: "Uses an AI command-line tool, such as Claude Code.",
+};
+
+const JEV_BLOCKED = "Needs the quote-builder key (Jev). Set it in Settings.";
+
+const MODES: { id: Mode; label: string; short: string; action: string; hint: string }[] = [
   {
     id: "chat",
-    label: "Model",
+    label: "AI writes it",
+    short: "AI writes",
     action: "Send",
-    hint: "The model researches the footage and writes the cut. Slowest, strongest at structure.",
+    hint: "AI researches the footage and writes the cut. Takes a few minutes.",
   },
   {
     id: "jev",
-    label: "Jev",
+    label: "Quick build from quotes",
+    short: "Quick build",
     action: "Build",
-    hint: "Jev picks quotes and shots out of the index. ~15 s, and it can only use what was actually said.",
+    hint: "Builds a cut from interview quotes in about 15 seconds.",
   },
   {
     id: "both",
-    label: "Jev → model",
-    action: "Build & refine",
-    hint: "Jev chooses a first cut, the model improves it. Best result measured, and a few minutes.",
+    label: "Quick build, then AI polish",
+    short: "Quick build + polish",
+    action: "Build & polish",
+    hint: "Builds a first cut from interview quotes, then AI improves it. Takes a few minutes.",
+  },
+];
+
+const NEW_CHAT_EXAMPLES = [
+  "A 30-second teaser that opens on a strong spoken hook",
+  "A 2-minute recap of the best interview moments",
+  "A B-roll montage of the venue, no talking",
+];
+
+type CutPreset = "social_30s" | "interview_3m" | "doc_15m";
+
+const CUT_PRESETS: { id: CutPreset; label: string; title: string; target: number; prompt: string }[] = [
+  {
+    id: "social_30s",
+    label: "Social reel",
+    title: "Social Reel (30s)",
+    target: 30,
+    prompt:
+      "Create an upbeat 30-second video for social media from this footage. Fast pacing, strong speech hook, energetic B-roll montage.",
+  },
+  {
+    id: "interview_3m",
+    label: "Highlights",
+    title: "Highlights (3m)",
+    target: 180,
+    prompt: "Create a 3-minute cut highlighting the best insights, keynote soundbites, and audience takeaways.",
+  },
+  {
+    id: "doc_15m",
+    label: "Documentary",
+    title: "Documentary (15m)",
+    target: 900,
+    prompt:
+      "Create a 15-minute documentary-style feature. Build a thoughtful narrative arc with deep speaker quotes, context, and rich natural sound.",
   },
 ];
 
 /** Survives component unmount/remount (e.g. navigating to Activity/Settings/Library and back). */
 const sessionEventsCache = new Map<number, ChatEvent[]>();
+
+/** File names by video id, per project, so research steps can name the clips they looked at. */
+const videoNamesCache = new Map<number, Map<number, string>>();
+
+const DOCK_KEY = "ghostreel.sonar.docked";
+
+/** An on/off setting that says which it is, not a pill whose colour has to be decoded. */
+function Switch({
+  checked,
+  disabled,
+  onChange,
+  label,
+  hint,
+  title,
+}: {
+  checked: boolean;
+  disabled?: boolean;
+  onChange: (next: boolean) => void;
+  label: string;
+  hint?: string;
+  title?: string;
+}) {
+  return (
+    <label className={`nle-switch${disabled ? " disabled" : ""}`} title={title}>
+      <input
+        type="checkbox"
+        role="switch"
+        checked={checked}
+        disabled={disabled}
+        onChange={(e) => onChange(e.target.checked)}
+      />
+      <span className="nle-switch-track" aria-hidden="true">
+        <span className="nle-switch-thumb" />
+      </span>
+      <span className="nle-switch-text">
+        <span className="nle-switch-label">
+          {label} <span className={`nle-switch-state${checked ? " on" : ""}`}>{checked ? "On" : "Off"}</span>
+        </span>
+        {hint && <span className="nle-switch-hint">{hint}</span>}
+      </span>
+    </label>
+  );
+}
+
+/** A research pass in one line ("Looked through 9 clips"), each step on demand. */
+function ResearchSummary({ calls, names }: { calls: ToolCallRecord[]; names: Map<number, string> }) {
+  // The same clip looked at twice is one line, counted.
+  const lines: { text: string; detail?: string; count: number; title: string }[] = [];
+  for (const c of calls) {
+    const d = describeCall(c, names);
+    const same = lines.find((l) => l.text === d.text);
+    if (same) same.count++;
+    else
+      lines.push({
+        ...d,
+        count: 1,
+        title: `${c.tool} ${typeof c.args === "string" ? c.args : JSON.stringify(c.args)}`,
+      });
+  }
+  return (
+    <details className="research-steps done">
+      <summary>
+        <span className="research-dot" />
+        <span className="research-now">{describeResearch(calls)}</span>
+        <ChevronRight size={14} strokeWidth={2} aria-hidden="true" className="research-caret" />
+      </summary>
+      <ol>
+        {lines.map((l, k) => (
+          <li key={k} title={l.title}>
+            {l.text}
+            {l.count > 1 && <span className="muted"> ×{l.count}</span>}
+            {l.detail && <span className="muted"> · {l.detail}</span>}
+          </li>
+        ))}
+      </ol>
+    </details>
+  );
+}
+
+/** An assistant answer: a short summary, then what changed as bullet lists. */
+function AnswerBody({ content }: { content: string }) {
+  const { summary, sections } = parseAnswer(content);
+  return (
+    <>
+      {summary && <div className="bubble-text">{summary}</div>}
+      {sections.map((s, k) => (
+        <div key={k} className={`answer-section ${s.kind}`}>
+          <div className="answer-section-title">{s.title}</div>
+          <ul>
+            {s.items.map((item, i) => (
+              <li key={i}>{item}</li>
+            ))}
+          </ul>
+        </div>
+      ))}
+    </>
+  );
+}
+
+/** A user message; a new-cut brief shows its title and target as a chip. */
+function UserText({ text }: { text: string }) {
+  const draft = parseDraftHeader(text);
+  if (!draft) return <div className="bubble-text">{text}</div>;
+  return (
+    <>
+      <div className="bubble-draft-chip">
+        New cut · {draft.title} · {clock(draft.target_s)} target
+      </div>
+      {draft.rest.trim() && <div className="bubble-text">{draft.rest.trim()}</div>}
+    </>
+  );
+}
 
 export default function ScriptsPanel({ projectId }: { projectId: number }) {
   const [sessions, setSessions] = useState<ChatSession[]>([]);
@@ -106,6 +303,118 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
   const [optimisticUser, setOptimisticUser] = useState<{ text: string; images: string[] } | null>(null);
   const [turnError, setTurnError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // NLE Sonar panel states
+  const [sonarOpen, setSonarOpen] = useState(false);
+  const [sonarTab, setSonarTab] = useState<"chat" | "history">("chat");
+  // Docked or floating is a working preference: remembered across sessions.
+  const [sonarDocked, setSonarDocked] = useState(() => {
+    try {
+      return localStorage.getItem(DOCK_KEY) === "1";
+    } catch {
+      return false;
+    }
+  });
+  useEffect(() => {
+    try {
+      localStorage.setItem(DOCK_KEY, sonarDocked ? "1" : "0");
+    } catch {
+      // Storage unavailable: the choice just isn't remembered.
+    }
+  }, [sonarDocked]);
+  const scriptEditorRef = useRef<ScriptEditorHandle>(null);
+  const composerRef = useRef<HTMLTextAreaElement>(null);
+
+  // Whether the open cut has edits not saved as a version. The editor keeps this to itself
+  // (a handle, not a prop), so the toolbar reads it on a short interval.
+  const [editorDirty, setEditorDirty] = useState(false);
+  useEffect(() => {
+    const id = window.setInterval(() => {
+      const dirty = Boolean(scriptEditorRef.current?.isDirty());
+      setEditorDirty((prev) => (prev === dirty ? prev : dirty));
+    }, 600);
+    return () => window.clearInterval(id);
+  }, []);
+
+  // New cut dialog: how to start first, presets only for a Sonar draft.
+  const [newCutModalOpen, setNewCutModalOpen] = useState(false);
+  const [selectedPreset, setSelectedPreset] = useState<CutPreset | null>("social_30s");
+  const [newCutTitle, setNewCutTitle] = useState(CUT_PRESETS[0].title);
+  const [newCutTargetS, setNewCutTargetS] = useState(CUT_PRESETS[0].target);
+  const [newCutType, setNewCutType] = useState<"ai" | "blank" | "branch">("ai");
+  const [newCutPrompt, setNewCutPrompt] = useState(CUT_PRESETS[0].prompt);
+
+  const applyPreset = (preset: CutPreset) => {
+    const p = CUT_PRESETS.find((x) => x.id === preset) ?? CUT_PRESETS[0];
+    setSelectedPreset(p.id);
+    setNewCutType("ai");
+    setNewCutTitle(p.title);
+    setNewCutTargetS(p.target);
+    setNewCutPrompt(p.prompt);
+  };
+
+  const chooseCutMethod = (method: "ai" | "blank" | "branch") => {
+    if (method === "ai") {
+      applyPreset(selectedPreset ?? "social_30s");
+      return;
+    }
+    setNewCutType(method);
+    if (method === "blank") {
+      setNewCutTitle("Untitled cut");
+      setNewCutTargetS(60);
+    } else {
+      const current = scriptEditorRef.current?.getScript();
+      setNewCutTitle(activeScript ? `${activeScript.title} (copy)` : "Copy of cut");
+      setNewCutTargetS(
+        Math.round(current?.target_duration_s || activeScript?.duration_s || 60),
+      );
+    }
+  };
+
+  // Escape closes the dialog.
+  useEffect(() => {
+    if (!newCutModalOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setNewCutModalOpen(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [newCutModalOpen]);
+
+  // Names for the clips Sonar researched; read once per project.
+  const [videoNames, setVideoNames] = useState<Map<number, string>>(
+    () => videoNamesCache.get(projectId) ?? new Map(),
+  );
+  useEffect(() => {
+    const cached = videoNamesCache.get(projectId);
+    if (cached) {
+      setVideoNames(cached);
+      return;
+    }
+    let cancelled = false;
+    projectView(projectId)
+      .then((view) => {
+        const names = new Map(view.videos.map((v) => [v.id, fileName(v.path)] as [number, string]));
+        videoNamesCache.set(projectId, names);
+        if (!cancelled) setVideoNames(names);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [projectId]);
+
+  // Toggle Sonar overlay with keyboard shortcut (Cmd+J / Ctrl+J)
+  useEffect(() => {
+    const handleKey = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "j") {
+        e.preventDefault();
+        setSonarOpen((prev) => !prev);
+      }
+    };
+    window.addEventListener("keydown", handleKey);
+    return () => window.removeEventListener("keydown", handleKey);
+  }, []);
 
 
   const addImages = (files: FileList | File[]) => {
@@ -179,6 +488,8 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
    * gain the most from not having to do it.
    */
   const [mode, setMode] = useState<Mode>("chat");
+  // The build options fold into one summary line; a narrow drawer has no room for them all.
+  const [optionsOpen, setOptionsOpen] = useState(false);
   /** Whether the Jev modes can run at all, so they are disabled with a reason, not failed with one. */
   const [jevReady, setJevReady] = useState<boolean | null>(null);
   /** Whether every finished cut is read editorially. `null` until settings have been read. */
@@ -228,6 +539,7 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
       return;
     }
     setSessions((prev) => prev.filter((s) => s.id !== id));
+    listScripts(projectId).then(setScripts).catch(() => {});
     if (selectedSessionId === id) {
       setSelectedSessionId(null);
       setSelectedScriptId(null);
@@ -236,8 +548,9 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
   };
 
   const [aiSettings, setAiSettingsState] = useState<AiSettings | null>(null);
+  const [researchLimit, setResearchLimit] = useState(0);
+  const researchLimitTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [availableModels, setAvailableModels] = useState<ModelStatus[]>([]);
-  const [cliModelList, setCliModelList] = useState<string[]>([]);
 
   // Whether the Jev modes are offerable at all. Asked once: a mode that cannot run should say so
   // before it is chosen, not fail after.
@@ -247,15 +560,9 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
       .then((ai) => {
         if (cancelled) return;
         setAiSettingsState(ai);
+        setResearchLimit(ai.chat_model.max_tool_rounds ?? 0);
         setJevReady(ai.jev.enabled && (ai.jev.has_key || ai.jev.key_from_env));
         setJudging(ai.jev.judge);
-        if (ai.chat_model.cli?.tool) {
-          cliModels(ai.chat_model.cli.tool)
-            .then((m) => {
-              if (!cancelled) setCliModelList(m);
-            })
-            .catch(() => {});
-        }
       })
       .catch(() => {
         // Unknown, not unavailable: leave the modes enabled rather than hiding them over a
@@ -280,15 +587,32 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
     try {
       const nextAi = await setAiSettings({ chat_model: patch });
       setAiSettingsState(nextAi);
-      if (patch.cli?.tool) {
-        cliModels(patch.cli.tool)
-          .then(setCliModelList)
-          .catch(() => setCliModelList([]));
-      }
     } catch (err) {
       setTurnError(String(err));
     }
   };
+
+  const saveResearchLimit = (raw: string) => {
+    if (researchLimitTimer.current) clearTimeout(researchLimitTimer.current);
+    const value = Number(raw);
+    if (!Number.isInteger(value) || value < 0 || value > 100) {
+      setResearchLimit(aiSettings?.chat_model.max_tool_rounds ?? 0);
+      return;
+    }
+    setResearchLimit(value);
+    if (value !== (aiSettings?.chat_model.max_tool_rounds ?? 0)) {
+      void handleUpdateChatModel({ max_tool_rounds: value });
+    }
+  };
+
+  useEffect(() => {
+    if (!aiSettings) return;
+    setResearchLimit(aiSettings.chat_model.max_tool_rounds ?? 0);
+  }, [aiSettings?.chat_model.max_tool_rounds]);
+
+  useEffect(() => () => {
+    if (researchLimitTimer.current) clearTimeout(researchLimitTimer.current);
+  }, []);
 
   // Load sessions and scripts on mount / projectId change
   useEffect(() => {
@@ -458,23 +782,19 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
     };
   }, [liveSessionId, projectId, selectedSessionId]);
 
-  const handleSelectSession = (sessId: number) => {
-    userSelectedRef.current = true;
-    setSelectedSessionId(sessId);
-    setTurnError(null);
-    setLiveEvents(sessionEventsCache.get(sessId) ?? []);
+  const handleSelectSession = async (sessId: number) => {
     // Auto-select latest script belonging to this session if any, otherwise null
     const sessScripts = scripts.filter((s) => s.session_id === sessId);
-    setSelectedScriptId(sessScripts.length > 0 ? Math.max(...sessScripts.map((s) => s.id)) : null);
+    const targetScriptId = sessScripts.length > 0 ? Math.max(...sessScripts.map((s) => s.id)) : null;
+    await selectScript(targetScriptId, sessId);
   };
 
-  const handleNewChat = () => {
-    userSelectedRef.current = true;
-    setSelectedSessionId(null);
-    setSelectedScriptId(null);
-    setMessages([]);
+  const handleNewChat = async () => {
+    await selectScript(null, null);
     setTurnError(null);
     setLiveEvents([]);
+    setSonarOpen(true);
+    setSonarTab("chat");
   };
 
   // A chat that chose a style keeps it: follow the selected chat's own. A new chat keeps
@@ -504,6 +824,27 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
     setOptimisticUser({ text: promptText, images: imagesToSend });
 
     try {
+      // If the editor has unsaved manual changes, SAVE THEM FIRST!
+      // This ensures the manual changes are written to the database under the current session,
+      // so the AI reads the manual edits as its baseline for the next turn.
+      let baselineScriptId = selectedScriptId;
+      if (scriptEditorRef.current?.isDirty()) {
+        const savedId = await scriptEditorRef.current.save();
+        if (savedId == null) {
+          // Abort turn to prevent AI generating against stale baseline without user edits
+          setTurnError("Failed to save manual edits before generating. Edit not sent.");
+          setTurnRunning(false);
+          setOptimisticUser(null);
+          setInputMessage(text);
+          setAttachedImages(imagesToSend);
+          return;
+        }
+        baselineScriptId = savedId;
+        setSelectedScriptId(savedId);
+        const updatedScripts = await listScripts(projectId).catch(() => [] as ScriptSummary[]);
+        setScripts(updatedScripts);
+      }
+
       // Jev first, when asked. The build lands in the open chat (or opens one), so the model's
       // turn that follows already holds the brief, the cut and the editorial notes — and a build
       // asked for mid-conversation continues that conversation rather than starting another.
@@ -533,7 +874,7 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
           "Improve this cut. Keep it to the brief, fix the editorial notes above, and keep every " +
           "quote a whole sentence. Reply with the full script JSON.";
       }
-      const res = await chatTurn(projectId, session, message, imagesToSend, style);
+      const res = await chatTurn(projectId, session, message, imagesToSend, style, baselineScriptId);
       setSelectedSessionId(res.session_id);
       userSelectedRef.current = true;
       sessionEventsCache.delete(res.session_id);
@@ -591,639 +932,308 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
     (s) => s.session_id == null || !sessions.some((sess) => sess.id === s.session_id),
   );
 
+  // Multi-script grouping: Group all script versions by title into distinct Script Cuts
+  const scriptCuts = useMemo(() => {
+    const map = new Map<string, { title: string; latestScript: ScriptSummary; versions: ScriptSummary[] }>();
+    for (const s of scripts) {
+      const existing = map.get(s.title);
+      if (!existing) {
+        map.set(s.title, { title: s.title, latestScript: s, versions: [s] });
+      } else {
+        existing.versions.push(s);
+        if (s.version > existing.latestScript.version) {
+          existing.latestScript = s;
+        }
+      }
+    }
+    for (const cut of map.values()) {
+      cut.versions.sort((a, b) => b.version - a.version);
+    }
+    return Array.from(map.values()).sort(
+      (a, b) => b.latestScript.created_at - a.latestScript.created_at
+    );
+  }, [scripts]);
+
+  const activeScript = scripts.find((s) => s.id === selectedScriptId);
+
+  // Robust guard against losing manual edits when switching cuts, versions, sessions, or starting fresh
+  const guardUnsaved = async (): Promise<boolean> => {
+    if (scriptEditorRef.current?.isDirty()) {
+      const saveNow = window.confirm(
+        "You have unsaved manual edits in the script editor.\n\nClick \x27OK\x27 to save changes as a new version before switching.\nClick \x27Cancel\x27 to keep editing your current draft without switching."
+      );
+      if (!saveNow) {
+        return false;
+      }
+      const savedId = await scriptEditorRef.current.save();
+      if (savedId == null) {
+        alert("Failed to save changes. Navigation cancelled.");
+        return false;
+      }
+      const updated = await listScripts(projectId).catch(() => [] as ScriptSummary[]);
+      setScripts(updated);
+    }
+    return true;
+  };
+
+  // Centralized script selection with dirty checking and issues isolation
+  const selectScript = async (targetScriptId: number | null, targetSessionId?: number | null, skipGuard = false) => {
+    if (targetScriptId === selectedScriptId && (targetSessionId === undefined || targetSessionId === selectedSessionId)) {
+      return;
+    }
+    if (!skipGuard && !(await guardUnsaved())) return;
+    userSelectedRef.current = true;
+    setSelectedScriptId(targetScriptId);
+    setLatestIssues(undefined); // Clear stale issues on script transition
+    setTurnError(null);
+    if (targetSessionId !== undefined) {
+      setSelectedSessionId(targetSessionId);
+      setLiveEvents(targetSessionId != null ? (sessionEventsCache.get(targetSessionId) ?? []) : []);
+      if (targetSessionId != null) {
+        chatMessages(targetSessionId).then(setMessages).catch(() => setMessages([]));
+      } else {
+        setMessages([]);
+      }
+    } else if (targetScriptId != null) {
+      const scr = scripts.find((s) => s.id === targetScriptId);
+      if (scr?.session_id != null && sessions.some((sess) => sess.id === scr.session_id)) {
+        setSelectedSessionId(scr.session_id);
+        setLiveEvents(sessionEventsCache.get(scr.session_id) ?? []);
+        chatMessages(scr.session_id).then(setMessages).catch(() => setMessages([]));
+      } else {
+        setSelectedSessionId(null);
+        setLiveEvents([]);
+        setMessages([]);
+      }
+    }
+  };
+
+  const handleDeleteVersion = async (scriptId: number) => {
+    const s = scripts.find((x) => x.id === scriptId);
+    if (!s) return;
+    if (!window.confirm(`Delete version v${s.version} of "${s.title}"?`)) return;
+    try {
+      if (selectedScriptId === scriptId) {
+        scriptEditorRef.current?.resetDirty();
+      }
+      await deleteScript(scriptId);
+      const updated = await listScripts(projectId).catch(() => [] as ScriptSummary[]);
+      setScripts(updated);
+      const cutVersions = updated.filter((x) => x.title === s.title);
+      if (cutVersions.length > 0) {
+        void selectScript(cutVersions[0].id, cutVersions[0].session_id, true);
+      } else if (updated.length > 0) {
+        void selectScript(updated[0].id, updated[0].session_id, true);
+      } else {
+        void selectScript(null, null, true);
+      }
+    } catch (err) {
+      setTurnError(String(err));
+    }
+  };
+
+  const handleCreateNewCut = async () => {
+    const title = newCutTitle.trim() || "Untitled cut";
+    setNewCutModalOpen(false);
+
+    if (newCutType === "blank") {
+      const blankScript: Script = {
+        title,
+        target_duration_s: newCutTargetS,
+        beats: [
+          {
+            id: "beat-1",
+            purpose: "Opening",
+            clips: [],
+          },
+        ],
+      };
+      try {
+        const res = await saveScript(projectId, blankScript, null);
+        const updated = await listScripts(projectId).catch(() => [] as ScriptSummary[]);
+        setScripts(updated);
+        setSelectedScriptId(res.script_id);
+        setSelectedSessionId(null);
+      } catch (err) {
+        setTurnError(String(err));
+      }
+    } else if (newCutType === "branch") {
+      const current = scriptEditorRef.current?.getScript();
+      if (!current) {
+        setTurnError("Open a cut first to copy it.");
+        return;
+      }
+      const branchedScript: Script = {
+        ...current,
+        title,
+        target_duration_s: newCutTargetS || current.target_duration_s,
+      };
+      try {
+        const res = await saveScript(projectId, branchedScript, null);
+        const updated = await listScripts(projectId).catch(() => [] as ScriptSummary[]);
+        setScripts(updated);
+        setSelectedScriptId(res.script_id);
+        setSelectedSessionId(null);
+      } catch (err) {
+        setTurnError(String(err));
+      }
+    } else {
+      // AI-generated cut: create a new session with targeted brief and open Sonar
+      userSelectedRef.current = true;
+      setSelectedSessionId(null);
+      setSelectedScriptId(null);
+      setMessages([]);
+      setSonarOpen(true);
+      setSonarTab("chat");
+      const promptToUse = newCutPrompt.trim() || `Create an edit titled "${title}" targeting ${newCutTargetS} seconds.`;
+      setInputMessage(`[Draft "${title}" — Target: ${newCutTargetS}s]\n${promptToUse}`);
+      // The brief is ready to send; put the caret there so Enter starts the draft.
+      window.setTimeout(() => composerRef.current?.focus(), 50);
+    }
+  };
+
+  const handleDeleteCut = async (cutTitle: string) => {
+    if (!window.confirm(`Delete the cut "${cutTitle}" and all its versions? This can't be undone.`)) {
+      return;
+    }
+    try {
+      await deleteScriptCut(projectId, cutTitle);
+      const updated = await listScripts(projectId).catch(() => [] as ScriptSummary[]);
+      setScripts(updated);
+      if (activeScript?.title === cutTitle) {
+        if (updated.length > 0) {
+          setSelectedScriptId(updated[0].id);
+          if (updated[0].session_id) {
+            setSelectedSessionId(updated[0].session_id);
+          }
+        } else {
+          setSelectedScriptId(null);
+          setSelectedSessionId(null);
+        }
+      }
+    } catch (err) {
+      setTurnError(String(err));
+    }
+  };
+
+  const openNewCut = async () => {
+    if (!(await guardUnsaved())) return;
+    setSelectedPreset("social_30s");
+    applyPreset("social_30s");
+    setNewCutModalOpen(true);
+  };
+
+  const cutsPanel = (
+    <CutsPanel
+      cuts={scriptCuts}
+      selectedScriptId={selectedScriptId}
+      onSelect={(id, sid) => void selectScript(id, sid)}
+      onNewCut={openNewCut}
+      onDeleteCut={handleDeleteCut}
+      onRestore={async (id) => {
+        if (!(await guardUnsaved())) return;
+        try {
+          const { stored } = await getScript(id);
+          const saved = await saveScript(projectId, { ...stored.script, title: stored.title }, stored.session_id);
+          setScripts(await listScripts(projectId));
+          await selectScript(saved.script_id, stored.session_id, true);
+        } catch (error) { setTurnError(String(error)); }
+      }}
+      onDeleteVersion={handleDeleteVersion}
+    />
+  );
+
+  const currentMode = MODES.find((m) => m.id === mode) ?? MODES[0];
+  const judgingOn = Boolean(jevReady && judging);
+  const viewingSessionId = selectedSessionId ?? liveSessionId;
+
+  // Live research, one line per step: a finished call replaces its own "started" line.
+  const liveSteps = (() => {
+    const steps: { label: string; detail?: string; running: boolean; tool?: string }[] = [];
+    for (const evt of displayEvents) {
+      if (evt.kind === "tool_started") {
+        steps.push({ label: describeLiveStep(evt.tool, evt.args, videoNames), tool: evt.tool, running: true });
+      } else if (evt.kind === "tool_finished") {
+        const open = [...steps].reverse().find((st) => st.running && st.tool === evt.tool);
+        if (open) {
+          open.running = false;
+          open.detail = evt.summary;
+        } else {
+          steps.push({ label: describeLiveStep(evt.tool, null, videoNames), tool: evt.tool, detail: evt.summary, running: false });
+        }
+      } else if (evt.kind === "drafting") steps.push({ label: "Writing the cut", running: true });
+      else if (evt.kind === "validating") steps.push({ label: "Checking the cut", running: true });
+    }
+    // Only the last step can still be in progress.
+    steps.forEach((st, k) => k < steps.length - 1 && (st.running = false));
+    return steps;
+  })();
+
   return (
-    <div className="scripts-layout">
-      {/* 1. Left Column: Sessions & Script Versions */}
-      <aside className="scripts-sidebar card">
-        <button type="button" className="new-chat-btn" onClick={handleNewChat}>
-          + New chat
-        </button>
-
-        <div className="sidebar-section-title">Chat Sessions</div>
-        <div className="sessions-list">
-          {sessions.length === 0 && liveSessionId == null && (
-            <div className="muted small">No sessions yet.</div>
-          )}
-          {liveSessionId != null && !sessions.some((s) => s.id === liveSessionId) && (
-            <div
-              className={`session-item ${selectedSessionId === liveSessionId ? "active" : ""}`}
-              onClick={() => handleSelectSession(liveSessionId)}
-            >
-              <span className="session-title">Current chat</span>
-              <span className="pill local small">Running</span>
-            </div>
-          )}
-          {sessions.map((sess) => {
-            const isSelected = sess.id === selectedSessionId;
-            return (
-              <div key={sess.id} className="session-group">
-                <div
-                  className={`session-item ${isSelected ? "active" : ""}`}
-                  onClick={() => handleSelectSession(sess.id)}
-                >
-                  <span className="session-title">{cleanTitle(sess.title)}</span>
-                  {liveSessionId === sess.id && <span className="pill local small">Running</span>}
-                  <span className="session-time muted small">
-                    {formatRelativeTime(sess.updated_at || sess.created_at)}
-                  </span>
-                  <button
-                    className="ghost small session-remove"
-                    title="Remove this chat (its scripts are kept)"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      void removeSession(sess.id);
-                    }}
-                  >
-                    ×
-                  </button>
-                </div>
-
-                {/* Script versions under selected session */}
-                {isSelected && sessionScripts.length > 0 && (
-                  <div className="session-scripts-sublist">
-                    {sessionScripts.map((s) => {
-                      const isScriptSelected = s.id === selectedScriptId;
-                      return (
-                        <div
-                          key={s.id}
-                          className={`script-version-item ${isScriptSelected ? "active" : ""}`}
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            userSelectedRef.current = true;
-                            setSelectedSessionId(sess.id);
-                            setSelectedScriptId(s.id);
-                          }}
-                        >
-                          <span className="version-tag">v{s.version}</span>
-                          <span className="version-info muted small">
-                            {s.beats} {s.beats === 1 ? "beat" : "beats"} · {s.clips} {s.clips === 1 ? "clip" : "clips"} · {s.duration_s.toFixed(1)} s
-                          </span>
-                        </div>
-                      );
-                    })}
-                  </div>
-                )}
-              </div>
-            );
-          })}
-        </div>
-
-        {/* Other scripts without matching session */}
-        {otherScripts.length > 0 && (
-          <div className="other-scripts-section">
-            <div className="sidebar-section-title">Other Scripts</div>
-            <div className="session-scripts-sublist standalone">
-              {otherScripts.map((s) => {
-                const isScriptSelected = s.id === selectedScriptId;
-                return (
-                  <div
-                    key={s.id}
-                    className={`script-version-item ${isScriptSelected ? "active" : ""}`}
-                    onClick={() => {
-                      userSelectedRef.current = true;
-                      setSelectedScriptId(s.id);
-                      if (s.session_id != null && sessions.some((sess) => sess.id === s.session_id)) {
-                        setSelectedSessionId(s.session_id);
-                        chatMessages(s.session_id).then(setMessages).catch(() => setMessages([]));
-                      } else {
-                        setSelectedSessionId(null);
-                        setMessages([]);
-                      }
-                    }}
-                  >
-                    <span className="version-tag">v{s.version}</span>
-                    <span className="version-info muted small">
-                      {s.beats} {s.beats === 1 ? "beat" : "beats"} · {s.clips} {s.clips === 1 ? "clip" : "clips"} · {s.duration_s.toFixed(1)} s
-                    </span>
-                  </div>
-                );
-              })}
-            </div>
-          </div>
-        )}
-      </aside>
-
-      {/* 2. Center Column: Chat */}
-      <section className="chat-panel card">
-        <div className="chat-header">
-          <span className="label">
-            {selectedSessionId != null
-              ? cleanTitle(sessions.find((s) => s.id === selectedSessionId)?.title)
-              : "New Script Chat"}
+    <div className={`nle-workspace-layout ${sonarOpen ? "sonar-visible" : ""} ${sonarOpen && sonarDocked ? "sonar-docked" : ""}`}>
+      {/* 1. Cut toolbar: what is open, whether it is saved, and the two actions on it. */}
+      <div className="nle-top-bar">
+        <div className="nle-top-bar-left">
+          <span className="nle-script-name" title={activeScript?.title}>
+            {activeScript ? activeScript.title : "No cut open"}
           </span>
-          <span className="chat-header-actions">
-            {isTurnRunning && <span className="pill local small">Running</span>}
-            {(selectedSessionId ?? liveSessionId) != null && (
-              <button
-                type="button"
-                className="small"
-                onClick={() => setLogOpen(true)}
-                title="Every prompt, the model's thinking and answers, and the helper's output"
-              >
-                Full log
-              </button>
+          {activeScript && (
+            <span className="pill small version-pill" title={`Version ${activeScript.version} of this cut`}>
+              v{activeScript.version}
+            </span>
+          )}
+          {activeScript && (
+            <span className="muted small nle-script-meta">
+              {activeScript.beats} {activeScript.beats === 1 ? "beat" : "beats"} · {activeScript.clips}{" "}
+              {activeScript.clips === 1 ? "clip" : "clips"} · {clock(activeScript.duration_s)}
+            </span>
+          )}
+          {activeScript && (
+            <span
+              className={`nle-save-state${editorDirty ? " dirty" : ""}`}
+              title={editorDirty ? "Save a version to keep these edits (Ctrl+S)" : "Everything is saved in this version"}
+            >
+              <span className="nle-save-dot" aria-hidden="true" />
+              {editorDirty ? "Unsaved changes" : `Saved ${formatRelativeTime(activeScript.created_at)}`}
+            </span>
+          )}
+        </div>
+
+        <div className="nle-top-bar-right">
+          <button
+            type="button"
+            className="small nle-new-cut-btn"
+            onClick={openNewCut}
+            title="Start another cut of this footage, e.g. a 0:30 reel next to a 3:00 recap"
+          >
+            <Plus size={14} strokeWidth={2} aria-hidden="true" />
+            New cut
+          </button>
+          <button
+            type="button"
+            className={`small nle-sonar-toggle-btn${sonarOpen ? " active" : ""}${isTurnRunning ? " running" : ""}`}
+            onClick={() => setSonarOpen((prev) => !prev)}
+            aria-pressed={sonarOpen}
+            title={`${sonarOpen ? "Hide" : "Show"} Sonar, the AI assistant (Ctrl+J)`}
+          >
+            <Radar size={16} strokeWidth={2} aria-hidden="true" />
+            <span className="sonar-label">Sonar</span>
+            {isTurnRunning && (
+              <span className="sonar-pulse-pill">
+                <span className="sonar-pulse-dot" /> Working…
+              </span>
             )}
-          </span>
+            <kbd className="nle-kbd">Ctrl+J</kbd>
+          </button>
         </div>
+      </div>
 
-        <div className="chat-messages" ref={messagesRef}>
-          {messages.length === 0 && !optimisticUser && (
-            <div className="chat-empty muted small">
-              Describe your video concept to generate a script with clips from this project’s footage.
-              <div className="chat-prompt-hint">
-                e.g. “Write a 60-second teaser showcasing the unboxing and initial test drive.”
-              </div>
-            </div>
-          )}
-
-          {messages.map((msg) => (
-            <div key={msg.id} className={`chat-message-row ${msg.role}`}>
-              {/* Tool calls rendered as chips */}
-              {msg.tool_calls && msg.tool_calls.length > 0 && (
-                <div className="tool-chips-row">
-                  {msg.tool_calls.map((tc, idx) => (
-                    <span
-                      key={idx}
-                      className="tag tool-chip"
-                      title={typeof tc.args === "string" ? tc.args : JSON.stringify(tc.args, null, 2)}
-                    >
-                      ⚙ {formatToolCall(tc)}
-                    </span>
-                  ))}
-                </div>
-              )}
-
-              {(msg.content || (msg.images && msg.images.length > 0)) && (
-                <div className={`chat-bubble ${msg.role}`}>
-                  {msg.images && msg.images.length > 0 && (
-                    <div className="chat-attached-images">
-                      {msg.images.map((img, idx) => (
-                        <MediaImage
-                          key={idx}
-                          path={img}
-                          alt={`Attached image ${idx + 1}`}
-                          className="chat-attached-image"
-                          onClick={() => setPreviewImage(img)}
-                          title="Click to view full image"
-                        />
-                      ))}
-                    </div>
-                  )}
-                  {msg.content && <div className="bubble-text">{msg.content}</div>}
-                  {msg.role === "assistant" && <ChatAnswerStats performance={msg.performance} />}
-                  {msg.script_id != null && (
-                    <div className="bubble-script-link">
-                      <button
-                        type="button"
-                        className={`ghost small link-button${selectedScriptId === msg.script_id ? " active-script" : ""}`}
-                        onClick={() => setSelectedScriptId(msg.script_id!)}
-                      >
-                        {selectedScriptId === msg.script_id
-                          ? `✓ Viewing v${findScriptVersion(msg.script_id)}`
-                          : `Open v${findScriptVersion(msg.script_id)}`}
-                      </button>
-                    </div>
-                  )}
-                </div>
-              )}
-            </div>
-          ))}
-
-          {/* Optimistic user message while turn runs (only if not already present in loaded messages) */}
-          {optimisticUser && !messages.some((m) => m.role === "user" && m.content === optimisticUser.text) && (
-            <div className="chat-message-row user">
-              <div className="chat-bubble user">
-                {optimisticUser.images.length > 0 && (
-                  <div className="chat-attached-images">
-                    {optimisticUser.images.map((img, idx) => (
-                      <MediaImage
-                        key={idx}
-                        path={img}
-                        alt={`Attached image ${idx + 1}`}
-                        className="chat-attached-image"
-                        onClick={() => setPreviewImage(img)}
-                        title="Click to view full image"
-                      />
-                    ))}
-                  </div>
-                )}
-                {optimisticUser.text && <div className="bubble-text">{optimisticUser.text}</div>}
-              </div>
-            </div>
-          )}
-
-          {/* Live progress during turn */}
-          {isTurnRunning && (
-            <div className="chat-message-row assistant live">
-              <div className="live-progress-container">
-                {displayEvents.map((evt, idx) => (
-                  <span
-                    key={idx}
-                    className="tag tool-chip live-chip"
-                    title={
-                      evt.kind === "tool_started" && evt.args
-                        ? typeof evt.args === "string"
-                          ? evt.args
-                          : JSON.stringify(evt.args, null, 2)
-                        : undefined
-                    }
-                  >
-                    {evt.kind === "tool_started" && `⚙ ${evt.tool}...`}
-                    {evt.kind === "tool_finished" && `✓ ${evt.tool} → ${evt.summary}`}
-                    {evt.kind === "drafting" && `✎ Drafting script...`}
-                    {evt.kind === "validating" && `🔍 Validating script...`}
-                  </span>
-                ))}
-                {activeChatTask && <TaskCard task={activeChatTask} compact />}
-              </div>
-            </div>
-          )}
-
-          {/* Show issues on finish if present */}
-          {latestIssues && latestIssues.length > 0 && !isTurnRunning && (
-            <div className="issues-box small">
-              <div className="label">Script Issues ({latestIssues.length})</div>
-              {latestIssues.map((iss, i) => (
-                <div key={i} className={`issue-row ${iss.severity === "error" ? "bad-text" : "warn"}`}>
-                  <span className={`pill ${iss.severity}`}>{iss.severity}</span>
-                  {iss.beat_id && <strong>[Beat {iss.beat_id}]</strong>}
-                  {iss.clip_index != null && <span>Clip #{iss.clip_index + 1}:</span>}
-                  <span>{iss.message}</span>
-                </div>
-              ))}
-            </div>
-          )}
-
-          {turnError && <div className="banner bad small">{turnError}</div>}
-        </div>
-
-        {/* Composer: what to make, then how to make it. */}
-        <div className="chat-composer" onDragOver={(e) => e.preventDefault()} onDrop={handleDrop}>
-          {/* Attached images preview strip */}
-          {attachedImages.length > 0 && (
-            <div className="chat-composer-attachments">
-              {attachedImages.map((img, idx) => (
-                <div key={idx} className="chat-composer-attachment-thumb">
-                  <img
-                    src={img}
-                    alt={`Attachment ${idx + 1}`}
-                    onClick={() => setPreviewImage(img)}
-                    title="Click to view full image"
-                  />
-                  <button
-                    type="button"
-                    className="chat-composer-attachment-remove"
-                    onClick={() => setAttachedImages((prev) => prev.filter((_, i) => i !== idx))}
-                    title="Remove image"
-                  >
-                    ×
-                  </button>
-                </div>
-              ))}
-            </div>
-          )}
-
-          <textarea
-            rows={3}
-            placeholder={
-              isTurnRunning
-                ? "Working…"
-                : "Describe the cut you want, or paste screenshots. Enter to send, Shift+Enter for a new line."
-            }
-            value={inputMessage}
-            disabled={isTurnRunning}
-            onChange={(e) => setInputMessage(e.target.value)}
-            onKeyDown={handleKeyDown}
-            onPaste={handlePaste}
-          />
-
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept="image/*"
-            multiple
-            style={{ display: "none" }}
-            onChange={handleFileSelect}
-          />
-
-          {/*
-            One decision rather than two buttons and a checkbox: every one of these turns the
-            same brief into a cut, and they differ only in which brain chooses and which writes.
-          */}
-          <div className="composer-modes" role="radiogroup" aria-label="How to build this cut">
-            {MODES.map((m) => {
-              const needsJev = m.id !== "chat";
-              const blocked = needsJev && (jevReady === false || style.broll);
-              return (
-                <button
-                  key={m.id}
-                  type="button"
-                  role="radio"
-                  aria-checked={mode === m.id}
-                  className={`composer-mode${mode === m.id ? " on" : ""}${blocked ? " blocked" : ""}`}
-                  disabled={isTurnRunning}
-                  title={
-                    needsJev && style.broll
-                      ? "Jev builds from interview quotes — a b-roll montage is written by the model"
-                      : blocked
-                        ? "Needs Jev turned on with an API key — see Settings"
-                        : m.hint
-                  }
-                  onClick={() => !(needsJev && style.broll) && setMode(m.id)}
-                >
-                  {m.label}
-                </button>
-              );
-            })}
-          </div>
-
-          {/* Model / Brain selector for script chat */}
-          {aiSettings && (
-            <div className="composer-model-bar">
-              <span className="composer-model-label">Brain:</span>
-              <div className="composer-backend-pills" role="radiogroup" aria-label="Script chat brain">
-                {(["auto", "local", "server", "cli"] as const).map((b) => (
-                  <button
-                    key={b}
-                    type="button"
-                    className={`backend-pill${aiSettings.chat_model.backend === b ? " active" : ""}`}
-                    disabled={isTurnRunning}
-                    onClick={() => handleUpdateChatModel({ backend: b })}
-                  >
-                    {b === "auto" ? "Auto" : b === "local" ? "Local" : b === "server" ? "Server" : "CLI"}
-                  </button>
-                ))}
-              </div>
-
-              <div className="composer-model-controls">
-                {aiSettings.chat_model.backend === "local" && (
-                  <>
-                    <select
-                      className="composer-model-select"
-                      value={aiSettings.chat_model.local_model}
-                      disabled={isTurnRunning}
-                      onChange={(e) => handleUpdateChatModel({ local_model: e.target.value })}
-                      title="Local model"
-                    >
-                      {!availableModels.some((m) => m.entry.id === aiSettings.chat_model.local_model) && (
-                        <option value={aiSettings.chat_model.local_model}>
-                          {aiSettings.chat_model.local_model}
-                        </option>
-                      )}
-                      {availableModels.map((m) => (
-                        <option key={m.entry.id} value={m.entry.id}>
-                          {m.entry.id} {m.installed_path ? "" : "(not downloaded)"}
-                        </option>
-                      ))}
-                    </select>
-
-                    <label className="composer-think-label" title="Reasoning / think mode">
-                      <input
-                        type="checkbox"
-                        checked={aiSettings.chat_model.think}
-                        disabled={isTurnRunning}
-                        onChange={(e) => handleUpdateChatModel({ think: e.target.checked })}
-                      />
-                      Think
-                    </label>
-                  </>
-                )}
-
-                {aiSettings.chat_model.backend === "cli" && (
-                  <>
-                    <select
-                      className="composer-model-select"
-                      value={aiSettings.chat_model.cli.tool}
-                      disabled={isTurnRunning}
-                      onChange={(e) => handleUpdateChatModel({ cli: { tool: e.target.value } })}
-                      title="CLI tool"
-                    >
-                      <option value="claude">claude</option>
-                      <option value="agy">agy</option>
-                      <option value="opencode">opencode</option>
-                      <option value="codex">codex</option>
-                    </select>
-
-                    {cliModelList.length > 0 ? (
-                      <select
-                        className="composer-model-select"
-                        value={aiSettings.chat_model.cli.model}
-                        disabled={isTurnRunning}
-                        onChange={(e) => handleUpdateChatModel({ cli: { model: e.target.value } })}
-                        title="CLI tool model"
-                      >
-                        <option value="">— default —</option>
-                        {!cliModelList.includes(aiSettings.chat_model.cli.model) && aiSettings.chat_model.cli.model && (
-                          <option value={aiSettings.chat_model.cli.model}>{aiSettings.chat_model.cli.model}</option>
-                        )}
-                        {cliModelList.map((m) => (
-                          <option key={m} value={m}>
-                            {m}
-                          </option>
-                        ))}
-                      </select>
-                    ) : (
-                      <input
-                        type="text"
-                        className="composer-model-input"
-                        defaultValue={aiSettings.chat_model.cli.model}
-                        placeholder="— default —"
-                        disabled={isTurnRunning}
-                        title="CLI model (optional)"
-                        onBlur={(e) => handleUpdateChatModel({ cli: { model: e.target.value } })}
-                      />
-                    )}
-
-                    <span
-                      className={aiSettings.chat_model.cli.installed ? "good-text small" : "bad-text small"}
-                      title={aiSettings.chat_model.cli.installed ? "Found in PATH" : "Not found in PATH"}
-                      style={{ fontSize: "11px" }}
-                    >
-                      {aiSettings.chat_model.cli.installed ? "✓" : "⚠️ not found"}
-                    </span>
-                  </>
-                )}
-
-                {aiSettings.chat_model.backend === "server" && (
-                  <>
-                    <input
-                      type="text"
-                      className="composer-model-input"
-                      defaultValue={aiSettings.chat_model.url}
-                      placeholder="http://127.0.0.1:8089"
-                      disabled={isTurnRunning}
-                      title="Server URL"
-                      onBlur={(e) => handleUpdateChatModel({ url: e.target.value })}
-                    />
-                    <input
-                      type="text"
-                      className="composer-model-input"
-                      defaultValue={aiSettings.chat_model.model}
-                      placeholder="— server default —"
-                      disabled={isTurnRunning}
-                      title="Server model name"
-                      onBlur={(e) => handleUpdateChatModel({ model: e.target.value })}
-                    />
-                  </>
-                )}
-
-                {aiSettings.chat_model.backend === "auto" && (
-                  <span className="muted small" style={{ fontSize: "11px" }}>
-                    Auto-selects best available
-                  </span>
-                )}
-
-                <label
-                  className="composer-think-label"
-                  title="Tool-call budget for chat research. 0 uses the backend default (local agents allow 30). Applies to local, server and CLI brains."
-                >
-                  <input
-                    key={`budget-${aiSettings.chat_model.max_tool_rounds ?? 0}`}
-                    type="number"
-                    className="composer-budget-input"
-                    min={0}
-                    max={1000}
-                    step={1}
-                    defaultValue={aiSettings.chat_model.max_tool_rounds ?? 0}
-                    disabled={isTurnRunning}
-                    onBlur={(e) => {
-                      const value = Number(e.currentTarget.value);
-                      if (!Number.isInteger(value) || value < 0 || value > 1000) {
-                        e.currentTarget.value = String(aiSettings.chat_model.max_tool_rounds ?? 0);
-                        return;
-                      }
-                      if (value !== (aiSettings.chat_model.max_tool_rounds ?? 0)) {
-                        handleUpdateChatModel({ max_tool_rounds: value });
-                      }
-                    }}
-                  />
-                  tools
-                </label>
-              </div>
-            </div>
-          )}
-
-          <div style={{ display: "flex", flexWrap: "wrap", gap: "8px", alignItems: "center" }}>
-            {/*
-              The judge is a separate want from the builder: somebody may have Jev assemble a cut
-              and not want every draft scored. `jev.enabled` gates both, so this writes its own flag.
-            */}
-            <button
-              type="button"
-              className={`composer-judge${jevReady && judging ? " on" : ""}`}
-              disabled={jevReady === false || judging === null}
-              aria-pressed={Boolean(jevReady && judging)}
-              title={
-                jevReady === false
-                  ? "Needs Jev turned on with an API key — see Settings"
-                  : judging
-                    ? "Every finished cut is read editorially — the shots against the voice, the opening, the ending. Click to stop."
-                    : "Finished cuts are not read editorially. Click to have Jev score them."
-              }
-              onClick={async () => {
-                const next = !judging;
-                setJudging(next);
-                try {
-                  const ai = await setAiSettings({ jev: { judge: next } });
-                  setJudging(ai.jev.judge);
-                } catch (e) {
-                  setJudging(!next);
-                  setTurnError(String(e));
-                }
-              }}
-            >
-              {jevReady && judging ? "Judging on" : "Judging off"}
-            </button>
-
-            <button
-              type="button"
-              className={`composer-judge${style.broll ? " on" : ""}`}
-              disabled={isTurnRunning}
-              aria-pressed={style.broll}
-              title={
-                style.broll
-                  ? "This chat cuts a montage on a theme: pictures only, no interviews, no voice-over. Click to go back to interview-led cuts."
-                  : "Cut a montage on a theme: pictures only, no interviews, no voice-over."
-              }
-              onClick={() => setStyle((s) => ({ ...s, broll: !s.broll }))}
-            >
-              B-roll only
-            </button>
-            {style.broll && (
-              <div className="composer-audio" role="radiogroup" aria-label="B-roll sound">
-                {(
-                  [
-                    [true, "Natural sound", "Each clip plays its own ambient sound; anyone speaking is muted."],
-                    [false, "Silent", "Every clip is muted, for music laid over it later."],
-                  ] as const
-                ).map(([natural, label, hint]) => (
-                  <button
-                    key={label}
-                    type="button"
-                    role="radio"
-                    aria-checked={style.natural_sound === natural}
-                    className={`composer-judge${style.natural_sound === natural ? " on" : ""}`}
-                    disabled={isTurnRunning}
-                    title={hint}
-                    onClick={() => setStyle((s) => ({ ...s, natural_sound: natural }))}
-                  >
-                    {label}
-                  </button>
-                ))}
-              </div>
-            )}
-
-            <button
-              type="button"
-              className="composer-attach-btn"
-              disabled={isTurnRunning}
-              onClick={() => fileInputRef.current?.click()}
-              title="Attach image or screenshot (or paste directly from clipboard)"
-            >
-              📎 Attach image
-            </button>
-          </div>
-
-          <div className="composer-go">
-            <p className="composer-hint small muted">
-              {style.broll
-                ? `A montage on the theme you describe: pictures only, no interviews, no voice-over. ${
-                    style.natural_sound ? "Clips keep their natural sound." : "Clips are muted, ready for music."
-                  }`
-                : jevReady === false && mode !== "chat"
-                  ? "Needs Jev turned on with an API key — see Settings."
-                  : MODES.find((m) => m.id === mode)?.hint}
-            </p>
-            <button
-              type="button"
-              className="primary"
-              disabled={
-                isTurnRunning ||
-                building ||
-                (!inputMessage.trim() && attachedImages.length === 0) ||
-                (mode !== "chat" && jevReady === false)
-              }
-              title={
-                mode !== "chat" && jevReady === false
-                  ? "Needs Jev turned on with an API key — see Settings"
-                  : undefined
-              }
-              onClick={handleSend}
-            >
-              {building
-                ? "Choosing…"
-                : isTurnRunning
-                  ? "Working…"
-                  : MODES.find((m) => m.id === mode)?.action}
-            </button>
-          </div>
-        </div>
-      </section>
-
-      {/* 3. Right Column: Script Editor for selected script */}
-      <div className="script-editor-col">
+      {/* 2. The editor, with Sonar beside it (docked) or over it (floating) — never over the toolbar. */}
+      <div className="nle-body-row">
+      <main className={`nle-main-canvas ${sonarOpen && sonarDocked ? "with-docked-sonar" : ""}`}>
         {selectedScriptId != null ? (
           <ScriptEditor
+            ref={scriptEditorRef}
             projectId={projectId}
             scriptId={selectedScriptId}
             sessionId={selectedSessionId}
@@ -1233,24 +1243,749 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
                 : undefined
             }
             latestIssues={latestIssues}
+            isAiWorking={isTurnRunning}
             onScriptSaved={handleScriptSaved}
+            cutsPanel={cutsPanel}
           />
         ) : (
-          <div className="card muted empty-editor-card">
-            <div className="empty-editor-content">
-              <h3>No script selected</h3>
-              <p className="small">
-                Select a script version from the left panel or ask the chat assistant in the center to generate one.
-              </p>
-            </div>
+          <div className="nle-grid nle-grid-empty">
+            <aside className="nle-panel nle-left">
+              <div className="nle-panel-tabs">
+                <span className="nle-panel-tab active">Cuts</span>
+              </div>
+              <div className="nle-panel-body">{cutsPanel}</div>
+            </aside>
+            <section className="nle-panel nle-center nle-empty-stage">
+              <div className="nle-viewer-empty">
+                <div className="nle-viewer-empty-icon"><Clapperboard size={36} strokeWidth={1.5} aria-hidden="true" /></div>
+                <h3>{isTurnRunning ? "Sonar is drafting this cut…" : "No cut open"}</h3>
+                <p className="small muted">
+                  Pick a cut on the left, or start a new one and let Sonar draft it from your footage.
+                </p>
+                <div className="inline" style={{ gap: "8px", justifyContent: "center" }}>
+                  <button type="button" className="primary" onClick={openNewCut}>
+                    <Plus size={16} strokeWidth={2} aria-hidden="true" />
+                    New cut
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSonarOpen(true);
+                      setSonarTab("chat");
+                    }}
+                  >
+                    <Radar size={16} strokeWidth={2} aria-hidden="true" />
+                    Open Sonar
+                  </button>
+                </div>
+              </div>
+            </section>
           </div>
         )}
+      </main>
+
+      {/* 3. Sonar drawer. Toggled from the toolbar or Ctrl+J; no edge tab to cover the inspector. */}
+      {sonarOpen && (
+        <aside className={`nle-sonar-overlay card ${sonarDocked ? "docked" : ""}`} aria-label="Sonar assistant">
+          <div className="nle-sonar-header">
+            <div className="nle-sonar-header-left">
+              <Radar size={16} strokeWidth={2} aria-hidden="true" />
+              <span className="nle-sonar-title">Sonar</span>
+            </div>
+
+            <div className="nle-sonar-tabs" role="tablist">
+              <button
+                type="button"
+                role="tab"
+                aria-selected={sonarTab === "chat"}
+                className={`nle-sonar-tab ${sonarTab === "chat" ? "active" : ""}`}
+                onClick={() => setSonarTab("chat")}
+              >
+                Chat
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={sonarTab === "history"}
+                className={`nle-sonar-tab ${sonarTab === "history" ? "active" : ""}`}
+                onClick={() => setSonarTab("history")}
+              >
+                History{sessions.length > 0 ? ` (${sessions.length})` : ""}
+              </button>
+            </div>
+
+            <div className="nle-sonar-header-right">
+              <button
+                type="button"
+                className="ghost small nle-sonar-icon-btn"
+                onClick={handleNewChat}
+                title="New chat"
+                aria-label="New chat"
+              >
+                <SquarePen size={16} strokeWidth={2} aria-hidden="true" />
+              </button>
+              <button
+                type="button"
+                className="ghost small nle-sonar-icon-btn"
+                onClick={() => setSonarDocked((d) => !d)}
+                title={sonarDocked ? "Float over the editor" : "Dock beside the editor"}
+                aria-label={sonarDocked ? "Float over the editor" : "Dock beside the editor"}
+              >
+                {sonarDocked ? <PictureInPicture2 size={16} strokeWidth={2} aria-hidden="true" /> : <PanelRight size={16} strokeWidth={2} aria-hidden="true" />}
+              </button>
+              <button
+                type="button"
+                className="ghost small nle-sonar-icon-btn"
+                onClick={() => setSonarOpen(false)}
+                title="Hide Sonar (Ctrl+J)"
+                aria-label="Hide Sonar"
+              >
+                <X size={16} strokeWidth={2} aria-hidden="true" />
+              </button>
+            </div>
+          </div>
+
+          <div className="nle-sonar-body">
+            {sonarTab === "history" ? (
+              <div className="nle-sonar-history-view">
+                <div className="nle-history-actions">
+                  <button type="button" className="new-chat-btn small" onClick={handleNewChat}>
+                    <SquarePen size={14} strokeWidth={2} aria-hidden="true" />
+                    New chat
+                  </button>
+                </div>
+
+                <div className="sidebar-section-title">Chats</div>
+                <div className="sessions-list">
+                  {sessions.length === 0 && liveSessionId == null && (
+                    <div className="muted small">No chats yet.</div>
+                  )}
+                  {liveSessionId != null && !sessions.some((s) => s.id === liveSessionId) && (
+                    <div
+                      className={`session-item ${selectedSessionId === liveSessionId ? "active" : ""}`}
+                      onClick={() => {
+                        handleSelectSession(liveSessionId);
+                        setSonarTab("chat");
+                      }}
+                    >
+                      <span className="session-title">Current chat</span>
+                      <span className="pill local small">Working</span>
+                    </div>
+                  )}
+                  {sessions.map((sess) => {
+                    const isSelected = sess.id === selectedSessionId;
+                    return (
+                      <div key={sess.id} className="session-group">
+                        <div
+                          className={`session-item ${isSelected ? "active" : ""}`}
+                          onClick={() => {
+                            handleSelectSession(sess.id);
+                            setSonarTab("chat");
+                          }}
+                        >
+                          <span className="session-title" title={cleanTitle(sess.title)}>{cleanTitle(sess.title)}</span>
+                          {liveSessionId === sess.id && <span className="pill local small">Working</span>}
+                          <span className="session-time muted small">
+                            {formatRelativeTime(sess.updated_at || sess.created_at)}
+                          </span>
+                          <button
+                            className="ghost small session-remove"
+                            title="Remove this chat (its cuts are kept)"
+                            aria-label="Remove this chat"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              void removeSession(sess.id);
+                            }}
+                          >
+                            <X size={14} strokeWidth={2} aria-hidden="true" />
+                          </button>
+                        </div>
+
+                        {/* Versions drafted in the selected chat */}
+                        {isSelected && sessionScripts.length > 0 && (
+                          <div className="session-scripts-sublist">
+                            {sessionScripts.map((s) => {
+                              const isScriptSelected = s.id === selectedScriptId;
+                              return (
+                                <div
+                                  key={s.id}
+                                  className={`script-version-item ${isScriptSelected ? "active" : ""}`}
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    void selectScript(s.id, sess.id);
+                                  }}
+                                >
+                                  <span className="version-tag">v{s.version}</span>
+                                  <span className="version-info muted small">
+                                    {s.beats} {s.beats === 1 ? "beat" : "beats"} · {s.clips} {s.clips === 1 ? "clip" : "clips"} · {clock(s.duration_s)}
+                                  </span>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+
+                {otherScripts.length > 0 && (
+                  <div className="other-scripts-section" style={{ marginTop: "16px" }}>
+                    <div className="sidebar-section-title">Cuts made without a chat</div>
+                    <div className="session-scripts-sublist standalone">
+                      {otherScripts.map((s) => {
+                        const isScriptSelected = s.id === selectedScriptId;
+                        return (
+                          <div
+                            key={s.id}
+                            className={`script-version-item ${isScriptSelected ? "active" : ""}`}
+                            onClick={() => {
+                              void selectScript(s.id);
+                            }}
+                            title={s.title}
+                          >
+                            <span className="version-tag">v{s.version}</span>
+                            <span className="version-info muted small">
+                              {s.title} · {clock(s.duration_s)}
+                            </span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+              </div>
+            ) : (
+              /* Chat Conversation View */
+              <div className={`nle-sonar-chat-view ${optionsOpen ? "show-options" : ""}`}>
+                <div className="chat-header">
+                  <span className="label chat-header-title">
+                    {selectedSessionId != null
+                      ? cleanTitle(sessions.find((s) => s.id === selectedSessionId)?.title)
+                      : "New chat"}
+                  </span>
+                  <span className="chat-header-actions">
+                    {viewingSessionId != null && (
+                      <button
+                        type="button"
+                        className="ghost small"
+                        onClick={() => setLogOpen(true)}
+                        title="Every prompt, the model’s thinking and answers, timings, and the helper’s output"
+                      >
+                        Full log
+                      </button>
+                    )}
+                  </span>
+                </div>
+
+                <div className="chat-messages" ref={messagesRef}>
+                  {messages.length === 0 && !optimisticUser && (
+                    <div className="chat-empty">
+                      <p className="chat-empty-lead">Describe the video you want.</p>
+                      <p className="small muted">
+                        Sonar looks through this project’s footage, picks the clips and writes a cut you can edit.
+                      </p>
+                      <div className="chat-example-chips" aria-label="Example requests">
+                        {NEW_CHAT_EXAMPLES.map((ex) => (
+                          <button
+                            key={ex}
+                            type="button"
+                            className="chat-example-chip"
+                            disabled={isTurnRunning || building}
+                            onClick={() => {
+                              setInputMessage(ex);
+                              composerRef.current?.focus();
+                            }}
+                          >
+                            {ex}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {messages.map((msg) => (
+                    <div key={msg.id} className={`chat-message-row ${msg.role}`}>
+                      {msg.tool_calls && msg.tool_calls.length > 0 && (
+                        <ResearchSummary calls={msg.tool_calls} names={videoNames} />
+                      )}
+
+                      {/* A tool row's text is the raw call list; the summary above replaces it. */}
+                      {msg.role !== "tool" && (msg.content || (msg.images && msg.images.length > 0)) && (
+                        <div className={`chat-bubble ${msg.role}`}>
+                          {msg.images && msg.images.length > 0 && (
+                            <div className="chat-attached-images">
+                              {msg.images.map((img, idx) => (
+                                <MediaImage
+                                  key={idx}
+                                  path={img}
+                                  alt={`Attached image ${idx + 1}`}
+                                  className="chat-attached-image"
+                                  onClick={() => setPreviewImage(img)}
+                                  title="Click to view full image"
+                                />
+                              ))}
+                            </div>
+                          )}
+                          {msg.content &&
+                            (msg.role === "assistant" ? (
+                              <AnswerBody content={msg.content} />
+                            ) : (
+                              <UserText text={msg.content} />
+                            ))}
+                          {msg.script_id != null && (
+                            <div className="bubble-script-link">
+                              {selectedScriptId === msg.script_id ? (
+                                <span className="bubble-viewing"><Check size={14} strokeWidth={2} aria-hidden="true" />Viewing v{findScriptVersion(msg.script_id)}</span>
+                              ) : (
+                                <button type="button" className="small" onClick={() => void selectScript(msg.script_id!)}>
+                                  Open v{findScriptVersion(msg.script_id)}
+                                </button>
+                              )}
+                              <button
+                                  type="button"
+                                  className="ghost small"
+                                  title="Open this version and hide Sonar so the whole timeline shows"
+                                  onClick={async () => {
+                                    await selectScript(msg.script_id!);
+                                    setSonarOpen(false);
+                                  }}
+                                >
+                                  Show on timeline
+                                </button>
+                            </div>
+                          )}
+                          {msg.role === "assistant" && <>
+                            <ChatAnswerStats performance={msg.performance} />
+                            <time className="chat-message-time small muted" title={fullTime(msg.created_at)}
+                              dateTime={new Date(msg.created_at < 1e11 ? msg.created_at * 1000 : msg.created_at).toISOString()}>
+                              {new Date(msg.created_at < 1e11 ? msg.created_at * 1000 : msg.created_at).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit", hour12: true })}
+                            </time>
+                          </>}
+                        </div>
+                      )}
+                    </div>
+                  ))}
+
+                  {optimisticUser && !messages.some((m) => m.role === "user" && m.content === optimisticUser.text) && (
+                    <div className="chat-message-row user">
+                      <div className="chat-bubble user">
+                        {optimisticUser.images.length > 0 && (
+                          <div className="chat-attached-images">
+                            {optimisticUser.images.map((img, idx) => (
+                              <MediaImage
+                                key={idx}
+                                path={img}
+                                alt={`Attached image ${idx + 1}`}
+                                className="chat-attached-image"
+                                onClick={() => setPreviewImage(img)}
+                                title="Click to view full image"
+                              />
+                            ))}
+                          </div>
+                        )}
+                        {optimisticUser.text && <UserText text={optimisticUser.text} />}
+                      </div>
+                    </div>
+                  )}
+
+                  {isTurnRunning && (
+                    <div className="chat-message-row assistant live">
+                      <div className="live-progress-container">
+                        {liveSteps.length > 0 && (
+                          <details className="research-steps">
+                            <summary>
+                              <span className={`research-dot${liveSteps[liveSteps.length - 1].running ? " on" : ""}`} />
+                              <span className="research-now">
+                                {liveSteps[liveSteps.length - 1].label}
+                                {liveSteps[liveSteps.length - 1].running ? "…" : ""}
+                              </span>
+                              <span className="research-count">
+                                {liveSteps.length} {liveSteps.length === 1 ? "step" : "steps"}
+                              </span>
+                            </summary>
+                            <ol>
+                              {liveSteps.map((st, k) => (
+                                <li key={k} className={st.running ? "running" : ""}>
+                                  <span className="research-step-icon" aria-hidden="true">{st.running ? <span className="research-dot on" /> : <Check size={12} strokeWidth={2.5} />}</span> {st.label}
+                                  {st.detail && <span className="muted"> · {st.detail}</span>}
+                                </li>
+                              ))}
+                            </ol>
+                          </details>
+                        )}
+                        {activeChatTask && <TaskCard task={activeChatTask} compact />}
+                      </div>
+                    </div>
+                  )}
+
+                  {latestIssues && latestIssues.length > 0 && !isTurnRunning && (
+                    <div className="issues-box small">
+                      <div className="label">To check in this cut ({latestIssues.length})</div>
+                      {latestIssues.map((iss, i) => (
+                        <div key={i} className={`issue-row ${iss.severity === "error" ? "bad-text" : "warn"}`}>
+                          <span className={`pill ${iss.severity}`}>{iss.severity}</span>
+                          {iss.beat_id && <strong>Beat {iss.beat_id}</strong>}
+                          {iss.clip_index != null && <span>clip {iss.clip_index + 1}:</span>}
+                          <span>{iss.message}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {turnError && <div className="banner bad small">{turnError}</div>}
+                </div>
+
+                {/* Composer */}
+                <div className="chat-composer" onDragOver={(e) => e.preventDefault()} onDrop={handleDrop}>
+                  {attachedImages.length > 0 && (
+                    <div className="chat-composer-attachments">
+                      {attachedImages.map((img, idx) => (
+                        <div key={idx} className="chat-composer-attachment-thumb">
+                          <img
+                            src={img}
+                            alt={`Attachment ${idx + 1}`}
+                            onClick={() => setPreviewImage(img)}
+                            title="Click to view full image"
+                          />
+                          <button
+                            type="button"
+                            className="chat-composer-attachment-remove"
+                            onClick={() => setAttachedImages((prev) => prev.filter((_, i) => i !== idx))}
+                            title="Remove image"
+                            aria-label="Remove image"
+                          >
+                            <X size={12} strokeWidth={2.5} aria-hidden="true" />
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  <textarea
+                    ref={composerRef}
+                    rows={3}
+                    aria-label="Message to Sonar"
+                    placeholder={
+                      isTurnRunning
+                        ? "Working…"
+                        : selectedSessionId != null
+                          ? "Ask for changes: tighter, a different opening, steadier shots…"
+                          : "Describe the cut you want…"
+                    }
+                    value={inputMessage}
+                    disabled={isTurnRunning || building}
+                    onChange={(e) => {
+                      setInputMessage(e.target.value);
+                      e.currentTarget.style.height = "auto";
+                      e.currentTarget.style.height = `${e.currentTarget.scrollHeight}px`;
+                    }}
+                    onKeyDown={handleKeyDown}
+                    onPaste={handlePaste}
+                  />
+
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    accept="image/*"
+                    multiple
+                    style={{ display: "none" }}
+                    onChange={handleFileSelect}
+                  />
+
+                  <div className="composer-toolbar">
+                    <button
+                      type="button"
+                      className="composer-icon-btn"
+                      disabled={isTurnRunning}
+                      onClick={() => fileInputRef.current?.click()}
+                      title="Attach an image or screenshot (or paste one)"
+                      aria-label="Attach image"
+                    >
+                      <Paperclip size={16} strokeWidth={2} aria-hidden="true" />
+                    </button>
+                    <button
+                      type="button"
+                      className={`composer-options-toggle${optionsOpen ? " open" : ""}`}
+                      onClick={() => setOptionsOpen((o) => !o)}
+                      aria-expanded={optionsOpen}
+                      title="How Sonar builds the cut, its style, and the engine"
+                    >
+                      <Settings2 size={14} strokeWidth={2} aria-hidden="true" className="composer-options-icon" />
+                      <span className="composer-options-summary">
+                        <strong>{currentMode.short}</strong>
+                        {aiSettings && mode !== "jev" && <span> · {brainSummary(aiSettings.chat_model)}</span>}
+                        {style.broll && <span> · B-roll montage</span>}
+                        {judgingOn && <span> · Review on</span>}
+                      </span>
+                      <span className="composer-options-caret" aria-hidden="true">{optionsOpen ? <ChevronUp size={14} strokeWidth={2} /> : <ChevronDown size={14} strokeWidth={2} />}</span>
+                    </button>
+                  </div>
+
+                  {optionsOpen && (
+                    <div className="composer-options" role="region" aria-label="Sonar build options">
+                      <button type="button" className="ghost small composer-options-done" onClick={() => setOptionsOpen(false)}>
+                        <ChevronLeft size={14} strokeWidth={2} aria-hidden="true" /> Back to chat
+                      </button>
+                      <div className="composer-section-label" id="sonar-method-label">How to build</div>
+                      <div className="composer-methods" role="radiogroup" aria-labelledby="sonar-method-label">
+                        {MODES.map((m) => {
+                          const needsJev = m.id !== "chat";
+                          const blocked = needsJev && (jevReady === false || style.broll);
+                          return (
+                            <button
+                              key={m.id}
+                              type="button"
+                              role="radio"
+                              aria-checked={mode === m.id}
+                              className={`composer-method${mode === m.id ? " on" : ""}${blocked ? " blocked" : ""}`}
+                              disabled={isTurnRunning || (needsJev && style.broll)}
+                              onClick={() => setMode(m.id)}
+                            >
+                              <span className="composer-method-radio" aria-hidden="true" />
+                              <span className="composer-method-text">
+                                <span className="composer-method-name">{m.label}</span>
+                                <span className="composer-method-hint">
+                                  {needsJev && style.broll
+                                    ? "Not for B-roll montages: this method builds from interview quotes."
+                                    : needsJev && jevReady === false
+                                      ? "Requires quote-builder setup."
+                                      : m.hint}
+                                </span>
+                              </span>
+                            </button>
+                          );
+                        })}
+                      </div>
+
+                      <div className="composer-section-label">Style</div>
+                      <div className="composer-switches">
+                        <Switch
+                          label="B-roll montage"
+                          hint="Pictures only, on a theme: no interviews, no voice-over."
+                          checked={style.broll}
+                          disabled={isTurnRunning}
+                          onChange={(on) => setStyle((s) => ({ ...s, broll: on }))}
+                        />
+                        {style.broll && (
+                          <div className="composer-audio" role="radiogroup" aria-label="Montage sound">
+                            {(
+                              [
+                                [true, "Natural sound", "Each clip plays its own ambient sound; anyone speaking is muted."],
+                                [false, "Silent", "Every clip is muted, ready for music."],
+                              ] as const
+                            ).map(([natural, label, hint]) => (
+                              <button
+                                key={label}
+                                type="button"
+                                role="radio"
+                                aria-checked={style.natural_sound === natural}
+                                className={`composer-sound${style.natural_sound === natural ? " on" : ""}`}
+                                disabled={isTurnRunning}
+                                title={hint}
+                                onClick={() => setStyle((s) => ({ ...s, natural_sound: natural }))}
+                              >
+                                {label}
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                        <Switch
+                          label="Editorial review"
+                          hint={
+                            jevReady === false
+                              ? "Requires quote-builder setup."
+                              : "Checks shots against the voice, opening and ending, then suggests fixes."
+                          }
+                          checked={judgingOn}
+                          disabled={jevReady === false || judging === null}
+                          onChange={async (next) => {
+                            setJudging(next);
+                            try {
+                              const ai = await setAiSettings({ jev: { judge: next } });
+                              setJudging(ai.jev.judge);
+                            } catch (e) {
+                              setJudging(!next);
+                              setTurnError(String(e));
+                            }
+                          }}
+                        />
+                      </div>
+
+                      {aiSettings && (
+                        <details className="composer-advanced">
+                          <summary>
+                            <span>Advanced: engine</span>
+                            <span className="muted">{brainSummary(aiSettings.chat_model)}</span>
+                          </summary>
+                          <div className="composer-model-bar">
+                            <div className="composer-backend-pills" role="radiogroup" aria-label="Where the AI runs">
+                              {(["auto", "local", "server", "cli"] as const).map((b) => (
+                                <button
+                                  key={b}
+                                  type="button"
+                                  role="radio"
+                                  aria-checked={aiSettings.chat_model.backend === b}
+                                  className={`backend-pill${aiSettings.chat_model.backend === b ? " active" : ""}`}
+                                  disabled={isTurnRunning}
+                                  title={ENGINE_HINTS[b]}
+                                  onClick={() => handleUpdateChatModel({ backend: b })}
+                                >
+                                  {b === "auto" ? "Auto" : b === "local" ? "Local" : b === "server" ? "Server" : "CLI"}
+                                </button>
+                              ))}
+                            </div>
+                            <p className="composer-engine-hint small muted">{ENGINE_HINTS[aiSettings.chat_model.backend]}</p>
+
+                            <div className="composer-model-controls">
+                              {aiSettings.chat_model.backend === "local" && (
+                                <>
+                                  <label className="composer-field">Model
+                                    <select
+                                      className="composer-model-select"
+                                      value={aiSettings.chat_model.local_model}
+                                      disabled={isTurnRunning}
+                                      onChange={(e) => handleUpdateChatModel({ local_model: e.target.value })}
+                                    >
+                                      {!availableModels.some((m) => m.entry.id === aiSettings.chat_model.local_model) && (
+                                        <option value={aiSettings.chat_model.local_model}>
+                                          {aiSettings.chat_model.local_model}
+                                        </option>
+                                      )}
+                                      {availableModels.map((m) => (
+                                        <option key={m.entry.id} value={m.entry.id}>
+                                          {m.external?.name ?? m.entry.id}{m.external?.quant ? ` · ${m.external.quant}` : ""} {m.installed_path ? "" : "(not downloaded)"}
+                                        </option>
+                                      ))}
+                                    </select>
+                                  </label>
+
+                                  <label className="composer-think-label" title="Let the model reason before it answers: slower, often better">
+                                    <input
+                                      type="checkbox"
+                                      checked={aiSettings.chat_model.think}
+                                      disabled={isTurnRunning}
+                                      onChange={(e) => handleUpdateChatModel({ think: e.target.checked })}
+                                    />
+                                    Think before answering
+                                  </label>
+                                </>
+                              )}
+
+                              {aiSettings.chat_model.backend === "cli" && (
+                                <>
+                                  <label className="composer-field">Tool
+                                    <select
+                                      className="composer-model-select"
+                                      value={aiSettings.chat_model.cli.tool}
+                                      disabled={isTurnRunning}
+                                      onChange={(e) => handleUpdateChatModel({ cli: { tool: e.target.value } })}
+                                    >
+                                      <option value="claude">Claude</option>
+                                      <option value="agy">Agy</option>
+                                      <option value="opencode">OpenCode</option>
+                                      <option value="codex">Codex</option>
+                                    </select>
+                                  </label>
+
+                                  <label className="composer-field">Model
+                                    <ModelSelect kind="cli" tool={aiSettings.chat_model.cli.tool} value={aiSettings.chat_model.cli.model} disabled={isTurnRunning} onChange={(model) => handleUpdateChatModel({ cli: { model } })} />
+                                  </label>
+
+                                  <span className={aiSettings.chat_model.cli.installed ? "muted small" : "bad-text small"}>
+                                    {aiSettings.chat_model.cli.installed
+                                      ? "Installed"
+                                      : `${CLI_NAMES[aiSettings.chat_model.cli.tool] ?? aiSettings.chat_model.cli.tool} isn't installed (not found in PATH)`}
+                                  </span>
+                                </>
+                              )}
+
+                              {aiSettings.chat_model.backend === "server" && (
+                                <>
+                                  <label className="composer-field">Server address
+                                    <input
+                                      type="text"
+                                      className="composer-model-input"
+                                      defaultValue={aiSettings.chat_model.url}
+                                      placeholder="http://127.0.0.1:8089"
+                                      disabled={isTurnRunning}
+                                      onBlur={(e) => handleUpdateChatModel({ url: e.target.value })}
+                                    />
+                                  </label>
+                                  <label className="composer-field">Model
+                                    <ModelSelect kind="server" url={aiSettings.chat_model.url} value={aiSettings.chat_model.model} placeholder="Server default" disabled={isTurnRunning} onChange={(model) => handleUpdateChatModel({ model })} />
+                                  </label>
+                                </>
+                              )}
+
+                              <label
+                                className="composer-think-label"
+                                title="How many lookups (searches, transcripts, clips) the AI may make while researching. 0 lets the AI research until it is done."
+                              >
+                                Research limit
+                                <input
+                                  type="number"
+                                  className="composer-budget-input"
+                                  min={0}
+                                  max={100}
+                                  step={1}
+                                  value={researchLimit}
+                                  disabled={isTurnRunning}
+                                  onChange={(e) => {
+                                    const raw = e.currentTarget.value;
+                                    setResearchLimit(raw === "" ? 0 : Number(raw));
+                                    if (researchLimitTimer.current) clearTimeout(researchLimitTimer.current);
+                                    researchLimitTimer.current = setTimeout(() => saveResearchLimit(raw), 400);
+                                  }}
+                                  onKeyDown={(e) => { if (e.key === "Enter") saveResearchLimit(e.currentTarget.value); }}
+                                  onBlur={(e) => saveResearchLimit(e.currentTarget.value)}
+                                />
+                                lookups · 0 = unlimited
+                              </label>
+                            </div>
+                          </div>
+                        </details>
+                      )}
+                    </div>
+                  )}
+
+                  <div className="composer-go">
+                    <p className="composer-hint small muted">
+                      {style.broll
+                        ? `A montage on the theme you describe. ${
+                            style.natural_sound ? "Clips keep their natural sound." : "Clips are muted, ready for music."
+                          }`
+                        : jevReady === false && mode !== "chat"
+                          ? <><span>{JEV_BLOCKED}</span> <button type="button" className="ghost small sonar-settings-link" onClick={() => window.dispatchEvent(new CustomEvent("ghostreel:navigate", { detail: { kind: "settings" } }))}>Open Settings</button></>
+                          : currentMode.hint}
+                    </p>
+                    <button
+                      type="button"
+                      className="primary"
+                      disabled={
+                        isTurnRunning ||
+                        building ||
+                        (!inputMessage.trim() && attachedImages.length === 0) ||
+                        (mode !== "chat" && jevReady === false)
+                      }
+                      title={mode !== "chat" && jevReady === false ? JEV_BLOCKED : "Send (Enter)"}
+                      onClick={handleSend}
+                    >
+                      {building ? "Choosing…" : isTurnRunning ? "Working…" : currentMode.action}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+        </aside>
+      )}
       </div>
 
-      {/* Lightbox modal for previewing attached images */}
-      {logOpen && (selectedSessionId ?? liveSessionId) != null && (
-        <ChatLogModal sessionId={(selectedSessionId ?? liveSessionId)!} onClose={() => setLogOpen(false)} />
+      {logOpen && viewingSessionId != null && (
+        <ChatLogModal sessionId={viewingSessionId} onClose={() => setLogOpen(false)} />
       )}
+      {/* Lightbox for attached images */}
       {previewImage && (
         <div className="chat-image-modal-overlay" onClick={() => setPreviewImage(null)}>
           <div className="chat-image-modal-content" onClick={(e) => e.stopPropagation()}>
@@ -1259,10 +1994,149 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
               className="chat-image-modal-close"
               onClick={() => setPreviewImage(null)}
               title="Close"
+              aria-label="Close"
             >
-              ×
+              <X size={16} strokeWidth={2} aria-hidden="true" />
             </button>
             <MediaImage path={previewImage} alt="Expanded preview" />
+          </div>
+        </div>
+      )}
+
+      {/* 4. New cut dialog: how to start first; presets only for a Sonar draft. */}
+      {newCutModalOpen && (
+        <div className="nle-modal-backdrop" onClick={() => setNewCutModalOpen(false)}>
+          <div
+            className="nle-modal-content nle-new-cut card"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="new-cut-title"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="nle-modal-header">
+              <h3 id="new-cut-title">New cut</h3>
+              <button
+                type="button"
+                className="ghost small nle-sonar-icon-btn"
+                onClick={() => setNewCutModalOpen(false)}
+                title="Close (Esc)"
+                aria-label="Close"
+              >
+                <X size={16} strokeWidth={2} aria-hidden="true" />
+              </button>
+            </div>
+
+            <p className="small muted nle-modal-intro">
+              A cut is one edit of this footage, with its own versions and Sonar chat. Make as many as you
+              like: a 0:30 reel next to a 15:00 documentary.
+            </p>
+
+            <div className="nle-field-label" id="new-cut-method">How to start</div>
+            <div className="nle-method-cards" role="radiogroup" aria-labelledby="new-cut-method">
+              {(
+                [
+                  ["ai", Sparkles, "Draft with Sonar", "Describe it; Sonar picks the clips and writes the first version."],
+                  ["blank", FilePlus, "Blank", "One empty beat. Build it yourself from the media bin."],
+                  [
+                    "branch",
+                    Copy,
+                    "Copy current cut",
+                    activeScript ? `Start from “${activeScript.title}” and change it from there.` : "Open a cut first to copy it.",
+                  ],
+                ] as const
+              ).map(([id, MethodIcon, label, hint]) => (
+                <button
+                  key={id}
+                  type="button"
+                  role="radio"
+                  aria-checked={newCutType === id}
+                  className={`nle-method-card${newCutType === id ? " on" : ""}`}
+                  disabled={id === "branch" && !activeScript}
+                  onClick={() => chooseCutMethod(id)}
+                >
+                  <MethodIcon size={16} strokeWidth={2} aria-hidden="true" className="nle-method-icon" />
+                  <span className="composer-method-text">
+                    <span className="composer-method-name">{label}</span>
+                    <span className="composer-method-hint">{hint}</span>
+                  </span>
+                </button>
+              ))}
+            </div>
+
+            {newCutType === "ai" && (
+              <>
+                <div className="nle-field-label" id="new-cut-presets">Start from a preset</div>
+                <div className="nle-preset-row" role="group" aria-labelledby="new-cut-presets">
+                  {CUT_PRESETS.map((p) => (
+                    <button
+                      key={p.id}
+                      type="button"
+                      className={`nle-preset-chip${selectedPreset === p.id ? " on" : ""}`}
+                      aria-pressed={selectedPreset === p.id}
+                      onClick={() => applyPreset(p.id)}
+                    >
+                      {p.label}
+                    </button>
+                  ))}
+                </div>
+              </>
+            )}
+
+            <div className="nle-modal-row">
+              <label className="nle-field nle-field-grow">
+                <span className="nle-field-label">Name</span>
+                <input
+                  type="text"
+                  value={newCutTitle}
+                  autoFocus
+                  onChange={(e) => {
+                    setNewCutTitle(e.target.value);
+                  }}
+                  placeholder="e.g. Keynote highlights"
+                />
+              </label>
+              <label className="nle-field nle-field-target">
+                <span className="nle-field-label">Target length</span>
+                <span className="nle-target-input">
+                  <DurationField value={newCutTargetS} min={5} max={7200}
+                    onChange={(value) => { if (value != null) setNewCutTargetS(value); setSelectedPreset(null); }} />
+                  <span className="small muted">m:ss</span>
+                </span>
+                <span className="nle-duration-presets" role="group" aria-label="Target duration presets">
+                  {[[30, "0:30"], [60, "1:00"], [180, "3:00"], [900, "15:00"]].map(([seconds, label]) => (
+                    <button key={seconds} type="button" className="ghost small" aria-pressed={newCutTargetS === seconds}
+                      onClick={() => { setNewCutTargetS(Number(seconds)); setSelectedPreset(null); }}>{label}</button>
+                  ))}
+                </span>
+              </label>
+            </div>
+
+            {newCutType === "ai" && (
+              <label className="nle-field">
+                <span className="nle-field-label">Brief for Sonar</span>
+                <textarea
+                  className="nle-brief"
+                  rows={5}
+                  value={newCutPrompt}
+                  onChange={(e) => setNewCutPrompt(e.target.value)}
+                  placeholder="The tone, the pacing, who should speak, what it should leave people with…"
+                />
+              </label>
+            )}
+
+            <div className="nle-modal-actions">
+              <button type="button" onClick={() => setNewCutModalOpen(false)}>
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="primary"
+                disabled={!(newCutTargetS >= 5) || (newCutType === "branch" && !activeScript)}
+                onClick={handleCreateNewCut}
+              >
+                {newCutType === "ai" ? "Start with Sonar" : newCutType === "branch" ? "Copy cut" : "Create blank cut"}
+              </button>
+            </div>
           </div>
         </div>
       )}

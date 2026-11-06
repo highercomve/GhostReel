@@ -491,6 +491,7 @@ pub fn lay_out(project: &Project, lines: &[Quote], shots: &[Option<Shot>], targe
             out_s: cut_at.unwrap_or(q.out_s),
             audio: Audio::Source,
             why: Some("the person saying it".into()),
+            tracks: None,
         }];
         // No usable break means no cutaway. A beat of the speaker alone is a worse cut than one
         // with b-roll; a beat whose b-roll chops a sentence is a broken one.
@@ -503,6 +504,7 @@ pub fn lay_out(project: &Project, lines: &[Quote], shots: &[Option<Shot>], targe
                 out_s: start + picture_s,
                 audio: Audio::Mute,
                 why: Some("shows what is being said".into()),
+                tracks: None,
             });
         }
         beats.push(Beat {
@@ -517,6 +519,7 @@ pub fn lay_out(project: &Project, lines: &[Quote], shots: &[Option<Shot>], targe
                 out_s: q.out_s,
                 why: Some("the voice runs on under the pictures".into()),
                 inferred: false,
+                tracks: None,
             }),
             notes: None,
         });

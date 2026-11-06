@@ -506,8 +506,11 @@ impl CliAgent {
             .map_err(|_| Error::Vision(format!("{} timed out after {}s", self.cfg.tool, self.cfg.timeout_secs)))?
             .map_err(|e| Error::Vision(format!("{} I/O error: {e}", self.cfg.tool)))?;
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let preview: String = stderr.chars().take(300).collect();
+            // codex reports why on stdout, as a JSON event; its stderr opens with a harmless
+            // "Reading additional input from stdin" that used to be the only thing shown.
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let reason = jsonl_error(&stdout).unwrap_or_else(|| String::from_utf8_lossy(&output.stderr).into_owned());
+            let preview: String = reason.chars().take(300).collect();
             return Err(Error::Vision(format!("{} exited {:?}: {preview}", self.cfg.tool, output.status.code())));
         }
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
@@ -619,6 +622,27 @@ impl CliAgent {
 
 /// `codex exec` in headless shape: JSONL events, no git-repo requirement (frames live in the data
 /// dir), read-only sandbox — it only has to look, never edit.
+/// The last error a JSONL-speaking tool reported on stdout, with any nested API error unwrapped
+/// to its message: `{"type":"error","message":"{\"error\":{\"message\":\"…\"}}"}`.
+fn jsonl_error(stdout: &str) -> Option<String> {
+    let mut found = None;
+    for line in stdout.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) else { continue };
+        let msg = match v["type"].as_str() {
+            Some("error") => v["message"].as_str(),
+            Some("turn.failed") => v["error"]["message"].as_str(),
+            _ => None,
+        };
+        if let Some(m) = msg {
+            let inner = serde_json::from_str::<serde_json::Value>(m)
+                .ok()
+                .and_then(|j| j["error"]["message"].as_str().map(str::to_string));
+            found = Some(inner.unwrap_or_else(|| m.to_string()));
+        }
+    }
+    found
+}
+
 fn codex_exec_prefix(bin: &Path) -> Vec<std::ffi::OsString> {
     vec![
         bin.as_os_str().to_owned(),
@@ -851,6 +875,15 @@ mod tests {
     }
 
     #[test]
+    fn codex_failure_reports_the_api_error_not_stderr() {
+        let out = r#"{"type":"turn.started"}
+{"type":"error","message":"{\"type\":\"error\",\"status\":400,\"error\":{\"message\":\"The 'x' model is not supported.\"}}"}
+{"type":"turn.failed","error":{"message":"{\"error\":{\"message\":\"The 'x' model is not supported.\"}}"}}"#;
+        assert_eq!(jsonl_error(out).as_deref(), Some("The 'x' model is not supported."));
+        assert_eq!(jsonl_error("plain text"), None);
+    }
+
+    #[test]
     fn a_tool_outside_path_is_still_found_in_the_usual_install_dirs() {
         // A desktop-launched app gets a bare PATH; the tool lives in ~/.local/bin.
         let home = tempfile::tempdir().unwrap();
@@ -944,6 +977,44 @@ mod tests {
 /// Runs with stdin closed and a short timeout: this is called to fill a menu, and a tool that
 /// decides to wait for input must not hang the window.
 pub fn list_models(cfg: &CliAgentConfig) -> Vec<String> {
+    if cfg.tool == "claude" {
+        return vec![
+            "opus",
+            "sonnet",
+            "haiku",
+            "fable",
+            "claude-fable-5-1",
+            "claude-opus-5-5",
+            "claude-sonnet-5-5",
+            "claude-haiku-5-5",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    }
+    if cfg.tool == "codex" {
+        let codex_home = std::env::var_os("CODEX_HOME")
+            .map(PathBuf::from)
+            .or_else(home_dir)
+            .map(|p| if std::env::var_os("CODEX_HOME").is_some() { p } else { p.join(".codex") });
+        let Some(dir) = codex_home else { return Vec::new() };
+        let mut models = std::fs::read_to_string(dir.join("models_cache.json"))
+            .ok()
+            .map(|s| parse_codex_models(&s))
+            .unwrap_or_default();
+        if let Ok(config) = std::fs::read_to_string(dir.join("config.toml")) {
+            if let Some(model) = config
+                .lines()
+                .find_map(|l| l.trim().strip_prefix("model = ").map(|v| v.trim().trim_matches(['"', '\'']).to_string()))
+                .filter(|s| !s.is_empty())
+            {
+                models.push(model);
+            }
+        }
+        models.sort();
+        models.dedup();
+        return models;
+    }
     let Some(bin) = find_binary(cfg) else { return Vec::new() };
     if !matches!(cfg.tool.as_str(), "opencode" | "agy") {
         return Vec::new();
@@ -957,6 +1028,20 @@ pub fn list_models(cfg: &CliAgentConfig) -> Vec<String> {
     }
 
     parse_model_list(&String::from_utf8_lossy(&out.stdout))
+}
+
+fn parse_codex_models(text: &str) -> Vec<String> {
+    serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .and_then(|v| v.get("models").and_then(|m| m.as_array()).cloned())
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|m| {
+            (m.get("visibility").and_then(|v| v.as_str()) == Some("list"))
+                .then(|| m.get("slug").and_then(|v| v.as_str()).map(str::to_string))
+                .flatten()
+        })
+        .collect()
 }
 
 /// Pull model ids out of what a tool prints.
@@ -980,7 +1065,31 @@ fn parse_model_list(text: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod model_list_tests {
-    use super::parse_model_list;
+    use super::{parse_codex_models, parse_model_list};
+
+    #[test]
+    fn codex_cache_only_returns_visible_slugs() {
+        let cache = r#"{"models":[{"slug":"a","visibility":"list"},{"slug":"b","visibility":"hide"},{"slug":"c","visibility":"list"}]}"#;
+        assert_eq!(parse_codex_models(cache), vec!["a", "c"]);
+    }
+
+    #[test]
+    fn claude_model_catalog_is_static() {
+        let cfg = crate::config::CliAgentConfig { tool: "claude".into(), ..Default::default() };
+        assert_eq!(
+            super::list_models(&cfg),
+            vec![
+                "opus",
+                "sonnet",
+                "haiku",
+                "fable",
+                "claude-fable-5-1",
+                "claude-opus-5-5",
+                "claude-sonnet-5-5",
+                "claude-haiku-5-5"
+            ]
+        );
+    }
 
     /// Real output from both tools, trimmed: a heading, a status line, tab-separated descriptions.
     #[test]

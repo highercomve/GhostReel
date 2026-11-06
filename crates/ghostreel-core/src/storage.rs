@@ -25,6 +25,8 @@ pub enum Kind {
     Previews,
     /// Images pasted into script chats.
     ChatImages,
+    /// Persistent model traces for script chats.
+    ChatLogs,
     /// Timeline exports written into the data dir.
     Exports,
     /// Scratch files of the chat helpers.
@@ -41,11 +43,12 @@ impl Kind {
             "keyframes" | "frames" => Kind::Keyframes,
             "previews" => Kind::Previews,
             "chat_images" | "chat-images" => Kind::ChatImages,
+            "chat_logs" | "chat-logs" => Kind::ChatLogs,
             "exports" => Kind::Exports,
             "temp" | "tmp" => Kind::Temp,
             _ => {
                 return Err(Error::Invalid(format!(
-                    "unknown kind '{s}' (proxies, keyframes, previews, chat_images, exports, temp)"
+                    "unknown kind '{s}' (proxies, keyframes, previews, chat_images, chat_logs, exports, temp)"
                 )));
             }
         })
@@ -59,6 +62,7 @@ pub struct Usage {
     pub keyframes: u64,
     pub previews: u64,
     pub chat_images: u64,
+    pub chat_logs: u64,
     pub exports: u64,
     pub temp: u64,
 }
@@ -70,13 +74,14 @@ impl Usage {
             Kind::Keyframes => &mut self.keyframes,
             Kind::Previews => &mut self.previews,
             Kind::ChatImages => &mut self.chat_images,
+            Kind::ChatLogs => &mut self.chat_logs,
             Kind::Exports => &mut self.exports,
             Kind::Temp => &mut self.temp,
         } += bytes;
     }
 
     pub fn total(&self) -> u64 {
-        self.proxies + self.keyframes + self.previews + self.chat_images + self.exports + self.temp
+        self.proxies + self.keyframes + self.previews + self.chat_images + self.chat_logs + self.exports + self.temp
     }
 }
 
@@ -248,6 +253,11 @@ fn inventory(data_dir: &Path) -> Vec<Item> {
         items.push(Item { kind: Kind::Exports, bytes: size_of(&e.path()), path: e.path(), owner });
     }
 
+    for e in entries(&data_dir.join("logs/chat")) {
+        let owner = e.path().file_stem().and_then(|s| s.to_str()).and_then(|s| s.parse().ok())
+            .map(Owner::Session).unwrap_or(Owner::None);
+        items.push(Item { kind: Kind::ChatLogs, bytes: size_of(&e.path()), path: e.path(), owner });
+    }
     for e in entries(&data_dir.join("tmp")) {
         items.push(Item { kind: Kind::Temp, bytes: size_of(&e.path()), path: e.path(), owner: Owner::None });
     }
@@ -461,6 +471,21 @@ mod tests {
     fn write(path: &Path, bytes: usize) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, vec![0u8; bytes]).unwrap();
+    }
+
+    #[test]
+    fn chat_logs_are_accounted_and_clearable_per_project() {
+        let (_tmp, data, mut db, a, _b) = fixture();
+        let session = crate::chat::create_session(&db, a, "log owner").unwrap();
+        let path = data.join("logs/chat").join(format!("{session}.jsonl"));
+        write(&path, 64);
+        let report = report(&db, &data).unwrap();
+        assert_eq!(report.usage.chat_logs, 64);
+        assert_eq!(report.projects.iter().find(|p| p.project_id == a).unwrap().usage.chat_logs, 64);
+        let cleared = clean(&mut db, &data, Scope::Project(a), &[Kind::ChatLogs]).unwrap();
+        assert_eq!(cleared.bytes_freed, 64);
+        assert!(!path.exists());
+        assert_eq!(crate::chat::sessions(&db, a).unwrap().len(), 1);
     }
 
     /// Projects A and B share folder `b`; A also has `a`. Video 1 (aa11) is A's only, video 2

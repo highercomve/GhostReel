@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { Check, ChevronDown } from "lucide-react";
 import {
   getAiSettings,
   getChatSettings,
@@ -8,6 +9,7 @@ import {
   setWebConfig,
   webStatus,
   type AiSettings,
+  type AiSettingsPatch,
   type ChatSettings,
   type WebConfigPatch,
   type WebStatus,
@@ -16,6 +18,362 @@ import {
 /** Bound here, nothing else on the network can reach it — which is what makes a password optional. */
 const isLoopback = (bind: string) => bind === "127.0.0.1" || bind === "localhost" || bind === "::1";
 
+// ─── per-section Saved cue ───────────────────────────────────────────────────
+
+type CueState = "idle" | "saving" | "saved";
+
+/** A transient "Saved" cue for one settings card: Saving… → Saved → fades out. */
+function useSavedCue() {
+  const [state, setState] = useState<CueState>("idle");
+  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const bump = (to: CueState) => {
+    setState(to);
+    if (timer.current) clearTimeout(timer.current);
+    if (to === "saved") timer.current = setTimeout(() => setState("idle"), 2200);
+  };
+  useEffect(() => () => { if (timer.current) clearTimeout(timer.current); }, []);
+  return {
+    state,
+    saving: () => bump("saving"),
+    saved: () => bump("saved"),
+    reset: () => {
+      if (timer.current) clearTimeout(timer.current);
+      setState("idle");
+    },
+  };
+}
+
+function SavedCue({ state }: { state: CueState }) {
+  if (state === "idle") return null;
+  return (
+    <span className={`saved-cue${state === "saved" ? " fade" : ""}`} role="status">
+      {state === "saving" ? (
+        "Saving…"
+      ) : (
+        <>
+          <Check size={13} strokeWidth={2} aria-hidden /> Saved
+        </>
+      )}
+    </span>
+  );
+}
+
+/** One settings write: run the card's cue; failures surface through the page banner via onPatch. */
+function useApplier(onPatch: (p: AiSettingsPatch) => Promise<boolean>) {
+  const cue = useSavedCue();
+  const apply = async (patch: AiSettingsPatch) => {
+    cue.saving();
+    if (await onPatch(patch)) cue.saved();
+    else cue.reset();
+  };
+  return { cue, apply };
+}
+
+// ─── Jev ─────────────────────────────────────────────────────────────────────
+
+function JevCard({
+  ai,
+  onPatch,
+  onError,
+}: {
+  ai: AiSettings | null;
+  onPatch: (p: AiSettingsPatch) => Promise<boolean>;
+  onError: (e: string | null) => void;
+}) {
+  const { cue, apply } = useApplier(onPatch);
+  const enabled = ai?.jev.enabled ?? false;
+  const keyRef = useRef<HTMLInputElement>(null);
+  return (
+    <section className="card">
+      <div className="settings-card-title">
+        Quote builder (Jev) — cloud builds &amp; reviews
+        <SavedCue state={cue.state} />
+      </div>
+      <p className="muted small">
+        Jev is TypeSafe&apos;s hosted model: it can assemble a first cut from indexed footage in about 15 s, flag
+        off-mic interviewers, and score finished drafts. It is the one part of GhostReel that leaves this computer —
+        when it is on, transcripts and frame descriptions go to <code>api.typesafe.ai</code>. Nothing is sent while
+        it is off. Sonar&apos;s build cards call this the quote-builder key.
+      </p>
+      <div className="settings-fields">
+        <div className="settings-field check">
+          <label htmlFor="jev-enabled">Enable Jev</label>
+          <input
+            id="jev-enabled"
+            type="checkbox"
+            checked={enabled}
+            disabled={!ai}
+            onChange={async (e) => {
+              const on = e.currentTarget.checked;
+              if (on && !ai?.jev.has_key && !ai?.jev.key_from_env) {
+                onError("Turning Jev on needs an API key: enter one below first");
+                return;
+              }
+              await apply({ jev: { enabled: on } });
+            }}
+          />
+          <span className="muted small">
+            builds cuts, tells interviewer questions apart from answers and judges finished drafts in the cloud
+          </span>
+        </div>
+        <div className="settings-field check">
+          <label htmlFor="jev-judge">Let Jev judge finished cuts</label>
+          <input
+            id="jev-judge"
+            type="checkbox"
+            checked={ai?.jev.judge ?? true}
+            disabled={!ai || !enabled}
+            onChange={async (e) => {
+              await apply({ jev: { judge: e.currentTarget.checked } });
+            }}
+          />
+          <span className="muted small">
+            scores drafted cuts in the cloud and flags weak moments
+            {!enabled && " · needs Jev above"}
+          </span>
+        </div>
+        <div className="settings-field">
+          <label htmlFor="jev-key">API key</label>
+          {ai?.jev.key_from_env ? (
+            <span className="muted small">
+              taken from <code>TYPESAFE_API_KEY</code> in the environment, which wins over anything typed here
+            </span>
+          ) : (
+            <>
+              <input
+                id="jev-key"
+                ref={keyRef}
+                type="password"
+                style={{ width: "22em" }}
+                placeholder={ai?.jev.has_key ? "new key" : "apikey_…"}
+                onKeyDown={async (e) => {
+                  if (e.key !== "Enter") return;
+                  const value = e.currentTarget.value.trim();
+                  e.currentTarget.value = "";
+                  // A new key also enables Jev so it is ready to use; clearing the key disables it.
+                  await apply(value ? { jev: { api_key: value, enabled: true } } : { jev: { api_key: "", enabled: false } });
+                }}
+              />
+              <span className="muted small">
+                {ai?.jev.has_key ? (
+                  <>
+                    Key saved ·{" "}
+                    <a
+                      href="#jev-key"
+                      onClick={(e) => {
+                        e.preventDefault();
+                        if (keyRef.current) {
+                          keyRef.current.value = "";
+                          keyRef.current.focus();
+                        }
+                      }}
+                    >
+                      Replace
+                    </a>
+                  </>
+                ) : (
+                  "press Enter to save"
+                )}
+                {" · "}
+                <a href="https://console.typesafe.ai/keys" target="_blank" rel="noreferrer">
+                  get one
+                </a>
+              </span>
+            </>
+          )}
+        </div>
+      </div>
+    </section>
+  );
+}
+
+// ─── Research ────────────────────────────────────────────────────────────────
+
+function ResearchCard({
+  ai,
+  onPatch,
+  onError,
+}: {
+  ai: AiSettings | null;
+  onPatch: (p: AiSettingsPatch) => Promise<boolean>;
+  onError: (e: string | null) => void;
+}) {
+  const { cue, apply } = useApplier(onPatch);
+  const limit = ai?.chat_model.max_tool_rounds ?? 0;
+  // null = untouched; the stored value decides whether the custom box is shown.
+  const [custom, setCustom] = useState<boolean | null>(null);
+  const showCustom = custom ?? (limit !== 0 && limit !== 30);
+  return (
+    <section className="card">
+      <div className="settings-card-title">
+        Research
+        <SavedCue state={cue.state} />
+      </div>
+      <div className="settings-fields">
+        <div className="settings-field">
+          <label htmlFor="research-limit">Research limit</label>
+          <select
+            id="research-limit"
+            value={showCustom ? "custom" : limit === 0 ? "unlimited" : String(limit)}
+            disabled={!ai}
+            onChange={async (e) => {
+              const v = e.currentTarget.value;
+              if (v === "custom") {
+                setCustom(true);
+                return;
+              }
+              setCustom(false);
+              await apply({ chat_model: { max_tool_rounds: v === "unlimited" ? 0 : Number(v) } });
+            }}
+          >
+            <option value="unlimited">Unlimited</option>
+            <option value="30">30</option>
+            {showCustom && <option value="custom">{`Custom (${limit})`}</option>}
+            {!showCustom && <option value="custom">Custom…</option>}
+          </select>
+          {showCustom && (
+            <input
+              id="research-limit-custom"
+              type="number"
+              min={1}
+              max={100}
+              step={1}
+              style={{ width: "80px" }}
+              disabled={!ai}
+              defaultValue={limit}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") e.currentTarget.blur();
+              }}
+              onBlur={async (e) => {
+                const value = Number(e.currentTarget.value);
+                if (!Number.isInteger(value) || value < 1 || value > 100) {
+                  onError("Custom research limit must be a whole number from 1 to 100.");
+                  return;
+                }
+                await apply({ chat_model: { max_tool_rounds: value } });
+              }}
+            />
+          )}
+          <span className="muted small">
+            How many footage look-ups the AI may do for one script.
+          </span>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+// ─── Editor instructions (system prompt) ─────────────────────────────────────
+
+function PromptCard({
+  settings,
+  onSettings,
+  onError,
+}: {
+  settings: ChatSettings;
+  onSettings: (s: ChatSettings) => void;
+  onError: (e: string | null) => void;
+}) {
+  const [text, setText] = useState(settings.system_prompt);
+  // Only show the editing surface when there is something of the editor's own to edit;
+  // the factory instructions stay fenced in a collapsed, read-only block.
+  const [editing, setEditing] = useState(() => {
+    const t = settings.system_prompt.trim();
+    return t !== "" && t !== settings.default_system_prompt.trim();
+  });
+  const cue = useSavedCue();
+  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => { if (timer.current) clearTimeout(timer.current); }, []);
+
+  const save = (value: string) => {
+    cue.saving();
+    if (timer.current) clearTimeout(timer.current);
+    timer.current = setTimeout(async () => {
+      try {
+        onSettings(await setChatSystemPrompt(value));
+        cue.saved();
+        onError(null);
+      } catch (e) {
+        onError(String(e));
+        cue.reset();
+      }
+    }, 800);
+  };
+
+  const isDefault = text.trim() === settings.default_system_prompt.trim() || !text.trim();
+
+  return (
+    <section className="card">
+      <div className="settings-card-title">
+        Editor instructions
+        <SavedCue state={cue.state} />
+      </div>
+      <p className="muted small">
+        The brief the AI follows when drafting scripts — story, shot choice, pacing, narration and audio. The
+        footage look-up and the reply format are built in and always applied; your brief sets the rest.
+      </p>
+      {editing ? (
+        <>
+          <textarea
+            className="prompt-editor"
+            value={text}
+            spellCheck={false}
+            placeholder="e.g. Cut tight one-minute highlights; put the best speaker on screen for the hook; keep narration short and plain; end on what to watch next."
+            onChange={(e) => {
+              setText(e.target.value);
+              save(e.target.value);
+            }}
+          />
+          <div className="row prompt-actions">
+            <span className="muted small">{isDefault ? "Using the default instructions" : "Using your instructions"}</span>
+            <button
+              className="ghost small"
+              disabled={isDefault}
+              onClick={() => {
+                setText(settings.default_system_prompt);
+                setEditing(false);
+                save("");
+              }}
+            >
+              Reset to default
+            </button>
+          </div>
+        </>
+      ) : (
+        <div className="prompt-summary">
+          <p className="muted small">
+            Using the default instructions — the AI picks quotes and clips from your footage, writes the narration,
+            and answers in the format GhostReel reads.
+          </p>
+          <div className="row">
+            <button
+              className="ghost small"
+              onClick={() => {
+                setText("");
+                setEditing(true);
+              }}
+            >
+              Write your own brief
+            </button>
+          </div>
+        </div>
+      )}
+      {/* The fixed factory instructions, fenced off: read-only and collapsed by default. */}
+      <details className="prompt-scaffold">
+        <summary>How the AI is instructed (advanced)</summary>
+        <p className="muted small">
+          {editing
+            ? "Your brief replaces the built-in instructions below. Either way the footage tools are added on top, so scripts keep working."
+            : "This is what the AI receives now. Writing your own brief replaces it wholesale — the footage tools are added on top."}
+        </p>
+        <pre className="prompt-scaffold-text">{settings.default_system_prompt}</pre>
+      </details>
+    </section>
+  );
+}
+
+// ─── Web access ──────────────────────────────────────────────────────────────
+
 function WebAccess() {
   const [web, setWeb] = useState<WebStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -23,6 +381,8 @@ function WebAccess() {
   const [port, setPort] = useState("");
   const [user, setUser] = useState("");
   const [password, setPassword] = useState("");
+  const usernameRef = useRef<HTMLInputElement>(null);
+  const cue = useSavedCue();
 
   const load = (s: WebStatus) => {
     setWeb(s);
@@ -38,10 +398,13 @@ function WebAccess() {
   }, []);
 
   const apply = async (patch: WebConfigPatch) => {
+    cue.saving();
     try {
       load(await setWebConfig(patch));
+      cue.saved();
       setError(null);
     } catch (err) {
+      cue.reset();
       setError(String(err));
     }
   };
@@ -87,473 +450,351 @@ function WebAccess() {
   };
 
   return (
-    <>
-      <h2>Web access</h2>
-      <section className="card">
-        <p className="muted small">
-          Serve GhostReel over HTTP as well as in this window, so it can be opened in a browser — here, or on a
-          phone or another computer on the same network. Everything still runs on this computer; the browser is
-          only a window onto it.
-        </p>
-        {locked && (
-          <p className="muted small">
-            You are looking at GhostReel through this server, so it can only be changed in the desktop app —
-            switching it off from here would close the page you are reading.
-          </p>
-        )}
-        {error && <div className="banner bad">{error}</div>}
-        {web.error && <div className="banner bad">The server did not start: {web.error}</div>}
-        {exposed && (
-          <div className="banner bad">
-            This server has no password and is not limited to this computer. Anyone on the same network can open
-            it and use GhostReel as you: read and change your projects, watch your footage, and reach the files on
-            this computer that GhostReel can reach. Turn sign-in on below unless you trust every device on this
-            network.
-          </div>
-        )}
-        <div className="settings-fields">
-          <div className="settings-field">
-            <label>Serve</label>
-            <input
-              type="checkbox"
-              checked={web.enabled}
-              disabled={locked}
-              onChange={(e) => apply({ enabled: e.currentTarget.checked })}
-            />
-            <span className="muted small">{state}</span>
-          </div>
-          {web.running && web.urls.length > 0 && (
-            <div className="settings-field">
-              <label>Open at</label>
-              <span className="muted small">
-                {web.urls.map((u, i) => (
-                  <span key={u}>
-                    {i > 0 && " · "}
-                    <code>{u}</code>
-                  </span>
-                ))}
-              </span>
-            </div>
+    <section className={`card web-access-card${locked ? " locked" : ""}`}>
+      <div className="settings-card-title">
+        Web access
+        <SavedCue state={cue.state} />
+      </div>
+      <p className="muted small">
+        Serve GhostReel over HTTP too — for a browser here, or on a phone or another computer on this network.
+        Everything still runs on this computer; the browser is only a window onto it.
+      </p>
+      {error && <div className="banner bad">{error}</div>}
+      {web.error && <div className="banner bad">The server did not start: {web.error}</div>}
+      {exposed && (
+        <div className="banner warn web-access-warning">
+          <span>Anyone on the same network can open this server without signing in and use GhostReel as you.</span>
+          {!locked && (
+            <button className="ghost small" onClick={async () => {
+              await apply({ auth_enabled: true });
+              requestAnimationFrame(() => {
+                usernameRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
+                usernameRef.current?.focus();
+              });
+            }}>
+              Turn on sign-in
+            </button>
           )}
-          <div className="settings-field">
-            <label>Address</label>
-            <input
-              type="text"
-              value={bind}
-              disabled={locked}
-              onChange={(e) => setBind(e.currentTarget.value)}
-              onBlur={commitBind}
-              onKeyDown={onEnter(commitBind)}
-            />
-            <span className="muted small">
-              0.0.0.0 to reach it from other devices · 127.0.0.1 for this computer only
-            </span>
-          </div>
-          <div className="settings-field">
-            <label>Port</label>
-            <input
-              type="number"
-              min={1}
-              max={65535}
-              style={{ width: "7em" }}
-              value={port}
-              disabled={locked}
-              onChange={(e) => setPort(e.currentTarget.value)}
-              onBlur={commitPort}
-              onKeyDown={onEnter(commitPort)}
-            />
-          </div>
-          <div className="settings-field">
-            <label>Sign-in</label>
-            <input
-              type="checkbox"
-              checked={web.auth_enabled}
-              disabled={locked}
-              onChange={(e) => apply({ auth_enabled: e.currentTarget.checked })}
-            />
-            <span className="muted small">
-              {web.auth_enabled
-                ? "on — the browser asks for the name and password below"
-                : "off — anyone who can reach the address is let straight in"}
-            </span>
-          </div>
-          <div className="settings-field">
-            <label>Username</label>
-            <input
-              type="text"
-              value={user}
-              disabled={locked || !web.auth_enabled}
-              onChange={(e) => setUser(e.currentTarget.value)}
-              onBlur={commitUser}
-              onKeyDown={onEnter(commitUser)}
-            />
-          </div>
-          <div className="settings-field">
-            <label>Password</label>
-            <input
-              type="password"
-              value={password}
-              disabled={locked || !web.auth_enabled}
-              placeholder="type to set a password"
-              onChange={(e) => setPassword(e.currentTarget.value)}
-              onBlur={commitPassword}
-              onKeyDown={onEnter(commitPassword)}
-            />
-            <span className="muted small">left blank, the saved password stays as it is</span>
-          </div>
+          {locked && <span>Turn on sign-in in the desktop app: Settings → Web access.</span>}
         </div>
-      </section>
-    </>
+      )}
+      <div className="settings-fields">
+        <div className="settings-field check">
+          <label htmlFor="web-serve">Serve</label>
+          <input
+            id="web-serve"
+            type="checkbox"
+            checked={web.enabled}
+            disabled={locked}
+            onChange={(e) => apply({ enabled: e.currentTarget.checked })}
+          />
+          <span className="muted small">{state}</span>
+        </div>
+        {web.running && web.urls.length > 0 && (
+          <div className="settings-field">
+            <label>Open at</label>
+            <span className="muted small">
+              {web.urls.map((u, i) => (
+                <span key={u}>
+                  {i > 0 && " · "}
+                  <code>{u}</code>
+                </span>
+              ))}
+            </span>
+          </div>
+        )}
+        <div className="settings-field">
+          <label htmlFor="web-bind">Address</label>
+          <input
+            id="web-bind"
+            type="text"
+            value={bind}
+            disabled={locked}
+            onChange={(e) => setBind(e.currentTarget.value)}
+            onBlur={commitBind}
+            onKeyDown={onEnter(commitBind)}
+          />
+          <span className="muted small">
+            0.0.0.0 to reach it from other devices · 127.0.0.1 for this computer only
+          </span>
+        </div>
+        <div className="settings-field">
+          <label htmlFor="web-port">Port</label>
+          <input
+            id="web-port"
+            type="number"
+            min={1}
+            max={65535}
+            style={{ width: "7em" }}
+            value={port}
+            disabled={locked}
+            onChange={(e) => setPort(e.currentTarget.value)}
+            onBlur={commitPort}
+            onKeyDown={onEnter(commitPort)}
+          />
+          <span className="muted small">1–65535</span>
+        </div>
+        <div className="settings-field check">
+          <label htmlFor="web-auth">Sign-in</label>
+          <input
+            id="web-auth"
+            type="checkbox"
+            checked={web.auth_enabled}
+            disabled={locked}
+            onChange={(e) => apply({ auth_enabled: e.currentTarget.checked })}
+          />
+          <span className="muted small">
+            protects this server with the name and password below
+          </span>
+        </div>
+        <div className="settings-field">
+          <label htmlFor="web-user">Username</label>
+          <input
+            id="web-user"
+            ref={usernameRef}
+            type="text"
+            value={user}
+            disabled={locked || !web.auth_enabled}
+            onChange={(e) => setUser(e.currentTarget.value)}
+            onBlur={commitUser}
+            onKeyDown={onEnter(commitUser)}
+          />
+        </div>
+        <div className="settings-field">
+          <label htmlFor="web-password">Password</label>
+          <input
+            id="web-password"
+            type="password"
+            value={password}
+            disabled={locked || !web.auth_enabled}
+            placeholder="type to set a password"
+            onChange={(e) => setPassword(e.currentTarget.value)}
+            onBlur={commitPassword}
+            onKeyDown={onEnter(commitPassword)}
+          />
+          <span className="muted small">leave blank to keep the saved password</span>
+        </div>
+      </div>
+    </section>
   );
 }
+
+// ─── main page ───────────────────────────────────────────────────────────────
 
 export default function SettingsPage() {
   const [settings, setSettings] = useState<ChatSettings | null>(null);
   const [ai, setAi] = useState<AiSettings | null>(null);
-  const [text, setText] = useState("");
-  const [saved, setSaved] = useState<"idle" | "saving" | "saved">("idle");
   const [error, setError] = useState<string | null>(null);
-  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     getAiSettings().then(setAi).catch(() => {});
     getChatSettings()
-      .then((s) => {
-        setSettings(s);
-        setText(s.system_prompt.trim() ? s.system_prompt : s.default_system_prompt);
-      })
+      .then(setSettings)
       .catch((e) => setError(String(e)));
   }, []);
 
-  const save = (value: string) => {
-    setSaved("saving");
-    if (timer.current) clearTimeout(timer.current);
-    timer.current = setTimeout(async () => {
-      try {
-        setSettings(await setChatSystemPrompt(value));
-        setSaved("saved");
-        setError(null);
-      } catch (e) {
-        setError(String(e));
-        setSaved("idle");
-      }
-    }, 800);
+  const patchAi = async (patch: AiSettingsPatch): Promise<boolean> => {
+    try {
+      setAi(await setAiSettings(patch));
+      setError(null);
+      return true;
+    } catch (err) {
+      setError(String(err));
+      return false;
+    }
   };
+
+  // Advanced · model runtime — collapsed by default; sections appear only when they apply.
+  const showChatRuntime = Boolean(ai && ai.chat_model.backend !== "server");
+  const showFrameServer = Boolean(ai && (ai.vision.backend === "server" || ai.vision.backend === "auto"));
+  const chat = useApplier(patchAi);
+  const frame = useApplier(patchAi);
 
   if (!settings) return <main>{error ? <div className="banner bad">{error}</div> : <p className="muted">Loading…</p>}</main>;
 
-  const isDefault = text.trim() === settings.default_system_prompt.trim() || !text.trim();
+  const moeBlocks = ai?.chat_model.moe_blocks ?? 64;
+  const moeLayers = Math.min(ai?.chat_model.cpu_moe_layers ?? 0, moeBlocks);
 
   return (
     <main>
       <header>
         <div>
           <h1>Settings</h1>
-          <p className="muted">Saved in ~/.ghostreel/config.toml</p>
+          <p className="muted">Changes save automatically · stored in ~/.ghostreel/config.toml</p>
         </div>
       </header>
 
-      {ai && (
-        <>
-          <h2>Script chat · research</h2>
-          <section className="card">
-            <div className="settings-field">
-              <label htmlFor="research-budget">Research limit</label>
-              <input id="research-budget" type="number" min={0} max={1000} step={1} style={{ width: "7em" }}
-                defaultValue={ai.chat_model.max_tool_rounds ?? 0}
-                onBlur={async (e) => {
-                  const value = Number(e.currentTarget.value);
-                  if (!Number.isInteger(value) || value < 0 || value > 1000) { setError("Research limit must be a whole number from 0 to 1000."); return; }
-                  try { setAi(await setAiSettings({ chat_model: { max_tool_rounds: value } })); setError(null); }
-                  catch (err) { setError(String(err)); }
-                }} />
-              <span className="muted small">0 uses the configured backend default. Local agents allow 30 calls by default; planning replies do not spend them. Selected shots and spoken quotes are inspected before the local agent reviews its draft. Server and CLI backends use this as their research-round limit. An adequately researched edit can finish sooner.</span>
-            </div>
-          </section>
-        </>
-      )}
+      {error && <div className="banner bad">{error}</div>}
 
-      {ai && ai.chat_model.backend !== "server" && (
-        <>
-          <h2>Script chat · model on this computer</h2>
-          <section className="card">
-            <p className="muted small">
-              How much room the model has while drafting. A bigger window fits more search results and a longer
-              script, but uses more VRAM. The frame-description model has its own, smaller window (Models page).
-            </p>
-            <div className="settings-fields">
-              <div className="settings-field">
-                <label>Context window</label>
-                <input
-                  type="number"
-                  min={2048}
-                  max={131072}
-                  step={2048}
-                  style={{ width: "7em" }}
-                  defaultValue={ai.chat_model.ctx_tokens}
-                  onChange={async (e) => {
-                    const v = Number(e.currentTarget.value);
-                    if (v < 2048 || v > 131072) return;
-                    try {
-                      setAi(await setAiSettings({ chat_model: { ctx_tokens: v } }));
-                    } catch (err) {
-                      setError(String(err));
-                    }
-                  }}
-                />
-                <span className="muted small">tokens · the loaded window is capped by the model and available memory</span>
-              </div>
-              <div className="settings-field">
-                <label>Flash attention · llama.cpp</label>
-                <select value={ai.chat_model.flash_attn} onChange={async (e) => {
-                  try { setAi(await setAiSettings({ chat_model: { flash_attn: e.currentTarget.value } })); }
-                  catch (err) { setError(String(err)); }
-                }}>
-                  <option value="auto">Automatic · use when supported</option>
-                  <option value="on">On · require support</option>
-                  <option value="off">Off · use f16 KV cache</option>
-                </select>
-              </div>
-              <div className="settings-field">
-                <label htmlFor="chat-moe-ram">MoE experts in system RAM · llama.cpp</label>
-                <input id="chat-moe-ram" type="range" min={0} max={ai.chat_model.moe_blocks ?? 64} step={1}
-                  style={{ width: "min(100%, 28em)" }}
-                  value={Math.min(ai.chat_model.cpu_moe_layers ?? 0, ai.chat_model.moe_blocks ?? 64)}
-                  onChange={(e) => setAi({ ...ai, chat_model: { ...ai.chat_model, cpu_moe_layers: Number(e.currentTarget.value) } })}
-                  onPointerUp={async (e) => {
-                    try { setAi(await setAiSettings({ chat_model: { cpu_moe_layers: Number(e.currentTarget.value) } })); }
-                    catch (err) { setError(String(err)); }
-                  }}
-                  onKeyUp={async (e) => {
-                    try { setAi(await setAiSettings({ chat_model: { cpu_moe_layers: Number(e.currentTarget.value) } })); }
-                    catch (err) { setError(String(err)); }
-                  }} />
-                <span className="small">{!ai.chat_model.cpu_moe_layers ? "Automatic · fit to available GPU memory"
-                  : ai.chat_model.moe_blocks
-                    ? `${Math.round(ai.chat_model.cpu_moe_layers / ai.chat_model.moe_blocks * 100)}% · ${ai.chat_model.cpu_moe_layers} of ${ai.chat_model.moe_blocks} expert blocks in RAM`
-                    : `${ai.chat_model.cpu_moe_layers} expert blocks in RAM`}</span>
-                <span className="muted small">Attention stays on the GPU. More experts in RAM free VRAM for context, but can slow generation. For AgentWorld on a 12 GB NVIDIA GPU, 80% (32 blocks) was tested at 128k context. Dense models ignore this setting; MLX manages its own memory. Changes apply when the model reloads.</span>
-              </div>
-              <div className="settings-field">
-                <label>KV cache</label>
-                <select
-                  value={ai.chat_model.kv_cache}
-                  onChange={async (e) => {
-                    try {
-                      setAi(await setAiSettings({ chat_model: { kv_cache: e.currentTarget.value } }));
-                    } catch (err) {
-                      setError(String(err));
-                    }
-                  }}
-                >
-                  <option value="q4_0">q4_0 — ~4× the context per GB</option>
-                  <option value="q8_0">q8_0 — balanced</option>
-                  <option value="f16">f16 — best quality, 4× the VRAM</option>
-                </select>
-              </div>
-            </div>
-          </section>
-        </>
-      )}
+      <h2>Basic</h2>
+      <div className="settings-group">
+        <JevCard ai={ai} onPatch={patchAi} onError={setError} />
+        <ResearchCard ai={ai} onPatch={patchAi} onError={setError} />
+        <PromptCard settings={settings} onSettings={setSettings} onError={setError} />
+        <WebAccess />
+      </div>
 
-      {ai && (ai.vision.backend === "server" || ai.vision.backend === "auto") && (
-        <>
-          <h2>Frame descriptions · server</h2>
-          <section className="card">
-            {ai.vision_caps.slots == null ? (
-              <p className="muted small">
-                This server doesn't report what it can do, so GhostReel describes one frame at a time. That is the
-                safe choice for LM Studio, Ollama or a hosted endpoint — only llama.cpp says how many requests it
-                will really work on at once, and guessing wrong just makes requests queue.
-              </p>
-            ) : (
-              <>
+      {(showChatRuntime || showFrameServer) && (
+        <details className="settings-advanced">
+          <summary>
+            <ChevronDown size={15} strokeWidth={2} aria-hidden />
+            <span>Advanced · model runtime</span>
+            <span className="muted small">Recommended: automatic — most editors never need this</span>
+          </summary>
+          <div className="settings-advanced-body">
+            {showChatRuntime && ai && (
+              <section className="card">
+                <div className="settings-card-title">
+                  Script chat · model runtime
+                  <SavedCue state={chat.cue.state} />
+                </div>
                 <p className="muted small">
-                  The server reports <strong>{ai.vision_caps.slots} slot{ai.vision_caps.slots === 1 ? "" : "s"}</strong>
-                  {ai.vision_caps.slot_ctx != null && <> of {ai.vision_caps.slot_ctx.toLocaleString()} tokens each</>}.
-                  Generating a token means reading every weight out of VRAM, so the card spends most of its time
-                  waiting on memory; describing several frames at once reads those weights once and answers all of
-                  them, which measured 1.7× faster on real footage. Asking for more than the server has is harmless —
-                  the extra requests simply queue.
+                  Recommended: automatic — GhostReel fits these to your hardware. Changes apply when the model
+                  reloads.
                 </p>
                 <div className="settings-fields">
                   <div className="settings-field">
-                    <label>Frames at once</label>
+                    <label htmlFor="chat-ctx">Context window</label>
                     <input
+                      id="chat-ctx"
                       type="number"
-                      min={1}
-                      max={16}
-                      style={{ width: "5em" }}
-                      defaultValue={ai.vision.describe_concurrency ?? 4}
+                      min={2048}
+                      max={131072}
+                      step={2048}
+                      style={{ width: "7em" }}
+                      defaultValue={ai.chat_model.ctx_tokens}
                       onChange={async (e) => {
                         const v = Number(e.currentTarget.value);
-                        if (v < 1 || v > 16) return;
-                        try {
-                          setAi(await setAiSettings({ vision: { describe_concurrency: v } }));
-                          setError(null);
-                        } catch (err) {
-                          setError(String(err));
-                        }
+                        if (v < 2048 || v > 131072) return;
+                        await chat.apply({ chat_model: { ctx_tokens: v } });
                       }}
                     />
                     <span className="muted small">
-                      {ai.vision_caps.slots === 1
-                        ? "this server runs one at a time — start it with more slots to gain anything"
-                        : `up to ${ai.vision_caps.slots} will run in parallel here`}
+                      tokens · more room for search results and long scripts — and more VRAM
                     </span>
                   </div>
+                  <div className="settings-field">
+                    <label htmlFor="chat-flash">Flash attention</label>
+                    <select
+                      id="chat-flash"
+                      value={ai.chat_model.flash_attn}
+                      onChange={async (e) => {
+                        await chat.apply({ chat_model: { flash_attn: e.currentTarget.value } });
+                      }}
+                    >
+                      <option value="auto">Automatic · use when supported</option>
+                      <option value="on">On · require support</option>
+                      <option value="off">Off · use f16 KV cache</option>
+                    </select>
+                    <span className="muted small">leave on Automatic — it turns itself on only when the GPU supports it</span>
+                  </div>
+                  <div className="settings-field">
+                    <label htmlFor="chat-moe-ram">Model memory split (large models)</label>
+                    <input
+                      id="chat-moe-ram"
+                      type="range"
+                      min={0}
+                      max={moeBlocks}
+                      step={1}
+                      style={{ width: "min(100%, 28em)" }}
+                      value={moeLayers}
+                      onChange={(e) =>
+                        setAi({
+                          ...ai,
+                          chat_model: { ...ai.chat_model, cpu_moe_layers: Number(e.currentTarget.value) },
+                        })
+                      }
+                      onPointerUp={async (e) => {
+                        await chat.apply({ chat_model: { cpu_moe_layers: Number(e.currentTarget.value) } });
+                      }}
+                      onKeyUp={async (e) => {
+                        await chat.apply({ chat_model: { cpu_moe_layers: Number(e.currentTarget.value) } });
+                      }}
+                    />
+                    <span className="small">
+                      {!ai.chat_model.cpu_moe_layers
+                        ? "Automatic · fit to available GPU memory"
+                        : ai.chat_model.moe_blocks
+                          ? `${Math.round(moeLayers / moeBlocks * 100)}% · ${moeLayers} of ${moeBlocks} in system memory`
+                          : `${moeLayers} in system memory`}
+                    </span>
+                    <span className="muted small">
+                      Keeps part of a large model in system memory so it fits your GPU. Leave on automatic unless loading fails.
+                    </span>
+                  </div>
+                  <div className="settings-field">
+                    <label htmlFor="chat-kv">KV cache</label>
+                    <select
+                      id="chat-kv"
+                      value={ai.chat_model.kv_cache}
+                      onChange={async (e) => {
+                        await chat.apply({ chat_model: { kv_cache: e.currentTarget.value } });
+                      }}
+                    >
+                      <option value="q4_0">q4_0 — ~4× the context per GB</option>
+                      <option value="q8_0">q8_0 — balanced</option>
+                      <option value="f16">f16 — best quality, 4× the VRAM</option>
+                    </select>
+                    <span className="muted small">lower precision fits more context in the same memory</span>
+                  </div>
                 </div>
-              </>
+              </section>
             )}
-            {ai.vision_caps.router && (
-              <p className="muted small">
-                This server is a <strong>llama.cpp router</strong>: the model and the flags it runs with can be
-                changed without restarting it.
-              </p>
+
+            {showFrameServer && ai && (
+              <section className="card">
+                <div className="settings-card-title">
+                  Frame descriptions · server
+                  <SavedCue state={frame.cue.state} />
+                </div>
+                {ai.vision_caps.slots == null ? (
+                  <p className="muted small">
+                    This server doesn&apos;t say how many frames it can describe at once, so GhostReel sends one at a
+                    time — the safe choice for LM Studio, Ollama or a hosted endpoint.
+                  </p>
+                ) : (
+                  <>
+                    <p className="muted small">
+                      The server runs <strong>{ai.vision_caps.slots} frame description{ai.vision_caps.slots === 1 ? "" : "s"}</strong>
+                      {ai.vision_caps.slot_ctx != null && <> of {ai.vision_caps.slot_ctx.toLocaleString()} tokens each</>} at
+                      once. Describing frames in parallel reuses the model already in memory — measured about 1.7×
+                      faster on real footage. Asking for more than the server has is harmless; the extras queue.
+                    </p>
+                    <div className="settings-fields">
+                      <div className="settings-field">
+                        <label htmlFor="frames-concurrency">Frames at once</label>
+                        <input
+                          id="frames-concurrency"
+                          type="number"
+                          min={1}
+                          max={16}
+                          style={{ width: "5em" }}
+                          defaultValue={ai.vision.describe_concurrency ?? 4}
+                          onChange={async (e) => {
+                            const v = Number(e.currentTarget.value);
+                            if (v < 1 || v > 16) return;
+                            await frame.apply({ vision: { describe_concurrency: v } });
+                          }}
+                        />
+                        <span className="muted small">
+                          {ai.vision_caps.slots === 1
+                            ? "this server runs one at a time — start it with more slots to gain anything"
+                            : `up to ${ai.vision_caps.slots} will run in parallel here`}
+                        </span>
+                      </div>
+                    </div>
+                  </>
+                )}
+                {ai.vision_caps.router && (
+                  <p className="muted small">
+                    This server is a llama.cpp router: the model it runs can be changed without restarting it.
+                  </p>
+                )}
+              </section>
             )}
-          </section>
-        </>
+          </div>
+        </details>
       )}
-
-      <h2>Script chat · Jev (builder & judge)</h2>
-      <section className="card">
-        <p className="muted small">
-          Jev is TypeSafe&apos;s hosted System One model. It can assemble a first-pass cut out of the index in ~15 s
-          (by choosing quotes and b-roll directly from indexed footage, used in &ldquo;Jev&rdquo; and &ldquo;Jev → model&rdquo;
-          modes), detect off-mic interviewers, and score finished drafts editorially (opening, ending, and shot-to-voice match).
-        </p>
-        <p className="muted small">
-          Off by default, and it is the one part of GhostReel that leaves this computer: when enabled, transcripts
-          and frame descriptions are sent to <code>api.typesafe.ai</code>. Nothing is sent while it is off.
-        </p>
-        <div className="settings-fields">
-          <div className="settings-field">
-            <label>Enable Jev</label>
-            <input
-              type="checkbox"
-              checked={ai?.jev.enabled ?? false}
-              disabled={!ai}
-              onChange={async (e) => {
-                const on = e.currentTarget.checked;
-                if (on && !ai?.jev.has_key && !ai?.jev.key_from_env) {
-                  setError("Turning Jev on needs an API key: enter one below first");
-                  return;
-                }
-                try {
-                  setAi(await setAiSettings({ jev: { enabled: on } }));
-                  setError(null);
-                } catch (err) {
-                  setError(String(err));
-                }
-              }}
-            />
-            <span className="muted small">
-              {ai?.jev.enabled ? "on — Jev can build cuts, detect interviewers, and judge" : "off — nothing is sent anywhere"}
-            </span>
-          </div>
-          <div className="settings-field">
-            <label>Enable Jev to be use in the Script generation</label>
-            <input
-              type="checkbox"
-              checked={ai?.jev.judge ?? true}
-              disabled={!ai || !ai?.jev.enabled}
-              onChange={async (e) => {
-                const on = e.currentTarget.checked;
-                try {
-                  setAi(await setAiSettings({ jev: { judge: on } }));
-                  setError(null);
-                } catch (err) {
-                  setError(String(err));
-                }
-              }}
-            />
-            <span className="muted small">
-              {!ai?.jev.enabled
-                ? "disabled — enable Jev above"
-                : ai?.jev.judge
-                  ? "on — every finished script is scored editorially"
-                  : "off — scripts are not scored automatically"}
-            </span>
-          </div>
-          <div className="settings-field">
-            <label>API key</label>
-            {ai?.jev.key_from_env ? (
-              <span className="muted small">
-                taken from <code>TYPESAFE_API_KEY</code> in the environment, which wins over anything typed here
-              </span>
-            ) : (
-              <>
-                <input
-                  type="password"
-                  style={{ width: "22em" }}
-                  placeholder={ai?.jev.has_key ? "•••••••• saved — type to replace" : "apikey_…"}
-                  onKeyDown={async (e) => {
-                    if (e.key !== "Enter") return;
-                    const value = e.currentTarget.value.trim();
-                    e.currentTarget.value = "";
-                    try {
-                      // If saving a non-empty key, also enable Jev so it's ready to use right away.
-                      // If saving an empty key (clearing it), disable Jev.
-                      const patch = value
-                        ? { api_key: value, enabled: true }
-                        : { api_key: "", enabled: false };
-                      setAi(await setAiSettings({ jev: patch }));
-                      setError(null);
-                    } catch (err) {
-                      setError(String(err));
-                    }
-                  }}
-                />
-                <span className="muted small">
-                  {ai?.jev.has_key ? "saved in config.toml · Enter to replace" : "press Enter to save"}
-                  {" · "}
-                  <a href="https://console.typesafe.ai/keys" target="_blank" rel="noreferrer">
-                    get one
-                  </a>
-                </span>
-              </>
-            )}
-          </div>
-        </div>
-      </section>
-
-      <h2>Script chat · editor instructions</h2>
-      <section className="card">
-        <p className="muted small">
-          The system prompt that tells the model how to edit: story, shot choice, pacing, narration and audio. It applies
-          to the next chat message. <code>{"{project}"}</code>, <code>{"{fps}"}</code>, <code>{"{width}"}</code> and{" "}
-          <code>{"{height}"}</code> are filled in. The footage tools and the rule that clips must come from indexed
-          footage are always added, so scripts keep working whatever you write here.
-        </p>
-        {error && <div className="banner bad">{error}</div>}
-        <textarea
-          className="prompt-editor"
-          value={text}
-          spellCheck={false}
-          onChange={(e) => {
-            setText(e.target.value);
-            save(e.target.value);
-          }}
-        />
-        <div className="row prompt-actions">
-          <span className="muted small">
-            {isDefault ? "Using the default instructions" : "Using your instructions"}
-            {saved === "saving" ? " · saving…" : saved === "saved" ? " · saved" : ""}
-          </span>
-          <button
-            className="ghost small"
-            disabled={isDefault}
-            onClick={() => {
-              setText(settings.default_system_prompt);
-              save("");
-            }}
-          >
-            Reset to default
-          </button>
-        </div>
-      </section>
-
-      <WebAccess />
     </main>
   );
 }

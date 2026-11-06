@@ -703,7 +703,8 @@ fn apply_llm_patch(
         cfg.model = model;
     }
     if let Some(lm) = v.local_model {
-        if models::vision_pair(&lm).is_none()
+        if !models::external_model(&lm).is_some_and(|m| m.entry.kind == models::ModelKind::Vision)
+            && models::vision_pair(&lm).is_none()
             && !models::find_entry(&lm).is_some_and(|e| e.kind == models::ModelKind::Vision)
         {
             return Err(format!("unknown local vision model '{lm}'"));
@@ -726,7 +727,7 @@ fn apply_llm_patch(
         cfg.cpu_moe_layers = layers;
     }
     if let Some(rounds) = v.max_tool_rounds {
-        cfg.max_tool_rounds = rounds;
+        cfg.max_tool_rounds = rounds.min(100);
     }
     if let Some(t) = v.think {
         cfg.think = t;
@@ -1206,6 +1207,53 @@ async fn video_playback(video_id: i64) -> CmdResult<PlaybackView> {
     Ok(PlaybackView { path: proxy, proxy: true })
 }
 
+/// Every audio track of a video's file, from its header.
+#[tauri::command]
+async fn video_audio_tracks(video_id: i64) -> CmdResult<Vec<ghostreel_core::audio_tracks::AudioTrackInfo>> {
+    let src = {
+        let db = open_db()?;
+        ghostreel_core::audio_tracks::track_source(&db, video_id).map_err(err)?
+    };
+    let ffprobe = doctor::locate("ffprobe").ok_or_else(|| "ffprobe not found".to_string())?;
+    ghostreel_core::audio_tracks::list_tracks(&ffprobe, &src.path, src.auto_track).await.map_err(err)
+}
+
+/// Mean level in dB of each audio track over a source range (-91 = silence), so the editor can
+/// show which tracks carry sound.
+#[tauri::command]
+async fn audio_levels(video_id: i64, in_s: f64, out_s: f64) -> CmdResult<Vec<f64>> {
+    let src = {
+        let db = open_db()?;
+        ghostreel_core::audio_tracks::track_source(&db, video_id).map_err(err)?
+    };
+    let ffprobe = doctor::locate("ffprobe").ok_or_else(|| "ffprobe not found".to_string())?;
+    let ffmpeg = doctor::locate("ffmpeg").ok_or_else(|| "ffmpeg not found".to_string())?;
+    let count = ghostreel_core::audio::track_count(&ffprobe, &src.path).await.map_err(err)?;
+    Ok(ghostreel_core::audio_tracks::track_levels(&ffmpeg, &src.path, count, in_s, out_s).await)
+}
+
+/// One audio track as a small cached `.m4a`, for the live viewer to play beside the picture.
+#[tauri::command]
+async fn audio_track_proxy(video_id: i64, track: u32) -> CmdResult<PathBuf> {
+    let p = paths()?;
+    let src = {
+        let db = Db::open(&p.db_file()).map_err(err)?;
+        ghostreel_core::audio_tracks::track_source(&db, video_id).map_err(err)?
+    };
+    let cached = ghostreel_core::audio_tracks::track_proxy_path(&p.data_dir, &src.content_hash, track);
+    if cached.metadata().is_ok_and(|m| m.len() > 0) {
+        return Ok(cached);
+    }
+    let ffprobe = doctor::locate("ffprobe").ok_or_else(|| "ffprobe not found".to_string())?;
+    let ffmpeg = doctor::locate("ffmpeg").ok_or_else(|| "ffmpeg not found".to_string())?;
+    let channels = ghostreel_core::audio::track_channels(&ffprobe, &src.path, track)
+        .await
+        .ok_or_else(|| format!("video #{video_id} has no audio track {}", track + 1))?;
+    ghostreel_core::audio_tracks::track_proxy(&ffmpeg, &p.data_dir, &src.path, &src.content_hash, track, channels)
+        .await
+        .map_err(err)
+}
+
 #[tauri::command]
 fn video_playback_progress(video_id: i64) -> CmdResult<Option<ghostreel_core::preview::PlaybackProgress>> {
     let p = paths()?;
@@ -1282,6 +1330,7 @@ async fn chat_turn(
     message: String,
     images: Option<Vec<String>>,
     style: Option<ghostreel_core::script::ChatStyle>,
+    script_id: Option<i64>,
 ) -> CmdResult<queue::ChatTurnView> {
     let session_id = match session_id {
         Some(id) => id,
@@ -1297,7 +1346,7 @@ async fn chat_turn(
     }
     let label = format!("Script chat: {}", message.chars().take(40).collect::<String>());
     let (tx, rx) = tokio::sync::oneshot::channel();
-    queue.enqueue_chat(&app, project_id, session_id, message, images.unwrap_or_default(), label, tx).await;
+    queue.enqueue_chat(&app, project_id, session_id, message, images.unwrap_or_default(), label, script_id, tx).await;
     match rx.await {
         Ok(res) => res,
         Err(_) => Err("chat task cancelled or failed".into()),
@@ -1322,7 +1371,16 @@ fn chat_messages(session_id: i64) -> CmdResult<Vec<ghostreel_core::chat::ChatMes
     ghostreel_core::chat::messages(&db, session_id).map_err(err)
 }
 
-/// The model's prompts, thinking, answers and helper output for a chat, after `after_seq`.
+/// Reveal a saved chat trace in the desktop file manager.
+#[tauri::command]
+fn open_chat_log(app: tauri::AppHandle, session_id: i64) -> CmdResult<()> {
+    use tauri_plugin_opener::OpenerExt;
+    let path = paths()?.data_dir.join("logs/chat").join(format!("{session_id}.jsonl"));
+    if !path.is_file() { return Err("No saved log for this chat".into()); }
+    app.opener().reveal_item_in_dir(path).map_err(err)
+}
+
+/// Read a bounded batch from the chat trace after `after_seq`.
 #[tauri::command]
 fn chat_log(session_id: i64, after_seq: u64) -> CmdResult<Vec<ghostreel_core::llmlog::LogEntry>> {
     Ok(ghostreel_core::llmlog::since(session_id, after_seq))
@@ -1353,6 +1411,18 @@ fn save_script(
     let issues = ghostreel_core::script::validate(&db, project_id, &script).map_err(err)?;
     let script_id = ghostreel_core::script::save_version(&db, project_id, &script, session_id).map_err(err)?;
     Ok(SaveScriptView { script_id, issues })
+}
+
+#[tauri::command]
+fn delete_script(script_id: i64) -> CmdResult<bool> {
+    let db = open_db()?;
+    ghostreel_core::script::delete(&db, script_id).map_err(err)
+}
+
+#[tauri::command]
+fn delete_script_cut(project_id: i64, title: String) -> CmdResult<usize> {
+    let db = open_db()?;
+    ghostreel_core::script::delete_cut(&db, project_id, &title).map_err(err)
 }
 
 /// WebKitGTK's DMABUF renderer dies with "Error 71 (Protocol error) dispatching to Wayland
@@ -1419,6 +1489,7 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             menu::install(app)?;
             if let Ok(p) = Paths::resolve() {
+                ghostreel_core::llmlog::init(&p.data_dir);
                 let _ = std::fs::create_dir_all(&p.data_dir);
                 app.asset_protocol_scope().allow_directory(&p.data_dir, true)?;
                 let previews_dir = p.data_dir.join("previews");
@@ -1484,6 +1555,9 @@ pub fn run() {
             video_steadiness,
             video_playback,
             video_playback_progress,
+            video_audio_tracks,
+            audio_levels,
+            audio_track_proxy,
             video_details,
             search,
             open_search_window,
@@ -1494,10 +1568,13 @@ pub fn run() {
             chat_sessions,
             chat_messages,
             chat_log,
+            open_chat_log,
             delete_chat_session,
             list_scripts,
             get_script,
             save_script,
+            delete_script,
+            delete_script_cut,
             models_status,
             enqueue_model_download,
             remove_model,

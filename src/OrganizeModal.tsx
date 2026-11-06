@@ -1,4 +1,18 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, type ComponentType } from "react";
+import {
+  Check,
+  ChevronDown,
+  ChevronUp,
+  Clapperboard,
+  Drone,
+  Folder,
+  Info,
+  Mic,
+  Monitor,
+  Music,
+  TriangleAlert,
+  type LucideProps,
+} from "lucide-react";
 import {
   executeOrganizeProject,
   planOrganizeProject,
@@ -6,6 +20,16 @@ import {
   type OrganizePlan,
   type OrganizeReport,
 } from "./api";
+
+/** Line icons per category folder (the category list in api.ts carries emoji, which we don't show). */
+const FOLDER_ICONS: Record<string, ComponentType<LucideProps>> = {
+  interview: Mic,
+  broll: Clapperboard,
+  screencast: Monitor,
+  drone: Drone,
+  audio: Music,
+  other: Folder,
+};
 
 export default function OrganizeModal({
   projectId,
@@ -94,7 +118,11 @@ export default function OrganizeModal({
           {!loading && report && (
             <div className="organize-success-state">
               <div className="good-text" style={{ fontSize: "1.2rem", marginBottom: "0.5rem" }}>
-                {report.errors.length ? "Organization completed with errors" : "✓ Files Organized Successfully"}
+                {report.errors.length ? (
+                  "Organized, with some errors"
+                ) : (
+                  <span className="icon-text"><Check size={18} strokeWidth={2} aria-hidden /> Files organized</span>
+                )}
               </div>
               <p>
                 Moved <strong>{report.moved_videos}</strong> video files and{" "}
@@ -140,9 +168,10 @@ export default function OrganizeModal({
                   <div className="organize-category-chips">
                     {Object.entries(categoryCounts).map(([folder, count]) => {
                       const matched = CATEGORIES.find((c) => c.folder === folder);
+                      const Icon = (matched && FOLDER_ICONS[matched.id]) || Folder;
                       return (
                         <div key={folder} className="organize-chip">
-                          <span className="icon">{matched?.icon ?? "📁"}</span>
+                          <span className="icon"><Icon size={14} strokeWidth={2} aria-hidden /></span>
                           <span className="name">{folder}</span>
                           <span className="count">{count} {count === 1 ? "file" : "files"}</span>
                         </div>
@@ -151,8 +180,8 @@ export default function OrganizeModal({
                   </div>
 
                   {totalSidecars > 0 && (
-                    <p className="muted small" style={{ marginTop: "0.75rem" }}>
-                      ℹ️ Also moving <strong>{totalSidecars}</strong> companion sidecar {totalSidecars === 1 ? "file" : "files"} (.xmp, .wav, .srt, .thm) alongside videos.
+                    <p className="muted small icon-text" style={{ marginTop: "0.75rem" }}>
+                      <Info size={14} strokeWidth={2} aria-hidden /> Also moving <strong>{totalSidecars}</strong> companion sidecar {totalSidecars === 1 ? "file" : "files"} (.xmp, .wav, .srt, .thm) alongside videos.
                     </p>
                   )}
 
@@ -163,8 +192,8 @@ export default function OrganizeModal({
                   )}
 
                   {plan.conflict_count > 0 && (
-                    <div className="banner bad small" style={{ marginTop: "0.5rem" }}>
-                      ⚠️ {plan.conflict_count} file(s) have naming collisions at their destination and will be skipped.
+                    <div className="banner bad small icon-text" style={{ marginTop: "0.5rem" }}>
+                      <TriangleAlert size={14} strokeWidth={2} aria-hidden /> {plan.conflict_count} file(s) have naming collisions at their destination and will be skipped.
                     </div>
                   )}
                 </div>
@@ -176,7 +205,11 @@ export default function OrganizeModal({
                   className="ghost small"
                   onClick={() => setShowDetails(!showDetails)}
                 >
-                  {showDetails ? "Hide file move details ▲" : `Show all ${plan.items.length} files ▼`}
+                  {showDetails ? (
+                    <>Hide file moves <ChevronUp size={14} strokeWidth={2} aria-hidden /></>
+                  ) : (
+                    <>Show all {plan.items.length} files <ChevronDown size={14} strokeWidth={2} aria-hidden /></>
+                  )}
                 </button>
 
                 {showDetails && (

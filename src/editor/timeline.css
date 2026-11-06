@@ -1,0 +1,564 @@
+/* ---- Timeline: zoomable lanes with a filmstrip, a scrubbable ruler and drag to reorder ---- */
+.script-timeline.tl {
+  --tl-ruler: 36px;
+  --tl-title: 22px;
+  --tl-picture: 52px;
+  --tl-sound: 26px;
+  --tl-gap: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+/* Toolbar: zoom −/slider/+, Fit, and the key hints toggle. */
+.tl-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 24px;
+  font-size: 11px;
+}
+.tl-tool {
+  min-width: 24px;
+  height: 22px;
+  padding: 0 7px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--panel);
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+}
+.tl-tool:hover:not(:disabled) { border-color: var(--accent); }
+.tl-tool:disabled { opacity: 0.45; cursor: default; }
+.tl-tool.on { background: color-mix(in srgb, var(--accent) 22%, var(--panel)); border-color: var(--accent); }
+.tl-fit { font-size: 11px; }
+.tl-toolbar input.tl-zoom {
+  flex: 0 0 130px;
+  width: 130px;
+  min-width: 0;
+  height: 16px;
+  padding: 0;
+  margin: 0;
+  border: none;
+  background: transparent;
+  accent-color: var(--accent);
+}
+.tl-zoom-label { min-width: 34px; font-variant-numeric: tabular-nums; }
+.tl-spacer { flex: 1; }
+.tl-sel {
+  max-width: 40%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tl-body { display: flex; gap: 6px; min-width: 0; }
+
+/* Lane names stay put while the lanes scroll under them. */
+.tl-names {
+  flex: 0 0 78px;
+  display: flex;
+  flex-direction: column;
+  gap: var(--tl-gap);
+}
+.tl-name { display: flex; align-items: center; gap: 4px; padding-left: 2px; font-size: 11px; color: var(--muted); }
+.tl-name > svg { flex: 0 0 auto; color: var(--muted); }
+.tl-name-ruler { height: var(--tl-ruler); }
+.tl-name-title { height: var(--tl-title); }
+.tl-name-picture { height: var(--tl-picture); }
+.tl-name-bed { height: var(--tl-sound); }
+
+.tl-scroll {
+  flex: 1;
+  min-width: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: thin;
+}
+.tl-content {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: var(--tl-gap);
+  min-width: 100%;
+}
+
+/* Ruler: ticks, beat ids, and the playhead's handle; pressing anywhere on it scrubs. */
+.tl-ruler {
+  position: relative;
+  height: var(--tl-ruler);
+  border-bottom: 1px solid var(--border);
+  overflow: hidden; /* the last tick label must not widen the scroll area at "fit" */
+  cursor: ew-resize;
+  user-select: none;
+  touch-action: none;
+}
+.tl-tick {
+  position: absolute;
+  bottom: 0;
+  width: 1px;
+  height: 4px;
+  background: color-mix(in srgb, var(--muted) 55%, transparent);
+}
+.tl-tick.major { height: 8px; background: var(--muted); }
+.tl-tick-label {
+  position: absolute;
+  bottom: 12px;
+  left: 3px;
+  font-size: 10px;
+  line-height: 1;
+  color: var(--muted);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+/* Ruler rows, top to bottom: beat names, time labels, the playhead handle — so none covers another. */
+.tl-beat-tag {
+  position: absolute;
+  top: 1px;
+  padding: 0 4px 0 5px;
+  border-left: 1px solid color-mix(in srgb, var(--accent) 55%, transparent);
+  font-size: 10.5px;
+  font-weight: 600;
+  line-height: 12px;
+  color: color-mix(in srgb, var(--text) 75%, var(--muted));
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  pointer-events: none;
+}
+.tl-beat-tag.current { color: var(--accent); }
+.script-timeline.tl[data-lane-height="compact"] .tl-beat-tag.near-target {
+  font-size: 0;
+  color: transparent;
+}
+@media (max-height: 760px) {
+  .script-timeline.tl .tl-beat-tag.near-target {
+    font-size: 0;
+    color: transparent;
+  }
+}
+
+.tl-playhead-handle {
+  position: absolute;
+  bottom: 0;
+  width: 11px;
+  height: 11px;
+  margin-left: -5.5px;
+  background: var(--bad);
+  clip-path: polygon(0 0, 100% 0, 100% 55%, 50% 100%, 0 55%);
+  z-index: 4;
+  pointer-events: none;
+}
+
+/* Lanes */
+.tl-lane {
+  position: relative;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--bg) 80%, var(--panel));
+  border: 1px solid var(--border);
+  cursor: crosshair;
+}
+.tl-lane-title { height: var(--tl-title); }
+.tl-lane-picture { height: var(--tl-picture); }
+.tl-lane-bed { height: var(--tl-sound); }
+
+.tl-block {
+  position: absolute;
+  top: 2px;
+  bottom: 2px;
+  display: flex;
+  align-items: center;
+  overflow: hidden;
+  padding: 0 6px;
+  border-radius: 3px;
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, transparent);
+  background: color-mix(in srgb, var(--accent) 24%, var(--panel));
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+  box-sizing: border-box;
+}
+.tl-block.movable { cursor: grab; }
+.tl-block.dragging { opacity: 0.4; }
+.tl-block.tl-title {
+  background: var(--btn-bg);
+  border-color: var(--border);
+  color: var(--text);
+}
+.tl-block.tl-title:hover {
+  border-color: color-mix(in srgb, var(--text) 30%, var(--border));
+}
+.tl-block.tl-bed {
+  background: color-mix(in srgb, var(--accent-2) 22%, var(--panel));
+  border-color: color-mix(in srgb, var(--accent-2) 45%, transparent);
+}
+/* A voice the pipeline carried under the pictures, rather than one the editor asked for. */
+.tl-block.tl-bed.inferred {
+  background: color-mix(in srgb, var(--good) 20%, var(--panel));
+}
+.tl-block.muted .tl-caption, .tl-block.muted.tl-bed { opacity: 0.7; }
+.tl-block.tl-picture.muted .tl-strip { filter: saturate(0.6); }
+.tl-block.selected {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+  z-index: 2;
+}
+
+/* Filmstrip behind the picture block's caption. */
+.tl-strip {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+.tl-thumb {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  overflow: hidden;
+  border-right: 1px solid color-mix(in srgb, var(--bg) 60%, transparent);
+  box-sizing: border-box;
+}
+.tl-thumb img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+.tl-thumb .media-image-placeholder { min-height: 0; font-size: 0; background: transparent; }
+
+.tl-caption {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+}
+/* Over thumbnails the caption sits on a solid chip so it reads in both themes. The file name and
+   source range only show on the selected or hovered clip; the tooltip always has them. */
+.tl-picture .tl-caption {
+  align-self: flex-start;
+  margin-top: 2px;
+  padding: 1px 5px;
+  border-radius: 3px;
+  background: var(--panel);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--border) 80%, transparent);
+}
+.tl-picture .tl-label { font-weight: 600; }
+.tl-picture:not(.selected):not(:hover) .tl-detail { display: none; }
+.tl-label {
+  font-size: 11px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.tl-label > svg { vertical-align: -2px; margin-right: 4px; }
+.tl-detail {
+  font-size: 10px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tl-handle {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 7px;
+  z-index: 2;
+  cursor: ew-resize;
+  touch-action: none;
+}
+.tl-handle.in { left: 0; }
+.tl-handle.out { right: 0; }
+.tl-handle:hover { background: color-mix(in srgb, var(--accent) 60%, transparent); }
+
+/* Where a dragged clip will land. */
+.tl-drop {
+  position: absolute;
+  top: -3px;
+  bottom: -3px;
+  width: 3px;
+  margin-left: -1.5px;
+  border-radius: 2px;
+  background: var(--accent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 30%, transparent);
+  z-index: 5;
+  pointer-events: none;
+}
+
+/* Beat boundaries across the lanes, below the ruler. */
+.tl-beat-line {
+  position: absolute;
+  top: var(--tl-ruler);
+  bottom: 0;
+  width: 0;
+  border-left: 1px dashed color-mix(in srgb, var(--muted) 45%, transparent);
+  z-index: 3;
+  pointer-events: none;
+}
+
+/* The preview player's position, drawn across the ruler and lanes. */
+.tl-playhead {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  margin-left: -1px;
+  background: var(--bad);
+  z-index: 4;
+  pointer-events: none;
+}
+
+.tl-keys {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  margin-left: 74px;
+}
+.tl-keys kbd {
+  display: inline-block;
+  min-width: 16px;
+  padding: 1px 5px;
+  margin-right: 3px;
+  border: 1px solid var(--border);
+  border-bottom-width: 2px;
+  border-radius: 4px;
+  background: var(--panel);
+  font-family: inherit;
+  font-size: 10px;
+  text-align: center;
+  color: var(--text);
+}
+
+/* A deliberately silent clip: present, but plainly not sound. The hatch is a texture; the words
+   sit on a solid chip at full text contrast so they read in both themes. */
+.tl-block.tl-bed.muted {
+  background: color-mix(in srgb, var(--muted) 14%, var(--panel));
+  border: 1px dashed var(--muted);
+  color: var(--text);
+  opacity: 1;
+}
+.tl-block.tl-bed.muted .tl-caption {
+  flex: 0 1 auto;
+  padding: 1px 6px;
+  border-radius: 3px;
+  background: var(--panel);
+  box-shadow: 0 0 0 1px var(--border);
+  opacity: 1;
+}
+.tl-block.tl-bed.muted .tl-label { font-size: 11px; font-weight: 700; color: var(--text); }
+.tl-block.tl-bed.muted .tl-detail { font-size: 11px; color: var(--muted); }
+.tl-unmute {
+  position: relative;
+  z-index: 3;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+  height: 18px;
+  margin-left: 6px;
+  padding: 0 7px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--panel);
+  color: var(--text);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1;
+  cursor: pointer;
+}
+.tl-unmute:hover { border-color: var(--accent); background: var(--panel); }
+
+/* ---- Audio lanes A1…An: one per source track, with monitor-only mute/solo ---- */
+.tl-name-audio { gap: 3px; }
+.tl-track-name { margin-right: auto; padding-left: 2px; font-weight: 600; color: var(--text); }
+.tl-name-audio.silenced .tl-track-name { color: var(--muted); text-decoration: line-through; }
+.tl-ms {
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--panel);
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1;
+  cursor: pointer;
+}
+.tl-ms:hover { border-color: var(--accent); color: var(--text); }
+.tl-ms.on.mute { background: color-mix(in srgb, var(--bad) 30%, var(--panel)); border-color: var(--bad); color: var(--text); }
+.tl-ms.on.solo { background: color-mix(in srgb, var(--warn) 34%, var(--panel)); border-color: var(--warn); color: var(--text); }
+.tl-lane-audio.silenced { opacity: 0.5; }
+
+/* Compact lanes: the caption runs on one line. */
+.tl-lane-audio .tl-block { padding-right: 4px; }
+.tl-lane-audio .tl-caption { flex-direction: row; align-items: baseline; gap: 6px; flex: 1; }
+.tl-lane-audio .tl-label { font-size: 10.5px; flex-shrink: 1; }
+.tl-lane-audio .tl-detail { font-size: 9.5px; flex-shrink: 2; }
+/* A cell too narrow for a name and a level badge keeps the name: it shortens to its leading
+   characters ("481_…") instead of leaving a bare "−19 dB" with no clue what is in the cell. */
+.tl-block.tl-compact { padding: 0 3px; }
+.tl-block.tl-compact .tl-label { font-size: 9.5px; letter-spacing: -0.2px; }
+.tl-block.tl-compact .tl-detail { display: none; }
+
+/* A track the file has but the clip doesn't play. */
+.tl-block.tl-bed.off {
+  background: color-mix(in srgb, var(--muted) 10%, var(--panel));
+  border: 1px dashed color-mix(in srgb, var(--accent-2) 40%, transparent);
+}
+.tl-block.tl-bed.off .tl-caption, .tl-block.tl-bed.off .tl-level { opacity: 0.6; }
+
+/* A track with nothing on it (an unplugged input): plainly empty, whatever is selected. */
+.tl-block.tl-bed.silent:not(.off):not(.muted) {
+  background: color-mix(in srgb, var(--muted) 14%, var(--panel));
+  border-color: color-mix(in srgb, var(--muted) 45%, transparent);
+}
+.tl-level {
+  position: relative;
+  z-index: 1;
+  flex-shrink: 0;
+  margin-left: 4px;
+  font-size: 9.5px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.tl-block.silent .tl-level { color: var(--warn); }
+.tl-level-bar {
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  height: 2px;
+  background: var(--good);
+  opacity: 0.8;
+  pointer-events: none;
+}
+.tl-block.off .tl-level-bar { background: var(--muted); }
+
+/* The other blocks of the selected clip: its picture and each of its tracks. */
+.tl-block.linked { box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 70%, transparent); }
+
+/* ---- Agent E: target marker, overrun, focus ---- */
+
+/* The cut's target length on the ruler, and a line down the lanes. */
+.tl-target {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 0;
+  border-left: 2px solid var(--good);
+  z-index: 3;
+  pointer-events: none;
+}
+.tl-target.over { border-left-color: var(--warn); }
+.tl-target-label {
+  position: absolute;
+  bottom: 11px;
+  right: 2px;
+  padding: 0 5px;
+  border-radius: 3px;
+  background: var(--panel);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--good) 60%, transparent);
+  color: var(--text);
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 13px;
+  white-space: nowrap;
+}
+.tl-target.over .tl-target-label { box-shadow: 0 0 0 1px var(--warn); color: var(--warn-text, var(--warn)); }
+.tl-target-line {
+  position: absolute;
+  top: var(--tl-ruler);
+  bottom: 0;
+  width: 0;
+  border-left: 1px dashed color-mix(in srgb, var(--good) 75%, transparent);
+  z-index: 3;
+  pointer-events: none;
+}
+/* Past the target: everything there is overrun. A flat tint, not a texture, so clips stay legible. */
+.tl-overrun {
+  position: absolute;
+  top: var(--tl-ruler);
+  bottom: 0;
+  background: color-mix(in srgb, var(--warn) 13%, transparent);
+  border-left: 1px dashed var(--warn);
+  z-index: 3;
+  pointer-events: none;
+}
+.tl-overrun + .tl-playhead { z-index: 4; }
+.tl-target-note { white-space: nowrap; font-variant-numeric: tabular-nums; }
+
+/* Which panel has the keys: the timeline shows it when focused. */
+.script-timeline.tl { outline: none; border-radius: 6px; }
+.script-timeline.tl:focus-visible,
+.script-timeline.tl:focus { box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 55%, transparent); }
+
+/* Toolbar buttons: glyphs centred. */
+.tl-tool { display: inline-flex; align-items: center; justify-content: center; }
+
+/* Agent 1 — readable audio and a synchronized, visibly scrollable lane viewport. */
+.script-timeline.tl { height: 100%; min-height: 0; }
+.tl-body { flex: 1; min-height: 0; overflow: hidden; }
+.tl-names { flex-basis: 142px; overflow: hidden; padding-bottom: 12px; }
+.tl-name, .tl-ruler, .tl-lane { flex-shrink: 0; box-sizing: border-box; }
+.tl-scroll { overflow: scroll; min-height: 0; scrollbar-width: auto; scrollbar-color: var(--muted) var(--bg); }
+.tl-name-audio > svg { display: none; }
+.tl-name-audio .tl-track-name { margin-right: 0; }
+.tl-lane-state { font-size: 10px; color: var(--muted); margin-right: auto; }
+.tl-ms { flex-shrink: 0; width: 24px; height: 24px; color: var(--text); }
+.tl-name-audio .tl-ms:first-of-type { margin-left: auto; }
+.tl-lane-audio.silenced, .tl-block.off .tl-caption, .tl-block.off .tl-level { opacity: 1; }
+.tl-block.tl-bed.muted .tl-caption { padding: 0; box-shadow: none; background: none; }
+.tl-block.tl-bed .tl-label, .tl-block.tl-bed.muted .tl-label { font-size: 10px; font-weight: 500; color: var(--text); }
+.tl-block.tl-bed .tl-level { font-size: 10px; color: var(--muted); }
+.tl-lane-audio .tl-unmute { display: none; }
+.tl-block.tl-bed.off, .tl-block.tl-bed.muted { border-color: var(--muted); }
+.tl-silent-summary { font-size: 10px; padding: 0 6px; color: var(--muted); background: var(--panel); border: none; text-align: left; height: var(--tl-sound); }
+.tl-silent-summary:hover { color: var(--text); }
+.tl-toolbar { flex-shrink: 0; }
+.tl-toolbar .tl-tool { white-space: nowrap; }
+.tl-toolbar .tl-sel { flex-shrink: 4; }
+.tl-scroll::-webkit-scrollbar { width: 12px; height: 12px; }
+.tl-scroll::-webkit-scrollbar-thumb { background: var(--muted); border: 3px solid var(--bg); border-radius: 8px; }
+.tl-scroll::-webkit-scrollbar-track, .tl-scroll::-webkit-scrollbar-corner { background: var(--bg); }
+.tl-empty-drop-hint { display: block; padding: 10px; font-size: 11px; color: var(--muted); pointer-events: none; }
+
+/* Agent A — round 3: lane density, readable inactive audio and lower-track access. */
+.script-timeline.tl { --tl-picture: 44px; --tl-sound: 28px; }
+.script-timeline.tl[data-lane-height="compact"] { --tl-picture: 36px; --tl-sound: 24px; }
+.script-timeline.tl[data-lane-height="tall"] { --tl-picture: 60px; --tl-sound: 42px; }
+.tl-density { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; color: var(--text); }
+.tl-density select { width: auto; min-width: 78px; height: 24px; padding: 0 4px; font-size: 11px; background: var(--btn-bg); color: var(--text); border: 1px solid var(--border); border-radius: 4px; }
+.tl-toolbar .tl-sel { min-width: 0; }
+.tl-content { padding-bottom: 8px; }
+.tl-names { padding-bottom: 20px; }
+.tl-track-continuation { display: flex; align-items: center; justify-content: center; gap: 5px; flex-shrink: 0; min-height: 24px; padding: 2px 6px; border: 1px solid var(--border); background: var(--btn-bg); color: var(--text); font-size: 11px; }
+.tl-silent-summary { color: var(--text); }
+.tl-lane-audio.silenced,
+.tl-block.tl-bed.off .tl-caption,
+.tl-block.tl-bed.off .tl-level,
+.tl-block.tl-bed.muted .tl-caption { opacity: 1; }
+.tl-block.tl-bed .tl-label,
+.tl-block.tl-bed.muted .tl-label,
+.tl-block.tl-bed .tl-detail,
+.tl-block.tl-bed .tl-level { font-size: 11px; color: var(--text); }
+.tl-block.tl-bed.off,
+.tl-block.tl-bed.muted { background: var(--panel); border: 1px dashed var(--muted); }
+.tl-name-audio.silenced .tl-track-name { color: var(--text); }
+.tl-lane-state { color: var(--text); }
+@media (max-height: 760px) {
+  .script-timeline.tl { --tl-ruler: 32px; --tl-title: 20px; --tl-gap: 3px; --tl-picture: 32px; --tl-sound: 24px; }
+  .script-timeline.tl[data-lane-height="compact"] { --tl-picture: 28px; --tl-sound: 24px; }
+  .script-timeline.tl[data-lane-height="tall"] { --tl-picture: 44px; --tl-sound: 36px; }
+  .nle-timeline-dock .script-timeline { padding-top: 4px; padding-bottom: 4px; }
+  .tl-toolbar .tl-sel { display: none; }
+}
+@media (max-width: 1300px) {
+  .tl-toolbar input.tl-zoom { flex-basis: 80px; width: 80px; }
+}

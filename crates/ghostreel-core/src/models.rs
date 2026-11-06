@@ -94,6 +94,17 @@ pub struct ModelStatus {
     pub installed_path: Option<PathBuf>,
     pub in_own_dir: bool,
     pub partial_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external: Option<ExternalModel>,
+}
+
+/// Display metadata for an installed model outside the curated catalog.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalModel {
+    pub name: String,
+    pub quant: Option<String>,
+    pub source: String,
+    pub mmproj_path: Option<PathBuf>,
 }
 
 /// Built-in catalog of recommended models with verified byte sizes.
@@ -327,7 +338,7 @@ fn native_catalog() -> Vec<CatalogEntry> {
             // prompt naming "Northwest Hills" nineteen times it replied that no such footage
             // existed. Qwen2.5-VL is a different failure — `vision: Unknown Token Type`, a chat
             // template this build cannot apply — so neither 3B nor 7B of that family works at all.
-            note: "writes scripts as well as describes; needs ~7 GB".into(),
+            note: "writes scripts as well as describing frames; needs ~7 GB".into(),
             languages: "multilingual".into(),
             // Upstream's own name, unprefixed, because a paired entry counts as installed only
             // when *both* files resolve — and discovery matches on the file name, so renaming it
@@ -581,9 +592,12 @@ pub fn moe_blocks(id: &str) -> Option<u32> {
     find_entry(id).filter(|e| e.id == "qwen-agentworld-35b-a3b").map(|_| 40)
 }
 
-/// Query installation status for every catalog entry.
+/// Catalog installation status plus all other installed GGUF models in the search roots.
 pub fn status(models_dir: &Path, search_paths: &[PathBuf]) -> Vec<ModelStatus> {
-    status_for(models_dir, &search_roots(models_dir, search_paths), uses_mlx())
+    let roots = search_roots(models_dir, search_paths);
+    let mut models = status_for(models_dir, &roots, uses_mlx());
+    models.extend(scan_external(models_dir, &roots));
+    models
 }
 
 fn status_for(models_dir: &Path, roots: &[PathBuf], mlx: bool) -> Vec<ModelStatus> {
@@ -593,7 +607,7 @@ fn status_for(models_dir: &Path, roots: &[PathBuf], mlx: bool) -> Vec<ModelStatu
             if entry.bundle.is_some() {
                 if entry.bundle_installed(models_dir) {
                     let path = entry.bundle_dir(models_dir);
-                    return ModelStatus { entry, installed_path: Some(path), in_own_dir: true, partial_bytes: None };
+                    return ModelStatus { entry, installed_path: Some(path), in_own_dir: true, partial_bytes: None, external: None };
                 }
                 let partial: u64 = entry
                     .downloads()
@@ -609,6 +623,7 @@ fn status_for(models_dir: &Path, roots: &[PathBuf], mlx: bool) -> Vec<ModelStatu
                     installed_path: None,
                     in_own_dir: false,
                     partial_bytes: (partial > 0).then_some(partial),
+                    external: None,
                 };
             }
             if let Some(proj_name) = &entry.mmproj_file_name {
@@ -622,7 +637,7 @@ fn status_for(models_dir: &Path, roots: &[PathBuf], mlx: bool) -> Vec<ModelStatu
 
                 if let (Some(m_p), Some(_p_p)) = (model_path, proj_path) {
                     let in_own = m_p.starts_with(models_dir);
-                    return ModelStatus { entry, installed_path: Some(m_p), in_own_dir: in_own, partial_bytes: None };
+                    return ModelStatus { entry, installed_path: Some(m_p), in_own_dir: in_own, partial_bytes: None, external: None };
                 }
 
                 // If not fully installed, check for partial files or already downloaded individual files
@@ -642,22 +657,116 @@ fn status_for(models_dir: &Path, roots: &[PathBuf], mlx: bool) -> Vec<ModelStatu
                     partial += m.len();
                 }
                 let partial_bytes = if partial > 0 { Some(partial) } else { None };
-                return ModelStatus { entry, installed_path: None, in_own_dir: false, partial_bytes };
+                return ModelStatus { entry, installed_path: None, in_own_dir: false, partial_bytes, external: None };
             }
 
             let own = models_dir.join(&entry.file_name);
             if own.is_file() && own.metadata().map(|m| m.len() > 0).unwrap_or(false) {
-                return ModelStatus { entry, installed_path: Some(own), in_own_dir: true, partial_bytes: None };
+                return ModelStatus { entry, installed_path: Some(own), in_own_dir: true, partial_bytes: None, external: None };
             }
             if let Some(found) = find(roots, &entry.file_name) {
                 let in_own = found.starts_with(models_dir);
-                return ModelStatus { entry, installed_path: Some(found), in_own_dir: in_own, partial_bytes: None };
+                return ModelStatus { entry, installed_path: Some(found), in_own_dir: in_own, partial_bytes: None, external: None };
             }
             let part = models_dir.join(format!("{}.part", entry.file_name));
             let partial_bytes = part.metadata().ok().map(|m| m.len()).filter(|&l| l > 0);
-            ModelStatus { entry, installed_path: None, in_own_dir: false, partial_bytes }
+            ModelStatus { entry, installed_path: None, in_own_dir: false, partial_bytes, external: None }
         })
         .collect()
+}
+
+/// Scan installed GGUFs without requiring catalog membership. Paths, rather than basenames,
+/// identify files so different quants and copies cannot resolve to the wrong model.
+pub fn scan_external(models_dir: &Path, roots: &[PathBuf]) -> Vec<ModelStatus> {
+    let mut files = Vec::new();
+    let mut pending = roots.to_vec();
+    let mut directories = std::collections::HashSet::new();
+    while let Some(dir) = pending.pop() {
+        let Ok(canonical) = std::fs::canonicalize(&dir) else { continue };
+        if !directories.insert(canonical) { continue; }
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("gguf")) {
+                    files.push(path);
+                }
+            } else if path.is_dir() {
+                pending.push(path);
+            }
+        }
+    }
+    let catalog = catalog();
+    files.sort();
+    let mut seen = std::collections::HashSet::new();
+    files.into_iter().filter_map(|path| {
+        let canonical = std::fs::canonicalize(&path).ok()?;
+        if !seen.insert(canonical) { return None; }
+        let name = path.file_name()?.to_str()?;
+        // Catalog matches retain their existing metadata and selection IDs.
+        if catalog.iter().any(|e| e.file_name.eq_ignore_ascii_case(name)) {
+            return None;
+        }
+        external_status(models_dir, &path)
+    }).collect()
+}
+
+fn main_gguf(path: &Path) -> bool {
+    let name = path.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
+    name.ends_with(".gguf") && !name.contains("mmproj") && !name.starts_with("mtp-")
+        && (!name.contains("-of-") || name.contains("-00001-of-"))
+        && path.is_file() && path.metadata().is_ok_and(|m| m.len() > 0)
+}
+
+/// Resolve the persisted ID directly, including models in configured search paths.
+/// A missing file is an error to the caller, never a download request.
+pub fn external_model(id: &str) -> Option<ModelStatus> {
+    let path = Path::new(id.strip_prefix("external:")?);
+    if !path.is_absolute() { return None; }
+    external_status(Path::new(""), path)
+}
+
+fn external_status(models_dir: &Path, path: &Path) -> Option<ModelStatus> {
+    if !main_gguf(path) { return None; }
+    let path = std::path::absolute(path).ok()?;
+    let stem = path.file_stem()?.to_str()?;
+    let lower = stem.to_lowercase();
+    let kind = if lower.contains("embed") { ModelKind::Embedding } else { ModelKind::Vision };
+    let mut projectors: Vec<_> = std::fs::read_dir(path.parent()?).ok()?.flatten()
+        .map(|e| e.path()).filter(|p| {
+            let n = p.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
+            n.contains("mmproj") && n.ends_with(".gguf") && p.is_file()
+                && p.metadata().is_ok_and(|m| m.len() > 0)
+        }).collect();
+    projectors.sort();
+    let mmproj_path = (kind == ModelKind::Vision).then(|| projectors.into_iter().next()).flatten();
+    let parts: Vec<_> = stem.split(['-', '.']).collect();
+    let quant = parts.iter().find(|p| {
+        let p = p.to_lowercase();
+        p.starts_with('q') && p.as_bytes().get(1).is_some_and(u8::is_ascii_digit)
+            || p.starts_with("iq") || p.starts_with("pq") || matches!(p.as_str(), "f16" | "bf16" | "f32")
+    }).map(|p| p.to_lowercase());
+    let display_stem = quant.as_ref().and_then(|q| lower.find(q)).map_or(stem, |i| &stem[..i]);
+    let mut name = display_stem.trim_end_matches(['-', '.', '_']).replace(['-', '_'], " ");
+    if let Some(first) = name.get_mut(..1) { first.make_ascii_uppercase(); }
+    let source = if path.to_string_lossy().to_lowercase().contains("lmstudio") { "LM Studio" }
+        else if path.to_string_lossy().to_lowercase().contains("ghostpen") { "GhostPen" }
+        else { "local folder" }.to_string();
+    Some(ModelStatus {
+        entry: CatalogEntry {
+            id: format!("external:{}", path.display()), kind,
+            file_name: path.to_str()?.to_string(), url: String::new(),
+            size_bytes: path.metadata().ok()?.len(), speed: 0, accuracy: 0,
+            note: String::new(), languages: String::new(),
+            mmproj_file_name: mmproj_path.as_ref().map(|p| p.to_string_lossy().into_owned()),
+            mmproj_url: None,
+            mmproj_size_bytes: mmproj_path.as_ref().and_then(|p| p.metadata().ok()).map(|m| m.len()),
+            vram_mb: None, bundle: None,
+        },
+        in_own_dir: !models_dir.as_os_str().is_empty() && path.starts_with(models_dir),
+        installed_path: Some(path), partial_bytes: None,
+        external: Some(ExternalModel { name, quant, source, mmproj_path }),
+    })
 }
 
 /// Remove a model file (and any `.part` file) from GhostReel's own `models_dir`.
@@ -774,6 +883,10 @@ pub fn well_known_dirs() -> Vec<PathBuf> {
 
 /// Look for `file_name` in `roots` (a few levels deep).
 pub fn find(roots: &[PathBuf], file_name: &str) -> Option<PathBuf> {
+    let direct = Path::new(file_name);
+    if direct.is_absolute() {
+        return (direct.is_file() && direct.metadata().is_ok_and(|m| m.len() > 0)).then(|| direct.to_path_buf());
+    }
     fn walk(dir: &Path, name: &str, depth: usize) -> Option<PathBuf> {
         let entries = std::fs::read_dir(dir).ok()?;
         let mut subdirs = Vec::new();
@@ -871,6 +984,67 @@ pub async fn download(
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn external_scan_pairs_classifies_and_keeps_catalog_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let own = dir.path().join("own");
+        let root = dir.path().join(".lmstudio/models");
+        let folder = root.join("highllama/highllama-qwen3.5-9b");
+        std::fs::create_dir_all(&folder).unwrap();
+        for file in ["highllama-qwen3.5-9b-q4_k_m.gguf", "mmproj-F16.gguf", "mtp-draft.gguf",
+            "embedding-test-Q8_0.gguf", "Bonsai-27B-Q1_0.gguf", "empty.gguf",
+            "split-00001-of-00002.gguf", "split-00002-of-00002.gguf"] {
+            std::fs::write(folder.join(file), if file == "empty.gguf" { &b""[..] } else { &b"model"[..] }).unwrap();
+        }
+        let models = scan_external(&own, &[root.clone(), root.clone()]);
+        assert_eq!(models.len(), 3 + usize::from(uses_mlx()), "main, embedding, first split shard; native catalog files on MLX hosts");
+        let model = models.iter().find(|m| m.entry.file_name.contains("highllama-qwen3.5-9b-q4")).unwrap();
+        let ext = model.external.as_ref().unwrap();
+        assert_eq!(ext.name, "Highllama qwen3.5 9b");
+        assert_eq!(ext.quant.as_deref(), Some("q4_k_m"));
+        assert_eq!(ext.source, "LM Studio");
+        assert_eq!(ext.mmproj_path, Some(folder.join("mmproj-F16.gguf")));
+        assert_eq!(model.entry.size_bytes, 5);
+        assert_eq!(model.entry.mmproj_size_bytes, Some(5));
+        let embed = models.iter().find(|m| m.entry.kind == ModelKind::Embedding).unwrap();
+        assert!(embed.external.as_ref().unwrap().mmproj_path.is_none());
+        let catalog = status_for(&own, &[root], false);
+        let bonsai = catalog.iter().find(|m| m.entry.id == "bonsai-27b").unwrap();
+        assert_eq!(bonsai.entry.speed, 3);
+        assert!(bonsai.external.is_none());
+    }
+
+    #[test]
+    fn external_ids_roundtrip_config_and_resolve_exact_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        for folder in [&first, &second] {
+            std::fs::create_dir_all(folder).unwrap();
+            std::fs::write(folder.join("Custom-Q4_K_M.gguf"), b"model").unwrap();
+        }
+        let models = scan_external(&dir.path().join("own"), &[dir.path().to_path_buf()]);
+        assert_eq!(models.len(), 2);
+        assert_ne!(models[0].entry.id, models[1].entry.id);
+        let mut config = Config::default();
+        config.vision.local_model = models[0].entry.id.clone();
+        let mut chat = config.chat_model();
+        chat.local_model = models[1].entry.id.clone();
+        config.chat_model = Some(chat);
+        let config_path = dir.path().join("config.toml");
+        config.save(&config_path).unwrap();
+        let loaded = Config::load(&config_path).unwrap();
+        for (id, expected) in [(&loaded.vision.local_model, &models[0]), (&loaded.chat_model().local_model, &models[1])] {
+            assert_eq!(*id, expected.entry.id);
+            let resolved = external_model(id).unwrap();
+            assert_eq!(resolved.installed_path, expected.installed_path);
+            assert!(resolved.external.unwrap().mmproj_path.is_none());
+        }
+        std::fs::remove_file(models[0].installed_path.as_ref().unwrap()).unwrap();
+        assert!(external_model(&loaded.vision.local_model).is_none());
+        assert!(external_model("external:relative.gguf").is_none());
+    }
 
     #[test]
     fn qwen_9b_is_available_for_native_and_mlx_backends() {
