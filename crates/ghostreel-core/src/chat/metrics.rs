@@ -209,6 +209,11 @@ mod tests {
 
     fn script_of(beats: Vec<Beat>, target: Option<f64>) -> Script {
         Script {
+            framing: None,
+            captions: None,
+            title_style: None,
+            caption_edits: Vec::new(),
+            agents: None,
             title: "t".into(),
             target_duration_s: target,
             fps: Some(Fps::new(25, 1)),
@@ -224,6 +229,7 @@ mod tests {
             purpose: format!("purpose of {id}"),
             narration: None,
             on_screen_text: None,
+            title_layout: None,
             notes: None,
             clips,
             bed,
@@ -231,7 +237,7 @@ mod tests {
     }
 
     fn clip(video_id: i64, in_s: f64, out_s: f64, audio: Audio) -> ScriptClip {
-        ScriptClip { video_id, in_s, out_s, audio, why: None, tracks: None }
+        ScriptClip { video_id, in_s, out_s, audio, why: None, tracks: None, framing: None }
     }
 
     #[test]

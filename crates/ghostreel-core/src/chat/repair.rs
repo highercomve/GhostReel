@@ -25,7 +25,7 @@ pub fn finish_script(
     }
     let mut issues = Vec::new();
     let note = |issues: &mut Vec<Issue>, message: String| {
-        issues.push(Issue { severity: IssueSeverity::Info, beat_id: None, clip_index: None, message });
+        issues.push(Issue { fixes: Vec::new(), severity: IssueSeverity::Info, beat_id: None, clip_index: None, message });
     };
 
     // Anything a previous repair added comes off first: the fit below counts clips, and a

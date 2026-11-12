@@ -1,11 +1,14 @@
 {
   "name": "ghostreel",
   "private": true,
-  "version": "0.14.0",
+  "version": "0.15.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc && vite build",
+    "typecheck": "tsc --noEmit",
+    "lint": "node scripts/check-dialogs.mjs",
+    "check": "npm run typecheck && npm run lint && node --test scripts/check-dialogs.test.mjs",
+    "build": "npm run lint && tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
     "doctor": "cargo run -q -p ghostreel-cli -- doctor",

@@ -1,10 +1,17 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
+import { onEvent } from "../events";
 import {
   fileName,
   mediaUrl,
+  scriptFraming,
   videoPlayback,
   videoPlaybackProgress,
   type Beat,
+  type ClipFraming,
+  type CropKeyframe,
+  type FramePlan,
+  type PlanSegment,
+  type Overlays,
   type PlaybackProgress,
   type Script,
   type VideoRow,
@@ -12,13 +19,14 @@ import {
 import {
   ArrowLeftToLine,
   Captions,
-  Scan,
   Ellipsis,
   Maximize,
+  MessageSquareText,
   Minimize,
   Pause,
   Play,
   Repeat,
+  Scan,
   SkipBack,
   SkipForward,
   StepBack,
@@ -27,7 +35,10 @@ import {
 } from "lucide-react";
 import { audible, autoTrack, loadAudioTracks, trackProxyUrl, type TrackMonitor } from "./audioTracks";
 import { fpsValue, frameClock } from "./timecode";
+import TextOverlays from "./TextOverlays";
+import { overlayKey } from "./textOverlay";
 import "./player.css";
+import { cropBox, fitRect } from "./FramedImage";
 
 /** One picture clip placed on the cut's clock. */
 export interface LiveSegment {
@@ -86,6 +97,29 @@ export function layoutScript(script: Script): LiveLayout {
   return { segments, beats, total: t };
 }
 
+/** The crop's corner at `t` seconds into a clip: the same rule the render's ffmpeg expression
+ * follows (straight moves between keyframes, a jump at a `cut`). */
+export function cropAt(kfs: CropKeyframe[], t: number): [number, number] {
+  if (kfs.length === 0) return [0, 0];
+  if (t <= kfs[0].t) return [kfs[0].x, kfs[0].y];
+  let i = 0;
+  while (i + 1 < kfs.length && kfs[i + 1].t <= t) i++;
+  const a = kfs[i];
+  const b = kfs[i + 1];
+  if (b && !b.cut && b.t > a.t) {
+    const u = Math.min(1, Math.max(0, (t - a.t) / (b.t - a.t)));
+    return [a.x + (b.x - a.x) * u, a.y + (b.y - a.y) * u];
+  }
+  return [a.x, a.y];
+}
+
+const framingKey = (beatIndex: number, clipIndex: number) => `${beatIndex}:${clipIndex}`;
+
+/** The stretch of a plan playing `t` seconds into its clip (the last one past the end). */
+function segmentAt(plan: FramePlan, t: number): PlanSegment | undefined {
+  return plan.segments.find((s) => t < s.end) ?? plan.segments[plan.segments.length - 1];
+}
+
 // Kept as exports of this module too: the rendered viewer imports them from here.
 export { fpsValue, frameClock };
 
@@ -127,6 +161,17 @@ interface LivePlayerProps {
   onShowTitles: (on: boolean) => void;
   showNarration: boolean;
   onShowNarration: (on: boolean) => void;
+  /** Titles and speech captions laid out as the render burns them. */
+  overlays?: Overlays | null;
+  showCaptions?: boolean;
+  onShowCaptions?: (on: boolean) => void;
+  /** Selected title (`t-<beat>`) or caption (`cap-…`), shared with the timeline and inspector. */
+  selectedOverlay?: string | null;
+  onSelectOverlay?: (key: string | null) => void;
+  /** A title or the captions dragged to a new anchor (0..1 of the output frame). */
+  onOverlayMove?: (key: string, x: number, y: number) => void;
+  /** A title or the captions resized: new line height as a fraction of the frame. */
+  onOverlayResize?: (key: string, size: number) => void;
   /** Timeline lane mute/solo: which source tracks are heard here. */
   trackMonitor?: TrackMonitor;
 }
@@ -148,6 +193,13 @@ export default function LivePlayer({
   onShowTitles,
   showNarration: subtitles,
   onShowNarration,
+  overlays,
+  showCaptions = false,
+  onShowCaptions,
+  selectedOverlay = null,
+  onSelectOverlay,
+  onOverlayMove,
+  onOverlayResize,
   trackMonitor,
 }: LivePlayerProps) {
   const layout = useMemo(() => layoutScript(script), [script]);
@@ -204,6 +256,53 @@ export default function LivePlayer({
   loopRef.current = loop;
 
   const vid = (slot: Slot) => (slot === 0 ? vidA.current : vidB.current);
+
+  // Framing: vertical (or square) cuts of wide footage play cropped along the same path the
+  // render uses. Asked again (debounced) whenever the script changes.
+  const [framings, setFramings] = useState<ClipFraming[]>([]);
+  const framingRef = useRef(new Map<string, FramePlan>());
+  const wrapRef = useRef<HTMLDivElement>(null);
+  const stackRef = useRef<HTMLCanvasElement>(null);
+  const blurRef = useRef<HTMLCanvasElement>(null);
+  // Faces or speakers indexed (a task finished): plan the crop again.
+  const [framingTick, setFramingTick] = useState(0);
+  useEffect(() => onEvent<number>("task-finished", () => setFramingTick((t) => t + 1)), []);
+  useEffect(() => {
+    let cancelled = false;
+    const framed = !!script.framing || script.beats.some((b) => b.clips.some((c) => c.framing));
+    if (!framed) {
+      setFramings([]);
+      return;
+    }
+    const timer = setTimeout(() => {
+      scriptFraming(script)
+        .then((f) => !cancelled && setFramings(f))
+        .catch(() => !cancelled && setFramings([]));
+    }, 300);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [script, framingTick]);
+  framingRef.current = useMemo(
+    () => new Map(framings.map((f) => [framingKey(f.beat_index, f.clip_index), f.plan])),
+    [framings],
+  );
+  const framedRatio = framings.length > 0 ? framings[0].plan.out_w / framings[0].plan.out_h : null;
+  // The picture area is always the output frame's shape, so text sits where the render puts it.
+  const outW = overlays?.width ?? script.width ?? 0;
+  const outH = overlays?.height ?? script.height ?? 0;
+  const frameRatio = framedRatio ?? (outW > 0 && outH > 0 ? outW / outH : null);
+  const frameRef = useRef<HTMLDivElement>(null);
+  const [frameH, setFrameH] = useState(0);
+  useEffect(() => {
+    const el = frameRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver(() => setFrameH(el.clientHeight));
+    ro.observe(el);
+    setFrameH(el.clientHeight);
+    return () => ro.disconnect();
+  }, []);
 
   const showSlot = (slot: Slot) => {
     vidA.current?.setAttribute("data-on", slot === 0 ? "1" : "0");
@@ -569,6 +668,101 @@ export default function LivePlayer({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Framing: every frame, place each video as the render frames it (the same plan, stretch by
+  // stretch): its crop filling the frame (CSS), the lower crop painted into the bottom half for
+  // stacked and screen layouts, or the whole picture fitted over a blurred copy for fit.
+  useEffect(() => {
+    let raf = 0;
+    const clear = (v: HTMLVideoElement) => {
+      if (!v.style.width) return;
+      for (const k of ["width", "height", "left", "top", "inset", "objectFit"] as const) v.style[k] = "";
+    };
+    const place = (v: HTMLVideoElement, srcW: number, srcH: number, x: number, y: number, w: number, h: number) => {
+      // The source rectangle x,y,w,h (source pixels) fills the frame.
+      v.style.inset = "auto";
+      v.style.objectFit = "fill";
+      Object.assign(v.style, cropBox(srcW, srcH, { x, y, w, h }));
+    };
+    const paint = (canvas: HTMLCanvasElement | null, v: HTMLVideoElement, plan: FramePlan, r: { x: number; y: number; w: number; h: number }, scale = 1) => {
+      if (!canvas || v.readyState < 2 || !v.videoWidth) return;
+      const dpr = window.devicePixelRatio || 1;
+      const cw = Math.max(1, Math.round(canvas.clientWidth * dpr * scale));
+      const ch = Math.max(1, Math.round(canvas.clientHeight * dpr * scale));
+      if (canvas.width !== cw || canvas.height !== ch) {
+        canvas.width = cw;
+        canvas.height = ch;
+      }
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return;
+      // The playback copy may be smaller than the source the path was planned on.
+      const sx = v.videoWidth / plan.src_w;
+      const sy = v.videoHeight / plan.src_h;
+      try {
+        ctx.drawImage(v, r.x * sx, r.y * sy, r.w * sx, r.h * sy, 0, 0, cw, ch);
+      } catch {
+        // Not decodable yet; the next frame tries again.
+      }
+    };
+    const tick = () => {
+      raf = requestAnimationFrame(tick);
+      const plans = framingRef.current;
+      const wrap = wrapRef.current;
+      let lower: { v: HTMLVideoElement; plan: FramePlan; seg: PlanSegment; t: number } | null = null;
+      let fitted: { v: HTMLVideoElement; plan: FramePlan } | null = null;
+      for (const slot of [0, 1] as Slot[]) {
+        const v = vid(slot);
+        if (!v) continue;
+        const idx = slotSeg.current[slot];
+        const seg = idx != null ? layoutRef.current.segments[idx] : undefined;
+        const plan = seg ? plans.get(framingKey(seg.beatIndex, seg.clipIndex)) : undefined;
+        if (!seg || !plan) {
+          clear(v);
+          continue;
+        }
+        const t = v.currentTime - seg.inS;
+        const part = segmentAt(plan, t);
+        const path = part?.paths[0];
+        if (!part || part.layout === "fit" || !path) {
+          // The whole picture, as big as fits, centred: the frame's own coordinates scaled back
+          // to source pixels.
+          const r = fitRect(plan);
+          place(v, plan.src_w, plan.src_h, r.x, r.y, r.w, r.h);
+          if (slot === activeRef.current) fitted = { v, plan };
+          continue;
+        }
+        const [x, y] = cropAt(path.keyframes, t);
+        place(v, plan.src_w, plan.src_h, x, y, path.w, path.h);
+        if (slot === activeRef.current && part.paths.length > 1) lower = { v, plan, seg: part, t };
+      }
+      if (wrap) wrap.dataset.stacked = lower ? "1" : "0";
+      const blur = blurRef.current;
+      if (blur) {
+        blur.style.display = fitted ? "block" : "none";
+        if (fitted) {
+          // A cover crop of the picture, drawn small: scaled up and blurred by CSS.
+          const { v, plan } = fitted;
+          const c = plan.content;
+          const aspect = plan.out_w / plan.out_h;
+          const w = Math.min(c.w, c.h * aspect);
+          const h = w / aspect;
+          paint(blur, v, plan, { x: c.x + (c.w - w) / 2, y: c.y + (c.h - h) / 2, w, h }, 0.125);
+        }
+      }
+      const canvas = stackRef.current;
+      if (!canvas) return;
+      canvas.style.display = lower ? "block" : "none";
+      if (!lower) return;
+      const { v, plan, seg, t } = lower;
+      const path = seg.paths[1];
+      const [x, y] = cropAt(path.keyframes, t);
+      paint(canvas, v, plan, { x, y, w: path.w, h: path.h });
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+    // The engine reads everything through refs.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   // New script (an unsaved edit, too): keep the playhead and re-place the clips around it.
   useEffect(() => {
     layoutRef.current = layout;
@@ -754,6 +948,27 @@ export default function LivePlayer({
     const tag = (e.target as HTMLElement).tagName;
     if (tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA") return;
     if (e.ctrlKey || e.metaKey || e.altKey) return;
+    // A selected title or caption: arrows nudge it (Shift: further), Esc lets go.
+    if (selectedOverlay && onOverlayMove) {
+      const o = [...(overlays?.titles ?? []), ...(overlays?.captions ?? [])].find((x, i) => overlayKey(x, i) === selectedOverlay);
+      const step = e.shiftKey ? 0.02 : 0.005;
+      const d: Record<string, [number, number]> = { ArrowLeft: [-step, 0], ArrowRight: [step, 0], ArrowUp: [0, -step], ArrowDown: [0, step] };
+      if (o && d[e.key]) {
+        const [dx, dy] = d[e.key];
+        // Captions are stored by the bottom of their text; a centred one (stacked cuts) converts.
+        const adj = o.kind === "caption" && o.v_anchor === "middle" ? (o.lines.length * o.style.size) / 2 : 0;
+        onOverlayMove(selectedOverlay, +Math.min(1, Math.max(0, o.x + dx)).toFixed(4), +Math.min(1, Math.max(0, o.y + dy + adj)).toFixed(4));
+        e.preventDefault();
+        e.stopPropagation();
+        return;
+      }
+      if (e.key === "Escape") {
+        onSelectOverlay?.(null);
+        e.preventDefault();
+        e.stopPropagation();
+        return;
+      }
+    }
     let handled = true;
     switch (e.key) {
       case " ":
@@ -807,8 +1022,11 @@ export default function LivePlayer({
   const empty = layout.segments.length === 0;
   const span = layout.beats.find((b) => displayTime >= b.start && displayTime < b.end)
     ?? (current ? layout.beats[current.beatIndex] : undefined);
-  const title = span?.beat.on_screen_text?.trim();
   const narration = span?.beat.narration?.trim();
+  const at = (o: { start_s: number; end_s: number }) => displayTime >= o.start_s && displayTime < o.end_s;
+  const visibleTitles = showTitles ? (overlays?.titles ?? []).filter(at) : [];
+  const visibleCaptions = showCaptions ? (overlays?.captions ?? []).filter((o) => !o.cue?.hidden && at(o)) : [];
+  const hasActiveCaption = visibleCaptions.length > 0;
   const currentVideo = currentVideoId != null ? videos[currentVideoId] : undefined;
   const currentName = currentVideo ? fileName(currentVideo.path) : currentVideoId != null ? `video ${currentVideoId}` : "";
 
@@ -820,14 +1038,46 @@ export default function LivePlayer({
         tabIndex={-1}
         onClick={() => {
           rootRef.current?.focus({ preventScroll: true });
+          // The first click off a selected title or caption only lets go of it.
+          if (selectedOverlay && onSelectOverlay) {
+            onSelectOverlay(null);
+            return;
+          }
           if (!empty) toggle();
         }}
         onDoubleClick={toggleFullscreen}
       >
-        <video ref={vidA} className="lp-video" data-on="1" preload="auto" playsInline
-          onLoadedMetadata={() => onMeta(0)} onEnded={() => activeRef.current === 0 && playingRef.current && advance()} />
-        <video ref={vidB} className="lp-video" data-on="0" preload="auto" playsInline
-          onLoadedMetadata={() => onMeta(1)} onEnded={() => activeRef.current === 1 && playingRef.current && advance()} />
+        <div
+          ref={frameRef}
+          className={`lp-frame ${framedRatio != null ? "is-framed" : ""} ${frameRatio != null ? "is-sized" : ""} ${frameRatio != null && frameRatio < 1 ? "is-portrait" : ""}`}
+          style={frameRatio != null ? ({ "--lp-frame-ratio": frameRatio } as React.CSSProperties) : undefined}
+        >
+          <canvas ref={blurRef} className="lp-fit-blur" aria-hidden="true" />
+          <div className="lp-vwrap" ref={wrapRef} data-stacked="0">
+            <video ref={vidA} className="lp-video" data-on="1" preload="auto" playsInline
+              onLoadedMetadata={() => onMeta(0)} onEnded={() => activeRef.current === 0 && playingRef.current && advance()} />
+            <video ref={vidB} className="lp-video" data-on="0" preload="auto" playsInline
+              onLoadedMetadata={() => onMeta(1)} onEnded={() => activeRef.current === 1 && playingRef.current && advance()} />
+          </div>
+          <canvas ref={stackRef} className="lp-stack-bottom" aria-hidden="true" />
+          {!empty && subtitles && narration && (
+            <div className={`lp-subtitle ${hasActiveCaption ? "lp-subtitle-above" : ""}`}>
+              {narration}
+            </div>
+          )}
+          {!empty && (
+            <TextOverlays
+              items={[...visibleCaptions, ...visibleTitles]}
+              frameH={frameH}
+              frameRef={frameRef}
+              editable={!!onOverlayMove}
+              selected={selectedOverlay}
+              onSelect={(k) => onSelectOverlay?.(k)}
+              onMove={(k, x, y) => onOverlayMove?.(k, x, y)}
+              onResize={(k, size) => onOverlayResize?.(k, size)}
+            />
+          )}
+        </div>
         <audio ref={bedRef} preload="auto" onLoadedMetadata={onBedMeta} />
 
         {empty ? (
@@ -849,8 +1099,6 @@ export default function LivePlayer({
               <div className="lp-action-safe"><span>Action safe · 93%</span></div>
               <div className="lp-title-safe"><span>Title safe · 90%</span></div>
             </div>}
-            {showTitles && title && <div className="lp-title">{title}</div>}
-            {subtitles && narration && <div className="lp-subtitle">{narration}</div>}
             {waitingFor != null && (
               <div className="lp-overlay-center lp-preparing">
                 {failed[waitingFor] ? (
@@ -932,6 +1180,20 @@ export default function LivePlayer({
               title={subtitles ? "Narration subtitles on: shown here and burned into renders and MP4 exports. Click to turn off." : "Narration subtitles off. Click to show and burn them in."}>
               <Captions size={16} strokeWidth={2} aria-hidden />
             </button>
+            <button
+              type="button"
+              className={`nle-tbtn lp-toggle ${showCaptions ? "on" : ""}`}
+              aria-pressed={showCaptions}
+              onClick={() => onShowCaptions?.(!showCaptions)}
+              aria-label="Speech captions"
+              title={
+                showCaptions
+                  ? "Speech captions on: what is said on camera, from the transcript."
+                  : "Speech captions off."
+              }
+            >
+              <MessageSquareText size={16} strokeWidth={2} aria-hidden />
+            </button>
           </div>
           <details className="nle-menu up lp-more">
             <summary className="nle-tbtn" title="Speed, loop, titles and subtitles" aria-label="More playback options">
@@ -955,6 +1217,15 @@ export default function LivePlayer({
               </button>
               <button type="button" role="menuitemcheckbox" aria-checked={subtitles} onClick={() => onShowNarration(!subtitles)}>
                 <Captions size={14} strokeWidth={2} aria-hidden /> Narration subtitles <span className="lp-more-state">{subtitles ? "On" : "Off"}</span>
+              </button>
+              <button
+                type="button"
+                role="menuitemcheckbox"
+                aria-checked={showCaptions}
+                onClick={() => onShowCaptions?.(!showCaptions)}
+              >
+                <MessageSquareText size={14} strokeWidth={2} aria-hidden /> Speech captions{" "}
+                <span className="lp-more-state">{showCaptions ? "On" : "Off"}</span>
               </button>
               <div className="small muted lp-more-note">Titles and subtitles shown here are burned into renders.</div>
             </div>

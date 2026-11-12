@@ -1,0 +1,193 @@
+/* The agent pool: the shared picker and the Settings list. */
+
+.agent-picker { display: flex; flex-direction: column; gap: 12px; min-width: 0; font-size: 12.5px; }
+.agent-picker.disabled { opacity: 0.6; }
+.agent-field { display: flex; flex-direction: column; gap: 5px; min-width: 0; margin: 0; padding: 0; border: 0; }
+.agent-field-label {
+  padding: 0;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+.agent-secondary { color: var(--muted); font-size: 11.5px; overflow-wrap: anywhere; }
+/* The status sits beside the dropdown while both fit, and drops under it in a narrow column
+   (the inspector) instead of being cut off at the edge. */
+.agent-orch { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; min-width: 0; }
+.agent-orch select { flex: 1 1 12em; width: 0; min-width: 0; max-width: 100%; }
+.agent-orch .agent-status { flex: 0 0 auto; }
+
+.agent-workers {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel);
+}
+.agent-worker {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto minmax(5.5em, 8em);
+  align-items: center;
+  gap: 10px;
+  padding: 7px 10px;
+}
+.agent-worker + .agent-worker { border-top: 1px solid var(--border); }
+.agent-worker.off .agent-worker-name,
+.agent-worker.off .agent-stepper { opacity: 0.55; }
+.agent-worker-name { display: flex; flex-direction: column; min-width: 0; }
+.agent-worker-title { font-weight: 600; color: var(--text); overflow-wrap: anywhere; }
+
+/* The on/off switch of a worker row (same look as the inspector's). */
+.agent-switch {
+  position: relative;
+  flex: 0 0 auto;
+  width: 34px;
+  height: 20px;
+  padding: 0;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: color-mix(in srgb, var(--muted) 30%, var(--panel));
+}
+.agent-switch:hover:not(:disabled) { background: color-mix(in srgb, var(--muted) 40%, var(--panel)); }
+.agent-switch.on,
+.agent-switch.on:hover:not(:disabled) { background: var(--accent-solid); border-color: var(--accent-solid); }
+.agent-switch:disabled { cursor: not-allowed; }
+.agent-switch-knob {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.35);
+  transition: left 0.12s ease;
+}
+.agent-switch.on .agent-switch-knob { left: 16px; }
+
+.agent-stepper { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
+.agent-stepper strong { min-width: 1.4em; text-align: center; font-variant-numeric: tabular-nums; }
+.agent-stepper .agent-secondary { margin-left: 2px; }
+
+.agent-status { display: inline-flex; align-items: center; gap: 6px; min-width: 0; font-size: 11.5px; line-height: 1.3; color: var(--muted); }
+.agent-orch .agent-status { white-space: nowrap; }
+.agent-status-dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; flex: 0 0 auto; }
+.agent-status.good .agent-status-dot { background: var(--good); }
+.agent-status.warn .agent-status-dot { background: var(--warn); }
+.agent-status.bad .agent-status-dot { background: var(--bad); }
+.agent-status.warn { color: var(--warn-text, var(--warn)); }
+.agent-status.bad { color: var(--bad); }
+.agent-status.checking { font-style: italic; }
+
+.agent-summary-line {
+  margin: 0;
+  padding: 8px 10px;
+  border-left: 3px solid var(--accent-solid);
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--accent) 8%, var(--panel));
+  color: var(--text);
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+.agent-picker-foot { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 14px; }
+.agent-note { color: var(--muted); font-size: 11.5px; }
+.agent-picker-foot > :first-child { margin-right: auto; }
+.agent-picker .link-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 0;
+  border: 0;
+  background: none;
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 500;
+}
+.agent-picker .link-btn:hover:not(:disabled) { background: none; text-decoration: underline; }
+.agent-picker .link-btn:disabled { color: var(--muted); }
+
+/* In the narrow inspector the stepper and status drop under the name. */
+.nle-inspector .agent-worker { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; }
+.nle-inspector .agent-worker .agent-worker-name { flex: 1 1 calc(100% - 50px); }
+.nle-inspector .agent-worker .agent-stepper { margin-left: 44px; }
+.nle-inspector .agent-worker .agent-status { margin-left: auto; }
+.nle-inspector .agent-worker .agent-stepper + .agent-status { white-space: nowrap; }
+
+.agents-card { gap: 10px; }
+.agents-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.agent-row {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg);
+}
+.agent-row.off { opacity: 0.65; }
+.agent-row-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.agent-name { font-weight: 600; width: 12em; max-width: 100%; }
+.agent-id { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.agent-summary { flex: 1; min-width: 10em; overflow-wrap: anywhere; }
+.agent-row-actions { display: inline-flex; align-items: center; gap: 4px; margin-left: auto; }
+.agent-row-body { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.agent-row-body .model-select-control { min-width: 14em; }
+.agent-url { width: 16em; max-width: 100%; }
+.agent-linked { display: inline-flex; align-items: center; gap: 5px; }
+.agent-stepper { display: inline-flex; align-items: center; gap: 6px; }
+.agent-stepper strong { min-width: 1.5em; text-align: center; font-variant-numeric: tabular-nums; }
+.agent-roles { display: inline-flex; flex-wrap: wrap; gap: 5px; }
+.agent-enabled input { accent-color: var(--accent); }
+.agents-default { display: flex; flex-direction: column; gap: 6px; padding-top: 10px; border-top: 1px solid var(--border); }
+.agents-card .sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+.clips-engines .agent-picker { align-self: stretch; }
+.agent-effort { min-width: 0; }
+
+/* A typed agent failure (AgentErrorView): who, a kind chip, the tool's own line, details. */
+.agent-error { display: flex; flex-direction: column; gap: 4px; min-width: 0; font-size: 12px; }
+.agent-error-line { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 6px; min-width: 0; }
+.agent-error-agent { font-weight: 600; }
+.agent-error-kind {
+  flex: 0 0 auto;
+  font-size: 11px;
+  line-height: 1.5;
+  padding: 0 7px;
+  border-radius: 99px;
+  border: 1px solid currentColor;
+  color: var(--bad);
+  white-space: nowrap;
+}
+.agent-error-kind.kind-busy, .agent-error-kind.kind-quota_exhausted, .agent-error-kind.kind-timeout { color: var(--warn); }
+.agent-error-message { flex: 1 1 14em; min-width: 0; color: var(--muted); overflow-wrap: anywhere; }
+.agent-error-message.clamp {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.agent-error-toggle { align-self: flex-start; display: inline-flex; align-items: center; gap: 4px; padding-left: 2px; }
+.agent-error-list { list-style: none; margin: 0; padding: 0 0 0 10px; display: flex; flex-direction: column; gap: 6px; border-left: 2px solid var(--border); }
+.agent-error-details {
+  margin: 0;
+  max-height: 12em;
+  overflow: auto;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  font-size: 11px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* Why the dialog's main action is off, beside it. */
+.nle-modal-actions-reason { margin-right: auto; align-self: center; }

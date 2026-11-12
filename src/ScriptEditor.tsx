@@ -8,6 +8,19 @@ import TimecodeField from "./editor/TimecodeField";
 import ScrollPanel from "./editor/ScrollPanel";
 import DurationField from "./editor/DurationField";
 import { fpsValue } from "./editor/timecode";
+import TextInspector from "./editor/TextInspector";
+import AgentPicker from "./agents/AgentPicker";
+import {
+  applyTitleStyleToAll,
+  cueKey,
+  patchCaptions,
+  patchCaptionStyle,
+  patchCueEdit,
+  patchTitleLayout,
+  patchTitleStyle,
+  resetCue,
+  retimeCue,
+} from "./editor/textOverlay";
 import {
   ArrowDown,
   ArrowLeft,
@@ -39,20 +52,26 @@ export interface ScriptEditorHandle {
   getScript: () => Script | null;
 }
 import {
+  applyScriptFix,
+  checkScript,
   fileName,
   getScript,
   projectView,
   saveScript,
+  scriptOverlays,
   videoFrames,
   videoTranscript,
   type Beat,
+  type Fix,
   type FrameRow,
   type Issue,
+  type Overlays,
   type Script,
   type ScriptClip,
   type TranscriptSegment,
   type VideoRow,
 } from "./api";
+import { onEvent } from "./events";
 import PreviewPlayer from "./PreviewPlayer";
 import ScriptTimeline from "./ScriptTimeline";
 import GridSplitters from "./editor/GridSplitters";
@@ -123,6 +142,9 @@ const ScriptEditor = forwardRef<ScriptEditorHandle, ScriptEditorProps>(function 
   const [loadedSessionId, setLoadedSessionId] = useState<number | null>(null);
   const [version, setVersion] = useState<number | null>(null);
   const [issues, setIssues] = useState<Issue[]>([]);
+  // What the last save's deterministic repair changed, and a fix being applied.
+  const [repairNotes, setRepairNotes] = useState<string[]>([]);
+  const [fixing, setFixing] = useState(false);
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -148,10 +170,29 @@ const ScriptEditor = forwardRef<ScriptEditorHandle, ScriptEditorProps>(function 
   const [compactPanel, setCompactPanel] = useState<"left" | "inspector" | null>(null);
   const [leftTab, setLeftTab] = useState<"cuts" | "beats" | "media">("beats");
   // The inspector tab someone picked; a new selection goes back to the tab that fits it.
-  const [inspPick, setInspPick] = useState<"clip" | "beat" | "cut" | null>(null);
+  const [inspPick, setInspPick] = useState<"clip" | "beat" | "cut" | "text" | null>(null);
   useEffect(() => setInspPick(null), [selectedBlock]);
   // Timeline lane mute/solo: what the live viewer lets you hear. Not saved.
   const [trackMonitor, setTrackMonitor] = useState<TrackMonitor>({ muted: [], solo: [] });
+  // Titles and captions laid out by the backend exactly as a render burns them; refreshed after
+  // every edit (debounced), so the viewer, the Captions lane and the Text tab agree with renders.
+  const [overlays, setOverlays] = useState<Overlays | null>(null);
+  useEffect(() => {
+    if (!script) return;
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      scriptOverlays(script)
+        .then((o) => !cancelled && setOverlays(o))
+        .catch(() => !cancelled && setOverlays(null));
+    }, 120);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [script]);
+  // The viewer's title and caption switches (what renders burn), so the Captions lane follows.
+  const [showFlags, setShowFlags] = useState({ titles: false, captions: true });
+  const handleShowFlags = useCallback((f: { titles: boolean; captions: boolean }) => setShowFlags(f), []);
 
   // Load project videos map for video names
   useEffect(() => {
@@ -194,6 +235,24 @@ const ScriptEditor = forwardRef<ScriptEditorHandle, ScriptEditorProps>(function 
       cancelled = true;
     };
   }, [scriptId]);
+
+  // Feedback is checked against the index as it is now: after every edit (debounced) and
+  // whenever a task finishes (faces or speakers indexed, say), so it never shows stale issues.
+  const [checkTick, setCheckTick] = useState(0);
+  useEffect(() => onEvent<number>("task-finished", () => setCheckTick((t) => t + 1)), []);
+  useEffect(() => {
+    if (!script) return;
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      checkScript(projectId, script)
+        .then((found) => !cancelled && setIssues(found))
+        .catch(() => {});
+    }, 400);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [script, projectId, checkTick]);
 
   // Update issues when latestIssues changes without clobbering dirty script state
   useEffect(() => {
@@ -245,7 +304,11 @@ const ScriptEditor = forwardRef<ScriptEditorHandle, ScriptEditorProps>(function 
     setError(null);
     try {
       const res = await saveScript(projectId, script, loadedSessionId ?? sessionId);
-      setInitialJson(JSON.stringify(script));
+      // The save may have repaired the framing (a clip trimmed off a screen share): show what
+      // was saved, and say what changed.
+      if (JSON.stringify(res.script) !== JSON.stringify(script)) setScript(res.script);
+      setInitialJson(JSON.stringify(res.script));
+      setRepairNotes(res.notes);
       setIssues(res.issues);
       onScriptSaved(res.script_id, res.issues);
       return res.script_id;
@@ -348,7 +411,10 @@ const ScriptEditor = forwardRef<ScriptEditorHandle, ScriptEditorProps>(function 
     .reduce((sum, c) => sum + Math.max(0, c.out_s - c.in_s), 0);
 
   const targetDuration = script.target_duration_s ?? 0;
-  const isOverTarget = targetDuration > 0 && totalDuration > targetDuration;
+  // Compared in whole frames: lengths are sums of float clip ranges, so a full frame over can
+  // land a hair short of 1/fps in seconds, and under a frame over is on target.
+  const framesOver = Math.round((totalDuration - targetDuration) * fpsValue(script.fps));
+  const isOverTarget = targetDuration > 0 && framesOver >= 1;
   const pctOfTarget = targetDuration > 0 ? (totalDuration / targetDuration) * 100 : 0;
 
   const errors = issues.filter((i) => i.severity === "error");
@@ -368,13 +434,35 @@ const ScriptEditor = forwardRef<ScriptEditorHandle, ScriptEditorProps>(function 
   const beat = selBeat != null ? script.beats[selBeat] : null;
   const clip = beat && selClip != null ? beat.clips[selClip] : null;
 
-  const inspTab: "clip" | "beat" | "cut" =
-    inspPick === "clip" && clip ? "clip"
+  // A title (`t-<beat>`) or a caption (`cap-…`) opens the Text tab.
+  const selTitle = selKind === "t" && beat ? overlays?.titles.find((o) => o.beat_index === selBeat) ?? null : null;
+  const selCue = selKind === "cap" ? overlays?.captions.find((o, i) => o.cue && cueKey(o.cue, i) === selectedBlock)?.cue ?? null : null;
+  const textAvailable = selKind === "t" ? beat != null : selKind === "cap";
+  const inspTab: "clip" | "beat" | "cut" | "text" =
+    inspPick === "text" && textAvailable ? "text"
+    : inspPick === "clip" && clip ? "clip"
     : inspPick === "beat" && beat ? "beat"
     : inspPick === "cut" ? "cut"
+    : textAvailable ? "text"
     : clip ? "clip"
     : beat ? "beat"
     : "cut";
+  const portrait = (overlays?.height ?? script.height ?? 0) > (overlays?.width ?? script.width ?? 0);
+  const beatStartOf = (bIdx: number) => script.beats.slice(0, bIdx).reduce((t, b) => t + beatDuration(b), 0);
+  const setTitleTimes = (bIdx: number, startRel: number | null, endRel: number | null) => {
+    const dur = beatDuration(script.beats[bIdx]);
+    const s0 = startRel == null || startRel <= 0.001 ? undefined : +startRel.toFixed(3);
+    const e0 = endRel == null || endRel >= dur - 0.001 ? undefined : +endRel.toFixed(3);
+    setScript(patchTitleLayout(script, bIdx, { start_s: s0, end_s: e0 }));
+  };
+  const onOverlayMove = (key: string, x: number, y: number) => {
+    if (key.startsWith("t-")) setScript(patchTitleLayout(script, Number(key.slice(2)), { x, y }));
+    else if (key.startsWith("cap-")) setScript(patchCaptions(script, { x, y }));
+  };
+  const onOverlayResize = (key: string, size: number) => {
+    if (key.startsWith("t-")) setScript(patchTitleStyle(script, Number(key.slice(2)), { size }));
+    else if (key.startsWith("cap-")) setScript(patchCaptionStyle(script, { size }));
+  };
   const fps = fpsValue(script.fps);
 
   const selectBeat = (bIdx: number) => setSelectedBlock(`beat-${bIdx}`);
@@ -461,10 +549,24 @@ const ScriptEditor = forwardRef<ScriptEditorHandle, ScriptEditorProps>(function 
     }
   };
 
+  const applyFix = async (fix: Fix) => {
+    setFixing(true);
+    setError(null);
+    try {
+      const res = await applyScriptFix(projectId, script, fix);
+      if (JSON.stringify(res.script) !== JSON.stringify(script)) setScript(res.script);
+      setIssues(res.issues);
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setFixing(false);
+    }
+  };
+
   const issueRow = (iss: Issue, i: number) => (
+    <div key={i} className="nle-issue-item">
     <button
       type="button"
-      key={i}
       className={`nle-issue ${iss.severity}`}
       onClick={() => {
         const bIdx = script.beats.findIndex((b) => b.id === iss.beat_id);
@@ -485,6 +587,16 @@ const ScriptEditor = forwardRef<ScriptEditorHandle, ScriptEditorProps>(function 
         {formatDurationText(iss.message)}
       </span>
     </button>
+    {iss.fixes && iss.fixes.length > 0 && (
+      <div className="nle-issue-fixes" role="group" aria-label="Fixes">
+        {iss.fixes.map((f, j) => (
+          <button type="button" key={j} className="small" disabled={fixing || isAiWorking} onClick={() => applyFix(f)}>
+            {formatDurationText(f.label)}
+          </button>
+        ))}
+      </div>
+    )}
+    </div>
   );
 
   const locked = isAiWorking ? "editor-locked" : "";
@@ -613,13 +725,19 @@ const ScriptEditor = forwardRef<ScriptEditorHandle, ScriptEditorProps>(function 
           onTime={setPlayhead}
           onControls={handleControls}
           trackMonitor={trackMonitor}
+          overlays={overlays}
+          selectedOverlay={selKind === "t" || selKind === "cap" ? selectedBlock : null}
+          onSelectOverlay={(k) => setSelectedBlock(k)}
+          onOverlayMove={isAiWorking ? undefined : onOverlayMove}
+          onOverlayResize={onOverlayResize}
+          onShowFlags={handleShowFlags}
         />
       </section>
 
       {/* Right: the inspector, as Clip / Beat / Cut tabs; a selection opens the tab that fits it */}
       <aside className={`nle-panel nle-inspector ${locked}`}>
         <div className="nle-panel-tabs insp-tabs" role="tablist" aria-label="Inspector">
-          {(["clip", "beat", "cut"] as const).map((t) => {
+          {(["clip", "beat", "text", "cut"] as const).filter((t) => t !== "text" || textAvailable).map((t) => {
             const available = t === "clip" ? clip != null : t === "beat" ? beat != null : true;
             return (
               <button
@@ -638,7 +756,7 @@ const ScriptEditor = forwardRef<ScriptEditorHandle, ScriptEditorProps>(function 
                       : "Select a beat in Beats or on the timeline"
                 }
               >
-                {t === "clip" ? "Clip" : t === "beat" ? "Beat" : "Cut"}
+                {t === "clip" ? "Clip" : t === "beat" ? "Beat" : t === "text" ? "Text" : "Cut"}
               </button>
             );
           })}
@@ -799,6 +917,68 @@ const ScriptEditor = forwardRef<ScriptEditorHandle, ScriptEditorProps>(function 
             );
           })()}
 
+          {inspTab === "text" && selKind === "t" && beat && selBeat != null && (selTitle ? (
+            <TextInspector
+              kind="title"
+              style={selTitle.style}
+              x={selTitle.x}
+              y={selTitle.y}
+              portrait={portrait}
+              fps={fps}
+              playhead={playhead}
+              disabled={isAiWorking}
+              text={beat.on_screen_text ?? ""}
+              beatId={beat.id}
+              beatStart={beatStartOf(selBeat)}
+              beatDuration={beatDuration(beat)}
+              startRel={selTitle.start_s - beatStartOf(selBeat)}
+              endRel={selTitle.end_s - beatStartOf(selBeat)}
+              onText={(v) => updateBeat(selBeat, { on_screen_text: v })}
+              onTimes={(a, b) => setTitleTimes(selBeat, a, b)}
+              onStyle={(patch) => setScript(patchTitleStyle(script, selBeat, patch))}
+              onPosition={(x, y) => setScript(patchTitleLayout(script, selBeat, { x, y }))}
+              onApplyAll={() => setScript(applyTitleStyleToAll(script, selBeat, beat.title_layout?.style ?? {}))}
+              onResetStyle={() => setScript(patchTitleLayout(script, selBeat, { style: undefined, x: undefined, y: undefined }))}
+            />
+          ) : (
+            <section className="nle-insp-section">
+              <label className="nle-insp-field insp-field-title">
+                <span className="insp-field-label">
+                  <Type size={13} strokeWidth={2} aria-hidden /> On-screen text
+                </span>
+                <input value={beat.on_screen_text ?? ""} onChange={(e) => updateBeat(selBeat, { on_screen_text: e.target.value })}
+                  placeholder="Title or lower third…" />
+              </label>
+              <div className="small muted">Write the title to style and place it.</div>
+            </section>
+          ))}
+
+          {inspTab === "text" && selKind === "cap" && overlays && (
+            <TextInspector
+              kind="caption"
+              style={overlays.caption_style}
+              x={overlays.caption_x}
+              y={overlays.caption_y}
+              portrait={portrait}
+              fps={fps}
+              playhead={playhead}
+              disabled={isAiWorking}
+              cue={selCue}
+              maxChars={script.captions?.max_chars ?? 42}
+              maxLines={script.captions?.max_lines ?? 2}
+              editCount={script.caption_edits?.length ?? 0}
+              onCueText={(text) => selCue && setScript(patchCueEdit(script, selCue, { text }))}
+              onCueTimes={(a, b) => selCue && setScript(retimeCue(script, selCue, a, b))}
+              onCueHide={(hidden) => selCue && setScript(patchCueEdit(script, selCue, { hidden }))}
+              onCueReset={() => selCue && setScript(resetCue(script, selCue))}
+              onResetAllEdits={() => setScript({ ...script, caption_edits: [] })}
+              onLayout={(max_chars, max_lines) => setScript(patchCaptions(script, { max_chars, max_lines }))}
+              onStyle={(patch) => setScript(patchCaptionStyle(script, patch))}
+              onPosition={(x, y) => setScript(patchCaptions(script, { x, y }))}
+              onResetStyle={() => setScript(patchCaptions(script, { style: undefined, x: undefined, y: undefined }))}
+            />
+          )}
+
           {inspTab === "beat" && beat && selBeat != null && (
             <section className="nle-insp-section">
               <div className="insp-beat-head">
@@ -877,7 +1057,7 @@ const ScriptEditor = forwardRef<ScriptEditorHandle, ScriptEditorProps>(function 
                     {clock(totalDuration)} of {clock(targetDuration)}
                     {isOverTarget
                       ? ` · ${clock(totalDuration - targetDuration)} over`
-                      : ` · ${clock(targetDuration - totalDuration)} left`}
+                      : ` · ${clock(Math.max(0, targetDuration - totalDuration))} left`}
                   </span>
                 )}
               </label>
@@ -892,8 +1072,15 @@ const ScriptEditor = forwardRef<ScriptEditorHandle, ScriptEditorProps>(function 
                   <Sparkles size={13} strokeWidth={2} aria-hidden /> Drafted by Sonar in “{sessionTitle}”
                 </div>
               )}
+              <div className="nle-insp-subtitle">Agents</div>
+              <AgentPicker
+                level="cut"
+                value={script.agents ?? null}
+                disabled={isAiWorking}
+                onChange={(agents) => setScript({ ...script, agents })}
+              />
               <div className="nle-insp-subtitle">Cut overview</div>
-              <ScrollPanel className="insp-overview-scroll" label="Cut overview"><ol className="insp-cut-overview">
+              <ScrollPanel className="insp-overview-scroll" label="Cut overview" nested><ol className="insp-cut-overview">
                 {script.beats.map((b, i) => (
                   <li key={b.id}>
                     <button type="button" className="ghost small" onClick={() => { selectBeat(i); setInspPick("beat"); }} title={b.purpose}>
@@ -903,9 +1090,14 @@ const ScriptEditor = forwardRef<ScriptEditorHandle, ScriptEditorProps>(function 
                 ))}
               </ol></ScrollPanel>
               <div className="nle-insp-subtitle">Feedback ({feedbackCount})</div>
-              {feedbackCount === 0 && <div className="small muted">{targetDuration > 0
-                ? `The cut runs ${clock(totalDuration)} against a ${clock(targetDuration)} target.`
-                : "No issues found."}</div>}
+              {/* The count is the rows listed below; the length against the target is the note under
+                  Target length, not a feedback row. */}
+              {feedbackCount === 0 && <div className="small muted">No issues found.</div>}
+              {repairNotes.length > 0 && (
+                <div className="nle-repair-notes small muted">
+                  Repaired on save: {repairNotes.map((n) => formatDurationText(n)).join("; ")}
+                </div>
+              )}
               {[...errors, ...warnings, ...infos].map(issueRow)}
             </section>
           )}
@@ -988,6 +1180,11 @@ const ScriptEditor = forwardRef<ScriptEditorHandle, ScriptEditorProps>(function 
               monitor={trackMonitor}
               onMonitor={setTrackMonitor}
               onSelect={(key) => setSelectedBlock(key)}
+              captions={showFlags.captions || script.captions ? overlays?.captions.map((o) => o.cue!).filter(Boolean) : undefined}
+              onTitleTime={isAiWorking ? undefined : (bIdx, a, b) => setTitleTimes(bIdx, a, b)}
+              onCueTime={isAiWorking ? undefined : (cue, a, b) => setScript(retimeCue(script, cue, a, b))}
+              onCueText={isAiWorking ? undefined : (cue, text) => setScript(patchCueEdit(script, cue, { text }))}
+              onCueHide={isAiWorking ? undefined : (cue, hidden) => setScript(patchCueEdit(script, cue, { hidden }))}
               playhead={playhead}
               onSeek={(t) => {
                 setPlayhead(t);
@@ -1162,6 +1359,7 @@ const KEY_GROUPS: KeyGroup[] = [
       { keys: [["↑"], ["↓"]], what: "Previous / next cut point" },
       { keys: [["Home"], ["End"]], what: "Start / end" },
       { keys: [["F"]], what: "Fullscreen" },
+      { keys: [["←"], ["→"], ["↑"], ["↓"]], what: "With a title or caption selected: nudge it (Shift: further)" },
     ],
   },
 ];
@@ -1175,6 +1373,10 @@ const MOUSE_ROWS: [string, string][] = [
   ["Drag a clip's edge", "Trim it"],
   ["Ctrl + wheel over the timeline", "Zoom around the pointer"],
   ["Drag the In or Out label", "Scrub that point by frames"],
+  ["Drag a title or caption in the viewer", "Move it (snaps to the middle and the safe margin; Alt: no snap)"],
+  ["Shift-drag it, or drag its corner", "Resize it"],
+  ["Drag a title or caption on the timeline", "Move it in time; drag an edge to retime"],
+  ["Double-click a caption on the timeline", "Edit its words"],
   ["Double-click the picture", "Fullscreen"],
 ];
 

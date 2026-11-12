@@ -28,6 +28,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             duration,
             config.script.shake_window_s,
             config.script.shake_stride_s,
+            |_| {},
         )
         .await?;
         let worst = w.iter().map(|x| x.jerk).fold(0.0f64, f64::max);

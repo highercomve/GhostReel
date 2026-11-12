@@ -508,9 +508,18 @@ fn median(values: &[f64]) -> f64 {
 }
 
 /// Decode the video as tiny greyscale frames and measure the camera's move between each pair.
-async fn decode_motions(ffmpeg: &Path, video: &Path, hwaccel: Option<&str>) -> Result<Vec<Option<Motion>>, Error> {
+/// Decode `video` and measure the camera motion between consecutive frames. `on_progress` gets
+/// the seconds decoded so far. A decode that ffmpeg did not finish (it failed part-way, or was
+/// killed) is an error, never a shorter measurement: a truncated camera path stored as complete
+/// would read as a measured, steady remainder.
+async fn decode_motions(
+    ffmpeg: &Path,
+    video: &Path,
+    hwaccel: Option<&str>,
+    on_progress: &mut impl FnMut(f64),
+) -> Result<Vec<Option<Motion>>, Error> {
     let mut cmd = crate::proc::command(ffmpeg);
-    cmd.args(["-v", "error"]);
+    cmd.args(["-nostdin", "-v", "error"]);
     if let Some(h) = hwaccel {
         cmd.args(["-hwaccel", h]);
     }
@@ -524,6 +533,7 @@ async fn decode_motions(ffmpeg: &Path, video: &Path, hwaccel: Option<&str>) -> R
             "rawvideo",
             "-",
         ])
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true)
@@ -547,10 +557,21 @@ async fn decode_motions(ffmpeg: &Path, video: &Path, hwaccel: Option<&str>) -> R
             // Look where the camera was last going; after a miss, start from rest again.
             guess = m.map(|m| (m.dx.round() as i32, m.dy.round() as i32)).unwrap_or((0, 0));
             motions.push(m);
+            if motions.len().is_multiple_of(ANALYSIS_FPS as usize) {
+                on_progress(motions.len() as f64 / ANALYSIS_FPS as f64);
+            }
+            // The motion search is CPU work between reads that are always ready on a fast
+            // decode: yield now and then so a stop (raced against this future) is seen at once.
+            if motions.len().is_multiple_of(8) {
+                tokio::task::yield_now().await;
+            }
         }
         prev = Some(std::mem::replace(&mut cur, vec![0u8; size]));
     }
-    let _ = child.wait().await;
+    let status = child.wait().await.map_err(|e| Error::Vision(format!("ffmpeg: {e}")))?;
+    if !status.success() {
+        return Err(Error::Vision(format!("ffmpeg stopped before the end of the video ({status})")));
+    }
     Ok(motions)
 }
 
@@ -563,18 +584,29 @@ pub async fn measure(
     duration_s: f64,
     window_s: f64,
     _stride_s: f64,
+    mut on_progress: impl FnMut(f64),
 ) -> Result<Vec<Window>, Error> {
     if duration_s <= 0.0 || window_s <= 0.0 {
         return Ok(Vec::new());
     }
     // Decoding 4K is the whole cost; the GPU does it eight times faster than the CPU when it can.
-    // Try it first and fall back — a machine without a usable decoder just takes longer.
+    // Try it first and fall back — a machine without a usable decoder just takes longer. Only a
+    // decode that ran to the end counts.
     let mut motions = Vec::new();
+    let mut last_error = None;
     for accel in [Some("cuda"), Some("vaapi"), None] {
-        motions = decode_motions(ffmpeg, video, accel).await.unwrap_or_default();
-        if !motions.is_empty() {
-            break;
+        match decode_motions(ffmpeg, video, accel, &mut on_progress).await {
+            Ok(m) if !m.is_empty() => {
+                motions = m;
+                last_error = None;
+                break;
+            }
+            Ok(_) => {}
+            Err(e) => last_error = Some(e),
         }
+    }
+    if let Some(e) = last_error {
+        return Err(e);
     }
 
     let stats = path_stats(&motions);

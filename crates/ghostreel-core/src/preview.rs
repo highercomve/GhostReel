@@ -31,6 +31,9 @@ pub struct PlannedSegment {
     /// Tracks the script chose for this audio (see `ScriptClip::tracks`); None = `audio_track`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tracks: Option<Vec<u32>>,
+    /// How the picture is cut to the cut's shape (the clip's framing, else the script's).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub framing: Option<crate::framing::Framing>,
 }
 
 /// The sound running under a beat: where it sits on the preview timeline and where it comes from.
@@ -101,6 +104,7 @@ impl std::fmt::Display for Encoder {
 pub struct PreviewOptions {
     pub burn_titles: bool,
     pub burn_narration: bool,
+    pub burn_captions: bool,
     /// Bring every clip to the same loudness. Cutting between a lav at -20 dB and a room mic at
     /// -33 dB is jarring however good each one is on its own.
     pub normalize_audio: bool,
@@ -111,6 +115,30 @@ pub struct PreviewOptions {
     pub speech_overrun_s: f64,
     pub out: Option<PathBuf>,
     pub cancel: Option<Arc<AtomicBool>>,
+    /// How big the frames are: a light 540p preview, or the cut's own size for a finished export.
+    pub size: RenderSize,
+}
+
+/// Output frame size of a render.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RenderSize {
+    /// 540 px tall: quick to build, for watching the cut while editing.
+    #[default]
+    Preview,
+    /// The cut's width × height (e.g. 1080×1920 for a vertical clip): what gets delivered.
+    Full,
+}
+
+impl RenderSize {
+    /// Frame size for a cut of `w`×`h`, both even (h264 needs it).
+    pub fn dimensions(self, w: u32, h: u32) -> (u32, u32) {
+        match self {
+            RenderSize::Preview => proxy_dimensions(w, h),
+            RenderSize::Full if w >= 2 && h >= 2 => (w & !1, h & !1),
+            RenderSize::Full => proxy_dimensions(w, h),
+        }
+    }
 }
 
 /// Result of rendering a timeline preview.
@@ -257,6 +285,7 @@ pub fn plan_segments(script: &Script, media: &HashMap<i64, ResolvedMedia>) -> Re
                 has_audio: res.has_audio,
                 audio_track: res.audio_track,
                 tracks: clip.tracks.clone(),
+                framing: crate::framing::effective(script, clip).cloned(),
             });
 
             timeline_start_s += dur;
@@ -344,6 +373,156 @@ pub fn generate_narration_srt(spans: &[BeatSpan]) -> String {
     srt
 }
 
+/// Format seconds into SubStation Alpha timestamp format `H:MM:SS.cc`.
+pub fn format_ass_time(sec: f64) -> String {
+    let total_cs = (sec.max(0.0) * 100.0).round() as u64;
+    let cs = total_cs % 100;
+    let total_s = total_cs / 100;
+    let s = total_s % 60;
+    let total_m = total_s / 60;
+    let m = total_m % 60;
+    let h = total_m / 60;
+    format!("{h}:{m:02}:{s:02}.{cs:02}")
+}
+
+/// Caption font size and bottom margin for a frame. A vertical frame (9:16) is watched in an app
+/// whose buttons and description cover the bottom fifth, so captions sit above that, and smaller
+/// type keeps a line to a few words on the narrow frame.
+pub fn caption_metrics(width: u32, height: u32) -> (u32, u32) {
+    let h = height as f64;
+    if height > width {
+        ((h * 0.042).round().max(12.0) as u32, (h * 0.22).round().max(10.0) as u32)
+    } else {
+        ((h * 0.055).round().max(12.0) as u32, (h * 0.08).round().max(10.0) as u32)
+    }
+}
+
+/// Break a burned title into lines that fit the frame. drawtext does not wrap, and on a narrow
+/// (9:16) frame a one-line title runs off both edges. The font size matches the title filter's
+/// `min(h/12, w/14)`; a glyph averages about 0.55 of the font size.
+pub fn wrap_title(text: &str, width: u32, height: u32) -> String {
+    let font = (height as f64 / 12.0).min(width as f64 / 14.0);
+    let max_chars = ((width as f64 * 0.9) / (font * 0.55)).floor().max(8.0) as usize;
+    let mut lines: Vec<String> = Vec::new();
+    for para in text.lines() {
+        let mut line = String::new();
+        for word in para.split_whitespace() {
+            if !line.is_empty() && line.chars().count() + 1 + word.chars().count() > max_chars {
+                lines.push(std::mem::take(&mut line));
+            }
+            if !line.is_empty() {
+                line.push(' ');
+            }
+            line.push_str(word);
+        }
+        lines.push(line);
+    }
+    lines.join("\n")
+}
+
+/// Generate Advanced SubStation Alpha (.ass) content from speech caption cues.
+pub fn generate_captions_ass(cues: &[crate::captions::Cue], width: u32, height: u32) -> String {
+    generate_captions_ass_styled(cues, width, height, None, false)
+}
+
+/// `generate_captions_ass` with a cut's caption style: position (bottom / center) and size.
+/// Sized from the shorter side so a 9:16 frame gets captions as readable as a 16:9 one.
+/// `at_seam` (a stacked layout) puts them on the middle of the frame, the seam between the two
+/// faces, where they cover neither.
+pub fn generate_captions_ass_styled(
+    cues: &[crate::captions::Cue],
+    width: u32,
+    height: u32,
+    style: Option<&crate::script::CaptionStyle>,
+    at_seam: bool,
+) -> String {
+    let scale = style.map(|s| s.size).filter(|s| *s > 0.2 && *s < 4.0).unwrap_or(1.0);
+    let basis = if height > width { (width as f64) * 0.95 } else { height as f64 };
+    let font_size = (basis * 0.055 * scale).round().max(12.0) as u32;
+    let center = at_seam || style.is_some_and(|s| s.position == "center");
+    // ASS alignment: 2 = bottom centre, 5 = middle centre (MarginV is then ignored). In 9:16 the
+    // bottom margin clears the platform UI (the lower fifth).
+    let alignment = if center { 5 } else { 2 };
+    let bottom = if height > width { 0.2 } else { 0.08 };
+    let margin_v = if center { 0 } else { ((height as f64) * bottom).round().max(10.0) as u32 };
+    let margin_h = ((width as f64) * 0.05).round().max(10.0) as u32;
+
+    let mut ass = format!(
+        "[Script Info]\n\
+         ScriptType: v4.00+\n\
+         PlayResX: {width}\n\
+         PlayResY: {height}\n\
+         ScaledBorderAndShadow: yes\n\n\
+         [V4+ Styles]\n\
+         Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n\
+         Style: Default,Arial,{font_size},&H00FFFFFF,&H000000FF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,3,1.5,{alignment},{margin_h},{margin_h},{margin_v},1\n\n\
+         [Events]\n\
+         Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+    );
+
+    for cue in cues {
+        let start = format_ass_time(cue.start_s);
+        let end = format_ass_time(cue.end_s);
+        let mut lines: Vec<&str> = cue.text.lines().collect();
+        if lines.len() > 2 {
+            lines.truncate(2);
+        }
+        let text = lines.join("\\N");
+        use std::fmt::Write;
+        writeln!(&mut ass, "Dialogue: 0,{start},{end},Default,,0,0,0,,{text}").unwrap();
+    }
+
+    ass
+}
+
+/// Greedy word wrap to lines of at most `max` characters (a longer word gets its own line).
+pub fn wrap_words(text: &str, max: usize) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    for word in text.split_whitespace() {
+        match lines.last_mut() {
+            Some(l) if l.chars().count() + 1 + word.chars().count() <= max => {
+                l.push(' ');
+                l.push_str(word);
+            }
+            _ => lines.push(word.to_string()),
+        }
+    }
+    lines.join("\n")
+}
+
+/// Assemble the `-vf` filtergraph for titles, narration subtitles, and speech captions.
+pub fn build_burn_filtergraph(
+    titles: &[(String, f64, f64)],
+    font: Option<&str>,
+    narration_path: Option<&str>,
+    captions_path: Option<&str>,
+    _captions_margin_v: u32,
+    narration_margin_v: u32,
+) -> String {
+    let font_clause = font.map(|f| format!(":font={f}")).unwrap_or_default();
+    let mut filters: Vec<String> = titles
+        .iter()
+        .map(|(file, start, end)| {
+            format!(
+                "drawtext=textfile={file}{font_clause}:expansion=none:enable='between(t,{start:.3},{end:.3})':\
+                 fontsize='min(h/12,w/14)':fontcolor=white:box=1:boxcolor=black@0.5:boxborderw=12:\
+                 x=(w-text_w)/2:y=h*0.08"
+            )
+        })
+        .collect();
+    if let Some(narration) = narration_path {
+        if captions_path.is_some() {
+            filters.push(format!("subtitles={narration}:force_style='MarginV={narration_margin_v}'"));
+        } else {
+            filters.push(format!("subtitles={narration}"));
+        }
+    }
+    if let Some(captions) = captions_path {
+        filters.push(format!("subtitles={captions}"));
+    }
+    filters.join(",")
+}
+
 /// Escape a file path for use as an *unquoted* filter option value inside a `-vf` filtergraph
 /// (e.g. `subtitles=<escaped>` or `drawtext=textfile=<escaped>`).
 ///
@@ -423,6 +602,25 @@ pub fn preview_plan(db: &Db, script_id: i64) -> Result<Vec<PlannedSegment>, Erro
     plan_segments(&stored.script, &media)
 }
 
+/// Where a script version's preview is rendered unless the caller picks a path.
+pub fn default_preview_path(data_dir: &Path, script_id: i64, version: i64) -> PathBuf {
+    data_dir.join("previews").join(format!("script_{script_id}_v{version}.mp4"))
+}
+
+/// Delete the default preview render of a script version, and its caption sidecar. Best effort:
+/// a file that is already gone is fine. Used when the script row is purged, so a later script
+/// that reuses the id never picks up the old render.
+pub fn remove_default_preview(data_dir: &Path, script_id: i64, version: i64) {
+    let mp4 = default_preview_path(data_dir, script_id, version);
+    for path in [mp4.with_extension("srt"), mp4] {
+        if let Err(e) = std::fs::remove_file(&path)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!("cannot remove preview {}: {e}", path.display());
+        }
+    }
+}
+
 /// Check if an existing preview MP4 render exists on disk for this script.
 pub fn find_preview(db: &Db, data_dir: &Path, script_id: i64) -> Result<Option<PathBuf>, Error> {
     let path: Option<String> = db
@@ -442,7 +640,7 @@ pub fn find_preview(db: &Db, data_dir: &Path, script_id: i64) -> Result<Option<P
     }
 
     if let Ok(stored) = script::load(db, script_id) {
-        let candidate = data_dir.join("previews").join(format!("script_{}_v{}.mp4", stored.id, stored.version));
+        let candidate = default_preview_path(data_dir, stored.id, stored.version);
         if candidate.is_file() {
             return Ok(Some(candidate));
         }
@@ -467,7 +665,7 @@ pub fn render_preview(
     let project_fps = stored.script.fps.unwrap_or_else(|| Fps::new(project.fps_num, project.fps_den));
     let proj_w = stored.script.width.unwrap_or(project.width) as u32;
     let proj_h = stored.script.height.unwrap_or(project.height) as u32;
-    let (proxy_w, proxy_h) = proxy_dimensions(proj_w, proj_h);
+    let (proxy_w, proxy_h) = opts.size.dimensions(proj_w, proj_h);
 
     let media = otio::resolve_media_for_script(db, stored.project_id, &stored.script, project_fps)?;
     let segments = plan_segments(&stored.script, &media)?;
@@ -493,6 +691,8 @@ pub fn render_preview(
         })
         .collect();
     let encoder = pick_encoder(ffmpeg);
+    // A cut that carries a caption style (clips do) always burns its speech captions.
+    let burn_captions = opts.burn_captions || stored.script.captions.is_some();
 
     let proxies_dir = data_dir.join("proxies");
     std::fs::create_dir_all(&proxies_dir).map_err(|e| Error::Io(proxies_dir.clone(), e))?;
@@ -500,7 +700,7 @@ pub fn render_preview(
     std::fs::create_dir_all(&previews_dir).map_err(|e| Error::Io(previews_dir.clone(), e))?;
 
     let out_path =
-        opts.out.clone().unwrap_or_else(|| previews_dir.join(format!("script_{}_v{}.mp4", stored.id, stored.version)));
+        opts.out.clone().unwrap_or_else(|| default_preview_path(data_dir, stored.id, stored.version));
     if let Some(parent) = out_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| Error::Io(parent.to_path_buf(), e))?;
     }
@@ -512,9 +712,9 @@ pub fn render_preview(
     let mut proxy_paths = Vec::new();
 
     let g_val = project_fps.as_f64().round().max(1.0) as i64;
-    let vf = format!(
-        "scale={proxy_w}:{proxy_h}:force_original_aspect_ratio=decrease,pad={proxy_w}:{proxy_h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps={}/{},format=yuv420p",
-        project_fps.num, project_fps.den
+    let fps_tail = format!("fps={}/{},format=yuv420p", project_fps.num, project_fps.den);
+    let letterbox_vf = format!(
+        "scale={proxy_w}:{proxy_h}:force_original_aspect_ratio=decrease,pad={proxy_w}:{proxy_h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1,{fps_tail}"
     );
 
     for (i, seg) in segments.iter().enumerate() {
@@ -526,7 +726,27 @@ pub fn render_preview(
             .get(&seg.video_id)
             .ok_or_else(|| Error::NotFound(format!("resolved media for video #{}", seg.video_id)))?;
 
-        let p_name = proxy_file_name_with_audio(
+        // A framed clip is cropped along its path instead of letterboxed; the path is part of
+        // the proxy's name, so moving a face or changing the layout builds a new one.
+        let plan = match &seg.framing {
+            Some(fr) => crate::framing::plan_clip(
+                db,
+                Some(ffmpeg),
+                Some(&seg.path),
+                seg.video_id,
+                seg.in_s,
+                seg.out_s,
+                fr,
+                proj_w as f64,
+                proj_h as f64,
+            )?,
+            None => None,
+        };
+        let vf = match &plan {
+            Some(p) => format!("{},{fps_tail}", p.ffmpeg_filter(proxy_w, proxy_h)),
+            None => letterbox_vf.clone(),
+        };
+        let mut p_name = proxy_file_name_with_audio(
             &res.content_hash,
             seg.in_s,
             seg.out_s,
@@ -539,6 +759,9 @@ pub fn render_preview(
             // sounding version replayed whichever one was built first after a mute toggle.
             if seg.mute { Some(&[]) } else { seg.tracks.as_deref() },
         );
+        if let Some(p) = &plan {
+            p_name = p_name.replace(".mp4", &format!("_f{}.mp4", p.digest()));
+        }
         let p_path = proxies_dir.join(p_name);
 
         let exists_and_non_empty = p_path.is_file() && std::fs::metadata(&p_path).map(|m| m.len() > 0).unwrap_or(false);
@@ -635,7 +858,8 @@ pub fn render_preview(
             ]);
             cmd.arg(&tmp_path);
 
-            let out = cmd.output().map_err(|e| Error::Preview(format!("failed to run ffmpeg for proxy: {e}")))?;
+            let out = crate::cancel::output(&mut cmd, opts.cancel.as_ref())
+                .map_err(ffmpeg_err("failed to run ffmpeg for proxy"))?;
             if !out.status.success() {
                 let stderr = String::from_utf8_lossy(&out.stderr);
                 let tail =
@@ -667,9 +891,15 @@ pub fn render_preview(
     }
     std::fs::write(&concat_list_path, concat_content).map_err(|e| Error::Io(concat_list_path.clone(), e))?;
 
+    let cues = if burn_captions || opts.out.is_some() {
+        crate::captions::cues_for_script(db, &stored.script)?
+    } else {
+        Vec::new()
+    };
+    let has_captions = burn_captions && !cues.is_empty();
     let has_titles = opts.burn_titles && beat_spans.iter().any(|b| b.on_screen_text.is_some());
     let has_narration = opts.burn_narration && beat_spans.iter().any(|b| b.narration.is_some());
-    let burn_pass_needed = has_titles || has_narration;
+    let burn_pass_needed = has_titles || has_narration || has_captions;
 
     let bed_pass_needed = !bed_spans.is_empty();
     let concat_output = if burn_pass_needed || bed_pass_needed {
@@ -680,16 +910,18 @@ pub fn render_preview(
 
     on_progress(0.86, "Concatenating segments…");
 
-    let concat_res = crate::proc::std_command(ffmpeg)
-        .args(["-y", "-f", "concat", "-safe", "0", "-i"])
-        .arg(&concat_list_path)
-        .args(["-c", "copy", "-movflags", "+faststart"])
-        .arg(&concat_output)
-        .output();
+    let concat_res = crate::cancel::output(
+        crate::proc::std_command(ffmpeg)
+            .args(["-y", "-f", "concat", "-safe", "0", "-i"])
+            .arg(&concat_list_path)
+            .args(["-c", "copy", "-movflags", "+faststart"])
+            .arg(&concat_output),
+        opts.cancel.as_ref(),
+    );
 
     let _ = std::fs::remove_file(&concat_list_path);
 
-    let concat_out = concat_res.map_err(|e| Error::Preview(format!("failed to spawn ffmpeg concat: {e}")))?;
+    let concat_out = concat_res.map_err(ffmpeg_err("failed to spawn ffmpeg concat"))?;
     if !concat_out.status.success() {
         let stderr = String::from_utf8_lossy(&concat_out.stderr);
         let tail = stderr.lines().rev().take(10).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
@@ -782,7 +1014,8 @@ pub fn render_preview(
         cmd.args(["-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2", "-movflags", "+faststart"]);
         cmd.arg(&mixed);
 
-        let mix_out = cmd.output().map_err(|e| Error::Preview(format!("failed to spawn audio bed mix: {e}")))?;
+        let mix_out = crate::cancel::output(&mut cmd, opts.cancel.as_ref())
+            .map_err(ffmpeg_err("failed to spawn audio bed mix"))?;
         for (wav, _) in &bed_files {
             let _ = std::fs::remove_file(wav);
         }
@@ -799,67 +1032,70 @@ pub fn render_preview(
 
     // Burn pass (if requested and content exists)
     if burn_pass_needed {
-        on_progress(0.88, "Burning titles and narration…");
+        on_progress(0.88, "Burning titles, subtitles and captions…");
 
-        // Title texts go through `textfile=` (no text escaping pitfalls) with `expansion=none`, so
-        // `%` in a title is literal.
         let mut temp_files_to_remove = Vec::new();
-        let mut titles = Vec::new(); // (escaped textfile path, start, end)
-        if has_titles {
-            for (i, span) in beat_spans.iter().enumerate() {
-                if let Some(text) = &span.on_screen_text {
-                    let tmp_txt = previews_dir.join(format!("title_{}_{i}_{}.txt", stored.id, std::process::id()));
-                    std::fs::write(&tmp_txt, text).map_err(|e| Error::Io(tmp_txt.clone(), e))?;
-                    titles.push((escape_filter_path(&tmp_txt), span.start_s, span.end_s));
-                    temp_files_to_remove.push(tmp_txt);
-                }
-            }
-        }
         let srt_escaped = if has_narration {
             let srt_path = out_path.parent().unwrap_or(Path::new(".")).join("narration.srt");
             std::fs::write(&srt_path, generate_narration_srt(&beat_spans))
                 .map_err(|e| Error::Io(srt_path.clone(), e))?;
+            temp_files_to_remove.push(srt_path.clone());
             Some(escape_filter_path(&srt_path))
         } else {
             None
         };
-
-        let filtergraph = |font: Option<&str>| {
-            let font = font.map(|f| format!(":font={f}")).unwrap_or_default();
-            let mut filters: Vec<String> = titles
-                .iter()
-                .map(|(file, start, end)| {
-                    format!(
-                        "drawtext=textfile={file}{font}:expansion=none:enable='between(t,{start:.3},{end:.3})':\
-                         fontsize=h/12:fontcolor=white:box=1:boxcolor=black@0.5:boxborderw=12:\
-                         x=(w-text_w)/2:y=h*0.08"
-                    )
-                })
-                .collect();
-            if let Some(srt) = &srt_escaped {
-                filters.push(format!("subtitles={srt}"));
+        // Titles and captions share one ASS file, each line at an explicit position, laid out
+        // exactly as the editor's live viewer draws them.
+        let overlays_escaped = if has_titles || has_captions {
+            let mut ov = crate::overlays::layout(&stored.script, if has_captions { &cues } else { &[] });
+            if !has_titles {
+                ov.titles.clear();
             }
-            filters.join(",")
+            let ass_path = out_path
+                .parent()
+                .unwrap_or(Path::new("."))
+                .join(format!("overlays_{}_{}.ass", stored.id, std::process::id()));
+            std::fs::write(&ass_path, crate::overlays::to_ass(&ov, proxy_w, proxy_h))
+                .map_err(|e| Error::Io(ass_path.clone(), e))?;
+            temp_files_to_remove.push(ass_path.clone());
+            Some(escape_filter_path(&ass_path))
+        } else {
+            None
         };
+
+        let (caption_font_size, captions_margin_v) = caption_metrics(proxy_w, proxy_h);
+        let narration_margin_v = captions_margin_v + (caption_font_size as f64 * 2.2).round() as u32 + 10;
+
+        // Narration moves up out of the captions' way only when captions are burnt.
+        let mut graph = build_burn_filtergraph(
+            &[],
+            None,
+            srt_escaped.as_deref(),
+            overlays_escaped.as_deref().filter(|_| has_captions),
+            captions_margin_v,
+            narration_margin_v,
+        );
+        if let Some(ov) = overlays_escaped.as_deref().filter(|_| !has_captions) {
+            if !graph.is_empty() {
+                graph.push(',');
+            }
+            graph.push_str(&format!("subtitles={ov}"));
+        }
         let burn = |graph: String| {
             let mut cmd = crate::proc::std_command(ffmpeg);
             cmd.args(["-y", "-i"]).arg(&burn_input).args(["-vf", &graph]);
             cmd.args(&encoder.args);
             cmd.args(["-c:a", "copy", "-movflags", "+faststart"]).arg(&out_path);
-            cmd.output()
+            crate::cancel::output(&mut cmd, opts.cancel.as_ref())
         };
 
-        let mut burn_res = burn(filtergraph(None));
-        // No default fontconfig match for drawtext: retry naming a generic family.
-        if has_titles && !matches!(&burn_res, Ok(o) if o.status.success()) {
-            burn_res = burn(filtergraph(Some("Sans")));
-        }
+        let burn_res = burn(graph);
         for tmp in &temp_files_to_remove {
             let _ = std::fs::remove_file(tmp);
         }
         let _ = std::fs::remove_file(&burn_input);
 
-        let burn_out = burn_res.map_err(|e| Error::Preview(format!("failed to spawn burn pass: {e}")))?;
+        let burn_out = burn_res.map_err(ffmpeg_err("failed to spawn burn pass"))?;
         if !burn_out.status.success() {
             let stderr = String::from_utf8_lossy(&burn_out.stderr);
             let tail =
@@ -868,12 +1104,21 @@ pub fn render_preview(
         }
     }
 
+    // Sidecar .srt for export when burn_captions is on
+    if burn_captions && opts.out.is_some() {
+        let sidecar_path = out_path.with_extension("srt");
+        let srt_text = crate::captions::to_srt(&cues);
+        std::fs::write(&sidecar_path, srt_text).map_err(|e| Error::Io(sidecar_path.clone(), e))?;
+    }
+
     // Insert exports row
     let now = crate::projects::now();
     db.conn.execute(
         "INSERT INTO exports(script_id, format, path, created_at) VALUES (?1, 'preview_mp4', ?2, ?3)",
         params![stored.id, out_path.to_string_lossy(), now],
     )?;
+    // Our own output: a scan of a folder it is saved into must not index it as footage.
+    crate::index::record_render(db, &out_path, Some(stored.id))?;
 
     on_progress(1.0, "Ready");
 
@@ -1124,6 +1369,17 @@ pub async fn playback_proxy_with_progress(
     Ok(out)
 }
 
+/// An ffmpeg call's I/O error as a render error: a stop stays a stop (`preview: cancelled`).
+fn ffmpeg_err(what: &'static str) -> impl Fn(std::io::Error) -> Error {
+    move |e| {
+        if crate::cancel::is_cancel_io(&e) {
+            Error::Preview("cancelled".into())
+        } else {
+            Error::Preview(format!("{what}: {e}"))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1137,6 +1393,11 @@ mod tests {
         // 1.51s = 37.75 frames -> rounds to 38 frames = 1.52s
         // Beat 2: clip 3 (5.0..7.0) -> 2.0s = 50 frames
         let script = Script {
+            framing: None,
+            captions: None,
+            title_style: None,
+            caption_edits: Vec::new(),
+            agents: None,
             title: "Plan Test".into(),
             target_duration_s: Some(5.0),
             fps: Some(Fps::new(25, 1)),
@@ -1148,8 +1409,10 @@ mod tests {
                     purpose: "intro".into(),
                     narration: Some("Voice 1".into()),
                     on_screen_text: Some("Title 1".into()),
+                    title_layout: None,
                     clips: vec![
                         script::ScriptClip {
+                            framing: None,
                             video_id: 1,
                             in_s: 0.0,
                             out_s: 1.0,
@@ -1158,6 +1421,7 @@ mod tests {
                             tracks: None,
                         },
                         script::ScriptClip {
+                            framing: None,
                             video_id: 2,
                             in_s: 2.0,
                             out_s: 3.51,
@@ -1174,7 +1438,9 @@ mod tests {
                     purpose: "body".into(),
                     narration: Some("Voice 2".into()),
                     on_screen_text: None,
+                    title_layout: None,
                     clips: vec![script::ScriptClip {
+                        framing: None,
                         video_id: 1,
                         in_s: 5.0,
                         out_s: 7.0,
@@ -1266,6 +1532,15 @@ mod tests {
         assert_eq!(proxy_dimensions(1080, 1920), (304, 540));
         assert_eq!(proxy_dimensions(1440, 1080), (720, 540));
         assert_eq!(proxy_dimensions(640, 480), (720, 540));
+    }
+
+    #[test]
+    fn a_full_render_keeps_the_cut_size_and_a_preview_stays_light() {
+        // A vertical clip exported for delivery is 1080x1920, not the 304x540 preview.
+        assert_eq!(RenderSize::Full.dimensions(1080, 1920), (1080, 1920));
+        assert_eq!(RenderSize::Preview.dimensions(1080, 1920), (304, 540));
+        assert_eq!(RenderSize::Full.dimensions(1081, 1921), (1080, 1920));
+        assert_eq!(RenderSize::default(), RenderSize::Preview);
     }
 
     /// Two clips that differ only in how their audio was treated are different files: a proxy
@@ -1505,6 +1780,11 @@ mod tests {
         // Beat 1: clip A (0.5..2.5, duration 2.0s), audio=source, with on_screen_text + narration
         // Beat 2: clip B (0.0..1.5, duration 1.5s)
         let script = Script {
+            framing: None,
+            captions: None,
+            title_style: None,
+            caption_edits: Vec::new(),
+            agents: None,
             title: "Preview Integration".into(),
             target_duration_s: Some(3.5),
             fps: Some(Fps::new(25, 1)),
@@ -1516,7 +1796,9 @@ mod tests {
                     purpose: "intro".into(),
                     narration: Some("Narration for Beat 1".into()),
                     on_screen_text: Some("Preview Title".into()),
+                    title_layout: None,
                     clips: vec![script::ScriptClip {
+                        framing: None,
                         video_id: 1,
                         in_s: 0.5,
                         out_s: 2.5,
@@ -1532,7 +1814,9 @@ mod tests {
                     purpose: "outro".into(),
                     narration: None,
                     on_screen_text: None,
+                    title_layout: None,
                     clips: vec![script::ScriptClip {
+                        framing: None,
                         video_id: 2,
                         in_s: 0.0,
                         out_s: 1.5,
@@ -1575,11 +1859,13 @@ mod tests {
             &PreviewOptions {
                 burn_titles: true,
                 burn_narration: true,
+                burn_captions: false,
                 normalize_audio: false,
                 audio_fade_s: 0.12,
                 speech_overrun_s: 0.35,
                 out: Some(burned_out.clone()),
                 cancel: None,
+                size: RenderSize::Preview,
             },
             |_, _| {},
         )
@@ -1587,8 +1873,81 @@ mod tests {
         assert_eq!(res3.path, burned_out);
         assert!(burned_out.is_file());
 
-        // Probe both outputs with ffprobe
-        for file in [&res1.path, &burned_out] {
+        // Fourth render with burn_titles + burn_captions + sidecar .srt export
+        db.conn
+            .execute(
+                "INSERT INTO transcript_segments(video_id, start_s, end_s, text)
+                 VALUES (1, 0.5, 2.5, 'Captioned beat 1')",
+                [],
+            )
+            .unwrap();
+        let export_out = data_dir.join("export_captions.mp4");
+        let res4 = render_preview(
+            &db,
+            temp.path(),
+            &ffmpeg,
+            script_id,
+            &PreviewOptions {
+                burn_titles: true,
+                burn_narration: false,
+                burn_captions: true,
+                normalize_audio: false,
+                audio_fade_s: 0.12,
+                speech_overrun_s: 0.35,
+                out: Some(export_out.clone()),
+                cancel: None,
+                size: RenderSize::Preview,
+            },
+            |_, _| {},
+        )
+        .unwrap();
+        assert_eq!(res4.path, export_out);
+        assert!(export_out.is_file());
+        let sidecar_srt = export_out.with_extension("srt");
+        assert!(sidecar_srt.is_file(), "sidecar .srt must exist next to export MP4");
+        let srt_text = std::fs::read_to_string(&sidecar_srt).unwrap();
+        assert!(srt_text.contains("Captioned beat 1"));
+
+        // Fifth: a moved, restyled title and a hand-edited caption burn, and the sidecar keeps the edit.
+        let mut edited = script.clone();
+        edited.beats[0].title_layout = Some(script::TitleLayout {
+            start_s: Some(0.5),
+            end_s: Some(1.5),
+            x: Some(0.06),
+            y: Some(0.78),
+            style: Some(script::TextStyle { align: Some("left".into()), bold: Some(true), ..Default::default() }),
+        });
+        edited.captions = Some(script::CaptionStyle { y: Some(0.3), ..Default::default() });
+        edited.caption_edits = vec![script::CueEdit {
+            video_id: 1,
+            src_start_s: 0.5,
+            src_end_s: 2.5,
+            text: Some("Edited {caption}".into()),
+            start_s: Some(1.0),
+            end_s: None,
+            hidden: false,
+        }];
+        let edited_id = script::save_version(&db, project.id, &edited, None).unwrap();
+        let edited_out = data_dir.join("edited.mp4");
+        render_preview(
+            &db,
+            temp.path(),
+            &ffmpeg,
+            edited_id,
+            &PreviewOptions {
+                burn_titles: true,
+                burn_captions: true,
+                out: Some(edited_out.clone()),
+                ..PreviewOptions::default()
+            },
+            |_, _| {},
+        )
+        .unwrap();
+        let srt_text = std::fs::read_to_string(edited_out.with_extension("srt")).unwrap();
+        assert!(srt_text.contains("00:00:00,500 --> 00:00:02,000\nEdited {caption}"), "{srt_text}");
+
+        // Probe outputs with ffprobe
+        for file in [&res1.path, &burned_out, &export_out] {
             let probe_out = crate::proc::std_command(&ffprobe)
                 .args([
                     "-v",
@@ -1624,6 +1983,54 @@ mod tests {
         assert_eq!(encoding_progress("out_time_us=1000000", None), Some((1.0, None)));
         assert_eq!(encoding_progress("out_time_us=N/A", Some(10.0)), None);
         assert_eq!(encoding_progress("out_time_us=NaN", Some(10.0)), None);
+    }
+
+    #[test]
+    fn titles_wrap_for_narrow_frames() {
+        assert_eq!(wrap_words("Mi tiempo vale más que diez dólares", 16), "Mi tiempo vale\nmás que diez\ndólares");
+        assert_eq!(wrap_words("corto", 16), "corto");
+    }
+
+    #[test]
+    fn test_burn_captions_filtergraph_and_timing() {
+        let cues = vec![
+            crate::captions::Cue { start_s: 1.25, end_s: 3.5, text: "First line\nSecond line".into(), ..Default::default() },
+            crate::captions::Cue { start_s: 4.0, end_s: 6.75, text: "Single line caption".into(), ..Default::default() },
+        ];
+
+        // 1. ASS text has the right times and formatting
+        let ass = generate_captions_ass(&cues, 960, 540);
+        assert!(ass.contains("Dialogue: 0,0:00:01.25,0:00:03.50,Default,,0,0,0,,First line\\NSecond line"));
+        assert!(ass.contains("Dialogue: 0,0:00:04.00,0:00:06.75,Default,,0,0,0,,Single line caption"));
+        assert!(ass.contains("PlayResX: 960"));
+        assert!(ass.contains("PlayResY: 540"));
+        // Style check: bold, white, black outline 3, margin_v ~ 8% of 540 = 43, font size ~ 5.5% of 540 = 30
+        assert!(ass.contains("Style: Default,Arial,30,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,3,1.5,2,48,48,43,1"));
+
+        // SRT text has the right times
+        let srt = crate::captions::to_srt(&cues);
+        assert!(srt.contains("1\n00:00:01,250 --> 00:00:03,500\nFirst line\nSecond line\n\n"));
+        assert!(srt.contains("2\n00:00:04,000 --> 00:00:06,750\nSingle line caption\n\n"));
+
+        // 2. Filtergraph with burn_captions on and cues exist
+        let cap_path = "escaped_captions.ass";
+        let narr_path = "escaped_narration.srt";
+        let fg_captions_only = build_burn_filtergraph(&[], None, None, Some(cap_path), 43, 119);
+        assert!(fg_captions_only.contains("subtitles=escaped_captions.ass"));
+        assert!(!fg_captions_only.contains("subtitles=escaped_narration.srt"));
+
+        // 3. Filtergraph when burn_captions is off (no captions)
+        let fg_narr_only = build_burn_filtergraph(&[], None, Some(narr_path), None, 43, 119);
+        assert!(!fg_narr_only.contains("escaped_captions.ass"));
+        assert!(fg_narr_only.contains("subtitles=escaped_narration.srt"));
+        assert!(!fg_narr_only.contains("force_style='MarginV=119'"));
+
+        // 4. Captions + narration together use different MarginV
+        let fg_both = build_burn_filtergraph(&[], None, Some(narr_path), Some(cap_path), 43, 119);
+        assert!(fg_both.contains("subtitles=escaped_narration.srt:force_style='MarginV=119'"));
+        assert!(fg_both.contains("subtitles=escaped_captions.ass"));
+        // Captions ASS uses MarginV 43, narration uses MarginV 119
+        assert_ne!(43, 119);
     }
 
     #[tokio::test]

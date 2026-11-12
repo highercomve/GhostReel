@@ -455,6 +455,24 @@ td.name {
   border-color: var(--warn);
 }
 
+.tag.good {
+  color: var(--good);
+  border-color: color-mix(in srgb, var(--good) 60%, transparent);
+  background: color-mix(in srgb, var(--good) 14%, transparent);
+}
+
+.tag.accent {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 60%, transparent);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+}
+
+.tag.muted {
+  color: var(--muted);
+  border-color: var(--border);
+  background: transparent;
+}
+
 .good-text {
   color: var(--good);
 }
@@ -2132,7 +2150,9 @@ form.rename input { font-size: 1.6rem; font-weight: 700; padding: 2px 8px; min-w
   position: absolute;
   top: calc(100% + 6px);
   right: 0;
-  min-width: 260px;
+  min-width: 320px;
+  max-height: calc(100vh - 80px);
+  overflow-y: auto;
   background: var(--panel);
   border: 1px solid var(--border);
   border-radius: 10px;
@@ -2266,6 +2286,51 @@ form.rename input { font-size: 1.6rem; font-weight: 700; padding: 2px 8px; min-w
   height: 1px;
   background: var(--border);
   margin: 4px 0;
+}
+
+.project-menu-stage-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 5px 10px;
+  gap: 10px;
+}
+
+.project-menu-stage-info {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  flex: 1;
+}
+
+.project-menu-stage-name {
+  font-size: 13px;
+  color: var(--text);
+  white-space: nowrap;
+}
+
+.project-menu-stage-link {
+  font-size: 11px;
+  color: var(--accent);
+  background: none;
+  border: none;
+  padding: 0;
+  text-decoration: underline;
+  cursor: pointer;
+  text-align: right;
+  line-height: 1.25;
+}
+
+.project-menu-stage-link:hover {
+  color: var(--text);
+}
+
+.project-menu-hint {
+  font-size: 11px;
+  color: var(--muted);
+  line-height: 1.35;
+  padding: 2px 10px 6px 35px;
 }
 
 .prompt-editor { width: 100%; min-height: 460px; font-family: ui-monospace, monospace; font-size: 0.85rem; line-height: 1.45; resize: vertical; box-sizing: border-box; }
@@ -3555,7 +3620,8 @@ pre.cli-test-result { background: var(--panel, #171a21); border: 1px solid var(-
   flex-direction: column;
   z-index: 1000;
   backdrop-filter: blur(14px);
-  animation: sonar-fly-in 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+  /* No fly-in transform: WebKitGTK can leave the first animation frame applied when the window
+     has not painted yet (app start), which left the panel shifted past the window's right edge. */
   overflow: hidden;
   padding: 0;
 }
@@ -3572,10 +3638,6 @@ pre.cli-test-result { background: var(--panel, #171a21); border: 1px solid var(-
   box-shadow: -6px 0 30px rgba(0, 0, 0, 0.45);
 }
 
-@keyframes sonar-fly-in {
-  from { transform: translateX(40px); opacity: 0; }
-  to { transform: translateX(0); opacity: 1; }
-}
 
 .nle-sonar-header {
   display: flex;
@@ -4163,6 +4225,10 @@ main.project-workspace.editor-mode {
   text-transform: uppercase;
   color: var(--muted);
 }
+.nle-issue-item { display: flex; flex-direction: column; gap: 4px; }
+.nle-issue-fixes { display: flex; flex-wrap: wrap; gap: 4px; padding-left: 7px; }
+.nle-issue-fixes button { font-size: 11px; padding: 2px 8px; }
+.nle-repair-notes { padding: 4px 2px; }
 .nle-issue {
   display: flex;
   align-items: flex-start;
@@ -4310,7 +4376,7 @@ main.nle-main-canvas { max-width: none; margin: 0; padding: 0; }
 .composer-options .composer-model-select,
 .composer-options .composer-model-input { max-width: none; width: 100%; box-sizing: border-box; padding: 5px 8px; font-size: 12px; }
 .composer-options .composer-think-label { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text); }
-.composer-options .composer-budget-input { width: 5em; }
+.composer-options .composer-budget-input { width: 6.5em; }
 .composer-style-row { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
 .composer-go { display: flex; align-items: center; gap: 10px; }
 .composer-go .composer-hint { flex: 1; min-width: 0; margin: 0; }
@@ -4614,7 +4680,7 @@ main.project-workspace.editor-mode:has(.nle-workspace-layout.sonar-docked) { pad
 }
 
 /* Editor and floating Sonar share one row under the toolbar, so the drawer never covers it. */
-.nle-body-row { position: relative; flex: 1; min-height: 0; display: flex; align-items: stretch; }
+.nle-body-row { position: relative; flex: 1; min-height: 0; min-width: 0; display: flex; align-items: stretch; }
 .nle-body-row > .nle-main-canvas { flex: 1 1 auto; min-width: 0; width: auto; }
 .nle-body-row > .nle-sonar-overlay:not(.docked) {
   position: absolute;
@@ -4717,7 +4783,8 @@ button.ghost.nle-sonar-icon-btn:hover:not(:disabled) { color: var(--text); backg
   border-radius: 8px;
 }
 .composer-method.on,
-.nle-method-card.on { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, var(--panel)); }
+.nle-method-card.on,
+.nle-method-card.on:hover:not(:disabled) { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, var(--panel)); }
 .composer-method:disabled,
 .nle-method-card:disabled { opacity: 0.5; cursor: not-allowed; }
 .composer-method.blocked:not(.on) { opacity: 0.6; }
@@ -4816,7 +4883,10 @@ button.ghost.nle-sonar-icon-btn:hover:not(:disabled) { color: var(--text); backg
 .nle-method-card.on .nle-method-icon { color: var(--accent); }
 .nle-preset-row { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 14px; }
 .nle-preset-chip { padding: 4px 11px; border-radius: 999px; font-size: 12px; font-weight: 500; }
-.nle-preset-chip.on { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent); }
+/* Selected stays selected under the pointer: the generic button hover (more specific) used to
+   repaint a just-clicked chip grey, so it read as unselected. */
+.nle-preset-chip.on,
+.nle-preset-chip.on:hover:not(:disabled) { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent); }
 .nle-modal-row { display: flex; gap: 12px; margin-bottom: 12px; }
 .nle-new-cut .nle-field { display: flex; flex-direction: column; min-width: 0; }
 .nle-new-cut .nle-field-grow { flex: 1 1 auto; }
@@ -5106,9 +5176,12 @@ body.nle-resizing-row, body.nle-resizing-row * { cursor: row-resize !important; 
   .sonar-visible .nle-grid:not(.nle-grid-empty) { grid-template-columns: minmax(0, 1fr); grid-template-rows: 30px minmax(0, 1fr) var(--nle-tl-h, min(290px, 43%)); }
   .sonar-visible .nle-compact-panels { display: flex; grid-row: 1; grid-column: 1; justify-content: space-between; gap: 6px; }
   .nle-compact-panels button { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
-  .sonar-visible .nle-center { grid-column: 1; grid-row: 2; }
-  .sonar-visible .nle-timeline-dock { grid-row: 3; }
-  .sonar-visible .nle-left, .sonar-visible .nle-inspector { display: none; }
+  /* Only the editing grid folds its side panels away; the no-cut grid (cut list + empty state)
+     keeps both columns, so the cut list stays reachable with Sonar open. */
+  .sonar-visible .nle-grid:not(.nle-grid-empty) > .nle-center { grid-column: 1; grid-row: 2; }
+  .sonar-visible .nle-grid:not(.nle-grid-empty) > .nle-timeline-dock { grid-row: 3; }
+  .sonar-visible .nle-grid:not(.nle-grid-empty) > .nle-left,
+  .sonar-visible .nle-grid:not(.nle-grid-empty) > .nle-inspector { display: none; }
   .sonar-visible .nle-grid[data-compact-panel="left"] > .nle-left,
   .sonar-visible .nle-grid[data-compact-panel="inspector"] > .nle-inspector { display: flex; position: absolute; top: 32px; bottom: calc(min(290px, 43%) + 6px); width: 300px; max-width: 90%; z-index: 20; box-shadow: 0 4px 16px color-mix(in srgb, var(--bg) 65%, transparent); }
   .sonar-visible .nle-left { left: 0; }
@@ -5757,3 +5830,165 @@ button.primary:disabled,
 .nle-version-more { padding-left: 34px; }
 .insp-cut-overview { grid-template-columns: minmax(0, 1fr); }
 .insp-cut-overview > li { min-width: 0; }
+
+/* People tab: one card per person (face, name tag fields, screen and speaking time). */
+.people-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  gap: 12px;
+}
+.person-card { gap: 10px; }
+.person-card.selected { border-color: var(--accent); }
+.person-card-head { display: flex; gap: 12px; align-items: flex-start; }
+.person-thumb {
+  width: 88px;
+  height: 88px;
+  flex: none;
+  border-radius: 10px;
+  object-fit: cover;
+  border: 1px solid var(--border);
+  background: var(--btn-bg);
+}
+.person-thumb-empty { display: inline-flex; align-items: center; justify-content: center; color: var(--muted); }
+.person-card-head .media-image-placeholder { width: 88px; height: 88px; min-height: 0; flex: none; border-radius: 10px; font-size: 0; }
+.person-fields { display: flex; flex-direction: column; gap: 6px; flex: 1; min-width: 0; }
+.person-fields input { width: 100%; }
+.person-fields input:first-child { font-weight: 600; }
+.person-stats { display: flex; flex-wrap: wrap; gap: 4px 14px; }
+.person-stats span { display: inline-flex; align-items: center; gap: 5px; }
+.person-actions { display: flex; justify-content: flex-end; }
+.person-actions button { display: inline-flex; align-items: center; gap: 6px; }
+.people-merge-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+  border-color: var(--accent);
+}
+/* Clips: the generate form, the clip-set row in the cuts list, and the clip grid. */
+.nle-new-cut .nle-method-cards { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+@media (max-width: 640px) {
+  .nle-new-cut .nle-method-cards { grid-template-columns: 1fr; }
+}
+.clips-form { display: flex; flex-direction: column; gap: 4px; }
+.clips-form .nle-modal-row .nle-field { flex: 1 1 0; }
+.clips-form input[type="number"] { width: 100%; }
+.clips-videos { margin: 4px 0 8px; }
+.clips-videos .nle-field-label { display: inline; margin-right: 8px; }
+.clips-engines { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; padding: 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); }
+.clips-check { display: inline-flex; align-items: center; gap: 8px; color: var(--text); }
+
+.clips-tasks { display: flex; flex-direction: column; gap: 6px; padding: 8px; }
+.clips-row-icon { flex: 0 0 26px; display: inline-flex; justify-content: center; padding: 8px 0 0 6px; color: var(--muted); }
+.clips-row.active > .nle-tree-row .clips-row-icon { color: var(--accent); }
+
+.nle-modal-content.clips-modal { max-width: 1100px; max-height: calc(100vh - 40px); overflow: auto; gap: 12px; padding: 20px 22px; }
+.clips-header { align-items: flex-start; gap: 16px; }
+.clips-header-text { min-width: 0; flex: 1; }
+.clips-header-text h3 { margin: 0 0 4px; font-size: 16px; overflow-wrap: anywhere; }
+.clips-header-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; align-items: center; gap: 8px; }
+.clips-grid { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 12px; }
+.clips-card { min-width: 0; gap: 8px; padding: 10px; }
+.clips-card.rejected { opacity: 0.5; }
+.clips-card.accepted { border-color: var(--good); }
+.clips-thumb { position: relative; aspect-ratio: 16 / 9; overflow: hidden; border-radius: 8px; background: var(--border); }
+.clips-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+/* A still framed as the clip's plan frames it (FramedImage): the output frame's shape, centred
+   in the thumbnail box, each crop filling its band. */
+.framed-image { position: relative; height: 100%; max-width: 100%; margin: 0 auto; display: flex; flex-direction: column; overflow: hidden; background: #000; }
+.framed-image-band { position: relative; flex: 1 1 0; min-height: 0; overflow: hidden; }
+.framed-image-band img { display: block; }
+.clips-thumb-empty { display: flex; align-items: center; justify-content: center; width: 100%; height: 100%; }
+.clips-thumb-time { position: absolute; right: 6px; bottom: 6px; padding: 1px 6px; border-radius: 6px; font-size: 11px; font-variant-numeric: tabular-nums; color: #fff; background: rgba(0, 0, 0, 0.75); }
+.clips-tags { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.clips-score { font-weight: 600; font-variant-numeric: tabular-nums; }
+.clips-tag { padding: 0 7px; border: 1px solid var(--border); border-radius: 999px; font-size: 11px; line-height: 17px; color: var(--text); }
+.clips-tag.warn { border-color: var(--warn); color: var(--warn-text); }
+.clips-source { margin-left: auto; font-variant-numeric: tabular-nums; }
+.clips-hook { font-weight: 600; line-height: 1.3; overflow-wrap: anywhere; }
+.clips-quote { margin: 0; padding-left: 8px; border-left: 2px solid var(--border); display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; overflow-wrap: anywhere; }
+.clips-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: auto; padding-top: 4px; }
+.clips-actions button.clips-accept.on { background: var(--good); border-color: var(--good); color: #0f0f15; }
+.clips-actions button.clips-reject.on { background: var(--bad); border-color: var(--bad); color: #0f0f15; }
+.clips-actions .clips-open { margin-left: auto; }
+
+/* A run (src/runs/RunLog.tsx): any long job, live or saved — in Sonar, on Activity. */
+.run-log {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel);
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: 100%;
+  min-width: 0;
+}
+.run-log.failed { border-color: color-mix(in srgb, var(--bad) 45%, var(--border)); }
+.run-log-head { display: flex; align-items: center; gap: 6px; font-size: 13px; min-width: 0; }
+.run-log-head > svg { flex: 0 0 auto; color: var(--muted); }
+/* The title gives way (ellipsis); the state chip, source and time never truncate. */
+.run-log-label { font-weight: 600; flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.run-log-state, .run-log-source { flex: 0 0 auto; }
+.run-log-state, .run-log-source {
+  font-size: 11px;
+  padding: 0 7px;
+  border-radius: 99px;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  white-space: nowrap;
+}
+.run-log-state.running, .run-log-state.done { color: var(--good); border-color: currentColor; }
+.run-log-state.failed { color: var(--bad); border-color: currentColor; }
+.run-log-time { flex: 0 0 auto; }
+.run-log-steps { list-style: none; margin: 0; padding: 0; font-size: 12px; }
+.run-log-step { line-height: 1.5; overflow-wrap: anywhere; }
+.run-log-step.running { color: var(--accent-2); }
+.run-log-step.failed .run-log-step-icon { color: var(--bad); }
+.run-log-step-icon { display: inline-flex; justify-content: center; width: 14px; margin-right: 4px; color: var(--muted); vertical-align: -1px; }
+.run-log-step-icon .research-dot { width: 6px; height: 6px; flex-basis: 6px; }
+.run-log-toggle { align-self: flex-start; display: inline-flex; align-items: center; gap: 4px; padding-left: 2px; }
+.run-log-summary { overflow-wrap: anywhere; }
+.run-log-links { display: flex; flex-wrap: wrap; gap: 6px; }
+.chat-message-row.run { width: 100%; }
+/* Thread items never shrink to fit: in a height-limited scrolling column they would otherwise be
+   squeezed below their content (WebKitGTK does) and draw over the next one. */
+.chat-messages > * { flex-shrink: 0; }
+.run-log > * { flex-shrink: 0; min-width: 0; }
+.run-log-events { list-style: none; margin: 2px 0 2px 18px; padding: 0; display: flex; flex-direction: column; gap: 2px; }
+.run-log-event { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 6px; color: var(--muted); overflow-wrap: anywhere; }
+.run-log-event.level-warning { color: var(--text); }
+.run-log-failure { padding: 6px 8px; border-radius: 8px; border: 1px solid color-mix(in srgb, var(--bad) 35%, var(--border)); background: color-mix(in srgb, var(--bad) 6%, var(--panel)); }
+.run-log-error { overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden; }
+.task-details .run-log-steps { margin-top: 6px; }
+.runs-history { display: flex; flex-direction: column; gap: 8px; }
+/* Preflight checks before a run (src/runs/PreflightList.tsx), in any run's form.. */
+.preflight-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; font-size: 12px; }
+.preflight-item { display: flex; gap: 6px; align-items: flex-start; min-width: 0; overflow-wrap: anywhere; }
+.preflight-item > svg { flex: 0 0 auto; margin-top: 2px; }
+.preflight-item.level-warn > svg { color: var(--warn); }
+.preflight-item.level-error > svg { color: var(--bad); }
+.preflight-text { display: inline-flex; flex-wrap: wrap; align-items: baseline; gap: 4px 6px; min-width: 0; }
+
+
+/* Cuts panel: undo right after a delete, and Recently deleted (core's trash). */
+.nle-undo {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 4px 8px 6px;
+  padding: 6px 6px 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel);
+  font-size: 12px;
+}
+.nle-undo-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.nle-undo .nle-field-clear { position: static; transform: none; }
+.nle-trash { border-top: 1px solid var(--border); padding: 4px 0 12px; }
+.nle-trash-toggle { display: flex; align-items: center; gap: 6px; width: 100%; justify-content: flex-start; padding: 6px 8px; }
+.nle-trash-list { list-style: none; margin: 0; padding: 0; }
+.nle-trash-item { display: flex; align-items: center; gap: 8px; padding: 6px 8px 6px 30px; }
+.nle-trash-text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.nle-trash-text .nle-tree-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

@@ -199,7 +199,7 @@ export default function StatusPage({ updater }: { updater: Updater }) {
   // The queue is the only history of indexing runs; the latest finished one dates "last run".
   const tasks = useQueue();
   const finishedRuns = tasks
-    .filter((t) => t.kind.type === "index" && t.state === "done" && t.finished_at)
+    .filter((t) => t.kind.type === "index" && (t.state === "done" || t.state === "partial") && t.finished_at)
     .map((t) => t.finished_at as number);
   const lastRun = finishedRuns.length ? Math.max(...finishedRuns) : null;
   const runningNow = tasks.some((t) => t.kind.type === "index" && isActive(t));

@@ -1,5 +1,7 @@
 //! `ghostreel` — headless GhostReel CLI.
 
+mod agents_cmd;
+mod clips_cmd;
 mod mcp;
 
 use std::io::{IsTerminal, Write};
@@ -17,8 +19,9 @@ use ghostreel_core::export::ExportFormat;
 use ghostreel_core::index::{self, Event, IndexLock};
 use ghostreel_core::paths::Paths;
 use ghostreel_core::probe::{Resolution, Target};
-use ghostreel_core::progress::{Progress, eta_text};
+use ghostreel_core::progress::{Progress, Tracker, eta_text};
 use ghostreel_core::projects::{NewProject, PipelineConfig};
+use ghostreel_core::runs::{RunLink, RunRecorder, RunState};
 use ghostreel_core::runtime;
 use ghostreel_core::script::{Audio, IssueSeverity, Script};
 use ghostreel_core::watch::FolderWatcher;
@@ -73,10 +76,10 @@ enum Command {
         /// When --redo frames is used, old keyframe files are deleted and re-extracted.
         #[arg(long, value_name = "STAGE")]
         redo: Option<String>,
-        /// Explicit stages to run (comma-separated: probe, transcribe, frames, describe, embed).
+        /// Explicit stages to run (comma-separated: probe, transcribe, frames, describe, embed, steadiness, faces, speakers).
         #[arg(long, value_delimiter = ',')]
         stages: Option<Vec<String>>,
-        /// Skip these pipeline stages (comma-separated: probe, transcribe, frames, describe, embed).
+        /// Skip these pipeline stages (comma-separated: probe, transcribe, frames, describe, embed, steadiness, faces, speakers).
         #[arg(long, value_delimiter = ',')]
         skip: Option<Vec<String>>,
         /// Shorthand to skip speech-to-text transcription.
@@ -115,6 +118,57 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Plan a vertical (or square) crop for a stretch of a video and render stills with it.
+    Crop {
+        video_id: i64,
+        from_s: f64,
+        to_s: f64,
+        /// follow_speaker, stacked or fixed.
+        #[arg(long, default_value = "follow_speaker")]
+        layout: String,
+        #[arg(long, default_value_t = 1080)]
+        width: u32,
+        #[arg(long, default_value_t = 1920)]
+        height: u32,
+        /// Follow (or hold on) this person.
+        #[arg(long)]
+        person: Option<i64>,
+        /// Where to write the stills (default: the data dir's frames/crops).
+        #[arg(long, short = 'o')]
+        out: Option<PathBuf>,
+        /// Print the whole plan (every keyframe) as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Find and track faces through video footage.
+    Faces {
+        /// Only this project's folders (default: all projects).
+        #[arg(long, short)]
+        project: Option<String>,
+        /// Re-run face tracking even on videos already processed.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Find who speaks when (by voice), group faces into people, and link each voice to a face.
+    Speakers {
+        /// Only this project (default: all projects).
+        #[arg(long, short)]
+        project: Option<String>,
+        /// Re-embed every video's voice and re-run the analysis even when nothing changed.
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// List recent runs (clip generation, indexing, renders…) from the app and the CLI.
+    Runs {
+        #[arg(long, short)]
+        project: Option<String>,
+        #[arg(long, short = 'n', default_value_t = 20)]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
     /// Show indexing progress.
     Status {
         #[arg(long, short)]
@@ -124,6 +178,22 @@ enum Command {
         videos: bool,
         #[arg(long)]
         json: bool,
+    },
+    /// The agent pool: models across backends that share the work (list, test, remove).
+    Agents {
+        #[command(subcommand)]
+        action: agents_cmd::AgentsAction,
+    },
+    /// Generate short clips from a project's footage (clip sets), list and export them.
+    Clips {
+        #[command(subcommand)]
+        action: clips_cmd::ClipsAction,
+    },
+    /// Deleted cuts, script versions and clip sets: list them and put them back. Deleting from the
+    /// app moves them here for 30 days.
+    Trash {
+        #[command(subcommand)]
+        action: TrashAction,
     },
     /// Manage and export video editing scripts.
     Script {
@@ -141,6 +211,22 @@ enum Command {
         action: Option<StorageAction>,
         #[arg(long)]
         json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum TrashAction {
+    /// List what is in the trash, newest first, with the id to restore it by.
+    List {
+        #[arg(long, short)]
+        project: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Put a deleted item back exactly as it was (all its versions or clips).
+    Restore {
+        /// The trash id (see `ghostreel trash list`).
+        id: String,
     },
 }
 
@@ -256,6 +342,28 @@ enum ScriptAction {
         #[arg(long)]
         json: bool,
     },
+    /// Check a saved script against the index as it is now and list its issues with their fixes
+    /// (numbered); apply one with --apply N, or the first fix of every warning with --all. Edits
+    /// are saved as a new version; a run_stage fix runs that indexing stage now.
+    Fix {
+        id: i64,
+        /// The fix to apply, numbered as listed.
+        #[arg(long)]
+        apply: Option<usize>,
+        /// Apply the first fix of each warning, checking again after each.
+        #[arg(long, conflicts_with = "apply")]
+        all: bool,
+        /// Apply in memory and show the result; save nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Run the deterministic framing repair on a saved script — trim a vertical clip off a screen
+    /// share at sentence edges, keep the closing hold on a face — and save it as a new version.
+    Repair {
+        id: i64,
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Export a script as an OpenTimelineIO (.otio) or Final Cut Pro 7 XML (.xml) timeline.
     Export {
         id: i64,
@@ -273,9 +381,14 @@ enum ScriptAction {
         burn_titles: bool,
         #[arg(long)]
         burn_narration: bool,
+        #[arg(long)]
+        burn_captions: bool,
         /// Bring every clip to the same loudness.
         #[arg(long)]
         normalize_audio: bool,
+        /// Render at the cut's own size (e.g. 1080x1920) instead of a light 540p preview.
+        #[arg(long)]
+        full: bool,
     },
     /// Chat with the editing agent to draft or refine a script.
     Chat {
@@ -325,17 +438,17 @@ enum ProjectAction {
         /// Disable speech-to-text transcription for this project.
         #[arg(long)]
         no_transcribe: bool,
-        /// Enabled pipeline stages (comma-separated: probe, transcribe, frames, describe, embed).
+        /// Enabled pipeline stages (comma-separated: probe, transcribe, frames, describe, embed, steadiness, faces, speakers).
         #[arg(long, value_delimiter = ',')]
         stages: Option<Vec<String>>,
     },
     /// Configure pipeline stages and settings for a project.
     Config {
         name: String,
-        /// Enable pipeline stages (comma-separated: probe, transcribe, frames, describe, embed).
+        /// Enable pipeline stages (comma-separated: probe, transcribe, frames, describe, embed, steadiness, faces, speakers).
         #[arg(long, value_delimiter = ',')]
         enable: Option<Vec<String>>,
-        /// Disable pipeline stages (comma-separated: probe, transcribe, frames, describe, embed).
+        /// Disable pipeline stages (comma-separated: probe, transcribe, frames, describe, embed, steadiness, faces, speakers).
         #[arg(long, value_delimiter = ',')]
         disable: Option<Vec<String>>,
         /// Disable speech-to-text transcription for this project.
@@ -375,6 +488,22 @@ enum ProjectAction {
         /// descriptions and vectors of footage no other project uses. Video files are untouched.
         #[arg(long)]
         purge: bool,
+    },
+    /// Manage the project's transcription glossary.
+    Glossary {
+        /// Project name.
+        project: String,
+        /// Add or update a term.
+        #[arg(long)]
+        add: Option<String>,
+        /// Mis-hearings of the term.
+        #[arg(long = "heard-as", num_args = 1..)]
+        heard_as: Vec<String>,
+        /// Remove a term.
+        #[arg(long)]
+        remove: Option<String>,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -496,11 +625,41 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
+        Command::Faces { project, force } => {
+            faces_cmd(&paths, project.as_deref(), force).await
+        }
+        Command::Speakers { project, force, json } => speakers_cmd(&paths, project.as_deref(), force, json).await,
+        Command::Crop { video_id, from_s, to_s, layout, width, height, person, out, json } => {
+            let db = open_db(&paths)?;
+            let ffmpeg = doctor::locate("ffmpeg").context("ffmpeg not found")?;
+            let framing = ghostreel_core::framing::Framing {
+                layout: layout.parse()?,
+                person_id: person,
+                box_: None,
+                overrides: Vec::new(),
+            };
+            let dir = out.unwrap_or_else(|| paths.data_dir.join("frames").join("crops"));
+            let t0 = std::time::Instant::now();
+            let (plan, stills) = ghostreel_core::framing::preview_crop(
+                &db, &ffmpeg, video_id, from_s, to_s, &framing, width, height, &dir, 4,
+            )?;
+            let value = if json { serde_json::to_value(&plan)? } else { ghostreel_core::framing::summary(&plan) };
+            println!("{}", serde_json::to_string_pretty(&value)?);
+            for (t, f) in stills {
+                println!("still {:.2}s: {}", from_s + t, f.display());
+            }
+            eprintln!("in {:.1} s", t0.elapsed().as_secs_f64());
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Mcp => {
             mcp::serve(paths).await?;
             Ok(ExitCode::SUCCESS)
         }
         Command::Script { action } => script_cmd(&paths, action).await,
+        Command::Clips { action } => clips_cmd::run(&paths, action).await,
+        Command::Agents { action } => agents_cmd::run(&paths, action).await,
+        Command::Runs { project, limit, json } => runs_cmd(&paths, project.as_deref(), limit, json),
+        Command::Trash { action } => trash_cmd(&paths, action),
         Command::Models { action } => models_cmd(&paths, action).await,
         Command::Config { action } => {
             match action {
@@ -715,7 +874,7 @@ fn fps_label(num: i64, den: i64) -> String {
 fn format_pipeline(pipeline: &PipelineConfig) -> String {
     let mut enabled = Vec::new();
     let mut disabled = Vec::new();
-    for &stage in ghostreel_core::index::STAGES {
+    for &stage in ghostreel_core::index::ALL_STAGES {
         if pipeline.is_enabled(stage) {
             enabled.push(stage);
         } else {
@@ -741,6 +900,9 @@ fn project_cmd(paths: &Paths, action: ProjectAction) -> anyhow::Result<ExitCode>
                 pipeline.frames = stages.iter().any(|s| s == "frames");
                 pipeline.describe = stages.iter().any(|s| s == "describe");
                 pipeline.embed = stages.iter().any(|s| s == "embed");
+                pipeline.steadiness = stages.iter().any(|s| s == "steadiness");
+                pipeline.faces = stages.iter().any(|s| s == "faces");
+                pipeline.speakers = stages.iter().any(|s| s == "speakers");
             }
             if no_transcribe {
                 pipeline.transcribe = false;
@@ -865,6 +1027,38 @@ fn project_cmd(paths: &Paths, action: ProjectAction) -> anyhow::Result<ExitCode>
             db.remove_project(p.id)?;
             println!("removed project '{}'{}", p.name, if purge { "" } else { " (indexed data kept)" });
         }
+        ProjectAction::Glossary { project, add, heard_as, remove, json } => {
+            let p = db.require_project(&project)?;
+            let mut glossary = p.glossary.clone();
+            let mut changed = false;
+
+            if let Some(term_to_remove) = remove {
+                if glossary.remove(&term_to_remove) {
+                    changed = true;
+                }
+            }
+
+            if let Some(term_to_add) = add {
+                glossary.add(&term_to_add, &heard_as);
+                changed = true;
+            }
+
+            if changed {
+                glossary = db.set_project_glossary(p.id, &glossary)?;
+            }
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&glossary)?);
+            } else {
+                for t in &glossary.terms {
+                    if t.heard_as.is_empty() {
+                        println!("{}", t.term);
+                    } else {
+                        println!("{}  \u{2190} heard as: {}", t.term, t.heard_as.join(", "));
+                    }
+                }
+            }
+        }
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -895,6 +1089,7 @@ fn storage_cmd(paths: &Paths, action: Option<StorageAction>, json: bool) -> anyh
             println!("  caches   {} ({})", size(r.usage.total()), line(&r.usage));
             println!("  models   {}", size(r.models));
             println!("  database {}", size(r.database));
+            println!("  backups  {}", size(r.backups));
             println!("  temp     {}", size(r.usage.temp));
             println!("  other    {}", size(r.other));
             println!(
@@ -962,6 +1157,32 @@ fn folder_cmd(paths: &Paths, action: FolderAction) -> anyhow::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// Print a check's issues; with `numbered`, their fixes too, numbered for `script fix --apply`.
+fn print_issues(issues: &[ghostreel_core::script::Issue], numbered: bool) {
+    let mut n = 0;
+    for issue in issues {
+        let tag = match issue.severity {
+            IssueSeverity::Error => "error",
+            IssueSeverity::Warning => "warning",
+            IssueSeverity::Info => "info",
+        };
+        match (&issue.beat_id, issue.clip_index) {
+            (Some(beat), Some(clip)) => println!("  [{tag}] beat {beat} clip {}: {}", clip + 1, issue.message),
+            (Some(beat), None) => println!("  [{tag}] beat {beat}: {}", issue.message),
+            _ => println!("  [{tag}] {}", issue.message),
+        }
+        if numbered {
+            for f in &issue.fixes {
+                n += 1;
+                println!("      fix {n}: {}", f.label);
+            }
+        }
+    }
+    if numbered && issues.is_empty() {
+        println!("  no issues");
+    }
+}
+
 async fn script_cmd(paths: &Paths, action: ScriptAction) -> anyhow::Result<ExitCode> {
     let db = open_db(paths)?;
     match action {
@@ -970,60 +1191,19 @@ async fn script_cmd(paths: &Paths, action: ScriptAction) -> anyhow::Result<ExitC
             let content = std::fs::read_to_string(&file)
                 .with_context(|| format!("cannot read script file '{}'", file.display()))?;
             let mut script = Script::parse_for_project(&content, &p).with_context(|| "failed to parse script JSON")?;
-            let snapped = ghostreel_core::script::snap_to_segments(&db, &mut script)?;
-            if snapped > 0 {
-                println!("snapped {snapped} clip boundary(ies) to speech segments");
-            }
-            // Same treatment a drafted script gets: a beat that would fall silent when it cuts
-            // away keeps the voice running under the pictures.
+            // Same treatment a drafted script gets (snap, beds, whole sentences, closing hold).
             let script_cfg = Config::load(&paths.config_file).unwrap_or_default().script;
-            for issue in ghostreel_core::chat::lay_audio_beds(&db, &mut script, &script_cfg) {
-                println!("  [info] {}", issue.message);
+            for note in ghostreel_core::script_check::repair_for_import(&db, p.id, &mut script, &script_cfg, None)? {
+                println!("  [info] {note}");
             }
-            // And the same guarantee a drafted script gets: a range stops where the speaker
-            // stopped, and then on a whole sentence.
-            let turns = ghostreel_core::chat::end_on_turns(&db, &mut script, &script_cfg);
-            if turns > 0 {
-                println!("  [info] ended {} where the speaker stopped, before the reply over the top",
-                    if turns == 1 { "one quote".to_string() } else { format!("{turns} quotes") });
-            }
-            let mended = ghostreel_core::chat::end_on_sentences(&db, &mut script, &script_cfg);
-            if mended > 0 {
-                println!("  [info] {}", if mended == 1 {
-                    "restored one trimmed quote to its full sentence".to_string()
-                } else {
-                    format!("restored {mended} trimmed quotes to their full sentences")
-                });
-            }
-            let shortened = ghostreel_core::chat::trim_pictures_to_bed(&mut script, &script_cfg);
-            if shortened > 0 {
-                println!("  [info] cut the pictures back to the voice in {}",
-                    if shortened == 1 { "one beat".to_string() } else { format!("{shortened} beats") });
-            }
-            let held = ghostreel_core::chat::hold_the_last_picture(&db, p.id, &mut script, &script_cfg);
-            if held > 0.0 {
-                println!("  [info] held the closing picture for {held:.1} s of quiet");
-            }
-            // A bed may not outlast the pictures it plays under, and everything above moves them.
-            // `finish_script` has always ended this way; this copy of the sequence never did.
-            ghostreel_core::chat::clamp_beds_to_beats(&db, &mut script, &script_cfg);
-            let issues = ghostreel_core::script::validate(&db, p.id, &script)?;
-            for issue in &issues {
-                let tag = match issue.severity {
-                    IssueSeverity::Error => "error",
-                    IssueSeverity::Warning => "warning",
-                    IssueSeverity::Info => "info",
-                };
-                if let Some(beat) = &issue.beat_id {
-                    if let Some(clip) = issue.clip_index {
-                        println!("  [{tag}] beat {beat} clip {}: {}", clip + 1, issue.message);
-                    } else {
-                        println!("  [{tag}] beat {beat}: {}", issue.message);
-                    }
-                } else {
-                    println!("  [{tag}] {}", issue.message);
-                }
-            }
+            let issues = ghostreel_core::script_check::check(
+                &db,
+                p.id,
+                &script,
+                &script_cfg,
+                &ghostreel_core::script_check::CheckOptions::default(),
+            )?;
+            print_issues(&issues, false);
             let has_errors = issues.iter().any(|i| i.severity == IssueSeverity::Error);
             if has_errors && !force {
                 bail!("script validation failed with errors; use --force to save anyway");
@@ -1189,6 +1369,95 @@ async fn script_cmd(paths: &Paths, action: ScriptAction) -> anyhow::Result<ExitC
                 }
             }
         }
+        ScriptAction::Fix { id, apply, all, dry_run } => {
+            let mut db = open_db(paths)?;
+            let stored = ghostreel_core::script::load(&db, id)?;
+            let cfg = Config::load(&paths.config_file).unwrap_or_default().script;
+            let min = ghostreel_core::clips::length_range(&db, stored.project_id, &stored.title).map(|r| r.0);
+            let opts = ghostreel_core::script_check::CheckOptions { trim_min_s: min, ..Default::default() };
+            let check = |db: &ghostreel_core::db::Db, s: &Script| {
+                ghostreel_core::script_check::check(db, stored.project_id, s, &cfg, &opts)
+            };
+            let mut script = stored.script.clone();
+            let mut issues = check(&db, &script)?;
+            let mut stages: Vec<String> = Vec::new();
+            let mut apply_one = |db: &mut ghostreel_core::db::Db,
+                                 script: &mut Script,
+                                 fix: &ghostreel_core::script::Fix|
+             -> anyhow::Result<()> {
+                let done = ghostreel_core::script_fix::apply_fix(db, stored.project_id, script, &fix.action)?;
+                println!("  applied: {} — {}", fix.label, done.note);
+                if let Some(stage) = done.run_stage {
+                    stages.push(stage);
+                }
+                Ok(())
+            };
+            if let Some(n) = apply {
+                let fixes: Vec<&ghostreel_core::script::Fix> = issues.iter().flat_map(|i| &i.fixes).collect();
+                let fix = fixes.get(n.wrapping_sub(1)).copied().cloned().with_context(|| {
+                    format!("no fix #{n}; this script has {} (run without --apply to list them)", fixes.len())
+                })?;
+                apply_one(&mut db, &mut script, &fix)?;
+                issues = check(&db, &script)?;
+            } else if all {
+                let mut tried: Vec<String> = Vec::new();
+                for _ in 0..10 {
+                    let next = issues
+                        .iter()
+                        .filter(|i| i.severity == IssueSeverity::Warning)
+                        .filter_map(|i| i.fixes.first())
+                        .find(|f| !tried.contains(&f.label))
+                        .cloned();
+                    let Some(fix) = next else { break };
+                    tried.push(fix.label.clone());
+                    apply_one(&mut db, &mut script, &fix)?;
+                    issues = check(&db, &script)?;
+                }
+            }
+            for stage in &stages {
+                if dry_run {
+                    println!("  would run the {stage} stage");
+                    continue;
+                }
+                println!("  running the {stage} stage…");
+                let config = Config::load(&paths.config_file).unwrap_or_default();
+                let rt = runtime::resolve(paths, &config).await?;
+                let iopts = index::Options {
+                    project_id: Some(stored.project_id),
+                    stages: Some(vec![stage.clone()]),
+                    ..Default::default()
+                };
+                let _lock = IndexLock::acquire(&paths.data_dir)?;
+                let summary = index::run_pipeline(&mut db, paths, &config, &rt, &iopts, |_| {}).await?;
+                println!("  {}", summary.line());
+                issues = check(&db, &script)?;
+            }
+            print_issues(&issues, true);
+            if script != stored.script && !dry_run {
+                let new_id = ghostreel_core::script::save_version(&db, stored.project_id, &script, None)?;
+                let saved = ghostreel_core::script::load(&db, new_id)?;
+                println!("saved script #{} \"{}\" v{}", saved.id, saved.title, saved.version);
+            }
+        }
+        ScriptAction::Repair { id, dry_run } => {
+            let stored = ghostreel_core::script::load(&db, id)?;
+            let cfg = Config::load(&paths.config_file).unwrap_or_default().script;
+            let min = ghostreel_core::clips::length_range(&db, stored.project_id, &stored.title).map(|r| r.0);
+            let mut script = stored.script.clone();
+            let notes = ghostreel_core::script_fix::repair_framing(&db, &mut script, cfg.speech_overrun_s, min);
+            for n in &notes {
+                println!("  [repaired] {n}");
+            }
+            let opts = ghostreel_core::script_check::CheckOptions { trim_min_s: min, ..Default::default() };
+            print_issues(&ghostreel_core::script_check::check(&db, stored.project_id, &script, &cfg, &opts)?, true);
+            if notes.is_empty() {
+                println!("nothing to repair");
+            } else if !dry_run {
+                let new_id = ghostreel_core::script::save_version(&db, stored.project_id, &script, None)?;
+                let saved = ghostreel_core::script::load(&db, new_id)?;
+                println!("saved script #{} \"{}\" v{}", saved.id, saved.title, saved.version);
+            }
+        }
         ScriptAction::Show { id, json } => {
             let stored = ghostreel_core::script::load(&db, id)?;
             if json {
@@ -1248,16 +1517,22 @@ async fn script_cmd(paths: &Paths, action: ScriptAction) -> anyhow::Result<ExitC
                 Err(e) => eprintln!("warning: validation failed: {e}"),
             }
         }
-        ScriptAction::Preview { id, out, burn_titles, burn_narration, normalize_audio } => {
+        ScriptAction::Preview { id, out, burn_titles, burn_narration, burn_captions, normalize_audio, full } => {
             let ffmpeg = doctor::locate("ffmpeg").context("ffmpeg not found")?;
             let opts = ghostreel_core::preview::PreviewOptions {
                 burn_titles,
                 burn_narration,
+                burn_captions,
                 normalize_audio,
                 audio_fade_s: Config::load(&paths.config_file).unwrap_or_default().script.audio_fade_s,
                 speech_overrun_s: Config::load(&paths.config_file).unwrap_or_default().script.speech_overrun_s,
                 out,
                 cancel: None,
+                size: if full {
+                    ghostreel_core::preview::RenderSize::Full
+                } else {
+                    ghostreel_core::preview::RenderSize::Preview
+                },
             };
             let t0 = std::time::Instant::now();
             let is_tty = std::io::stderr().is_terminal();
@@ -1286,12 +1561,10 @@ async fn script_cmd(paths: &Paths, action: ScriptAction) -> anyhow::Result<ExitC
         ScriptAction::Refine { project, session, rounds } => {
             let p = db.require_project(&project)?;
             let config = Config::load(&paths.config_file)?;
-            let vision_setup = runtime::resolve_chat(paths, &config).await;
-            eprintln!("Chat model: {}", vision_setup.describe());
-            let backend =
-                ghostreel_core::chat::ChatBackend::from_vision_setup(&vision_setup, config.script.server_timeout_s)
-                    .await?
-                    .with_window(config.chat_model().ctx_tokens);
+            let cut = ghostreel_core::chat::cut_agents(&db, None, Some(session));
+            let lease = ghostreel_core::chat::lease_backend(paths, &config, None, cut.as_ref(), |w| eprintln!("{w}")).await?;
+            eprintln!("Chat model: {}", lease.describe);
+            let (backend, _slot, max_tool_rounds) = (lease.backend, lease.slot, lease.max_tool_rounds);
             let mut embedder = None;
             let embed_setup = runtime::resolve_embed(paths, &config).await;
             match runtime::start_embedder(&embed_setup, |_, _| {}).await {
@@ -1300,11 +1573,11 @@ async fn script_cmd(paths: &Paths, action: ScriptAction) -> anyhow::Result<ExitC
             }
             let mut ctx = ghostreel_core::chat::ChatContext {
                 db,
-                data_dir: paths.data_dir.clone(),
+                paths: paths.clone(),
                 backend,
                 embedder,
                 system_prompt: Some(config.chat.system_prompt.clone()),
-                max_tool_rounds: config.chat_model().max_tool_rounds,
+                max_tool_rounds,
                 script: config.script.clone(),
                 jev: config.jev.clone(),
                 cancel: None,
@@ -1333,12 +1606,10 @@ async fn script_cmd(paths: &Paths, action: ScriptAction) -> anyhow::Result<ExitC
         ScriptAction::Chat { project, session, images, message } => {
             let p = db.require_project(&project)?;
             let config = Config::load(&paths.config_file)?;
-            let vision_setup = runtime::resolve_chat(paths, &config).await;
-            eprintln!("Chat model: {}", vision_setup.describe());
-            let backend =
-                ghostreel_core::chat::ChatBackend::from_vision_setup(&vision_setup, config.script.server_timeout_s)
-                    .await?
-                    .with_window(config.chat_model().ctx_tokens);
+            let cut = ghostreel_core::chat::cut_agents(&db, None, session);
+            let lease = ghostreel_core::chat::lease_backend(paths, &config, None, cut.as_ref(), |w| eprintln!("{w}")).await?;
+            eprintln!("Chat model: {}", lease.describe);
+            let (backend, _slot, max_tool_rounds) = (lease.backend, lease.slot, lease.max_tool_rounds);
 
             let mut embedder = None;
             if config.chat_model().max_tool_rounds != 0 {
@@ -1348,11 +1619,11 @@ async fn script_cmd(paths: &Paths, action: ScriptAction) -> anyhow::Result<ExitC
 
             let mut ctx = ghostreel_core::chat::ChatContext {
                 db,
-                data_dir: paths.data_dir.clone(),
+                paths: paths.clone(),
                 backend,
                 embedder,
                 system_prompt: Some(config.chat.system_prompt.clone()),
-                max_tool_rounds: config.chat_model().max_tool_rounds,
+                max_tool_rounds,
                 script: config.script.clone(),
                 jev: config.jev.clone(),
                 cancel: None,
@@ -1468,22 +1739,32 @@ async fn index_cmd(
         to_skip.push("transcribe".into());
     }
     if !to_skip.is_empty() {
-        let base_stages = resolved_stages.unwrap_or_else(|| index::STAGES.iter().map(|&s| s.to_string()).collect());
+        let base_stages = resolved_stages.unwrap_or_else(|| index::ALL_STAGES.iter().map(|&s| s.to_string()).collect());
         resolved_stages = Some(base_stages.into_iter().filter(|s| !to_skip.contains(s)).collect());
     }
     if let Some(ref stages) = resolved_stages {
         for s in stages {
-            if !index::STAGES.contains(&s.as_str()) {
-                anyhow::bail!("unknown stage '{s}'; valid values: {}", index::STAGES.join(", "));
+            if !index::ALL_STAGES.contains(&s.as_str()) {
+                anyhow::bail!("unknown stage '{s}'; valid values: {}", index::ALL_STAGES.join(", "));
             }
         }
     }
 
+    // Ctrl+C / SIGTERM stops the run at once (children killed, the run recorded as stopped)
+    // instead of leaving it marked running.
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if !watch {
+        let flag = cancel.clone();
+        tokio::spawn(async move {
+            shutdown_signal().await;
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+    }
     let opts = index::Options {
         project_id: pid,
         retry_failed,
         settle_secs: if watch { 10 } else { 0 },
-        cancel: None,
+        cancel: Some(cancel),
         stages: resolved_stages,
     };
 
@@ -1522,6 +1803,8 @@ async fn index_cmd(
             Event::StageBackend { stage, backend } => println!("{stage}: {backend}"),
             Event::StageUnavailable { stage, reason } => println!("  ! {stage} postponed: {reason}"),
             Event::DownloadingModel { file } => println!("downloading {file}…"),
+            Event::Waiting { stage, what } => println!("{stage}: waiting for {what}"),
+            Event::RendersSkipped { count } => println!("  skipped {count} files GhostReel rendered itself"),
             Event::JobDone { video_id, stage } => {
                 if !tty {
                     println!("  ✓ {stage} #{video_id}")
@@ -1555,12 +1838,47 @@ async fn index_cmd(
             }
             Err(e) => return Err(e.into()),
         };
+        // Recorded in the shared runs table, saved as it goes, so the app (waiting on this
+        // process's lock) shows its live steps; a second connection, as the run holds the first.
+        let mut rec = cli_run(&db, pid, "index", "Index");
+        let live_db = open_db(paths).ok();
+        if let (Some(rec), Some(db)) = (rec.as_mut(), live_db.as_ref()) {
+            rec.save_live(db);
+        }
         // Re-resolved every run: GhostPen/highllama may have started or stopped meanwhile.
         let rt = runtime::resolve(paths, &config).await?;
-        let s = index::run(&mut db, &rt, &opts, &mut print).await?;
+        let res = index::run_pipeline(&mut db, paths, &config, &rt, &opts, |e: Event| {
+            record_event(&mut rec, &e);
+            if let (Some(rec), Some(db)) = (rec.as_mut(), live_db.as_ref()) {
+                rec.save_live(db);
+            }
+            print(e)
+        })
+        .await;
         drop(lock);
         if tty {
             eprint!("\r\x1b[2K");
+        }
+        if let Some(mut rec) = rec {
+            match &res {
+                Ok(s) => rec.finish(
+                    s.run_state(),
+                    Some(s.line()),
+                    pid.map(|id| RunLink::Project { id }).into_iter().collect(),
+                    s.problems_line(),
+                ),
+                Err(e) if e.is_cancelled() => rec.finish(RunState::Cancelled, None, Vec::new(), None),
+                Err(e) => rec.finish(RunState::Failed, None, Vec::new(), Some(e.to_string())),
+            }
+            if let Err(e) = rec.save(&db) {
+                eprintln!("ghostreel: could not record the run: {e}");
+            }
+        }
+        let s = res?;
+        if !json {
+            for p in &s.problems {
+                println!("  ! {}", p.message());
+            }
         }
         failed_total += s.jobs_failed;
         if !json {
@@ -1587,6 +1905,347 @@ async fn index_cmd(
         }
     }
     Ok(if failed_total == 0 { ExitCode::SUCCESS } else { ExitCode::from(3) })
+}
+
+fn trash_cmd(paths: &Paths, action: TrashAction) -> anyhow::Result<ExitCode> {
+    use ghostreel_core::trash;
+    let db = open_db(paths)?;
+    match action {
+        TrashAction::List { project, json } => {
+            let items = trash::list(&db, project_id(&db, project.as_deref())?)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&items)?);
+                return Ok(ExitCode::SUCCESS);
+            }
+            if items.is_empty() {
+                println!("the trash is empty");
+            }
+            let now = ghostreel_core::projects::now();
+            for i in &items {
+                let days_left = ((i.purge_at - now).max(0) + 86_399) / 86_400;
+                println!("{}  {}  (project #{}, {days_left} days left)", i.id, i.label, i.project_id);
+            }
+        }
+        TrashAction::Restore { id } => {
+            let item = trash::restore(&db, &id, "cli")?;
+            println!("restored {}", item.label);
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn runs_cmd(paths: &Paths, project: Option<&str>, limit: usize, json: bool) -> anyhow::Result<ExitCode> {
+    let db = open_db(paths)?;
+    let runs = match project_id(&db, project)? {
+        Some(pid) => db.runs_for_project(pid, limit)?,
+        None => db.recent_runs(limit)?,
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&runs)?);
+        return Ok(ExitCode::SUCCESS);
+    }
+    if runs.is_empty() {
+        println!("no runs recorded yet");
+    }
+    for r in &runs {
+        let links: Vec<String> = r
+            .links
+            .iter()
+            .map(|l| match l {
+                RunLink::ClipSet { id } => format!("clip set {id}"),
+                RunLink::Script { id } => format!("script #{id}"),
+                RunLink::File { path } => path.clone(),
+                RunLink::Video { id } => format!("video #{id}"),
+                RunLink::Project { id } => format!("project #{id}"),
+            })
+            .collect();
+        println!("{} [{}] {} ({}, {})", r.id, r.state.as_str(), r.label, r.kind, r.source);
+        if let Some(s) = &r.summary {
+            println!("    {s}");
+        }
+        if let Some(e) = &r.error {
+            println!("    error: {e}");
+        }
+        for st in &r.steps {
+            println!("    - {}{}", st.label, if st.note.is_empty() { String::new() } else { format!(": {}", st.note) });
+        }
+        if !links.is_empty() {
+            println!("    → {}", links.join(", "));
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// A run recorded for a CLI pass over one project (so the app's history shows it); `None` when the
+/// pass covers every project.
+fn cli_run(db: &Db, pid: Option<i64>, kind: &str, what: &str) -> Option<RunRecorder> {
+    let pid = pid?;
+    let name = db.project(pid).map(|p| p.name).unwrap_or_else(|_| pid.to_string());
+    Some(RunRecorder::start(kind, format!("{what} “{name}”"), Some(pid), "cli"))
+}
+
+/// Feed an indexer event into the run being recorded.
+fn record_event(rec: &mut Option<RunRecorder>, e: &Event) {
+    let Some(rec) = rec.as_mut() else { return };
+    match e.run_report() {
+        Some(index::EventReport::Progress(p)) => rec.snapshot(&p),
+        Some(index::EventReport::Note(n)) => rec.note(&n),
+        Some(index::EventReport::Event { phase, event }) => rec.event_in(&phase, event),
+        None => {}
+    }
+}
+
+/// Finish and save a recorded CLI run from the pass's result.
+fn finish_cli_run<T>(
+    db: &Db,
+    rec: Option<RunRecorder>,
+    res: &Result<T, ghostreel_core::Error>,
+    summary: impl FnOnce(&T) -> String,
+) {
+    let Some(mut rec) = rec else { return };
+    let project = rec.run().project_id;
+    rec.finish_with(
+        res,
+        |v| (Some(summary(v)), project.map(|id| RunLink::Project { id }).into_iter().collect()),
+        |e| e.to_string().contains(ghostreel_core::chat::CANCELLED),
+    );
+    if let Err(e) = rec.save(db) {
+        eprintln!("ghostreel: could not record the run: {e}");
+    }
+}
+
+async fn faces_cmd(
+    paths: &Paths,
+    project: Option<&str>,
+    force: bool,
+) -> anyhow::Result<ExitCode> {
+    let mut db = open_db(paths)?;
+    let pid = project_id(&db, project)?;
+    let config = Config::load(&paths.config_file)?;
+    let rt = runtime::resolve(paths, &config).await?;
+    let mut rec = cli_run(&db, pid, "faces", "Track faces");
+
+    let lock = match IndexLock::acquire(&paths.data_dir) {
+        Ok(l) => l,
+        Err(ghostreel_core::Error::Busy(msg)) => {
+            eprintln!("ghostreel: {msg}");
+            return Ok(ExitCode::from(1));
+        }
+        Err(e) => return Err(e.into()),
+    };
+
+    let tty = std::io::stderr().is_terminal();
+    let mut bar_visible = false;
+    let mut on_event = |e: Event| {
+        record_event(&mut rec, &e);
+        if bar_visible && !matches!(e, Event::Progress(_) | Event::JobDone { .. } | Event::JobStarted { .. }) {
+            eprint!("\r\x1b[2K");
+            bar_visible = false;
+        }
+        match e {
+            Event::JobStarted { path, .. } => {
+                if !tty {
+                    println!("faces {}", path.display());
+                }
+            }
+            Event::StageUnavailable { stage, reason } => println!("  ! {stage} postponed: {reason}"),
+            Event::JobDone { video_id, stage } => {
+                if !tty {
+                    println!("  ✓ {stage} #{video_id}");
+                }
+            }
+            Event::JobFailed { video_id, stage, error } => println!("  ✗ {stage} #{video_id}: {error}"),
+            Event::Progress(p) => {
+                if tty {
+                    eprint!("\r\x1b[2K{}", progress_line(&p));
+                    let _ = std::io::stderr().flush();
+                    bar_visible = true;
+                }
+            }
+            _ => {}
+        }
+    };
+
+    let mut tracker = Tracker::new(&[("faces", 1.0)]);
+    let opts = index::Options { project_id: pid, ..Default::default() };
+    let res = index::run_face_jobs(&mut db, paths, &config, &rt, &opts, force, &mut tracker, &mut on_event).await;
+    if bar_visible {
+        eprint!("\r\x1b[2K");
+    }
+    drop(lock);
+    finish_cli_run(&db, rec, &res, |s| format!("Tracked faces on {} of {} videos", s.measured, s.total));
+    let summary = res?;
+
+    let video_ids: Vec<(i64, String)> = match pid {
+        Some(p) => {
+            let mut st = db.conn.prepare(
+                "SELECT v.id, COALESCE(vf.path, '')
+                 FROM videos v
+                 JOIN video_files vf ON vf.video_id = v.id
+                 JOIN project_folders pf ON pf.folder_id = vf.folder_id AND pf.project_id = ?1
+                 GROUP BY v.id
+                 ORDER BY v.id",
+            )?;
+            let rows = st.query_map([p], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect::<Result<_, _>>()?
+        }
+        None => {
+            let mut st = db.conn.prepare(
+                "SELECT v.id, COALESCE(vf.path, '')
+                 FROM videos v
+                 JOIN video_files vf ON vf.video_id = v.id
+                 GROUP BY v.id
+                 ORDER BY v.id",
+            )?;
+            let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect::<Result<_, _>>()?
+        }
+    };
+
+    println!("\n--- Face Tracking Report ---");
+    for (vid, path) in video_ids {
+        let tracks = db.face_tracks(vid)?;
+        let filename = std::path::Path::new(&path).file_name().unwrap_or_default().to_string_lossy();
+        if tracks.is_empty() {
+            println!("Video #{vid} ({filename}): 0 tracks, 0 faces, people ≈ 0");
+            continue;
+        }
+        let total_faces: usize = tracks.iter().map(|t| t.n_faces).sum();
+        // Group tracks by mean embedding (average-linkage, cosine >= 0.5 = same person).
+        // To estimate prominent people, filter out transient noise / low-quality screen-share icons
+        // (min 5 faces, box height >= 12% of frame) and count clusters representing >= 5% of faces.
+        // Fallback to all tracks / clusters if none meet quality criteria.
+        let quality_tracks: Vec<_> =
+            tracks.iter().filter(|t| t.n_faces >= 5 && t.avg_box_h >= 0.12).cloned().collect();
+        let target_tracks = if !quality_tracks.is_empty() { quality_tracks } else { tracks.clone() };
+        let clusters = ghostreel_core::faces::cluster_tracks_average_linkage(&target_tracks, 0.5);
+        let total_clustered_faces: usize = target_tracks.iter().map(|t| t.n_faces).sum();
+        let min_faces_threshold = (total_clustered_faces as f64 * 0.05).round() as usize;
+        let n_people = clusters
+            .iter()
+            .filter(|cl| {
+                let cluster_faces: usize = cl.iter().map(|&idx| target_tracks[idx].n_faces).sum();
+                cluster_faces >= min_faces_threshold.max(1)
+            })
+            .count()
+            .max(if total_faces > 0 { 1 } else { 0 });
+        println!(
+            "Video #{vid} ({filename}): {} tracks, {} faces, people ≈ {}",
+            tracks.len(),
+            total_faces,
+            n_people
+        );
+    }
+
+    Ok(if summary.failed > 0 { ExitCode::from(1) } else { ExitCode::SUCCESS })
+}
+
+async fn speakers_cmd(paths: &Paths, project: Option<&str>, force: bool, json: bool) -> anyhow::Result<ExitCode> {
+    let mut db = open_db(paths)?;
+    let pid = project_id(&db, project)?;
+    let config = Config::load(&paths.config_file)?;
+    let rt = runtime::resolve(paths, &config).await?;
+    let mut rec = cli_run(&db, pid, "speakers", "Find speakers");
+    let lock = match IndexLock::acquire(&paths.data_dir) {
+        Ok(l) => l,
+        Err(ghostreel_core::Error::Busy(msg)) => {
+            eprintln!("ghostreel: {msg}");
+            return Ok(ExitCode::from(1));
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let tty = std::io::stderr().is_terminal();
+    let mut bar_visible = false;
+    let mut failed = false;
+    let mut on_event = |e: Event| {
+        record_event(&mut rec, &e);
+        if bar_visible && !matches!(e, Event::Progress(_) | Event::JobDone { .. } | Event::JobStarted { .. }) {
+            eprint!("\r\x1b[2K");
+            bar_visible = false;
+        }
+        match e {
+            Event::JobStarted { path, .. } if !tty && !json => println!("speakers {}", path.display()),
+            Event::StageUnavailable { stage, reason } => eprintln!("  ! {stage} postponed: {reason}"),
+            Event::DownloadingModel { file } => eprintln!("  downloading {file} (once)…"),
+            Event::JobFailed { video_id, stage, error } => {
+                failed = true;
+                eprintln!("  ✗ {stage} #{video_id}: {error}")
+            }
+            Event::Progress(p) if tty => {
+                eprint!("\r\x1b[2K{}", progress_line(&p));
+                let _ = std::io::stderr().flush();
+                bar_visible = true;
+            }
+            _ => {}
+        }
+    };
+    let started = std::time::Instant::now();
+    let mut tracker = Tracker::new(&[("speakers", 1.0)]);
+    let opts = index::Options { project_id: pid, ..Default::default() };
+    let res = index::run_speaker_jobs(&mut db, paths, &config, &rt, &opts, force, &mut tracker, &mut on_event).await;
+    if bar_visible {
+        eprint!("\r\x1b[2K");
+    }
+    drop(lock);
+    finish_cli_run(&db, rec, &res, |r| match r.first() {
+        Some((_, r)) if r.up_to_date => "Speakers already up to date".to_string(),
+        Some((_, r)) => format!("Found {} speakers and {} people", r.speakers.len(), r.people.people.len()),
+        None => "Speakers not analysed (voice model unavailable)".to_string(),
+    });
+    let reports = res?;
+    if json {
+        let out: Vec<_> = reports.iter().map(|(p, r)| serde_json::json!({ "project_id": p, "report": r })).collect();
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(if failed { ExitCode::from(1) } else { ExitCode::SUCCESS });
+    }
+    for (pid, r) in &reports {
+        let name = db.project(*pid).map(|p| p.name).unwrap_or_default();
+        println!("\n--- Speakers: {name} ---");
+        if r.up_to_date {
+            println!("Up to date (nothing changed since the last run; --force to redo).");
+            continue;
+        }
+        println!(
+            "{} of {} videos with speech embedded, {} failed; {} voice windows",
+            r.embedded, r.total, r.failed, r.windows
+        );
+        println!("Speakers found: {}", r.speakers.len());
+        for s in &r.speakers {
+            println!("  Speaker {}: {:.0} s of speech ({} windows)", s.speaker, s.speech_s, s.windows);
+        }
+        println!(
+            "People found: {} ({} new, {} small face clusters dropped)",
+            r.people.people.len(),
+            r.people.created,
+            r.people.dropped_clusters
+        );
+        for (id, tracks, secs) in &r.people.people {
+            let label = db.person(*pid, *id).ok().and_then(|p| p.name).unwrap_or_else(|| format!("Person {id}"));
+            println!("  {label} (#{id}): {tracks} face tracks, {secs:.0} s on screen");
+        }
+        println!("Links (video, speaker → person):");
+        for l in &r.links {
+            let who = match (l.person_id, &l.name) {
+                (Some(_), Some(n)) => n.clone(),
+                (Some(id), None) => format!("Person {id}"),
+                (None, _) => "nobody on screen".into(),
+            };
+            println!(
+                "  #{} speaker {} → {who}  (correlation {}, confidence {})",
+                l.video_id,
+                l.speaker,
+                l.correlation.map(|c| format!("{c:.3}")).unwrap_or_else(|| "–".into()),
+                l.confidence.map(|c| format!("{c:.2}")).unwrap_or_else(|| "–".into()),
+            );
+        }
+        let t = &r.timings;
+        println!(
+            "Timings: voices {:.1} s, clustering {:.1} s, people {:.1} s, linking {:.1} s",
+            t.embed_s, t.cluster_s, t.people_s, t.link_s
+        );
+    }
+    println!("Total {:.1} s", started.elapsed().as_secs_f64());
+    Ok(if failed { ExitCode::from(1) } else { ExitCode::SUCCESS })
 }
 
 /// `[██████░░░░░░]  48%  probe 12/25  · about 2 min left · clip.mp4`

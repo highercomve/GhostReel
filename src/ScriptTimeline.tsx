@@ -1,7 +1,8 @@
 import { formatDuration } from "./timeFormat";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import type { AudioTrackInfo, FrameRow, Script, VideoRow } from "./api";
-import { AudioLines, ChevronDown, Film, Type, Volume2 } from "lucide-react";
+import type { AudioTrackInfo, Cue, FrameRow, Script, VideoRow } from "./api";
+import { AudioLines, ChevronDown, EyeOff, Film, MessageSquareText, Type, Volume2 } from "lucide-react";
+import { cueKey } from "./editor/textOverlay";
 import MediaImage from "./MediaImage";
 import { PICK_MIME, type Pick } from "./editor/MediaBin";
 import {
@@ -23,7 +24,7 @@ import "./editor/timeline.css";
 /** One block on a lane, already positioned in seconds on the cut's timeline. */
 type Block = {
   key: string;
-  kind: "title" | "picture" | "bed";
+  kind: "title" | "picture" | "bed" | "cue";
   beat: number;
   clip: number | null;
   /** Position in the finished cut. */
@@ -40,6 +41,11 @@ type Block = {
   track?: number;
   /** Audio blocks: the file has this track but the clip doesn't play it. */
   off?: boolean;
+  /** Titles and caption cues: how far they may move on the cut's clock. */
+  lo?: number;
+  hi?: number;
+  /** Caption blocks: the cue. */
+  cue?: Cue;
 };
 
 type ClipRef = { beat: number; clip: number };
@@ -48,7 +54,12 @@ type ClipRef = { beat: number; clip: number };
 type Gesture =
   | { type: "trim"; beat: number; clip: number | null; edge: "in" | "out"; x: number }
   | { type: "move"; from: ClipRef; key: string; x0: number; y0: number; active: boolean }
+  /** A title or caption moved or retimed by its edge, within its beat (or clip). */
+  | { type: "item"; key: string; mode: "move" | "in" | "out"; x0: number; s0: number; e0: number; lo: number; hi: number; active: boolean }
   | { type: "scrub" };
+
+/** The shortest a title or caption may be made by dragging. */
+const MIN_ITEM = 0.2;
 
 /** Air on both sides of the content so the playhead handle at 0 and at the end isn't clipped. */
 const GUTTER = 8;
@@ -137,14 +148,19 @@ function layout(
     const beatEnd = at;
     beatStarts.push({ beat: b, id: beat.id, start: beatStart, end: beatEnd });
 
-    if (beat.on_screen_text?.trim()) {
+    if (beat.on_screen_text?.trim() && beatEnd > beatStart) {
+      const dur = beatEnd - beatStart;
+      const rel0 = clamp(beat.title_layout?.start_s ?? 0, 0, Math.max(0, dur - 0.1));
+      const rel1 = clamp(beat.title_layout?.end_s ?? dur, rel0 + 0.1, Math.max(dur, rel0 + 0.1));
       blocks.push({
         key: `t-${b}`,
         kind: "title",
         beat: b,
         clip: null,
-        start: beatStart,
-        end: beatEnd,
+        start: beatStart + rel0,
+        end: Math.min(beatEnd, beatStart + rel1),
+        lo: beatStart,
+        hi: beatEnd,
         sourceIn: 0,
         videoId: null,
         label: beat.on_screen_text,
@@ -228,7 +244,29 @@ function ownerOf(key: string | null): string | null {
   if (kind === "b") return `bed${beat}`;
   return null;
 }
-const blockOwner = (b: Block) => (b.kind === "title" ? null : b.clip != null ? `c${b.beat}-${b.clip}` : `bed${b.beat}`);
+const blockOwner = (b: Block) =>
+  b.kind === "title" || b.kind === "cue" ? null : b.clip != null ? `c${b.beat}-${b.clip}` : `bed${b.beat}`;
+
+/** Caption cues as blocks on their own lane. */
+function cueBlocks(cues: Cue[] | undefined): Block[] {
+  return (cues ?? []).map((cue, i) => ({
+    key: cueKey(cue, i),
+    kind: "cue" as const,
+    beat: -1,
+    clip: null,
+    start: cue.start_s,
+    end: cue.end_s,
+    sourceIn: cue.src_start_s ?? 0,
+    videoId: cue.video_id ?? null,
+    label: cue.text.replace(/\n/g, " "),
+    detail: cue.hidden ? "hidden" : cue.edited ? "edited" : "",
+    muted: !!cue.hidden,
+    inferred: false,
+    lo: cue.min_s ?? 0,
+    hi: cue.max_s ?? cue.end_s,
+    cue,
+  }));
+}
 
 type Props = {
   script: Script;
@@ -260,6 +298,14 @@ type Props = {
   onMonitor?: (m: TrackMonitor) => void;
   /** Turn a muted clip's own sound back on. */
   onUnmute?: (beat: number, clip: number) => void;
+  /** Speech caption cues (hidden ones included), for the Captions lane. */
+  captions?: Cue[];
+  /** A title moved or retimed: seconds after its beat starts. */
+  onTitleTime?: (beat: number, startRel: number, endRel: number) => void;
+  /** A caption moved or retimed, on the cut's clock. */
+  onCueTime?: (cue: Cue, start: number, end: number) => void;
+  onCueText?: (cue: Cue, text: string) => void;
+  onCueHide?: (cue: Cue, hidden: boolean) => void;
 };
 
 /**
@@ -291,16 +337,26 @@ export default function ScriptTimeline({
   monitor: monitorProp,
   onMonitor,
   onUnmute,
+  captions,
+  onTitleTime,
+  onCueTime,
+  onCueText,
+  onCueHide,
 }: Props) {
   const videoIds = useMemo(
     () => script.beats.flatMap((b) => [...b.clips.map((c) => c.video_id), ...(b.bed ? [b.bed.video_id] : [])]),
     [script],
   );
   const trackInfo = useAudioTracks(videoIds);
-  const { blocks, total, beatStarts, laneCount } = useMemo(
+  const { blocks: scriptBlocks, total, beatStarts, laneCount } = useMemo(
     () => layout(script, videos, trackInfo),
     [script, videos, trackInfo],
   );
+  const blocks = useMemo(() => [...scriptBlocks, ...cueBlocks(captions)], [scriptBlocks, captions]);
+  /** A title or caption being dragged: drawn here until it is dropped. */
+  const [itemDrag, setItemDrag] = useState<{ key: string; start: number; end: number } | null>(null);
+  const itemDragRef = useRef(itemDrag);
+  const [editingCue, setEditingCue] = useState<string | null>(null);
   const [ownMonitor, setOwnMonitor] = useState<TrackMonitor>({ muted: [], solo: [] });
   const monitor = monitorProp ?? ownMonitor;
   const setMonitor = (m: TrackMonitor) => {
@@ -481,8 +537,8 @@ export default function ScriptTimeline({
   const levelOf = useAudioLevels(levelRequests);
 
   // The latest values for listeners registered once.
-  const live = useRef({ pps, total, zoomTo, onSeek, onTrim, onMoveClip, pictures });
-  live.current = { pps, total, zoomTo, onSeek, onTrim, onMoveClip, pictures };
+  const live = useRef({ pps, total, zoomTo, onSeek, onTrim, onMoveClip, pictures, blocks, onTitleTime, onCueTime });
+  live.current = { pps, total, zoomTo, onSeek, onTrim, onMoveClip, pictures, blocks, onTitleTime, onCueTime };
 
   const timeAt = useCallback((clientX: number) => {
     const rect = contentRef.current?.getBoundingClientRect();
@@ -546,6 +602,24 @@ export default function ScriptTimeline({
         if (Math.abs(delta) < 0.02) return;
         gesture.current = { ...g, x: e.clientX };
         L.onTrim(g.beat, g.clip, g.edge, delta);
+      } else if (g.type === "item") {
+        const delta = (e.clientX - g.x0) / L.pps;
+        if (!g.active) {
+          if (Math.abs(e.clientX - g.x0) < DRAG_THRESHOLD) return;
+          g.active = true;
+        }
+        let start = g.s0;
+        let end = g.e0;
+        if (g.mode === "move") {
+          start = clamp(g.s0 + delta, g.lo, Math.max(g.lo, g.hi - (g.e0 - g.s0)));
+          end = start + (g.e0 - g.s0);
+        } else if (g.mode === "in") {
+          start = clamp(g.s0 + delta, g.lo, g.e0 - MIN_ITEM);
+        } else {
+          end = clamp(g.e0 + delta, g.s0 + MIN_ITEM, g.hi);
+        }
+        itemDragRef.current = { key: g.key, start, end };
+        setItemDrag(itemDragRef.current);
       } else if (g.type === "scrub") {
         L.onSeek(timeAt(e.clientX));
       } else if (g.type === "move") {
@@ -561,6 +635,19 @@ export default function ScriptTimeline({
     const up = () => {
       const g = gesture.current;
       gesture.current = null;
+      if (g?.type === "item") {
+        const d = itemDragRef.current;
+        itemDragRef.current = null;
+        setItemDrag(null);
+        if (g.active && d) {
+          const b = live.current.blocks.find((x) => x.key === g.key);
+          if (b?.kind === "title" && b.lo != null) live.current.onTitleTime?.(b.beat, d.start - b.lo, d.end - b.lo);
+          else if (b?.kind === "cue" && b.cue) live.current.onCueTime?.(b.cue, d.start, d.end);
+          suppressClick.current = true;
+          setTimeout(() => (suppressClick.current = false), 0);
+        }
+        return;
+      }
       if (g?.type === "move" && g.active) {
         const target = movingRef.current;
         movingRef.current = null;
@@ -604,15 +691,45 @@ export default function ScriptTimeline({
         const dir = e.key === "ArrowRight" ? 1 : -1;
         if (!sel) {
           onSeek(Math.min(Math.max(playhead + dir * step, 0), total));
+        } else if (sel.kind === "title" || sel.kind === "cue") {
+          // Titles and captions: arrows move them (Shift: only the start, as for a clip's in).
+          const lo = sel.lo ?? 0;
+          const hi = sel.hi ?? total;
+          const d = dir * Math.min(step, 1) * (e.altKey ? 0.5 : 1);
+          let start = sel.start;
+          let end = sel.end;
+          if (e.shiftKey) start = clamp(sel.start + d, lo, sel.end - MIN_ITEM);
+          else {
+            start = clamp(sel.start + d, lo, Math.max(lo, hi - (sel.end - sel.start)));
+            end = start + (sel.end - sel.start);
+          }
+          if (sel.kind === "title") onTitleTime?.(sel.beat, start - lo, end - lo);
+          else if (sel.cue) onCueTime?.(sel.cue, start, end);
         } else {
           onTrim(sel.beat, sel.clip, edge, dir * step);
         }
         break;
       }
+      case "h":
+        if (mod || sel?.kind !== "cue" || !sel.cue) return;
+        onCueHide?.(sel.cue, !sel.cue.hidden);
+        break;
+      case "Enter":
+        if (sel?.kind !== "cue") return;
+        setEditingCue(sel.key);
+        break;
       case "i":
       case "o": {
         // Put this edge where the playhead is, read back into the source file's own clock.
         if (mod || !sel || playhead < sel.start || playhead > sel.end) return;
+        if (sel.kind === "title" || sel.kind === "cue") {
+          const lo = sel.lo ?? 0;
+          const start = e.key === "i" ? clamp(playhead, lo, sel.end - MIN_ITEM) : sel.start;
+          const end = e.key === "o" ? Math.max(playhead, sel.start + MIN_ITEM) : sel.end;
+          if (sel.kind === "title") onTitleTime?.(sel.beat, start - lo, end - lo);
+          else if (sel.cue) onCueTime?.(sel.cue, start, end);
+          break;
+        }
         onSetEdge(sel.beat, sel.clip, e.key === "i" ? "in" : "out", sel.sourceIn + (playhead - sel.start));
         break;
       }
@@ -640,6 +757,11 @@ export default function ScriptTimeline({
       }
       case "Delete":
       case "Backspace": {
+        if (sel?.kind === "cue" && sel.cue) {
+          // A caption is not deleted, only hidden: the transcript still has it.
+          onCueHide?.(sel.cue, true);
+          break;
+        }
         if (!sel || !onDelete) return;
         // Own audio is the clip's sound, not a block of its own: deleting it would drop the picture too.
         if (sel.kind === "title" || sel.key.startsWith("a-")) return;
@@ -684,6 +806,7 @@ export default function ScriptTimeline({
   const collapseSilent = !expandSilent && silentTracks.length > 0;
   const lanes: { id: string; kind: Block["kind"]; label: string; track?: number; summary?: boolean }[] = [
     { id: "title", kind: "title", label: "Titles" },
+    ...(captions && captions.length > 0 ? [{ id: "cue", kind: "cue" as const, label: "Captions" }] : []),
     { id: "picture", kind: "picture", label: "Picture" },
     ...laneStates.filter((s) => !collapseSilent || !s.silent).map(({ track }) => ({
       id: `a${track}`, kind: "bed" as const, label: trackName(track), track,
@@ -864,10 +987,18 @@ export default function ScriptTimeline({
               <div
                 key={lane.id}
                 className={`tl-name tl-name-${lane.kind}`}
-                title={lane.kind === "title" ? "On-screen text, one block per beat" : "The pictures, in story order"}
+                title={
+                  lane.kind === "title"
+                    ? "On-screen text, one block per beat: drag to move, drag an edge to retime"
+                    : lane.kind === "cue"
+                      ? "Speech captions: drag to move, drag an edge to retime, double-click to edit, H hides"
+                      : "The pictures, in story order"
+                }
               >
                 {lane.kind === "title" ? (
                   <Type size={13} strokeWidth={2} aria-hidden />
+                ) : lane.kind === "cue" ? (
+                  <MessageSquareText size={13} strokeWidth={2} aria-hidden />
                 ) : (
                   <Film size={13} strokeWidth={2} aria-hidden />
                 )}
@@ -1024,7 +1155,19 @@ export default function ScriptTimeline({
                     // The name wins: below that width the cell shows a shortened file name instead of
                     // a bare "−18 dB", and the badge (with the full name in the tooltip) returns when
                     // there is room for both.
-                    const width = Math.max(1, (b.end - b.start) * pps);
+                    const dragged = itemDrag?.key === b.key ? itemDrag : null;
+                    const bStart = dragged?.start ?? b.start;
+                    const bEnd = dragged?.end ?? b.end;
+                    const width = Math.max(1, (bEnd - bStart) * pps);
+                    const isItem = b.kind === "title" || b.kind === "cue";
+                    const itemGesture = (mode: "move" | "in" | "out") => (e: React.PointerEvent) => {
+                      if (e.button !== 0 || (b.kind === "title" ? !onTitleTime : !onCueTime)) return;
+                      e.stopPropagation();
+                      gesture.current = {
+                        type: "item", key: b.key, mode, x0: e.clientX, s0: b.start, e0: b.end,
+                        lo: b.lo ?? 0, hi: b.hi ?? total, active: false,
+                      };
+                    };
                     const compact = b.kind === "bed" && width < 84;
                     const captionFrom = b.kind === "bed" ? 34 : 48;
                     return (
@@ -1041,13 +1184,22 @@ export default function ScriptTimeline({
                         selected !== b.key && selOwner != null && blockOwner(b) === selOwner ? "linked" : "",
                         moving?.key === b.key ? "dragging" : "",
                         b.kind === "picture" && onMoveClip ? "movable" : "",
+                        isItem ? "movable" : "",
+                        dragged ? "item-dragging" : "",
+                        b.cue?.edited ? "edited" : "",
                         compact ? "tl-compact" : "",
                       ]
                         .filter(Boolean)
                         .join(" ")}
-                      style={{ left: xOf(b.start), width }}
+                      style={{ left: xOf(bStart), width }}
                       onClick={selectable(b)}
+                      onDoubleClick={b.kind === "cue" && onCueText ? (e) => {
+                        e.stopPropagation();
+                        onSelect(b.key, -1, null);
+                        setEditingCue(b.key);
+                      } : undefined}
                       onPointerDown={(e) => {
+                        if (isItem) return itemGesture("move")(e);
                         if (e.button !== 0 || b.kind !== "picture" || b.clip == null || !onMoveClip) return;
                         gesture.current = {
                           type: "move",
@@ -1058,7 +1210,7 @@ export default function ScriptTimeline({
                           active: false,
                         };
                       }}
-                      title={`${b.kind === "title" ? "On-screen title · " : ""}${b.track != null ? `${trackName(b.track)} · ` : ""}${b.label}${b.detail ? ` · ${b.detail}` : ""}${
+                      title={`${b.kind === "title" ? "On-screen title · " : b.kind === "cue" ? "Caption · " : ""}${b.track != null ? `${trackName(b.track)} · ` : ""}${b.label}${b.detail ? ` · ${b.detail}` : ""}${
                         info ? ` · ${trackDescription(info)}` : ""
                       }${db != null ? ` · ${dbLabel(db)}` : ""}${
                         b.inferred ? " · voice carried under the pictures" : ""
@@ -1067,7 +1219,9 @@ export default function ScriptTimeline({
                       }`}
                     >
                       {b.kind === "picture" && filmstrip(b)}
-                      {b.kind !== "title" && (
+                      {isItem ? (
+                        <span className="tl-handle in" onPointerDown={itemGesture("in")} />
+                      ) : (
                         <span
                           className="tl-handle in"
                           onPointerDown={(e) => {
@@ -1076,6 +1230,7 @@ export default function ScriptTimeline({
                           }}
                         />
                       )}
+                      {b.kind === "cue" && b.cue?.hidden && width >= 20 && <EyeOff size={11} strokeWidth={2} aria-hidden className="tl-cue-hidden" />}
                       {width >= captionFrom && <span className="tl-caption">
                         <span className="tl-label">
                           {b.label}
@@ -1105,7 +1260,9 @@ export default function ScriptTimeline({
                           <span className="tl-level-bar" style={{ width: `${levelFraction(db) * 100}%` }} />
                         </>
                       )}
-                      {b.kind !== "title" && (
+                      {isItem ? (
+                        <span className="tl-handle out" onPointerDown={itemGesture("out")} />
+                      ) : (
                         <span
                           className="tl-handle out"
                           onPointerDown={(e) => {
@@ -1114,9 +1271,27 @@ export default function ScriptTimeline({
                           }}
                         />
                       )}
+
                     </div>
                     );
                   })}
+                {lane.kind === "cue" && editingCue && (() => {
+                  const b = blocks.find((x) => x.key === editingCue);
+                  if (!b?.cue) return null;
+                  const cue = b.cue;
+                  return (
+                    <CueTextEditor
+                      key={editingCue}
+                      left={xOf(b.start)}
+                      text={cue.text.replace(/\n/g, " ")}
+                      onDone={(text) => {
+                        setEditingCue(null);
+                        if (text != null && text.trim() && text.trim() !== cue.text.replace(/\n/g, " ")) onCueText?.(cue, text.trim());
+                        wrapRef.current?.focus();
+                      }}
+                    />
+                  );
+                })()}
                 {lane.kind === "picture" && total === 0 && <span className="tl-empty-drop-hint">Drag footage here from Media to start the cut</span>}
                 {lane.summary && <button type="button" className="tl-silent-summary" onClick={() => setExpandSilent(true)}>
                   {silentTracks.map((s) => trackName(s.track)).join(" · ")} silent
@@ -1188,7 +1363,8 @@ export default function ScriptTimeline({
           <span><kbd>s</kbd> snap to sentence</span>
           {onToggleTrack && <span><kbd>m</kbd> audio track on/off</span>}
           <span><kbd>c</kbd> / <kbd>ctrl</kbd><kbd>k</kbd> blade</span>
-          <span><kbd>del</kbd> delete clip or bed</span>
+          <span><kbd>del</kbd> delete clip or bed (caption: hide)</span>
+          {captions && captions.length > 0 && <span><kbd>h</kbd> hide caption · <kbd>enter</kbd> edit it</span>}
           <span><kbd>=</kbd><kbd>-</kbd> zoom</span>
           <span><kbd>ctrl</kbd>+wheel zoom</span>
           <span><kbd>\</kbd> fit</span>
@@ -1198,5 +1374,40 @@ export default function ScriptTimeline({
         </div>
       )}
     </div>
+  );
+}
+
+/** Inline editor for a caption's text, opened by double-clicking it on the Captions lane. */
+function CueTextEditor({ text, left, onDone }: { text: string; left: number; onDone: (text: string | null) => void }) {
+  const ref = useRef<HTMLInputElement>(null);
+  const done = useRef(false);
+  useEffect(() => {
+    ref.current?.focus();
+    ref.current?.select();
+  }, []);
+  const finish = (value: string | null) => {
+    if (done.current) return;
+    done.current = true;
+    onDone(value);
+  };
+  return (
+    <input
+      ref={ref}
+      className="tl-cue-editor"
+      style={{ left }}
+      defaultValue={text}
+      aria-label="Caption text"
+      onPointerDown={(e) => e.stopPropagation()}
+      onClick={(e) => e.stopPropagation()}
+      onKeyDown={(e) => {
+        e.stopPropagation();
+        if (e.key === "Escape") finish(null);
+        else if (e.key === "Enter") {
+          e.preventDefault();
+          finish(e.currentTarget.value);
+        }
+      }}
+      onBlur={(e) => finish(e.currentTarget.value)}
+    />
   );
 }

@@ -200,9 +200,9 @@ function ResearchCard({
 }) {
   const { cue, apply } = useApplier(onPatch);
   const limit = ai?.chat_model.max_tool_rounds ?? 0;
-  // null = untouched; the stored value decides whether the custom box is shown.
-  const [custom, setCustom] = useState<boolean | null>(null);
-  const showCustom = custom ?? (limit !== 0 && limit !== 30);
+  // null = untouched; the stored value decides whether the cap box is shown.
+  const [capped, setCapped] = useState<boolean | null>(null);
+  const showCap = capped ?? limit !== 0;
   return (
     <section className="card">
       <div className="settings-card-title">
@@ -214,40 +214,37 @@ function ResearchCard({
           <label htmlFor="research-limit">Research limit</label>
           <select
             id="research-limit"
-            value={showCustom ? "custom" : limit === 0 ? "unlimited" : String(limit)}
+            value={showCap ? "cap" : "unlimited"}
             disabled={!ai}
             onChange={async (e) => {
-              const v = e.currentTarget.value;
-              if (v === "custom") {
-                setCustom(true);
+              if (e.currentTarget.value === "cap") {
+                setCapped(true);
                 return;
               }
-              setCustom(false);
-              await apply({ chat_model: { max_tool_rounds: v === "unlimited" ? 0 : Number(v) } });
+              setCapped(false);
+              await apply({ chat_model: { max_tool_rounds: 0 } });
             }}
           >
             <option value="unlimited">Unlimited</option>
-            <option value="30">30</option>
-            {showCustom && <option value="custom">{`Custom (${limit})`}</option>}
-            {!showCustom && <option value="custom">Custom…</option>}
+            <option value="cap">{showCap && limit > 0 ? `Cap (${limit})` : "Cap…"}</option>
           </select>
-          {showCustom && (
+          {showCap && (
             <input
               id="research-limit-custom"
               type="number"
               min={1}
-              max={100}
               step={1}
               style={{ width: "80px" }}
               disabled={!ai}
-              defaultValue={limit}
+              defaultValue={limit > 0 ? limit : undefined}
+              placeholder="rounds"
               onKeyDown={(e) => {
                 if (e.key === "Enter") e.currentTarget.blur();
               }}
               onBlur={async (e) => {
                 const value = Number(e.currentTarget.value);
-                if (!Number.isInteger(value) || value < 1 || value > 100) {
-                  onError("Custom research limit must be a whole number from 1 to 100.");
+                if (!Number.isInteger(value) || value < 1) {
+                  onError("A research cap must be a whole number of 1 or more. Choose Unlimited for no cap.");
                   return;
                 }
                 await apply({ chat_model: { max_tool_rounds: value } });
@@ -255,7 +252,9 @@ function ResearchCard({
             />
           )}
           <span className="muted small">
-            How many footage look-ups the AI may do for one script.
+            How many rounds of footage look-ups the AI may do for one script, clip search or answer.
+            Unlimited by default: it stops when it has what it needs, when you stop it, or when it keeps
+            asking for the same thing.
           </span>
         </div>
       </div>

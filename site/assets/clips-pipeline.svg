@@ -1,0 +1,87 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 520 940" width="520" height="940" role="img" aria-labelledby="t d">
+  <title id="t">How GhostReel generates clips</title>
+  <desc id="d">What indexing stored feeds five steps: candidates found by code, workers scoring them in parallel, an orchestrator picking the best, code checking, framing and saving them as a clip set, and you reviewing and exporting.</desc>
+  <style>
+    svg { --bg:#0d0d15; --card:#15151f; --line:rgba(233,232,242,.16); --text:#e9e8f2; --muted:rgba(233,232,242,.72); --code:#2fd6c8; --model:#b4a9ff; --you:#e9e8f2; }
+    @media (prefers-color-scheme: light) {
+      svg { --bg:#f8f7fc; --card:#ffffff; --line:rgba(28,27,38,.16); --text:#1c1b26; --muted:rgba(28,27,38,.72); --code:#0f8f86; --model:#5a45e6; --you:#1c1b26; }
+    }
+    text { font-family: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; fill: var(--text); }
+    .bg { fill: var(--bg); }
+    .card { fill: var(--card); stroke: var(--line); stroke-width: 1; }
+    .h { font-size: 18px; font-weight: 650; }
+    .b { font-size: 14.5px; fill: var(--muted); }
+    .tag { font-size: 12px; font-weight: 650; letter-spacing: .06em; }
+    .chip { fill: none; stroke: var(--line); }
+    .chipt { font-size: 13px; fill: var(--muted); }
+    .code { stroke: var(--code); } .codet { fill: var(--code); }
+    .model { stroke: var(--model); } .modelt { fill: var(--model); }
+    .you { stroke: var(--you); } .yout { fill: var(--you); }
+    .bar { stroke-width: 4; stroke-linecap: round; }
+    .arrow { stroke: var(--line); stroke-width: 2; fill: none; }
+    .head { fill: var(--muted); }
+    .mini { fill: none; stroke: var(--model); stroke-opacity: .55; }
+    .minit { font-size: 12.5px; fill: var(--muted); }
+  </style>
+  <rect class="bg" width="520" height="940" rx="14"/>
+
+  <!-- Inputs -->
+  <text class="tag" x="24" y="38" fill-opacity=".7" style="fill:var(--muted)">FROM INDEXING</text>
+  <rect class="chip" x="24" y="52" width="104" height="30" rx="15"/><text class="chipt" x="76" y="72" text-anchor="middle">Transcripts</text>
+  <rect class="chip" x="136" y="52" width="96" height="30" rx="15"/><text class="chipt" x="184" y="72" text-anchor="middle">Keyframes</text>
+  <rect class="chip" x="240" y="52" width="138" height="30" rx="15"/><text class="chipt" x="309" y="72" text-anchor="middle">Faces, speakers</text>
+  <rect class="chip" x="386" y="52" width="110" height="30" rx="15"/><text class="chipt" x="441" y="72" text-anchor="middle">Steadiness</text>
+  <path class="arrow" d="M260 88 V108"/><path class="head" d="M254 106 L260 116 L266 106 Z"/>
+
+  <!-- 1 Candidates (code) -->
+  <rect class="card" x="16" y="120" width="488" height="134" rx="12"/>
+  <path class="bar code" d="M18 134 V232"/>
+  <text class="h" x="36" y="150">1 · Candidates</text>
+  <text class="tag codet" x="488" y="150" text-anchor="end">CODE</text>
+  <text class="b" x="36" y="176">Sentence-bounded windows of 20–60 s from every</text>
+  <text class="b" x="36" y="198">selected video. Never on an off-mic line, a hole in</text>
+  <text class="b" x="36" y="220">the transcript or a shaky stretch. Each one carries</text>
+  <text class="b" x="36" y="242">a visual label, its faces and its speakers.</text>
+  <path class="arrow" d="M260 258 V270"/><path class="head" d="M254 270 L260 280 L266 270 Z"/>
+
+  <!-- 2 Workers (model) -->
+  <rect class="card" x="16" y="284" width="488" height="178" rx="12"/>
+  <path class="bar model" d="M18 298 V448"/>
+  <text class="h" x="36" y="314">2 · Workers, in parallel</text>
+  <text class="tag modelt" x="488" y="314" text-anchor="end">MODEL</text>
+  <text class="b" x="36" y="340">One job per ~10 minutes of footage: the brief, the</text>
+  <text class="b" x="36" y="362">glossary, the transcript and its candidates go in,</text>
+  <text class="b" x="36" y="384">scored picks come out. Every GhostReel tool is open.</text>
+  <rect class="mini" x="36" y="404" width="132" height="40" rx="8"/><text class="minit" x="102" y="429" text-anchor="middle">Built-in model</text>
+  <rect class="mini" x="180" y="404" width="132" height="40" rx="8"/><text class="minit" x="246" y="429" text-anchor="middle">Model server</text>
+  <rect class="mini" x="324" y="404" width="160" height="40" rx="8"/><text class="minit" x="404" y="429" text-anchor="middle">Coding-agent CLI</text>
+  <path class="arrow" d="M260 468 V488"/><path class="head" d="M254 486 L260 496 L266 486 Z"/>
+
+  <!-- 3 Orchestrator (model) -->
+  <rect class="card" x="16" y="500" width="488" height="148" rx="12"/>
+  <path class="bar model" d="M18 514 V634"/>
+  <text class="h" x="36" y="530">3 · Orchestrator</text>
+  <text class="tag modelt" x="488" y="530" text-anchor="end">MODEL</text>
+  <text class="b" x="36" y="556">Merges the picks and drops overlaps, spreads them</text>
+  <text class="b" x="36" y="578">across videos and speakers, prefers faces for 9:16,</text>
+  <text class="b" x="36" y="600">then picks the best and writes each hook. Without</text>
+  <text class="b" x="36" y="622">an orchestrator, code picks instead.</text>
+  <path class="arrow" d="M260 654 V674"/><path class="head" d="M254 672 L260 682 L266 672 Z"/>
+
+  <!-- 4 Check, frame, save (code) -->
+  <rect class="card" x="16" y="686" width="488" height="126" rx="12"/>
+  <path class="bar code" d="M18 700 V798"/>
+  <text class="h" x="36" y="716">4 · Check, frame and save</text>
+  <text class="tag codet" x="488" y="716" text-anchor="end">CODE</text>
+  <text class="b" x="36" y="742">Whole sentences, a breath before the cut, a closing</text>
+  <text class="b" x="36" y="764">hold. The crop follows the speaker, stacks two people</text>
+  <text class="b" x="36" y="786">or puts a screen share over the camera. Saved as a set.</text>
+  <path class="arrow" d="M260 818 V838"/><path class="head" d="M254 836 L260 846 L266 836 Z"/>
+
+  <!-- 5 Review (you) -->
+  <rect class="card" x="16" y="850" width="488" height="74" rx="12"/>
+  <path class="bar you" d="M18 864 V910"/>
+  <text class="h" x="36" y="880">5 · Review and export</text>
+  <text class="tag yout" x="488" y="880" text-anchor="end">YOU</text>
+  <text class="b" x="36" y="906">Accept or reject in the grid; export full-size MP4s.</text>
+</svg>

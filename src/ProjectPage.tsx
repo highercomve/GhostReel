@@ -1,12 +1,16 @@
 import MediaImage from "./MediaImage";
+import { confirmAction } from "./dialogs";
 import { cleanSearchSnippet, matchedTerms } from "./searchSnippet";
 import { Check, ChevronDown, Folder, FolderTree, Music, Pencil, Plus, Settings, TriangleAlert, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ask, open } from "@tauri-apps/plugin-dialog";
+import { open } from "@tauri-apps/plugin-dialog";
+import { navigate } from "./navigate";
 import {
   addFolder,
   clock,
+  enqueueFaces,
   enqueueIndex,
+  enqueueSpeakers,
   enqueueSteadiness,
   fileName,
   fpsLabel,
@@ -18,6 +22,7 @@ import {
   getAiSettings,
   setAiSettings,
   setProjectPipeline,
+  setProjectGlossary,
   removeProject,
   excludeVideo,
   includeVideo,
@@ -27,6 +32,7 @@ import {
   videoFrames,
   videoTranscript,
   CATEGORIES,
+  type Glossary,
   type Hit,
   type ProjectView,
   type VideoRow,
@@ -36,8 +42,10 @@ import TaskCard from "./TaskCard";
 import { useQueue } from "./useQueue";
 import VideoPanel from "./VideoPanel";
 import ScriptsPanel from "./ScriptsPanel";
+import PeoplePanel from "./PeoplePanel";
 import OrganizeModal from "./OrganizeModal";
 import { useVideoSelection } from "./useVideoSelection";
+import { stageDisplay, stageTagClass } from "./stageStatus";
 
 function SpeechCell({ v, transcribeEnabled }: { v: VideoRow; transcribeEnabled?: boolean }) {
   if (v.segments > 0) return <span className="good-text">{v.language ? v.language.toUpperCase() : <Check size={14} strokeWidth={2} aria-label="Has speech" />}</span>;
@@ -164,7 +172,8 @@ function Snippet({ text }: { text: string }) {
 export default function ProjectPage({ projectId, onChanged, openVideo }: {
   projectId: number; onChanged: () => void; openVideo?: { videoId: number; t: number };
 }) {
-  const [tab, setTab] = useState<"library" | "scripts">("library");
+  const [tab, setTab] = useState<"library" | "scripts" | "glossary" | "people">("library");
+  const [peopleRefresh, setPeopleRefresh] = useState(0);
   const [view, setView] = useState<ProjectView | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [selected, setSelected] = useState<number | null>(null);
@@ -174,6 +183,9 @@ export default function ProjectPage({ projectId, onChanged, openVideo }: {
   const [searchingKey, setSearchingKey] = useState<string | null>(null);
   const searchSequence = useRef(0);
   const [folderId, setFolderId] = useState<number | null>(null);
+  const [glossaryFilter, setGlossaryFilter] = useState("");
+  const [newTerm, setNewTerm] = useState("");
+  const [newHeardAs, setNewHeardAs] = useState("");
   const [editName, setEditName] = useState<string | null>(null);
   const [samplingSize, setSamplingSize] = useState<number>(768);
   const [organizeModalOpen, setOrganizeModalOpen] = useState(false);
@@ -263,12 +275,19 @@ export default function ProjectPage({ projectId, onChanged, openVideo }: {
     setFolderId(null);
     setCategoryFilter(null);
     setQuery("");
+    setGlossaryFilter("");
+    setNewTerm("");
+    setNewHeardAs("");
     setEditName(null);
     refresh();
   }, [refresh]);
 
   // Keep the table fresh while this project's task runs, and once it finishes.
-  const myTasks = tasks.filter((t) => t.kind.type === "index" && t.kind.project_id === projectId);
+  const myTasks = tasks.filter(
+    (t) =>
+      (t.kind.type === "index" || t.kind.type === "steadiness" || t.kind.type === "faces" || t.kind.type === "speakers") &&
+      t.kind.project_id === projectId,
+  );
   const running = myTasks.find((t) => t.state === "running");
   const queued = myTasks.find((t) => t.state === "queued");
   const lastFinished = [...myTasks].reverse().find((t) => t.state !== "running" && t.state !== "queued");
@@ -280,6 +299,7 @@ export default function ProjectPage({ projectId, onChanged, openVideo }: {
   useEffect(() => {
     return onEvent<number>("task-finished", () => {
       refresh();
+      setPeopleRefresh((n) => n + 1);
       onChanged();
     });
   }, [refresh, onChanged]);
@@ -309,25 +329,25 @@ export default function ProjectPage({ projectId, onChanged, openVideo }: {
     } catch {
       /* keep generic wording */
     }
-    const ok = await ask(
+    const ok = await confirmAction(
       `Re-extract and re-describe all keyframes of this project with ${interval} interval at ${size}px sampling size? Transcripts are kept. This re-runs frame descriptions and search embeddings, which can take a while.`,
-      { title: "Rebuild keyframes", kind: "warning" },
+      { title: "Rebuild keyframes", destructive: true },
     );
     if (ok) run(() => redoProjectStage(projectId, "frames"));
   };
 
   const onDelete = async () => {
     if (!view) return;
-    const ok = await ask(`Delete project "${view.project.name}"? Your video files are not touched.`, {
+    const ok = await confirmAction(`Delete project "${view.project.name}"? Your video files are not touched.`, {
       title: "Delete project",
-      kind: "warning",
+      destructive: true,
     });
     if (!ok) return;
     // Second question: the index (keyframes, transcripts, previews) can be kept for reuse, since
     // re-indexing the same footage is slow.
-    const purge = await ask(
+    const purge = await confirmAction(
       "Also delete what was indexed for it — keyframes, preview renders, and the transcripts, descriptions and search index of footage no other project uses?\n\nKeep it if you may add this footage to another project later. Your video files are not touched either way.",
-      { title: "Delete the indexed data too?", kind: "warning", okLabel: "Delete indexed data", cancelLabel: "Keep it" },
+      { title: "Delete the indexed data too?", destructive: true, okLabel: "Delete indexed data", cancelLabel: "Keep it" },
     );
     run(() => removeProject(projectId, purge));
   };
@@ -399,6 +419,89 @@ export default function ProjectPage({ projectId, onChanged, openVideo }: {
   const stage = (name: string) => st.stages.find((s) => s.stage === name);
   const selectedVideo = view.videos.find((v) => v.id === selected) ?? null;
 
+  const glossary: Glossary = p.glossary ?? { terms: [] };
+
+  const onAddTerm = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const term = newTerm.trim();
+    if (!term) return;
+    const variants = newHeardAs
+      .split(",")
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0);
+
+    const existingIndex = glossary.terms.findIndex(
+      (t) => t.term.toLowerCase() === term.toLowerCase()
+    );
+    let nextTerms = [...glossary.terms];
+    if (existingIndex >= 0) {
+      const existing = nextTerms[existingIndex];
+      const mergedHeardAs = [...existing.heard_as];
+      for (const v of variants) {
+        if (
+          v.toLowerCase() !== term.toLowerCase() &&
+          !mergedHeardAs.some((h) => h.toLowerCase() === v.toLowerCase())
+        ) {
+          mergedHeardAs.push(v);
+        }
+      }
+      nextTerms[existingIndex] = { ...existing, heard_as: mergedHeardAs };
+    } else {
+      const cleanVariants = variants.filter(
+        (v) => v.toLowerCase() !== term.toLowerCase()
+      );
+      nextTerms.push({ term, heard_as: cleanVariants });
+    }
+    await run(() => setProjectGlossary(projectId, { terms: nextTerms }));
+    setNewTerm("");
+    setNewHeardAs("");
+  };
+
+  const onRemoveTerm = async (termToRemove: string) => {
+    const nextTerms = glossary.terms.filter(
+      (t) => t.term.toLowerCase() !== termToRemove.toLowerCase()
+    );
+    await run(() => setProjectGlossary(projectId, { terms: nextTerms }));
+  };
+
+  const onRemoveHeardAs = async (term: string, variantToRemove: string) => {
+    const nextTerms = glossary.terms.map((t) => {
+      if (t.term.toLowerCase() === term.toLowerCase()) {
+        return {
+          ...t,
+          heard_as: t.heard_as.filter(
+            (h) => h.toLowerCase() !== variantToRemove.toLowerCase()
+          ),
+        };
+      }
+      return t;
+    });
+    await run(() => setProjectGlossary(projectId, { terms: nextTerms }));
+  };
+
+  // Plain computation, not useMemo: this runs after the `if (!view) return` above, and a hook
+  // there is called on some renders and not others (React error #310, a blank window).
+  const glossaryQuery = glossaryFilter.trim().toLowerCase();
+  const filteredGlossaryTerms = !glossaryQuery
+    ? glossary.terms
+    : glossary.terms.filter(
+        (t) =>
+          t.term.toLowerCase().includes(glossaryQuery) ||
+          t.heard_as.some((h) => h.toLowerCase().includes(glossaryQuery)),
+      );
+
+  const onApplyGlossary = async () => {
+    if (
+      !(await confirmAction(
+        "Re-transcribe every video in this project with the glossary? This runs speech-to-text again.",
+        { okLabel: "Re-transcribe" },
+      ))
+    ) {
+      return;
+    }
+    await run(() => redoProjectStage(projectId, "transcribe"));
+  };
+
   const editorMode = tab === "scripts";
   const statsLine = `${p.width}×${p.height} · ${fpsLabel(p.fps_num, p.fps_den)} fps · ${st.videos} videos · ${humanDuration(st.total_duration_s)} · ${humanSize(st.total_size)}`;
   // In the editor the project header, the tabs and the actions share one slim row, so the cut
@@ -422,6 +525,32 @@ export default function ProjectPage({ projectId, onChanged, openVideo }: {
         onClick={() => setTab("scripts")}
       >
         Scripts
+      </button>
+      <button
+        type="button"
+        role="tab"
+        aria-selected={tab === "glossary"}
+        className={`tab-btn ${tab === "glossary" ? "active" : ""}`}
+        onClick={() => setTab("glossary")}
+      >
+        Glossary{glossary.terms.length > 0 && (
+          <span className="muted small" style={{ marginLeft: "0.35rem" }}>
+            {glossary.terms.length}
+          </span>
+        )}
+      </button>
+      <button
+        type="button"
+        role="tab"
+        aria-selected={tab === "people"}
+        className={`tab-btn ${tab === "people" ? "active" : ""}`}
+        onClick={() => setTab("people")}
+      >
+        People{(view?.people_count ?? 0) > 0 && (
+          <span className="muted small" style={{ marginLeft: "0.35rem" }}>
+            {view?.people_count}
+          </span>
+        )}
       </button>
     </div>
   );
@@ -495,50 +624,235 @@ export default function ProjectPage({ projectId, onChanged, openVideo }: {
                   </select>
                 </div>
 
-                <button
-                  type="button"
-                  className="project-menu-item"
-                  onClick={() => {
-                    setMenuOpen(false);
-                    onRebuildFrames();
-                  }}
-                  disabled={!!running || !!queued || view.videos.length === 0}
-                  title="Re-extract and re-describe keyframes with current interval and sampling size"
-                >
-                  <span>Rebuild keyframes…</span>
-                </button>
+                {(() => {
+                  const totalVideos = view.videos.length;
 
-                {view.videos.some((v) => !v.steadiness_measured) ? (
-                  <button
-                    type="button"
-                    className="project-menu-item"
-                    onClick={() => {
-                      setMenuOpen(false);
-                      run(() => enqueueSteadiness(projectId, false));
-                    }}
-                    disabled={!!running || !!queued}
-                    title="Analyze camera steadiness/shake for unmeasured videos in this project"
-                  >
-                    <span>Analyze camera shake</span>
-                    <span className="tag warn small">pending</span>
-                  </button>
-                ) : (
-                  <button
-                    type="button"
-                    className="project-menu-item"
-                    onClick={async () => {
-                      setMenuOpen(false);
-                      const ok = await ask("Re-measure camera steadiness for all videos in this project?", {
-                        title: "Re-analyze camera shake",
-                      });
-                      if (ok) run(() => enqueueSteadiness(projectId, true));
-                    }}
-                    disabled={!!running || !!queued || view.videos.length === 0}
-                    title="Re-measure camera steadiness for all videos in this project"
-                  >
-                    <span>Re-analyze camera shake…</span>
-                  </button>
-                )}
+                  // Every stage's status comes from the backend's one stage gate (off for a stage
+                  // the project turned off); the queue only adds whether it is running right now.
+                  const shown = (name: string) => stageDisplay(view.stages?.find((x) => x.stage === name), running);
+                  const framesCount = stage("frames");
+                  const transcribeCount = stage("transcribe");
+                  const describeCount = stage("describe");
+                  const embedCount = stage("embed");
+                  const [framesStatus, transcribeStatus, describeStatus, embedStatus] = [
+                    shown("frames"),
+                    shown("transcribe"),
+                    shown("describe"),
+                    shown("embed"),
+                  ];
+                  const measuredSteadiness = view.videos.filter((v) => v.steadiness_measured).length;
+                  const steadinessStatus = shown("steadiness");
+                  const faceModelsMissing = view.face_models_available === false;
+                  const measuredFaces = view.videos.filter((v) => v.faces_measured).length;
+                  const facesStatus = shown("faces");
+                  const speakersPending = view.speakers_pending ?? 0;
+                  const speakersEverRan = (view.people_count ?? 0) > 0 || (totalVideos > 0 && speakersPending === 0);
+                  const speakersStatus = shown("speakers");
+                  const tag = (d: { state: string; reason: string | null }) => (
+                    <span className={`tag ${stageTagClass(d.state)} small`} title={d.reason ?? undefined}>
+                      {d.state}
+                    </span>
+                  );
+
+                  return (
+                    <>
+                      <div className="project-menu-stage-row">
+                        <div className="project-menu-stage-info">
+                          <span className="project-menu-stage-name">Keyframes</span>
+                          {tag(framesStatus)}
+                        </div>
+                        <button
+                          type="button"
+                          className="small"
+                          onClick={() => {
+                            setMenuOpen(false);
+                            onRebuildFrames();
+                          }}
+                          disabled={!!running || !!queued || totalVideos === 0}
+                          title="Re-extract and re-describe keyframes with current interval and sampling size"
+                        >
+                          {(framesCount?.done ?? 0) > 0 ? "Re-run…" : "Run"}
+                        </button>
+                      </div>
+
+                      <div className="project-menu-stage-row">
+                        <div className="project-menu-stage-info">
+                          <span className="project-menu-stage-name">Transcription</span>
+                          {tag(transcribeStatus)}
+                        </div>
+                        <button
+                          type="button"
+                          className="small"
+                          onClick={async () => {
+                            setMenuOpen(false);
+                            const isRerun = (transcribeCount?.done ?? 0) > 0;
+                            if (isRerun) {
+                              const ok = await confirmAction(
+                                "Re-transcribe all videos in this project? This will redo transcription and subsequent stages.",
+                                { title: "Re-run transcription", destructive: true },
+                              );
+                              if (!ok) return;
+                            }
+                            run(() => redoProjectStage(projectId, "transcribe"));
+                          }}
+                          disabled={!!running || !!queued || totalVideos === 0}
+                          title="Transcribe speech with Whisper"
+                        >
+                          {(transcribeCount?.done ?? 0) > 0 ? "Re-run…" : "Run"}
+                        </button>
+                      </div>
+
+                      <div className="project-menu-stage-row">
+                        <div className="project-menu-stage-info">
+                          <span className="project-menu-stage-name">Frame descriptions</span>
+                          {tag(describeStatus)}
+                        </div>
+                        <button
+                          type="button"
+                          className="small"
+                          onClick={async () => {
+                            setMenuOpen(false);
+                            const isRerun = (describeCount?.done ?? 0) > 0;
+                            if (isRerun) {
+                              const ok = await confirmAction(
+                                "Re-describe keyframes for all videos in this project? This will redo frame descriptions and search embeddings.",
+                                { title: "Re-run frame descriptions", destructive: true },
+                              );
+                              if (!ok) return;
+                            }
+                            run(() => redoProjectStage(projectId, "describe"));
+                          }}
+                          disabled={!!running || !!queued || totalVideos === 0}
+                          title="Describe keyframes with vision model"
+                        >
+                          {(describeCount?.done ?? 0) > 0 ? "Re-run…" : "Run"}
+                        </button>
+                      </div>
+
+                      <div className="project-menu-stage-row">
+                        <div className="project-menu-stage-info">
+                          <span className="project-menu-stage-name">Search embeddings</span>
+                          {tag(embedStatus)}
+                        </div>
+                        <button
+                          type="button"
+                          className="small"
+                          onClick={async () => {
+                            setMenuOpen(false);
+                            const isRerun = (embedCount?.done ?? 0) > 0;
+                            if (isRerun) {
+                              const ok = await confirmAction(
+                                "Re-generate search embeddings for all videos in this project?",
+                                { title: "Re-run search embeddings", destructive: true },
+                              );
+                              if (!ok) return;
+                            }
+                            run(() => redoProjectStage(projectId, "embed"));
+                          }}
+                          disabled={!!running || !!queued || totalVideos === 0}
+                          title="Generate vector embeddings and search chunks"
+                        >
+                          {(embedCount?.done ?? 0) > 0 ? "Re-run…" : "Run"}
+                        </button>
+                      </div>
+
+                      <div className="project-menu-stage-row">
+                        <div className="project-menu-stage-info">
+                          <span className="project-menu-stage-name">Camera shake</span>
+                          {tag(steadinessStatus)}
+                        </div>
+                        <button
+                          type="button"
+                          className="small"
+                          onClick={async () => {
+                            setMenuOpen(false);
+                            const isRerun = totalVideos > 0 && measuredSteadiness === totalVideos;
+                            if (isRerun) {
+                              const ok = await confirmAction("Re-measure camera steadiness for all videos in this project?", {
+                                title: "Re-analyze camera shake",
+                              });
+                              if (ok) run(() => enqueueSteadiness(projectId, true));
+                            } else {
+                              run(() => enqueueSteadiness(projectId, false));
+                            }
+                          }}
+                          disabled={!!running || !!queued || totalVideos === 0}
+                          title="Analyze camera steadiness and shake for videos in this project"
+                        >
+                          {totalVideos > 0 && measuredSteadiness === totalVideos ? "Re-run…" : "Run"}
+                        </button>
+                      </div>
+
+                      <div className="project-menu-stage-row">
+                        <div className="project-menu-stage-info">
+                          <span className="project-menu-stage-name">Faces</span>
+                          {tag(facesStatus)}
+                        </div>
+                        {faceModelsMissing ? (
+                          <button
+                            type="button"
+                            className="project-menu-stage-link"
+                            onClick={() => {
+                              setMenuOpen(false);
+                              navigate("models");
+                            }}
+                            title="Download YuNet and SFace models on the Models page"
+                          >
+                            Download face models on the Models page
+                          </button>
+                        ) : (
+                          <button
+                            type="button"
+                            className="small"
+                            onClick={async () => {
+                              setMenuOpen(false);
+                              const isRerun = totalVideos > 0 && measuredFaces === totalVideos;
+                              if (isRerun) {
+                                const ok = await confirmAction("Re-analyze faces for all videos in this project?", {
+                                  title: "Re-analyze faces",
+                                });
+                                if (ok) run(() => enqueueFaces(projectId, true));
+                              } else {
+                                run(() => enqueueFaces(projectId, false));
+                              }
+                            }}
+                            disabled={!!running || !!queued || totalVideos === 0}
+                            title="Find and track faces through video footage"
+                          >
+                            {totalVideos > 0 && measuredFaces === totalVideos ? "Re-run…" : "Run"}
+                          </button>
+                        )}
+                      </div>
+
+                      <div className="project-menu-stage-row">
+                        <div className="project-menu-stage-info">
+                          <span className="project-menu-stage-name">Speakers</span>
+                          {tag(speakersStatus)}
+                        </div>
+                        <button
+                          type="button"
+                          className="small"
+                          onClick={async () => {
+                            setMenuOpen(false);
+                            if (speakersEverRan && speakersPending === 0) {
+                              const ok = await confirmAction(
+                                "Re-analyze speakers and people for all videos in this project? Names you gave people are kept.",
+                                { title: "Re-analyze speakers" },
+                              );
+                              if (ok) run(() => enqueueSpeakers(projectId, true));
+                            } else {
+                              run(() => enqueueSpeakers(projectId, false));
+                            }
+                          }}
+                          disabled={!!running || !!queued || totalVideos === 0}
+                          title="Find who speaks when, group faces into people and link each voice to a face"
+                        >
+                          {speakersEverRan && speakersPending === 0 ? "Re-run…" : "Run"}
+                        </button>
+                      </div>
+                    </>
+                  );
+                })()}
 
                 <div className="project-menu-divider" />
 
@@ -596,6 +910,55 @@ export default function ProjectPage({ projectId, onChanged, openVideo }: {
                   <span>Search embeddings</span>
                 </label>
 
+                <label className="project-menu-checkbox" title="Measure camera motion and shake">
+                  <input
+                    type="checkbox"
+                    checked={p.pipeline.steadiness ?? true}
+                    disabled={!!running || !!queued}
+                    onChange={async (e) => {
+                      const next = { ...p.pipeline, steadiness: e.target.checked };
+                      await run(() => setProjectPipeline(projectId, next));
+                    }}
+                  />
+                  <span>Camera shake</span>
+                </label>
+
+                <div>
+                  <label className="project-menu-checkbox" title="Find and track faces through video footage">
+                    <input
+                      type="checkbox"
+                      checked={p.pipeline.faces ?? true}
+                      disabled={!!running || !!queued}
+                      onChange={async (e) => {
+                        const next = { ...p.pipeline, faces: e.target.checked };
+                        await run(() => setProjectPipeline(projectId, next));
+                      }}
+                    />
+                    <span>Faces</span>
+                  </label>
+                  <div className="project-menu-hint">
+                    Finds and follows faces — needed for speaker framing. ~5 min per hour of video.
+                  </div>
+                </div>
+
+                <div>
+                  <label className="project-menu-checkbox" title="Find who speaks when and which face each voice is">
+                    <input
+                      type="checkbox"
+                      checked={p.pipeline.speakers ?? true}
+                      disabled={!!running || !!queued}
+                      onChange={async (e) => {
+                        const next = { ...p.pipeline, speakers: e.target.checked };
+                        await run(() => setProjectPipeline(projectId, next));
+                      }}
+                    />
+                    <span>Speakers</span>
+                  </label>
+                  <div className="project-menu-hint">
+                    Tells voices apart, groups faces into people and links them. ~1 min per hour of video.
+                  </div>
+                </div>
+
                 <div className="project-menu-divider" />
 
                 <div className="project-menu-section-title">Project</div>
@@ -640,7 +1003,150 @@ export default function ProjectPage({ projectId, onChanged, openVideo }: {
       {!editorMode && tabs}
 
       {editorMode ? (
-        <ScriptsPanel projectId={projectId} />
+                <ScriptsPanel projectId={projectId} selectedVideoIds={selectedIds} videoCount={view?.videos.length ?? 0} />
+      ) : tab === "people" ? (
+        <>
+          {running && <TaskCard task={running} compact />}
+          {!running && queued && <TaskCard task={queued} compact />}
+          <PeoplePanel projectId={projectId} refreshKey={peopleRefresh} />
+        </>
+      ) : tab === "glossary" ? (
+        <>
+          {error && <div className="banner bad">{error}</div>}
+          {running && <TaskCard task={running} compact />}
+          {!running && queued && <TaskCard task={queued} compact />}
+          {!running && !queued && lastFinished && lastFinished.state !== "done" && <TaskCard task={lastFinished} compact />}
+
+          <p className="muted" style={{ margin: "0 0 1rem" }}>
+            {'Terms Whisper should spell correctly. "Heard as" lists known mis-hearings that are fixed automatically when a video is transcribed.'}
+          </p>
+
+          {glossary.terms.length > 8 && (
+            <div style={{ marginBottom: "1rem" }}>
+              <input
+                type="text"
+                placeholder="Filter terms"
+                value={glossaryFilter}
+                onChange={(e) => setGlossaryFilter(e.target.value)}
+                style={{ maxWidth: "320px" }}
+              />
+            </div>
+          )}
+
+          <section className="card list" style={{ gap: "0.75rem" }}>
+            <form
+              onSubmit={onAddTerm}
+              style={{
+                display: "flex",
+                gap: "0.5rem",
+                alignItems: "center",
+                flexWrap: "wrap",
+                paddingBottom: glossary.terms.length > 0 ? "0.75rem" : undefined,
+                borderBottom: glossary.terms.length > 0 ? "1px solid var(--border)" : undefined,
+              }}
+            >
+              <input
+                type="text"
+                placeholder="Term (e.g. GhostReel)"
+                value={newTerm}
+                onChange={(e) => setNewTerm(e.target.value)}
+                style={{ flex: "1 1 180px" }}
+              />
+              <input
+                type="text"
+                placeholder="Heard as (comma-separated, e.g. ghost real, ghost rail)"
+                value={newHeardAs}
+                onChange={(e) => setNewHeardAs(e.target.value)}
+                style={{ flex: "2 1 260px" }}
+              />
+              <button type="submit" className="small" disabled={!newTerm.trim()}>
+                Add term
+              </button>
+            </form>
+
+            {glossary.terms.length === 0 && (
+              <div className="muted">
+                No glossary terms yet — add technical terms or names Whisper tends to mishear.
+              </div>
+            )}
+            {glossary.terms.length > 0 && filteredGlossaryTerms.length === 0 && (
+              <div className="muted">No terms match &ldquo;{glossaryFilter}&rdquo;.</div>
+            )}
+            {filteredGlossaryTerms.map((t) => (
+              <div
+                key={t.term}
+                className="row"
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: "1rem",
+                  flexWrap: "wrap",
+                }}
+              >
+                <div style={{ display: "flex", alignItems: "center", gap: "0.75rem", flexWrap: "wrap" }}>
+                  <span style={{ fontWeight: 600 }}>{t.term}</span>
+                  {t.heard_as.length > 0 && (
+                    <div style={{ display: "flex", gap: "0.35rem", alignItems: "center", flexWrap: "wrap" }}>
+                      <span className="muted small">heard as:</span>
+                      {t.heard_as.map((h) => (
+                        <span
+                          key={h}
+                          className="chip"
+                          style={{
+                            display: "inline-flex",
+                            alignItems: "center",
+                            gap: "0.25rem",
+                            padding: "2px 8px",
+                            fontSize: "12px",
+                          }}
+                        >
+                          <span>{h}</span>
+                          <button
+                            type="button"
+                            className="ghost small"
+                            style={{
+                              padding: "0",
+                              lineHeight: 1,
+                              border: "none",
+                              cursor: "pointer",
+                              display: "inline-flex",
+                              alignItems: "center",
+                            }}
+                            onClick={() => onRemoveHeardAs(t.term, h)}
+                            title={`Remove variant "${h}"`}
+                            aria-label={`Remove variant "${h}"`}
+                          >
+                            <X size={12} strokeWidth={2} />
+                          </button>
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+                <button
+                  type="button"
+                  className="ghost small"
+                  onClick={() => onRemoveTerm(t.term)}
+                  title={`Remove term "${t.term}"`}
+                >
+                  Remove
+                </button>
+              </div>
+            ))}
+          </section>
+
+          <div style={{ marginTop: "1rem" }}>
+            <button
+              type="button"
+              onClick={onApplyGlossary}
+              disabled={!!running || !!queued || view.videos.length === 0}
+              title="Re-transcribe every video in this project with the glossary"
+            >
+              Apply to transcribed videos
+            </button>
+          </div>
+        </>
       ) : (
         <>
           {error && <div className="banner bad">{error}</div>}
@@ -718,11 +1224,11 @@ export default function ProjectPage({ projectId, onChanged, openVideo }: {
             onClose={() => setSelected(null)}
             onExclude={async (role) => {
               const name = fileName(selectedVideo.path);
-              const ok = await ask(
+              const ok = await confirmAction(
                 role === "reference"
                   ? `Use "${name}" as a reference edit? The script chat will study it (length, pacing, structure) but never use it as footage. It disappears from search.`
                   : `Remove "${name}" from this project's library? It won't be searched, indexed or used in scripts. The file is not deleted.`,
-                { title: role === "reference" ? "Reference edit" : "Remove from library", kind: "warning" },
+                { title: role === "reference" ? "Reference edit" : "Remove from library", destructive: true },
               );
               if (!ok) return;
               setSelected(null);

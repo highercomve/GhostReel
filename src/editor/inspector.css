@@ -216,3 +216,27 @@ kbd.keycap {
 @media (max-width: 900px) {
   .nle-keys-sheet .nle-keys-cols { grid-template-columns: minmax(0, 1fr); }
 }
+
+/* Text tab: title and caption look, place and timing. */
+.insp-text .insp-text-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 10px; }
+.insp-text select { width: 100%; font-size: 12.5px; }
+.insp-text input[type="color"] { width: 100%; height: 26px; padding: 1px 2px; cursor: pointer; }
+.insp-text input[type="range"] { width: 100%; }
+.insp-seg { display: inline-flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+.insp-seg > button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 30px;
+  padding: 3px 8px;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  color: var(--muted);
+  font-size: 11.5px;
+}
+.insp-seg > button + button { border-left: 1px solid var(--border); }
+.insp-seg > button:hover:not(:disabled) { background: color-mix(in srgb, var(--accent) 10%, transparent); color: var(--text); }
+.insp-seg > button.on { background: var(--accent); color: #fff; }
+.insp-presets { display: flex; width: 100%; }
+.insp-presets > button { flex: 1; }

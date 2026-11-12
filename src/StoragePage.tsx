@@ -1,10 +1,9 @@
 import { useCallback, useEffect, useState } from "react";
-import { ask } from "@tauri-apps/plugin-dialog";
+import { confirmAction } from "./dialogs";
 import {
   cleanStorage,
   compactDatabase,
   humanSize,
-  isDesktop,
   modelsStatus,
   removeProject,
   storageReport,
@@ -105,8 +104,8 @@ const KINDS: KindDef[] = [
 /** Clearing caches: what is rebuilt on demand, so nothing visible is lost. */
 const CACHES: StorageKind[] = ["proxies", "previews", "temp"];
 
-const confirmAction = (message: string, title: string, okLabel: string) =>
-  isDesktop ? ask(message, { title, kind: "warning", okLabel, cancelLabel: "Cancel" }) : Promise.resolve(window.confirm(message));
+const confirmStorage = (message: string, title: string, okLabel: string) =>
+  confirmAction(message, { title, okLabel, destructive: true });
 
 const total = (u: Record<string, number>) => Object.values(u).reduce((a, b) => a + b, 0);
 
@@ -192,7 +191,7 @@ export default function StoragePage({ onChanged }: { onChanged: () => void }) {
     const shared = project && project.shared > 0 && kinds.some((k) => k === "proxies" || k === "keyframes")
       ? `\n\nSome of this footage is also in other projects; their copies go too.`
       : "";
-    const ok = await confirmAction(
+    const ok = await confirmStorage(
       `${actionVerb} ${humanSize(bytes)} of ${what}${where}?\n\n${why}${shared}`,
       `${actionVerb} ${what}`,
       actionVerb,
@@ -202,7 +201,7 @@ export default function StoragePage({ onChanged }: { onChanged: () => void }) {
 
   const cleanUnused = async () => {
     if (!report) return;
-    const ok = await confirmAction(
+    const ok = await confirmStorage(
       `Delete ${humanSize(total(report.unused))} that no project uses?\n\nThis covers footage no project watches any more (${report.unused_videos} ${report.unused_videos === 1 ? "video" : "videos"}, including their transcripts and descriptions), files of deleted scripts and chats, proxies in formats this version no longer reads, and temporary files. Your video files are not touched.`,
       "Clean up unused files",
       "Delete",
@@ -215,7 +214,7 @@ export default function StoragePage({ onChanged }: { onChanged: () => void }) {
   };
 
   const deleteProject = async (p: ProjectStorage) => {
-    const ok = await confirmAction(
+    const ok = await confirmStorage(
       `Delete project "${p.name}" and everything GhostReel made for it?\n\nIts keyframes, proxies, previews and chat images go, and so do the transcripts, descriptions and search index of footage no other project uses. Your video files are not touched.`,
       "Delete project",
       "Delete project",
@@ -325,6 +324,20 @@ export default function StoragePage({ onChanged }: { onChanged: () => void }) {
                     </button>
                   </td>
                 </tr>
+                {r.backups > 0 && (
+                  <tr>
+                    <td className="name">
+                      <div className="storage-name-row">
+                        <span>Database backups</span>
+                        <span className="storage-category-badge data">Safety copies</span>
+                      </div>
+                      <div className="muted small">A copy of the library a day; only the newest few are kept. Cleanup never removes them.</div>
+                    </td>
+                    <td className="num">{humanSize(r.backups)}</td>
+                    <td className="bar-col"><Bar bytes={r.backups} of={r.total} /></td>
+                    <td />
+                  </tr>
+                )}
                 {r.other > 0 && (
                   <tr>
                     <td className="name">

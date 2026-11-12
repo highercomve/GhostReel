@@ -24,6 +24,8 @@ const EMIT_EVERY: Duration = Duration::from_millis(250);
 pub struct Progress {
     /// Current phase name (`hash`, `probe`, …).
     pub phase: String,
+    /// The phase's human name ([`crate::runs::phase_label`]), so no front end keeps its own table.
+    pub label: String,
     pub phase_done: u64,
     pub phase_total: u64,
     /// Overall completion of the run, 0.0–1.0 (time-weighted across phases).
@@ -37,6 +39,30 @@ pub struct Progress {
     /// until it stops. The bar animates instead of claiming a percentage it does not know.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub indeterminate: bool,
+}
+
+impl Progress {
+    /// "12 of 40" when the phase counts something, else empty: a step's note.
+    pub fn count_note(&self) -> String {
+        if self.phase_total > 0 { format!("{} of {}", self.phase_done, self.phase_total) } else { String::new() }
+    }
+
+    /// A snapshot for work measured as a plain fraction (a render, a clip run) rather than with a
+    /// [`Tracker`]: nothing is counted, so `phase_done`/`phase_total` are zero.
+    pub fn fraction(phase: &str, fraction: f64, elapsed_secs: f64, indeterminate: bool) -> Self {
+        let fraction = fraction.clamp(0.0, 1.0);
+        Progress {
+            phase: phase.to_string(),
+            label: crate::runs::phase_label(phase),
+            phase_done: 0,
+            phase_total: 0,
+            fraction,
+            eta_secs: None,
+            elapsed_secs,
+            current: None,
+            indeterminate,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -168,7 +194,9 @@ impl Tracker {
             }
             p.total = p.done;
         }
-        self.current = self.phases.len().saturating_sub(1);
+        // The current phase stays the last one that ran: jumping to the last *declared* phase
+        // made the final snapshot report a phase that never ran (a bogus "Building the search
+        // index" step at the end of runs that never embedded).
     }
 
     pub fn snapshot(&self, current: Option<PathBuf>) -> Progress {
@@ -184,6 +212,7 @@ impl Tracker {
         let phase = &self.phases[self.current];
         Progress {
             phase: phase.name.to_string(),
+            label: crate::runs::phase_label(phase.name),
             phase_done: phase.done,
             phase_total: phase.total,
             fraction: if finished { 1.0 } else { fraction.clamp(0.0, 1.0) },

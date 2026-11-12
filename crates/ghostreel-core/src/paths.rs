@@ -46,6 +46,12 @@ impl Paths {
         Ok(Self { config_file, data_dir })
     }
 
+    /// A self-contained layout under `dir` (the config file beside the data): for tests and
+    /// portable installs.
+    pub fn in_dir(dir: &Path) -> Self {
+        Self { config_file: dir.join("config.toml"), data_dir: dir.to_path_buf() }
+    }
+
     pub fn db_file(&self) -> PathBuf {
         self.data_dir.join("ghostreel.db")
     }

@@ -3,6 +3,75 @@
 All notable changes to GhostReel. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [SemVer](https://semver.org/) while the project is 0.x (minor = features, patch = fixes).
 
+## [0.15.0] — 2026-11-11
+
+### Added
+
+- Generate clips: a new **Clips** cut type mines short, self-contained moments from every
+  selected video of a project and saves them as a clip set.
+  - Code finds sentence-bounded candidates, avoiding off-mic lines, holes in the transcript
+    and shaky stretches.
+  - Workers score them in parallel, and an orchestrator picks the best and writes each hook.
+  - Code checks, frames and saves the result.
+  - The set opens as a grid where each clip is accepted or rejected, then the accepted clips
+    are exported as full-size MP4s.
+  - The CLI has `ghostreel clips`, and MCP has `generate_clips`, `find_clip_candidates`,
+    `check_clips`, `save_clips` and `list_clip_sets`. The guide has a diagram of the pipeline.
+- Agents: workers and the orchestrator can each be the built-in model, a model server or a
+  coding-agent CLI. Several agents share the jobs by priority, and an agent that is busy or out
+  of quota rests while the others carry on. `ghostreel agents` and MCP `list_agents` list them.
+- One tool set everywhere: Sonar, clip workers, the clip orchestrator and MCP agents call the
+  same GhostReel tools, defined once. Tool calls have no budget by default; a cap is optional
+  in Settings.
+- Faces, speakers and people: new indexing stages find face tracks, who speaks when (voice
+  embeddings), and the people across a project. Names are kept across re-runs, and duplicates
+  can be merged. There is a People tab, plus MCP `get_faces`, `get_people`, `set_person`,
+  `merge_people`, `get_speakers` and `get_scenes`.
+- Vertical framing for 9:16 and 1:1:
+  - The crop follows whoever is speaking, or stacks two people.
+  - A screen share is shown on top of the speaker's camera, and empty shots are fitted over a
+    blurred copy of themselves.
+  - The live player shows the same crop the render uses.
+  - MCP `preview_crop` shows a planned crop.
+- Speech captions, burned into renders with an `.srt` beside them, and text overlays in the
+  editor.
+- Project glossary: terms Whisper should spell correctly, used as its prompt and to correct
+  known mis-hearings. It can be re-applied to stored transcripts without re-transcribing.
+- Recently deleted: deleted cuts and clip sets go to a trash for 30 days, with an undo right
+  after a delete. The CLI has `ghostreel trash`, and MCP has `list_trash` and `restore_trash`.
+- Database backups: a snapshot at startup and every six hours while the app runs, keeping one
+  per day for the last week.
+- The run log keeps every step of a run, with links to what it made and their current state.
+  A clip run also records which tools each worker and the orchestrator called.
+
+### Changed
+
+- Exports render at the cut's full size. Only previews stay at the light preview size.
+  `ghostreel script preview --full` and MCP `preview_script` with `full_size` render full
+  size too.
+- When GhostPen is running, GhostReel asks it to free its GPU models before loading its own
+  model, leaving alone any model the run is using from GhostPen. A local run then stays on the
+  GPU instead of falling back to the CPU.
+- The window remembers its size and position.
+- Renders written into a watched folder are no longer indexed as footage.
+
+### Fixed
+
+- Confirmation dialogs in the desktop app. WebKitGTK answered `confirm()` with "yes" without
+  showing anything, so a delete happened on the first click. Every question now goes through
+  the native dialog, and the browser build keeps the browser's dialogs. A lint check keeps it
+  that way.
+- A model is paired with the image projector beside it, not the first file of that name. A
+  9B model loaded with a 27B projector failed with an `n_embd` mismatch.
+- A new version of a cut no longer joins a deleted clip set, and a deleted clip keeps its place
+  in its set.
+- Purging the trash removes old preview files, so a cut that reuses an id never shows another
+  cut's preview.
+- The cut list, the Sonar panel and the clip grid fit their columns, and 9:16 thumbnails show
+  the planned crop.
+- A clip's target length includes its closing hold, so a new clip no longer starts over its
+  target.
+
 ## [0.14.0] — 2026-11-06
 
 ### Added
@@ -895,6 +964,7 @@ is and the editor cuts around the shaky stretches; camera originals play in the 
 See the git history: `git log v0.1.5`.
 
 [Unreleased]: https://github.com/highercomve/GhostReel/compare/v0.14.0...HEAD
+[0.15.0]: https://github.com/highercomve/GhostReel/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/highercomve/GhostReel/compare/v0.13.2...v0.14.0
 [0.13.2]: https://github.com/highercomve/GhostReel/compare/v0.13.1...v0.13.2
 [0.13.1]: https://github.com/highercomve/GhostReel/compare/v0.13.0...v0.13.1

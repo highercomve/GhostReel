@@ -567,6 +567,11 @@ mod tests {
 
     fn bedded_script() -> Script {
         Script {
+            framing: None,
+            captions: None,
+            title_style: None,
+            caption_edits: Vec::new(),
+            agents: None,
             title: "Deer".into(),
             target_duration_s: Some(30.0),
             fps: None,
@@ -577,7 +582,9 @@ mod tests {
                 purpose: "Show what she is talking about".into(),
                 narration: None,
                 on_screen_text: None,
+                title_layout: None,
                 clips: vec![ScriptClip {
+                    framing: None,
                     video_id: 2,
                     in_s: 0.0,
                     out_s: 4.0,
@@ -835,8 +842,15 @@ mod tests {
             .unwrap();
 
         let mut script = bedded_script();
-        script.beats[0].clips[0] =
-            ScriptClip { video_id: 1, in_s: 20.0, out_s: 30.0, audio: Audio::Mute, why: None, tracks: None };
+        script.beats[0].clips[0] = ScriptClip {
+            framing: None,
+            video_id: 1,
+            in_s: 20.0,
+            out_s: 30.0,
+            audio: Audio::Mute,
+            why: None,
+            tracks: None,
+        };
         let s = state(&db, &script, None, &JevConfig::default());
 
         let seen = s["beats"][0]["seen"].as_array().unwrap();

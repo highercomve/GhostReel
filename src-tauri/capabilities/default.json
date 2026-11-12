@@ -3,5 +3,5 @@
   "identifier": "default",
   "description": "Capabilities for GhostReel windows",
   "windows": ["main", "search"],
-  "permissions": ["core:default", "dialog:default", "opener:default", "updater:default", "process:allow-restart"]
+  "permissions": ["core:default", "dialog:default", "opener:default", "updater:default", "process:allow-restart", "window-state:default"]
 }

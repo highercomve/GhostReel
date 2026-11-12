@@ -105,6 +105,9 @@ pub struct Report {
     pub models: u64,
     /// The library database, with its write-ahead log and any legacy copy.
     pub database: u64,
+    /// Daily snapshots of the database (`backup.rs`). Cleanup never removes them; the backup
+    /// rotation keeps the newest few.
+    pub backups: u64,
     /// The rest: logs, config, anything not listed above.
     pub other: u64,
     /// Files no project uses: footage no project watches, deleted scripts and chats, scratch.
@@ -374,10 +377,12 @@ pub fn report(db: &Db, data_dir: &Path) -> Result<Report, Error> {
         })
         .map(|e| size_of(&e.path()))
         .sum();
+    let backups = size_of(&crate::backup::dir(data_dir));
     Ok(Report {
         data_dir: data_dir.to_path_buf(),
         total,
-        other: total.saturating_sub(usage.total() + models + database),
+        other: total.saturating_sub(usage.total() + models + database + backups),
+        backups,
         usage,
         models,
         database,
@@ -580,6 +585,30 @@ mod tests {
         assert_eq!(s.bytes_freed, 200);
         let r = report(&db, &data).unwrap();
         assert_eq!(r.usage.keyframes, 0);
+        assert_eq!(r.projects.iter().find(|p| p.project_id == a).unwrap().usage.previews, 300);
+    }
+
+    #[test]
+    fn backups_are_counted_on_their_own_and_cleanup_never_touches_them() {
+        let (_tmp, data, mut db, _a, _b) = fixture();
+        write(&data.join("backups/ghostreel-20261110-0900.db"), 400);
+        write(&data.join("backups/ghostreel-20261111-0900.db"), 500);
+        let r = report(&db, &data).unwrap();
+        assert_eq!(r.backups, 900);
+        assert_eq!(r.total, r.usage.total() + r.models + r.database + r.backups + r.other);
+        clean(&mut db, &data, Scope::Unused, &[]).unwrap();
+        clean(&mut db, &data, Scope::All, &[Kind::Proxies, Kind::Previews, Kind::Temp, Kind::Exports]).unwrap();
+        assert!(data.join("backups/ghostreel-20261111-0900.db").is_file());
+        assert!(data.join("backups/ghostreel-20261110-0900.db").is_file());
+    }
+
+    #[test]
+    fn trashed_scripts_keep_their_files_until_purged() {
+        let (_tmp, data, mut db, a, _b) = fixture();
+        crate::trash::trash_script(&db, 7, "app").unwrap();
+        clean(&mut db, &data, Scope::Unused, &[]).unwrap();
+        assert!(data.join("previews/script_7_v1.mp4").is_file(), "a trashed cut can still be restored");
+        let r = report(&db, &data).unwrap();
         assert_eq!(r.projects.iter().find(|p| p.project_id == a).unwrap().usage.previews, 300);
     }
 

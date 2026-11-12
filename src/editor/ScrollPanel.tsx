@@ -1,9 +1,13 @@
 import { useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { ChevronDown } from "lucide-react";
 
-/** A bounded scroll region with a solid, line-safe bottom edge and an explicit continuation. */
-export default function ScrollPanel({ children, className = "", label }: {
-  children: ReactNode; className?: string; label: string;
+/**
+ * A bounded scroll region with a solid, line-safe bottom edge and an explicit continuation.
+ * `nested` is for a region inside another panel (more content follows it): it shows the
+ * "More below" control only while it has more, never an "End of panel" marker mid-panel.
+ */
+export default function ScrollPanel({ children, className = "", label, nested = false }: {
+  children: ReactNode; className?: string; label: string; nested?: boolean;
 }) {
   const viewport = useRef<HTMLDivElement>(null);
   const content = useRef<HTMLDivElement>(null);
@@ -66,12 +70,12 @@ export default function ScrollPanel({ children, className = "", label }: {
       </div>
       <div className="editor-scroll-guard" style={{ height: guard }} aria-hidden="true" />
     </div>
-    <button type="button" className="editor-scroll-more" disabled={!more}
+    {(more || !nested) && <button type="button" className="editor-scroll-more" disabled={!more}
       aria-label={`More below in ${label}`} onClick={() => {
         const el = viewport.current;
         if (el) el.scrollBy({ top: Math.max(48, el.clientHeight * 0.65), behavior: "smooth" });
       }}>
       {more ? <>More below <ChevronDown size={13} aria-hidden="true" /></> : "End of panel"}
-    </button>
+    </button>}
   </div>;
 }

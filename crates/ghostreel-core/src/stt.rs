@@ -63,20 +63,33 @@ pub async fn transcribe(
     video: &Path,
     duration_s: f64,
     mut on_progress: impl FnMut(f64),
+    prompt: Option<&str>,
 ) -> Result<Transcript, Error> {
     let mut t = match engine {
         Engine::Server { url, chunk_secs } => {
-            transcribe_server(url, *chunk_secs, ffmpeg, video, duration_s, &mut on_progress).await?
+            transcribe_server(url, *chunk_secs, ffmpeg, video, duration_s, &mut on_progress, prompt).await?
         }
         Engine::Local { asr_bin, model, language } => {
-            match transcribe_local(asr_bin, model, language, false, ffmpeg, video, duration_s, &mut on_progress).await {
+            match transcribe_local(asr_bin, model, language, false, ffmpeg, video, duration_s, &mut on_progress, prompt)
+                .await
+            {
                 Ok(t) => t,
                 // Typically the GPU is busy with other models (out of memory): CPU is slower but works.
                 Err(Error::Stt(e)) if e.contains("[gpu]") => {
                     tracing::warn!("local whisper failed on GPU, retrying on CPU: {e}");
-                    transcribe_local(asr_bin, model, language, true, ffmpeg, video, duration_s, &mut on_progress)
-                        .await
-                        .map_err(|cpu_err| Error::Stt(format!("{e}; CPU retry: {cpu_err}")))?
+                    transcribe_local(
+                        asr_bin,
+                        model,
+                        language,
+                        true,
+                        ffmpeg,
+                        video,
+                        duration_s,
+                        &mut on_progress,
+                        prompt,
+                    )
+                    .await
+                    .map_err(|cpu_err| Error::Stt(format!("{e}; CPU retry: {cpu_err}")))?
                 }
                 Err(e) => return Err(e),
             }
@@ -120,10 +133,11 @@ impl<'a> Transcriber<'a> {
         video: &Path,
         duration_s: f64,
         mut progress: impl FnMut(f64),
+        prompt: Option<&str>,
     ) -> Result<Transcript, Error> {
         self.audio = None;
         let Engine::Local { asr_bin, model, language } = self.engine else {
-            return transcribe(self.engine, ffmpeg, video, duration_s, progress).await;
+            return transcribe(self.engine, ffmpeg, video, duration_s, progress, prompt).await;
         };
         let audio = tempfile::Builder::new()
             .prefix("ghostreel-audio-")
@@ -150,7 +164,7 @@ impl<'a> Transcriber<'a> {
             .worker
             .as_mut()
             .unwrap()
-            .transcribe(self.audio.as_ref().unwrap().path(), duration_s, &mut progress)
+            .transcribe(self.audio.as_ref().unwrap().path(), duration_s, &mut progress, prompt)
             .await;
         match result {
             Ok(mut t) => {
@@ -161,7 +175,7 @@ impl<'a> Transcriber<'a> {
                 // Kill a failed worker before a retry, releasing any GPU memory it owns.
                 self.shutdown().await;
                 tracing::warn!("persistent whisper failed, retrying with isolated helper: {error}");
-                transcribe(self.engine, ffmpeg, video, duration_s, progress).await
+                transcribe(self.engine, ffmpeg, video, duration_s, progress, prompt).await
             }
         }
     }
@@ -213,9 +227,13 @@ impl LocalWorker {
         audio: &Path,
         duration_s: f64,
         progress: &mut impl FnMut(f64),
+        prompt: Option<&str>,
     ) -> Result<Transcript, Error> {
-        let request =
-            serde_json::to_vec(&serde_json::json!({ "audio": audio })).map_err(|e| Error::Stt(e.to_string()))?;
+        let mut req_val = serde_json::json!({ "audio": audio });
+        if let Some(p) = prompt {
+            req_val["prompt"] = serde_json::Value::String(p.to_string());
+        }
+        let request = serde_json::to_vec(&req_val).map_err(|e| Error::Stt(e.to_string()))?;
         self.input.write_all(&request).await.map_err(|e| Error::Stt(e.to_string()))?;
         self.input.write_all(b"\n").await.map_err(|e| Error::Stt(e.to_string()))?;
         self.input.flush().await.map_err(|e| Error::Stt(e.to_string()))?;
@@ -299,6 +317,7 @@ async fn transcribe_server(
     video: &Path,
     duration_s: f64,
     on_progress: &mut impl FnMut(f64),
+    prompt: Option<&str>,
 ) -> Result<Transcript, Error> {
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(5))
@@ -317,7 +336,7 @@ async fn transcribe_server(
         let from = (start - CHUNK_OVERLAP_SECS).max(0.0);
         let len = (end - from) + if last { 1.0 } else { CHUNK_OVERLAP_SECS };
         let audio = extract_opus(ffmpeg, video, from, len).await?;
-        let body: VerboseJson = post_chunk(&client, url, audio).await?;
+        let body: VerboseJson = post_chunk(&client, url, audio, prompt).await?;
         if out.language.is_none() {
             out.language = body.language.filter(|l| !l.is_empty());
         }
@@ -385,8 +404,13 @@ struct VerboseJson {
     segments: Option<Vec<Segment>>,
 }
 
-async fn post_chunk(client: &reqwest::Client, url: &str, audio: Vec<u8>) -> Result<VerboseJson, Error> {
-    let form = reqwest::multipart::Form::new()
+async fn post_chunk(
+    client: &reqwest::Client,
+    url: &str,
+    audio: Vec<u8>,
+    prompt: Option<&str>,
+) -> Result<VerboseJson, Error> {
+    let mut form = reqwest::multipart::Form::new()
         .part(
             "file",
             reqwest::multipart::Part::bytes(audio)
@@ -395,6 +419,9 @@ async fn post_chunk(client: &reqwest::Client, url: &str, audio: Vec<u8>) -> Resu
                 .map_err(|e| Error::Stt(e.to_string()))?,
         )
         .text("response_format", "verbose_json");
+    if let Some(p) = prompt {
+        form = form.text("prompt", p.to_string());
+    }
     let resp = client
         .post(format!("{url}/v1/audio/transcriptions"))
         .multipart(form)
@@ -492,6 +519,7 @@ async fn transcribe_local(
     video: &Path,
     duration_s: f64,
     on_progress: &mut impl FnMut(f64),
+    prompt: Option<&str>,
 ) -> Result<Transcript, Error> {
     let mut decoder = crate::proc::command(ffmpeg)
         .args(["-nostdin", "-v", "error", "-i"])
@@ -511,6 +539,9 @@ async fn transcribe_local(
 
     let mut cmd = crate::proc::command(asr_bin);
     cmd.arg("--model").arg(model).args(["--language", language]);
+    if let Some(p) = prompt {
+        cmd.args(["--prompt", p]);
+    }
     if cpu {
         cmd.arg("--cpu");
     }
@@ -612,13 +643,55 @@ done
         let mut worker = LocalWorker::start(&bin, Path::new("model"), "auto").unwrap();
         let pid = worker.child.id().unwrap();
         for _ in 0..2 {
-            let t = worker.transcribe(Path::new("audio.f32"), 1.0, &mut |_| {}).await.unwrap();
+            let t = worker.transcribe(Path::new("audio.f32"), 1.0, &mut |_| {}, None).await.unwrap();
             assert_eq!(t.segments, vec![seg(0.0, 1.0, "hello")]);
             assert_eq!(t.language.as_deref(), Some("en"));
             assert_eq!(worker.child.id(), Some(pid));
         }
         assert_eq!(std::fs::read_to_string(starts).unwrap().lines().count(), 1);
         drop(worker);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn worker_request_json_includes_prompt() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("worker");
+        let requests_file = tmp.path().join("requests.jsonl");
+        std::fs::write(
+            &bin,
+            format!(
+                r#"#!/bin/sh
+echo '{{"type":"loaded","gpu":true}}'
+while IFS= read -r request; do
+  echo "$request" >> '{}'
+  echo '{{"type":"segment","start":0,"end":1,"text":"hello"}}'
+  echo '{{"type":"done","language":"en"}}'
+done
+"#,
+                requests_file.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut worker = LocalWorker::start(&bin, Path::new("model"), "auto").unwrap();
+        worker
+            .transcribe(Path::new("audio.f32"), 1.0, &mut |_| {}, Some("Glossary: Kubernetes, homelab."))
+            .await
+            .unwrap();
+
+        let recorded = std::fs::read_to_string(&requests_file).unwrap();
+        let req_json: serde_json::Value = serde_json::from_str(recorded.trim()).unwrap();
+        assert_eq!(req_json["prompt"], "Glossary: Kubernetes, homelab.");
+        assert_eq!(req_json["audio"], "audio.f32");
+
+        // When prompt is None, "prompt" key is omitted
+        worker.transcribe(Path::new("audio.f32"), 1.0, &mut |_| {}, None).await.unwrap();
+        let lines: Vec<_> = std::fs::read_to_string(&requests_file).unwrap().lines().map(|s| s.to_string()).collect();
+        assert_eq!(lines.len(), 2);
+        let req_json_none: serde_json::Value = serde_json::from_str(&lines[1]).unwrap();
+        assert!(req_json_none.get("prompt").is_none());
     }
 
     fn seg(start: f64, end: f64, text: &str) -> Segment {
@@ -737,7 +810,7 @@ echo '{"type":"done","language":"en","audio_s":2.0}'
         std::fs::set_permissions(&asr, std::fs::Permissions::from_mode(0o755)).unwrap();
         let engine = Engine::Local { asr_bin: asr, model: tmp.path().join("m.bin"), language: "auto".into() };
         let mut progress = Vec::new();
-        let t = transcribe(&engine, Path::new("ffmpeg"), &video, 2.0, |p| progress.push(p)).await.unwrap();
+        let t = transcribe(&engine, Path::new("ffmpeg"), &video, 2.0, |p| progress.push(p), None).await.unwrap();
         assert_eq!(t.segments, vec![seg(0.0, 1.0, "hello")], "no-speech hallucination dropped");
         assert_eq!(t.language.as_deref(), Some("en"));
         assert_eq!(progress, vec![1.0, 2.0]);
@@ -762,7 +835,7 @@ echo '{"type":"done","language":"en","audio_s":2.0}'
             .unwrap();
         std::fs::set_permissions(&asr, std::fs::Permissions::from_mode(0o755)).unwrap();
         let engine = Engine::Local { asr_bin: asr, model: "m".into(), language: "auto".into() };
-        let err = transcribe(&engine, Path::new("ffmpeg"), &video, 1.0, |_| {}).await.unwrap_err();
+        let err = transcribe(&engine, Path::new("ffmpeg"), &video, 1.0, |_| {}, None).await.unwrap_err();
         assert!(err.to_string().contains("loading model"), "{err}");
     }
 
@@ -798,7 +871,7 @@ esac
         .unwrap();
         std::fs::set_permissions(&asr, std::fs::Permissions::from_mode(0o755)).unwrap();
         let engine = Engine::Local { asr_bin: asr, model: "m".into(), language: "auto".into() };
-        let t = transcribe(&engine, Path::new("ffmpeg"), &video, 1.0, |_| {}).await.unwrap();
+        let t = transcribe(&engine, Path::new("ffmpeg"), &video, 1.0, |_| {}, None).await.unwrap();
         assert_eq!(t.segments[0].text, "on cpu");
     }
 
@@ -855,7 +928,7 @@ esac
         let engine = Engine::Server { url, chunk_secs: 10.0 };
         // (sine tone has no silences → fixed 10 s boundaries; chunks 2+ start with 2 s pre-roll)
         let mut progress = Vec::new();
-        let t = transcribe(&engine, Path::new("ffmpeg"), &video, 25.0, |p| progress.push(p)).await.unwrap();
+        let t = transcribe(&engine, Path::new("ffmpeg"), &video, 25.0, |p| progress.push(p), None).await.unwrap();
         assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 3, "25 s in 10 s chunks");
         let got: Vec<(f64, &str)> = t.segments.iter().map(|s| (s.start, s.text.as_str())).collect();
         // chunk 1 audio starts at 8 s: its "a" at 9 s overlaps chunk 0's last segment (ends 10.5)

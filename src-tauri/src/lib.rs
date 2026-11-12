@@ -1,6 +1,7 @@
 //! GhostReel desktop app. UI logic lives in the React frontend; everything else is
 //! `ghostreel-core`, shared with the CLI.
 
+mod agents;
 mod media;
 mod menu;
 mod queue;
@@ -85,6 +86,22 @@ fn set_project_pipeline(project_id: i64, pipeline: PipelineConfig) -> CmdResult<
 }
 
 #[tauri::command]
+fn get_project_glossary(project_id: i64) -> CmdResult<ghostreel_core::glossary::Glossary> {
+    let db = open_db()?;
+    let p = db.project(project_id).map_err(err)?;
+    Ok(p.glossary)
+}
+
+#[tauri::command]
+fn set_project_glossary(
+    project_id: i64,
+    glossary: ghostreel_core::glossary::Glossary,
+) -> CmdResult<ghostreel_core::glossary::Glossary> {
+    let mut db = open_db()?;
+    db.set_project_glossary(project_id, &glossary).map_err(err)
+}
+
+#[tauri::command]
 fn rename_project(project_id: i64, name: String) -> CmdResult<Project> {
     open_db()?.rename_project(project_id, &name).map_err(err)
 }
@@ -143,6 +160,14 @@ struct ProjectView {
     videos: Vec<VideoRow>,
     /// Videos taken out of the library: removed, or kept as reference edits for the script chat.
     excluded: Vec<ExcludedView>,
+    face_models_available: bool,
+    /// Videos with speech whose voices are not analysed yet (speakers stage).
+    speakers_pending: usize,
+    /// People found in the project so far.
+    people_count: usize,
+    /// Each pipeline stage's status for the Project menu (off / unavailable / pending / failed /
+    /// done), from the same gate the index pipeline uses.
+    stages: Vec<index::StageStatus>,
 }
 
 #[derive(Serialize)]
@@ -161,6 +186,9 @@ struct FolderView {
 
 #[tauri::command]
 fn project_view(project_id: i64) -> CmdResult<ProjectView> {
+    let p = paths()?;
+    let config = Config::load(&p.config_file).unwrap_or_default();
+    let face_models_available = ghostreel_core::models::face_models_available(&p, &config);
     let db = open_db()?;
     let folders = db
         .folders(Some(project_id))
@@ -180,6 +208,10 @@ fn project_view(project_id: i64) -> CmdResult<ProjectView> {
             .into_iter()
             .map(|(video_id, role, path)| ExcludedView { video_id, role, path })
             .collect(),
+        face_models_available,
+        speakers_pending: ghostreel_core::speakers::pending_videos(&db, project_id).map_err(err)?,
+        people_count: db.people(project_id).map_err(err)?.len(),
+        stages: index::stage_statuses(&db, project_id, &config, face_models_available).map_err(err)?,
     })
 }
 
@@ -355,6 +387,84 @@ async fn enqueue_steadiness(
     Ok(queue.enqueue(&app, queue::TaskKind::Steadiness { project_id, force }, label).await)
 }
 
+#[tauri::command]
+async fn enqueue_faces(
+    app: AppHandle,
+    queue: State<'_, queue::Queue>,
+    project_id: i64,
+    force: Option<bool>,
+) -> CmdResult<u64> {
+    let name = open_db()?.project(project_id).map_err(err)?.name;
+    let force = force.unwrap_or(false);
+    let label = if force {
+        format!("Re-analyze faces “{name}”")
+    } else {
+        format!("Analyze faces “{name}”")
+    };
+    Ok(queue.enqueue(&app, queue::TaskKind::Faces { project_id, force }, label).await)
+}
+
+#[tauri::command]
+async fn enqueue_speakers(
+    app: AppHandle,
+    queue: State<'_, queue::Queue>,
+    project_id: i64,
+    force: Option<bool>,
+) -> CmdResult<u64> {
+    let name = open_db()?.project(project_id).map_err(err)?.name;
+    let force = force.unwrap_or(false);
+    let label = if force { format!("Re-analyze speakers “{name}”") } else { format!("Analyze speakers “{name}”") };
+    Ok(queue.enqueue(&app, queue::TaskKind::Speakers { project_id, force }, label).await)
+}
+
+#[tauri::command]
+fn project_people(project_id: i64) -> CmdResult<Vec<ghostreel_core::speakers::PersonSummary>> {
+    open_db()?.person_summaries(project_id).map_err(err)
+}
+
+#[tauri::command]
+fn set_person(
+    project_id: i64,
+    person_id: i64,
+    name: Option<String>,
+    handle: Option<String>,
+    role: Option<String>,
+) -> CmdResult<ghostreel_core::speakers::Person> {
+    open_db()?
+        .set_person(project_id, person_id, name.as_deref(), handle.as_deref(), role.as_deref())
+        .map_err(err)
+}
+
+#[tauri::command]
+fn merge_people(project_id: i64, keep_id: i64, merge_id: i64) -> CmdResult<ghostreel_core::speakers::Person> {
+    open_db()?.merge_people(project_id, keep_id, merge_id).map_err(err)
+}
+
+#[tauri::command]
+fn video_speakers(
+    video_id: i64,
+    from_s: Option<f64>,
+    to_s: Option<f64>,
+) -> CmdResult<Vec<ghostreel_core::speakers::SpeakerTurn>> {
+    open_db()?.speaker_turns(video_id, from_s.unwrap_or(0.0), to_s.unwrap_or(f64::MAX)).map_err(err)
+}
+
+/// Path of a cached face thumbnail for a person (cropped from the video on first request).
+#[tauri::command]
+async fn person_thumbnail(project_id: i64, person_id: i64) -> CmdResult<Option<String>> {
+    tokio::task::spawn_blocking(move || {
+        let p = paths()?;
+        let db = open_db()?;
+        db.person(project_id, person_id).map_err(err)?;
+        let ffmpeg = doctor::locate("ffmpeg").ok_or_else(|| "ffmpeg not found".to_string())?;
+        Ok(ghostreel_core::speakers::person_thumbnail(&db, &p.data_dir, &ffmpeg, person_id)
+            .map_err(err)?
+            .map(|p| p.to_string_lossy().into_owned()))
+    })
+    .await
+    .map_err(err)?
+}
+
 /// Reset a stage (and later stages) back to pending for a project's videos, then enqueue an index run.
 /// `stage` must be one of: frames, transcribe, describe, embed.
 #[tauri::command]
@@ -364,6 +474,12 @@ async fn redo_project_stage(
     project_id: i64,
     stage: String,
 ) -> CmdResult<u64> {
+    // Project-level analysis stages re-run in place rather than through the job pipeline.
+    match stage.as_str() {
+        "speakers" => return enqueue_speakers(app, queue, project_id, Some(true)).await,
+        "faces" => return enqueue_faces(app, queue, project_id, Some(true)).await,
+        _ => {}
+    }
     let p = paths()?;
     let db = open_db()?;
     index::reset_stages(&db, &p.data_dir, Some(project_id), &stage).map_err(err)?;
@@ -407,6 +523,7 @@ async fn enqueue_preview(
     script_id: i64,
     burn_titles: bool,
     burn_narration: bool,
+    burn_captions: bool,
     normalize_audio: bool,
     out: Option<String>,
 ) -> CmdResult<u64> {
@@ -419,7 +536,7 @@ async fn enqueue_preview(
     Ok(queue
         .enqueue(
             &app,
-            queue::TaskKind::RenderPreview { script_id, burn_titles, burn_narration, normalize_audio, out },
+            queue::TaskKind::RenderPreview { script_id, burn_titles, burn_narration, burn_captions, normalize_audio, out },
             label,
         )
         .await)
@@ -456,6 +573,47 @@ fn get_script_preview(script_id: i64) -> CmdResult<Option<String>> {
 #[tauri::command]
 async fn queue_list(queue: State<'_, queue::Queue>) -> CmdResult<Vec<queue::Task>> {
     Ok(queue.snapshot().await)
+}
+
+/// Saved runs (finished tasks of the app's queue and of the CLI), newest first: one project's, or
+/// every project's when `project_id` is absent.
+#[tauri::command]
+fn list_runs(project_id: Option<i64>, limit: Option<usize>) -> CmdResult<Vec<ghostreel_core::runs::Run>> {
+    let db = open_db()?;
+    let limit = limit.unwrap_or(100).min(ghostreel_core::runs::RUNS_KEPT);
+    match project_id {
+        Some(id) => db.runs_for_project(id, limit),
+        None => db.recent_runs(limit),
+    }
+    .map_err(err)
+}
+
+/// For each run link, where its target stands: there, in the trash (restorable), or gone.
+#[tauri::command]
+fn run_links_state(links: Vec<ghostreel_core::runs::RunLink>) -> CmdResult<Vec<ghostreel_core::runs::LinkState>> {
+    let db = open_db()?;
+    ghostreel_core::runs::links_state(&db, &links).map_err(err)
+}
+
+/// What is in a project's trash (deleted cuts, versions and clip sets), newest first.
+#[tauri::command]
+fn list_trash(project_id: i64) -> CmdResult<Vec<ghostreel_core::trash::TrashItem>> {
+    let db = open_db()?;
+    ghostreel_core::trash::list(&db, Some(project_id)).map_err(err)
+}
+
+/// Put a trash entry back exactly as it was.
+#[tauri::command]
+fn restore_trash(trash_id: String) -> CmdResult<ghostreel_core::trash::TrashItem> {
+    let db = open_db()?;
+    ghostreel_core::trash::restore(&db, &trash_id, "app").map_err(err)
+}
+
+/// Restore whatever a run link points at from the trash (a run's deleted clip set or cut).
+#[tauri::command]
+fn restore_run_link(link: ghostreel_core::runs::RunLink) -> CmdResult<ghostreel_core::trash::TrashItem> {
+    let db = open_db()?;
+    ghostreel_core::trash::restore_link(&db, &link, "app").map_err(err)
 }
 
 #[tauri::command]
@@ -727,7 +885,7 @@ fn apply_llm_patch(
         cfg.cpu_moe_layers = layers;
     }
     if let Some(rounds) = v.max_tool_rounds {
-        cfg.max_tool_rounds = rounds.min(100);
+        cfg.max_tool_rounds = rounds;
     }
     if let Some(t) = v.think {
         cfg.think = t;
@@ -1319,6 +1477,60 @@ struct ScriptView {
 struct SaveScriptView {
     script_id: i64,
     issues: Vec<ghostreel_core::script::Issue>,
+    /// What the deterministic repair changed before saving (empty: saved as given).
+    notes: Vec<String>,
+    /// The script as saved (after repairs).
+    script: ghostreel_core::script::Script,
+}
+
+/// A script after one fix, checked again (not saved: the editor saves it).
+#[derive(Serialize)]
+struct FixedScriptView {
+    script: ghostreel_core::script::Script,
+    issues: Vec<ghostreel_core::script::Issue>,
+    note: String,
+}
+
+/// The checks of a script against the index as it is now. A clip of a clip run keeps that run's
+/// minimum length when a fix trims it.
+fn live_issues(
+    db: &ghostreel_core::db::Db,
+    project_id: i64,
+    script: &ghostreel_core::script::Script,
+) -> CmdResult<Vec<ghostreel_core::script::Issue>> {
+    let cfg = paths().map(|p| Config::load(&p.config_file).unwrap_or_default().script).unwrap_or_default();
+    let min = ghostreel_core::clips::length_range(db, project_id, &script.title).map(|r| r.0);
+    let opts = ghostreel_core::script_check::CheckOptions { trim_min_s: min, ..Default::default() };
+    ghostreel_core::script_check::check(db, project_id, script, &cfg, &opts).map_err(err)
+}
+
+/// Queue the indexing stages the issues ask for (the project has them on, nothing queued or
+/// running for them yet, and the last try didn't fail) and say so on the issues. When it
+/// finishes, `task-finished` makes the editor check and plan the framing again.
+async fn queue_needed_stages(
+    app: &AppHandle,
+    queue: &queue::Queue,
+    project_id: i64,
+    issues: &mut [ghostreel_core::script::Issue],
+) {
+    for stage in ghostreel_core::script_check::stages_to_queue(issues) {
+        let (kind, label) = match stage.as_str() {
+            "faces" => (queue::TaskKind::Faces { project_id, force: false }, "Find faces for framing"),
+            "speakers" => (queue::TaskKind::Speakers { project_id, force: false }, "Find speakers for framing"),
+            _ => (queue::TaskKind::Index { project_id }, "Index for framing"),
+        };
+        let tasks = queue.snapshot().await;
+        let same = |t: &&queue::Task| t.kind.key() == kind.key() && t.project_id == Some(project_id);
+        let active = tasks.iter().filter(same).any(|t| t.state.is_active());
+        let failed = tasks.iter().filter(same).last().is_some_and(|t| t.state == queue::TaskState::Failed);
+        if failed {
+            continue;
+        }
+        if !active {
+            queue.enqueue(app, kind, label.to_string()).await;
+        }
+        ghostreel_core::script_check::mark_queued(issues, &stage);
+    }
 }
 
 #[tauri::command]
@@ -1376,7 +1588,9 @@ fn chat_messages(session_id: i64) -> CmdResult<Vec<ghostreel_core::chat::ChatMes
 fn open_chat_log(app: tauri::AppHandle, session_id: i64) -> CmdResult<()> {
     use tauri_plugin_opener::OpenerExt;
     let path = paths()?.data_dir.join("logs/chat").join(format!("{session_id}.jsonl"));
-    if !path.is_file() { return Err("No saved log for this chat".into()); }
+    if !path.is_file() {
+        return Err("No saved log for this chat".into());
+    }
     app.opener().reveal_item_in_dir(path).map_err(err)
 }
 
@@ -1387,42 +1601,209 @@ fn chat_log(session_id: i64, after_seq: u64) -> CmdResult<Vec<ghostreel_core::ll
 }
 
 #[tauri::command]
+async fn generate_clips(
+    app: AppHandle,
+    queue: State<'_, queue::Queue>,
+    project_id: i64,
+    options: ghostreel_core::clips::ClipOptions,
+) -> CmdResult<u64> {
+    options.validate().map_err(err)?;
+    agents::check_selection(Some(&options.agents))?;
+    let db = open_db()?;
+    let name = db.project(project_id).map(|p| p.name).unwrap_or_else(|_| format!("{project_id}"));
+    let label = format!("Generate {} {} “{name}”", options.count, if options.count == 1 { "clip" } else { "clips" });
+    Ok(queue.enqueue(&app, queue::TaskKind::Clips { project_id, options }, label).await)
+}
+
+/// What a clip run with these options would run into, before it is queued: agents that cannot
+/// be used and indexing still to do (`ghostreel_core::clips::preflight`).
+#[tauri::command]
+async fn clips_preflight(
+    project_id: i64,
+    options: ghostreel_core::clips::ClipOptions,
+) -> CmdResult<ghostreel_core::preflight::Preflight> {
+    let p = paths()?;
+    let config = Config::load(&p.config_file).map_err(err)?;
+    ghostreel_core::clips::preflight(&p, &config, project_id, &options).await.map_err(err)
+}
+
+#[tauri::command]
+fn list_clip_sets(project_id: i64) -> CmdResult<Vec<ghostreel_core::clips::ClipSet>> {
+    let db = open_db()?;
+    let data_dir = paths()?.data_dir;
+    let mut sets = ghostreel_core::clips::list_sets(&db, project_id).map_err(err)?;
+    let cfg = script_cfg();
+    for s in &mut sets {
+        ghostreel_core::clips::with_thumbs(&db, &data_dir, s);
+        ghostreel_core::clips::with_live_checks(&db, &cfg, s);
+    }
+    Ok(sets)
+}
+
+/// The script settings (defaults when the config can't be read).
+fn script_cfg() -> ghostreel_core::config::ScriptConfig {
+    paths().map(|p| Config::load(&p.config_file).unwrap_or_default().script).unwrap_or_default()
+}
+
+#[tauri::command]
+fn get_clip_set(set_id: String) -> CmdResult<ghostreel_core::clips::ClipSet> {
+    let db = open_db()?;
+    let mut set = ghostreel_core::clips::load_set(&db, &set_id).map_err(err)?;
+    ghostreel_core::clips::with_thumbs(&db, &paths()?.data_dir, &mut set);
+    ghostreel_core::clips::with_live_checks(&db, &script_cfg(), &mut set);
+    Ok(set)
+}
+
+#[tauri::command]
+fn set_clip_status(set_id: String, script_id: i64, status: String) -> CmdResult<ghostreel_core::clips::ClipSet> {
+    let db = open_db()?;
+    let mut set = ghostreel_core::clips::set_item_status(&db, &set_id, script_id, &status).map_err(err)?;
+    ghostreel_core::clips::with_thumbs(&db, &paths()?.data_dir, &mut set);
+    ghostreel_core::clips::with_live_checks(&db, &script_cfg(), &mut set);
+    Ok(set)
+}
+
+/// Move a clip set and its clips to the trash (restorable; recorded as a run).
+#[tauri::command]
+fn delete_clip_set(set_id: String) -> CmdResult<ghostreel_core::trash::TrashItem> {
+    let db = open_db()?;
+    ghostreel_core::clips::delete_set(&db, &set_id, "app").map_err(err)
+}
+
+/// Render a set's clips (accepted only, or everything not rejected) into `dir`.
+#[tauri::command]
+async fn export_clip_set(
+    app: AppHandle,
+    queue: State<'_, queue::Queue>,
+    set_id: String,
+    dir: String,
+    accepted_only: bool,
+) -> CmdResult<u64> {
+    let db = open_db()?;
+    let set = ghostreel_core::clips::load_set(&db, &set_id).map_err(err)?;
+    let n = set.items.iter().filter(|i| if accepted_only { i.status == "accepted" } else { i.status != "rejected" }).count();
+    if n == 0 {
+        return Err(if accepted_only { "no accepted clips to export".into() } else { "no clips to export".into() });
+    }
+    Ok(queue
+        .enqueue(&app, queue::TaskKind::ExportClips { set_id, dir, accepted_only }, format!("Export {n} {}", if n == 1 { "clip" } else { "clips" }))
+        .await)
+}
+
+#[tauri::command]
 fn list_scripts(project_id: i64) -> CmdResult<Vec<ghostreel_core::script::ScriptSummary>> {
     let db = open_db()?;
     ghostreel_core::script::list(&db, project_id).map_err(err)
 }
 
 #[tauri::command]
-fn get_script(script_id: i64) -> CmdResult<ScriptView> {
+async fn get_script(app: AppHandle, queue: State<'_, queue::Queue>, script_id: i64) -> CmdResult<ScriptView> {
     let db = open_db()?;
     let stored = ghostreel_core::script::load(&db, script_id).map_err(err)?;
-    let issues = ghostreel_core::script::validate(&db, stored.project_id, &stored.script).map_err(err)?;
+    let mut issues = live_issues(&db, stored.project_id, &stored.script)?;
+    queue_needed_stages(&app, &queue, stored.project_id, &mut issues).await;
     Ok(ScriptView { stored, issues })
 }
 
+/// Check an (unsaved) script against the index as it is now: the editor asks whenever the script
+/// changes or a task finishes, so what it shows is never stale.
 #[tauri::command]
-fn save_script(
+async fn check_script(
+    app: AppHandle,
+    queue: State<'_, queue::Queue>,
+    project_id: i64,
+    script: ghostreel_core::script::Script,
+) -> CmdResult<Vec<ghostreel_core::script::Issue>> {
+    let db = open_db()?;
+    let mut issues = live_issues(&db, project_id, &script)?;
+    queue_needed_stages(&app, &queue, project_id, &mut issues).await;
+    Ok(issues)
+}
+
+/// Apply one fix an issue offered to an (unsaved) script and check it again. A run_stage fix
+/// turns the stage on when asked and queues it; the script comes back unchanged.
+#[tauri::command]
+async fn apply_script_fix(
+    app: AppHandle,
+    queue: State<'_, queue::Queue>,
+    project_id: i64,
+    mut script: ghostreel_core::script::Script,
+    fix: ghostreel_core::script::FixAction,
+) -> CmdResult<FixedScriptView> {
+    let mut db = open_db()?;
+    let applied = ghostreel_core::script_fix::apply_fix(&mut db, project_id, &mut script, &fix).map_err(err)?;
+    if let Some(stage) = &applied.run_stage {
+        let kind = match stage.as_str() {
+            "faces" => queue::TaskKind::Faces { project_id, force: false },
+            "speakers" => queue::TaskKind::Speakers { project_id, force: false },
+            _ => queue::TaskKind::Index { project_id },
+        };
+        queue.enqueue(&app, kind, format!("Run {stage} (asked by a framing fix)")).await;
+    }
+    let mut issues = live_issues(&db, project_id, &script)?;
+    queue_needed_stages(&app, &queue, project_id, &mut issues).await;
+    Ok(FixedScriptView { script, issues, note: applied.note })
+}
+
+#[tauri::command]
+async fn save_script(
+    app: AppHandle,
+    queue: State<'_, queue::Queue>,
     project_id: i64,
     mut script: ghostreel_core::script::Script,
     session_id: Option<i64>,
 ) -> CmdResult<SaveScriptView> {
+    agents::check_selection(script.agents.as_ref())?;
     let db = open_db()?;
     let _ = ghostreel_core::script::snap_to_segments(&db, &mut script).map_err(err)?;
-    let issues = ghostreel_core::script::validate(&db, project_id, &script).map_err(err)?;
+    // The deterministic framing work (a vertical clip off a screen share, the closing hold on a
+    // face), the same pass clip runs and imports get; what it did comes back as notes.
+    let cfg = paths().map(|p| Config::load(&p.config_file).unwrap_or_default().script).unwrap_or_default();
+    let min = ghostreel_core::clips::length_range(&db, project_id, &script.title).map(|r| r.0);
+    let notes = ghostreel_core::script_fix::repair_framing(&db, &mut script, cfg.speech_overrun_s, min);
+    let mut issues = live_issues(&db, project_id, &script)?;
+    queue_needed_stages(&app, &queue, project_id, &mut issues).await;
     let script_id = ghostreel_core::script::save_version(&db, project_id, &script, session_id).map_err(err)?;
-    Ok(SaveScriptView { script_id, issues })
+    Ok(SaveScriptView { script_id, issues, notes, script })
+}
+
+/// Move one script version to the trash (restorable; recorded as a run).
+#[tauri::command]
+fn delete_script(script_id: i64) -> CmdResult<ghostreel_core::trash::TrashItem> {
+    let db = open_db()?;
+    ghostreel_core::script::delete(&db, script_id, "app").map_err(err)
+}
+
+/// Move every version of a cut to the trash, as one restorable entry.
+#[tauri::command]
+fn delete_script_cut(project_id: i64, title: String) -> CmdResult<ghostreel_core::trash::TrashItem> {
+    let db = open_db()?;
+    ghostreel_core::script::delete_cut(&db, project_id, &title, "app").map_err(err)
 }
 
 #[tauri::command]
-fn delete_script(script_id: i64) -> CmdResult<bool> {
+fn script_captions(script: ghostreel_core::script::Script) -> CmdResult<Vec<ghostreel_core::captions::Cue>> {
     let db = open_db()?;
-    ghostreel_core::script::delete(&db, script_id).map_err(err)
+    ghostreel_core::captions::cues_for_script(&db, &script).map_err(err)
 }
 
+/// Every burnt-in title and caption of a script, laid out exactly as a render places them, so
+/// the live viewer draws the same lines in the same spots.
 #[tauri::command]
-fn delete_script_cut(project_id: i64, title: String) -> CmdResult<usize> {
+fn script_overlays(script: ghostreel_core::script::Script) -> CmdResult<ghostreel_core::overlays::Overlays> {
     let db = open_db()?;
-    ghostreel_core::script::delete_cut(&db, project_id, &title).map_err(err)
+    ghostreel_core::overlays::for_script(&db, &script).map_err(err)
+}
+
+/// The crop path of every framed clip in a script (vertical cuts of wide footage), so the live
+/// player crops exactly as a render will.
+#[tauri::command]
+fn script_framing(
+    script: ghostreel_core::script::Script,
+) -> CmdResult<Vec<ghostreel_core::framing::ClipFraming>> {
+    let db = open_db()?;
+    let ffmpeg = doctor::locate("ffmpeg");
+    ghostreel_core::framing::plans_for_script(&db, ffmpeg.as_deref(), &script).map_err(err)
 }
 
 /// WebKitGTK's DMABUF renderer dies with "Error 71 (Protocol error) dispatching to Wayland
@@ -1462,6 +1843,53 @@ async fn set_web_config(app: AppHandle, patch: webui::WebConfigPatch) -> CmdResu
     Ok(webui::status(&app.state::<webui::WebServer>(), &config.web))
 }
 
+/// Write a database snapshot when the newest is older than `max_age`. Failures are logged,
+/// never fatal.
+fn backup_if_older_than(max_age: std::time::Duration) {
+    let Ok(p) = Paths::resolve() else { return };
+    let db = match Db::open(&p.db_file()) {
+        Ok(db) => db,
+        Err(e) => return eprintln!("housekeeping: cannot open the library: {e}"),
+    };
+    if let Err(e) = ghostreel_core::backup::ensure_newer_than(&db, &p.data_dir, std::time::SystemTime::now(), max_age) {
+        eprintln!("housekeeping: database backup failed: {e}");
+    }
+}
+
+/// At start-up: write a database snapshot when the newest is older than
+/// `backup::BACKUP_EVERY`, then purge trash entries past `trash::KEEP_DAYS` (the snapshot goes
+/// first, so it still holds what the purge removes). Failures are logged, never fatal.
+fn start_up_housekeeping() {
+    backup_if_older_than(ghostreel_core::backup::BACKUP_EVERY);
+    let Ok(p) = Paths::resolve() else { return };
+    let db = match Db::open(&p.db_file()) {
+        Ok(db) => db,
+        Err(e) => return eprintln!("housekeeping: cannot open the library: {e}"),
+    };
+    if let Err(e) = ghostreel_core::trash::purge_expired(&db, &p.data_dir, ghostreel_core::projects::now(), "app") {
+        eprintln!("housekeeping: emptying old trash failed: {e}");
+    }
+}
+
+/// For an app left open for days: every `backup::BACKUP_CHECK_EVERY`, write a snapshot when the
+/// newest is older than `backup::BACKUP_CHECK_AGE`.
+async fn periodic_backups() {
+    use ghostreel_core::backup::{BACKUP_CHECK_AGE, BACKUP_CHECK_EVERY};
+    // The first tick is a full period away: start-up has just taken care of this moment.
+    let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + BACKUP_CHECK_EVERY, BACKUP_CHECK_EVERY);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        let _ = tauri::async_runtime::spawn_blocking(|| backup_if_older_than(BACKUP_CHECK_AGE)).await;
+    }
+}
+
+/// What of the main window is remembered across restarts (everything but visibility).
+fn window_state_flags() -> tauri_plugin_window_state::StateFlags {
+    use tauri_plugin_window_state::StateFlags;
+    StateFlags::SIZE | StateFlags::POSITION | StateFlags::MAXIMIZED | StateFlags::FULLSCREEN
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     #[cfg(target_os = "linux")]
@@ -1478,6 +1906,17 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(updater.build())
         .plugin(tauri_plugin_process::init())
+        // The main window comes back at its last size, place and maximized state. It starts
+        // hidden (tauri.conf.json) and the plugin restores it as it is created, before `setup`
+        // shows it, so it never visibly jumps. Visibility itself is not restored: a window
+        // hidden at quit must still open. On Wayland the compositor owns the position, so only
+        // size and maximized apply there. The search window opens fresh each time.
+        .plugin(
+            tauri_plugin_window_state::Builder::default()
+                .with_state_flags(window_state_flags())
+                .with_denylist(&["search"])
+                .build(),
+        )
         .manage(SearchState::default())
         .manage(tokio::sync::OnceCell::<media::MediaServer>::new())
         .manage(queue::Queue::default())
@@ -1508,6 +1947,16 @@ pub fn run() {
                     }
                 }
             }
+            // Config windows are built (and restored by the window-state plugin) before setup.
+            if let Some(main) = app.get_webview_window("main") {
+                let _ = main.show();
+                let _ = main.set_focus();
+            }
+            // House keeping off the UI thread: snapshot the library when the newest backup is a
+            // day old, then empty the trash of what is past keeping. A running app snapshots
+            // again every few hours it stays open.
+            std::thread::spawn(start_up_housekeeping);
+            tauri::async_runtime::spawn(periodic_backups());
             tauri::async_runtime::spawn(queue::worker(app.handle().clone()));
             webui::forward_events(app.handle());
             let handle = app.handle().clone();
@@ -1520,11 +1969,18 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            agents::list_agents,
+            agents::save_agents,
+            agents::test_agent,
+            agents::resolve_agents,
+            agents::agent_status,
             doctor,
             cli_models,
             list_projects,
             create_project,
             set_project_pipeline,
+            get_project_glossary,
+            set_project_glossary,
             rename_project,
             exclude_video,
             include_video,
@@ -1540,11 +1996,23 @@ pub fn run() {
             remove_folder,
             enqueue_index,
             enqueue_steadiness,
+            enqueue_faces,
+            enqueue_speakers,
+            project_people,
+            set_person,
+            merge_people,
+            video_speakers,
+            person_thumbnail,
             enqueue_preview,
             enqueue_export,
             preview_plan,
             get_script_preview,
             queue_list,
+            list_runs,
+            run_links_state,
+            list_trash,
+            restore_trash,
+            restore_run_link,
             cancel_task,
             clear_finished_tasks,
             redo_project_stage,
@@ -1571,10 +2039,22 @@ pub fn run() {
             open_chat_log,
             delete_chat_session,
             list_scripts,
+            generate_clips,
+            clips_preflight,
+            list_clip_sets,
+            get_clip_set,
+            set_clip_status,
+            delete_clip_set,
+            export_clip_set,
             get_script,
+            check_script,
+            apply_script_fix,
             save_script,
             delete_script,
             delete_script_cut,
+            script_captions,
+            script_overlays,
+            script_framing,
             models_status,
             enqueue_model_download,
             remove_model,

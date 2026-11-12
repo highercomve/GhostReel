@@ -3,11 +3,16 @@ import { Inbox } from "lucide-react";
 import { clearFinishedTasks, enqueueIndex, listProjects, type ProjectSummary } from "./api";
 import TaskCard from "./TaskCard";
 import { isActive, useQueue } from "./useQueue";
+import RunLog from "./runs/RunLog";
+import { useRuns } from "./runs/useRuns";
 
 export default function ActivityPage() {
   const tasks = useQueue();
   const active = tasks.filter(isActive);
   const finished = tasks.filter((t) => !isActive(t)).reverse();
+  // Saved runs the queue no longer holds: earlier sessions, and runs from the command line.
+  const inQueue = new Set(tasks.map((t) => t.run_id));
+  const history = useRuns(null, 50).filter((r) => !r.task && !inQueue.has(r.key));
 
   // The empty state doubles as the shortest path to the most common job here: indexing.
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
@@ -93,6 +98,17 @@ export default function ActivityPage() {
           finished.map((t) => <TaskCard key={t.id} task={t} />)
         )}
       </section>
+
+      {history.length > 0 && (
+        <>
+          <h2>History</h2>
+          <section className="runs-history">
+            {history.map((r) => (
+              <RunLog key={r.key} run={r} compact />
+            ))}
+          </section>
+        </>
+      )}
     </main>
   );
 }

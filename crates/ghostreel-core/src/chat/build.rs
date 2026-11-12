@@ -486,6 +486,7 @@ pub fn lay_out(project: &Project, lines: &[Quote], shots: &[Option<Shot>], targe
         });
 
         let mut clips = vec![ScriptClip {
+            framing: None,
             video_id: q.video_id,
             in_s: q.in_s,
             out_s: cut_at.unwrap_or(q.out_s),
@@ -499,6 +500,7 @@ pub fn lay_out(project: &Project, lines: &[Quote], shots: &[Option<Shot>], targe
             let picture_s = q.out_s - cut_at;
             let start = (shot.t_s - picture_s / 2.0).max(0.0);
             clips.push(ScriptClip {
+                framing: None,
                 video_id: shot.video_id,
                 in_s: start,
                 out_s: start + picture_s,
@@ -512,6 +514,7 @@ pub fn lay_out(project: &Project, lines: &[Quote], shots: &[Option<Shot>], targe
             purpose: shorten(&q.text, 120),
             narration: None,
             on_screen_text: None,
+            title_layout: None,
             clips,
             bed: Some(AudioBed {
                 video_id: q.video_id,
@@ -525,6 +528,11 @@ pub fn lay_out(project: &Project, lines: &[Quote], shots: &[Option<Shot>], targe
         });
     }
     Script {
+        framing: None,
+        captions: None,
+        title_style: None,
+        caption_edits: Vec::new(),
+        agents: None,
         title: project.name.clone(),
         target_duration_s: Some(target_s),
         fps: Some(crate::script::Fps::new(project.fps_num, project.fps_den)),

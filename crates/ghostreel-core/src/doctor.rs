@@ -186,10 +186,15 @@ pub async fn run(paths: &Paths) -> Report {
     if mlx_entry.is_some() {
         model_files.retain(|(role, _)| !role.starts_with("vision"));
     }
+    // The projector is looked up beside its model, as the runtime loads it.
+    let vision_model = model_files.iter().find(|(role, _)| role == "vision (local)").map(|(_, p)| p.clone());
     let mut models: Vec<ModelFile> = model_files
         .into_iter()
         .map(|(role, pattern)| {
-            let found = crate::models::find(&search, &pattern);
+            let found = match (&vision_model, role == "vision projector (local)") {
+                (Some(model), true) => crate::models::find_with_projector(&search, model, &pattern).1,
+                _ => crate::models::find(&search, &pattern),
+            };
             ModelFile { role, pattern, found }
         })
         .collect();

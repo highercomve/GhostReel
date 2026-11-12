@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
-import { ChevronDown, ChevronRight, Ellipsis, Plus, X } from "lucide-react";
-import { chatMessages, type ScriptSummary } from "../api";
+import { ArchiveRestore, ChevronDown, ChevronRight, Ellipsis, History, Plus, Scissors, X } from "lucide-react";
+import { chatMessages, type ClipSet, type ScriptSummary, type TrashItem } from "../api";
 import { formatDuration as clock } from "../timeFormat";
 import { fullTime, relativeTime, useMinuteNow } from "./relativeTime";
 
@@ -19,7 +19,26 @@ interface CutsPanelProps {
   onDeleteCut: (title: string) => void;
   onRestore: (scriptId: number) => Promise<void>;
   onDeleteVersion: (scriptId: number) => void;
+  /** Clip sets sit in the same list as the cuts, each as one row. */
+  clipSets: ClipSet[];
+  onOpenClipSet: (setId: string) => void;
+  onDeleteClipSet: (setId: string) => void;
+  /** Deleted cuts, versions and clip sets of the project (core's trash), newest first. */
+  trash: TrashItem[];
+  onRestoreTrash: (trashId: string) => Promise<void>;
+  /** The delete just made, offered for undo for a few seconds. */
+  undoItem: TrashItem | null;
+  onDismissUndo: () => void;
 }
+
+type Entry = { at: number; cut: ScriptCut } | { at: number; set: ClipSet };
+
+const toMs = (t: number) => (t < 1e11 ? t * 1000 : t);
+
+const clipSetName = (set: ClipSet) => {
+  const n = set.items.length;
+  return `${n} ${n === 1 ? "clip" : "clips"} · ${set.options.format ?? "original"}`;
+};
 
 const versionNote = (text: string) => {
   if (!text || text === "Saved by hand") return text;
@@ -40,7 +59,8 @@ const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? o
 /**
  * The project's cuts, like a composition list: one row per edit of the footage, its versions
  * folded underneath. The open cut is expanded so going back a version is one click.
- * Deleting sits behind each row's ⋯ menu so a stray click on a row never reaches it.
+ * Deleting sits behind each row's ⋯ menu so a stray click on a row never reaches it, and what is
+ * deleted goes to core's trash: undo right after, or restore from Recently deleted for 30 days.
  */
 export default function CutsPanel({
   cuts,
@@ -50,7 +70,24 @@ export default function CutsPanel({
   onDeleteCut,
   onRestore,
   onDeleteVersion,
+  clipSets,
+  onOpenClipSet,
+  onDeleteClipSet,
+  trash,
+  onRestoreTrash,
+  undoItem,
+  onDismissUndo,
 }: CutsPanelProps) {
+  const [trashOpen, setTrashOpen] = useState(false);
+  const [restoringTrash, setRestoringTrash] = useState<string | null>(null);
+  const restoreTrashItem = async (id: string) => {
+    setRestoringTrash(id);
+    try {
+      await onRestoreTrash(id);
+    } finally {
+      setRestoringTrash(null);
+    }
+  };
   const now = useMinuteNow();
   const [notes, setNotes] = useState<Record<number, string>>({});
   const [restoring, setRestoring] = useState(false);
@@ -76,7 +113,17 @@ export default function CutsPanel({
   const [menuFor, setMenuFor] = useState<string | null>(null);
 
   const q = filter.trim().toLowerCase();
-  const shown = q ? cuts.filter((c) => c.title.toLowerCase().includes(q)) : cuts;
+  const entries: Entry[] = [
+    ...cuts.map((cut) => ({ at: toMs(cut.latestScript.created_at), cut })),
+    ...clipSets.map((set) => ({ at: toMs(set.created_at), set })),
+  ].sort((a, b) => b.at - a.at);
+  const shown = q
+    ? entries.filter((e) =>
+        "cut" in e
+          ? e.cut.title.toLowerCase().includes(q)
+          : `${clipSetName(e.set)} ${e.set.brief}`.toLowerCase().includes(q),
+      )
+    : entries;
 
   const toggleMenu = (key: string) => setMenuFor((m) => (m === key ? null : key));
 
@@ -103,12 +150,86 @@ export default function CutsPanel({
         </button>
       </div>
 
+      {undoItem && (
+        <div className="nle-undo" role="status">
+          <span className="nle-undo-text" title={undoItem.label}>
+            {undoItem.label} deleted
+          </span>
+          <button
+            type="button"
+            className="small"
+            disabled={restoringTrash === undoItem.id}
+            onClick={() => void restoreTrashItem(undoItem.id)}
+          >
+            Undo
+          </button>
+          <button type="button" className="nle-field-clear" onClick={onDismissUndo} title="Dismiss" aria-label="Dismiss">
+            <X size={14} strokeWidth={2} aria-hidden="true" />
+          </button>
+        </div>
+      )}
+
       {shown.length === 0 && (
-        <div className="muted small nle-panel-empty">{cuts.length === 0 ? "No cuts yet." : "No cut matches."}</div>
+        <div className="muted small nle-panel-empty">{entries.length === 0 ? "No cuts yet." : "No cut matches."}</div>
       )}
 
       <ul className="nle-tree">
-        {shown.map((cut) => {
+        {shown.map((entry) => {
+          if ("set" in entry) {
+            const set = entry.set;
+            const setKey = `set:${set.id}`;
+            const accepted = set.items.filter((i) => i.status === "accepted").length;
+            return (
+              <li key={setKey} className={`nle-tree-cut clips-row ${set.items.some((i) => i.script_id === selectedScriptId) ? "active" : ""}`}>
+                <div className="nle-tree-row">
+                  <span className="clips-row-icon" aria-hidden="true">
+                    <Scissors size={14} strokeWidth={2} />
+                  </span>
+                  <button
+                    type="button"
+                    className="nle-tree-label nle-tree-label-2"
+                    onClick={() => onOpenClipSet(set.id)}
+                    title={`${clipSetName(set)}\n${set.brief.trim() || "No brief"}\nMade ${fullTime(set.created_at)}`}
+                  >
+                    <span className="nle-tree-name">{clipSetName(set)}</span>
+                    <span className="nle-tree-sub">
+                      <span>{set.brief.trim() || "No brief"}</span>
+                      <span>{relativeTime(set.created_at, now)}</span>
+                      <span>{accepted} accepted</span>
+                    </span>
+                  </button>
+                  <button
+                    type="button"
+                    className={`nle-tree-more ${menuFor === setKey ? "open" : ""}`}
+                    onClick={() => toggleMenu(setKey)}
+                    aria-expanded={menuFor === setKey}
+                    aria-label={`More for ${clipSetName(set)}`}
+                    title="More"
+                  >
+                    <Ellipsis size={16} strokeWidth={2} aria-hidden="true" />
+                  </button>
+                </div>
+                {menuFor === setKey && (
+                  <div className="nle-tree-menu">
+                    <button
+                      type="button"
+                      className="small danger"
+                      onClick={() => {
+                        setMenuFor(null);
+                        onDeleteClipSet(set.id);
+                      }}
+                    >
+                      Delete clip set…
+                    </button>
+                    <button type="button" className="small ghost" onClick={() => setMenuFor(null)}>
+                      Cancel
+                    </button>
+                  </div>
+                )}
+              </li>
+            );
+          }
+          const cut = entry.cut;
           const isActive = cut.versions.some((v) => v.id === selectedScriptId);
           const open = toggled[cut.title] ?? isActive;
           const latest = cut.latestScript;
@@ -244,6 +365,51 @@ export default function CutsPanel({
           );
         })}
       </ul>
+
+      {trash.length > 0 && (
+        <div className="nle-trash">
+          <button
+            type="button"
+            className="nle-trash-toggle ghost small"
+            aria-expanded={trashOpen}
+            onClick={() => setTrashOpen((o) => !o)}
+          >
+            {trashOpen ? <ChevronDown size={14} strokeWidth={2} aria-hidden="true" /> : <ChevronRight size={14} strokeWidth={2} aria-hidden="true" />}
+            <History size={14} strokeWidth={2} aria-hidden="true" />
+            Recently deleted <span className="muted">({trash.length})</span>
+          </button>
+          {trashOpen && (
+            <ul className="nle-trash-list">
+              {trash.map((item) => {
+                const daysLeft = Math.max(0, Math.ceil((toMs(item.purge_at) - now) / 86_400_000));
+                return (
+                  <li key={item.id} className="nle-trash-item">
+                    <div className="nle-trash-text">
+                      <span className="nle-tree-name" title={item.label}>{item.label}</span>
+                      <span
+                        className="muted small"
+                        title={`Deleted ${fullTime(item.deleted_at)} · removed for good ${fullTime(item.purge_at)}`}
+                      >
+                        Deleted {relativeTime(item.deleted_at, now)} · {plural(daysLeft, "day")} left
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      className="small ghost icon-text"
+                      disabled={restoringTrash === item.id}
+                      onClick={() => void restoreTrashItem(item.id)}
+                      title="Put it back exactly as it was"
+                    >
+                      <ArchiveRestore size={13} strokeWidth={2} aria-hidden="true" />
+                      {restoringTrash === item.id ? "Restoring…" : "Restore"}
+                    </button>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+        </div>
+      )}
     </div>
   );
 }

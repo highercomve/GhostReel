@@ -25,5 +25,8 @@ pub fn command(program: impl AsRef<OsStr>) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new(program);
     #[cfg(windows)]
     cmd.creation_flags(CREATE_NO_WINDOW);
+    // A child lives no longer than the task that owns it: when Stop drops the work (see
+    // `cancel::race`), ffmpeg, helpers and CLI agents are killed with it instead of running on.
+    cmd.kill_on_drop(true);
     cmd
 }

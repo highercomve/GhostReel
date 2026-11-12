@@ -191,36 +191,97 @@ pub async fn probe_service(
     p.capable.then_some(p)
 }
 
-/// The resolution `doctor` and `runtime` share when the service answers for a capability, so
-/// both always tell the same story.
+/// A model a GhostPen service holds in memory and can be asked to release (`POST /unload`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GhostModel {
+    /// The chat/vision model.
+    Chat,
+    /// The whisper model.
+    Stt,
+}
+
+/// Which of the service's models this run gets from GhostPen itself: those must stay loaded.
+fn models_in_use(svc: &GhostService, rt: &crate::runtime::Runtime) -> Vec<GhostModel> {
+    let base = svc.url.trim_end_matches('/');
+    let mut used = Vec::new();
+    if let crate::runtime::VisionSetup::Server(s) = &rt.vision
+        && s.url.trim_end_matches('/') == base
+    {
+        used.push(GhostModel::Chat);
+    }
+    if let crate::runtime::SttSetup::Ready(crate::stt::Engine::Server { url, .. }) = &rt.stt
+        && url.trim_end_matches('/') == base
+    {
+        used.push(GhostModel::Stt);
+    }
+    used
+}
+
 /// After an indexing run: the GhostPen model service it used releases its chat/vision and
 /// whisper models now (`POST /unload`), as the local helper is killed when a run ends. The small
 /// embedding model stays for search; GhostPen unloads it once idle. Best-effort: a service that
 /// is gone or too old for `/unload` is simply left alone.
 pub async fn release_after_run(rt: &crate::runtime::Runtime) {
     let Some(svc) = discover_in(&candidate_paths(), pid_alive) else { return };
-    let base = svc.url.trim_end_matches('/');
-    let mut models = Vec::new();
-    if let crate::runtime::VisionSetup::Server(s) = &rt.vision
-        && s.url.trim_end_matches('/') == base
-    {
-        models.push("chat");
-    }
-    if let crate::runtime::SttSetup::Ready(crate::stt::Engine::Server { url, .. }) = &rt.stt
-        && url.trim_end_matches('/') == base
-    {
-        models.push("stt");
-    }
+    let models = models_in_use(&svc, rt);
     if models.is_empty() {
         return;
     }
-    let _ = probe::probe_client()
-        .post(format!("{base}/unload"))
-        .json(&serde_json::json!({ "models": models }))
-        .send()
-        .await;
+    if unload_models(&svc, &models).await {
+        tracing::info!("asked {} to unload {:?} after the run that used them", svc.app, models);
+    }
 }
 
+/// What a GhostReel run may ask GhostPen to release before it loads a model of its own on the
+/// GPU: everything except the models this run gets from GhostPen itself. Without a runtime (a
+/// chat or agent run, which only needs its own chat model) that is both.
+pub fn models_to_free(rt: Option<&crate::runtime::Runtime>) -> Vec<GhostModel> {
+    let all = [GhostModel::Chat, GhostModel::Stt];
+    let Some(rt) = rt else { return all.to_vec() };
+    let Some(svc) = discover_in(&candidate_paths(), pid_alive) else { return all.to_vec() };
+    let used = models_in_use(&svc, rt);
+    all.into_iter().filter(|m| !used.contains(m)).collect()
+}
+
+/// Before GhostReel loads a model of its own on the GPU: a running GhostPen holding its chat and
+/// whisper models leaves too little VRAM, and the built-in model silently falls back to the CPU
+/// (minutes per run instead of seconds). So ask the service to release `models` (the caller
+/// leaves out any it is using itself; see `models_to_free`). Only when GhostPen is actually
+/// running (its announcement file names a live process) and the user has not opted out; its small
+/// embedding model stays. Best-effort: an empty list, no service, an old one without `/unload`,
+/// or an error all leave things as they are. Returns whether it unloaded.
+pub async fn free_gpu_for_local_model(models: &[GhostModel]) -> bool {
+    if models.is_empty() {
+        return false;
+    }
+    let config = crate::paths::Paths::resolve()
+        .ok()
+        .and_then(|p| crate::config::Config::load(&p.config_file).ok())
+        .unwrap_or_default();
+    let Some(svc) = discover(&config) else { return false };
+    let ok = unload_models(&svc, models).await;
+    if ok {
+        tracing::info!("asked {} to unload {:?} before loading a local model", svc.app, models);
+    }
+    ok
+}
+
+/// Ask a GhostPen service to unload some of its models; true when it answered with success.
+pub async fn unload_models(svc: &GhostService, models: &[GhostModel]) -> bool {
+    let base = svc.url.trim_end_matches('/');
+    matches!(
+        probe::probe_client()
+            .post(format!("{base}/unload"))
+            .json(&serde_json::json!({ "models": models }))
+            .send()
+            .await,
+        Ok(r) if r.status().is_success()
+    )
+}
+
+/// The resolution `doctor` and `runtime` share when the service answers for a capability, so
+/// both always tell the same story.
 pub fn service_resolution(backend: Backend, p: Probe) -> Resolution {
     let reason = format!("GhostPen shared service: {}{}", p.detail, p.caps.summary());
     Resolution { backend, target: Target::Server, probe: Some(p), reason }
@@ -228,6 +289,58 @@ pub fn service_resolution(backend: Backend, p: Probe) -> Resolution {
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn asks_a_running_service_to_unload_its_models() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = vec![0u8; 4096];
+            let mut got = String::new();
+            // Read until the JSON body has arrived.
+            while !got.contains("]}") {
+                let n = sock.read(&mut buf).unwrap();
+                if n == 0 { break; }
+                got.push_str(&String::from_utf8_lossy(&buf[..n]));
+            }
+            let body = r#"{"unloaded":{"chat":true,"stt":true}}"#;
+            write!(sock, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}", body.len()).unwrap();
+            got
+        });
+        let svc = GhostService {
+            path: PathBuf::from("/run/user/1000/ghost/models.json"),
+            app: "GhostPen".into(),
+            pid: None,
+            url: format!("http://127.0.0.1:{port}"),
+            capabilities: Default::default(),
+            models: Default::default(),
+        };
+        assert!(unload_models(&svc, &[GhostModel::Chat, GhostModel::Stt]).await);
+        let request = server.join().unwrap();
+        assert!(request.starts_with("POST /unload "), "{request}");
+        assert!(request.contains(r#"{"models":["chat","stt"]}"#), "{request}");
+    }
+
+    #[tokio::test]
+    async fn a_service_that_is_gone_is_left_alone() {
+        let svc = GhostService {
+            path: PathBuf::from("/x"),
+            app: "GhostPen".into(),
+            pid: None,
+            url: "http://127.0.0.1:9".into(),
+            capabilities: Default::default(),
+            models: Default::default(),
+        };
+        assert!(!unload_models(&svc, &[GhostModel::Chat]).await);
+    }
+
+    #[tokio::test]
+    async fn nothing_to_free_asks_nothing() {
+        // No service lookup, no request: what the tests' fake helpers rely on.
+        assert!(!free_gpu_for_local_model(&[]).await);
+    }
     use super::*;
 
     const EXAMPLE: &str = r#"{

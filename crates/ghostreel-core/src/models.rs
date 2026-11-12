@@ -17,6 +17,21 @@ pub fn effective_models_dir(paths: &Paths, config: &Config) -> PathBuf {
     config.models.dir.clone().unwrap_or_else(|| paths.models_dir())
 }
 
+/// Check if face detection and recognition models are available on disk.
+pub fn face_models_available(paths: &Paths, config: &Config) -> bool {
+    let models_dir = effective_models_dir(paths, config);
+    let roots = search_roots(&models_dir, &config.models.search_paths);
+    find(&roots, "face_detection_yunet_2023mar.onnx").is_some()
+        && find(&roots, "face_recognition_sface_2021dec.onnx").is_some()
+}
+
+/// Check if the voice (speaker embedding) model is available on disk.
+pub fn speaker_model_available(paths: &Paths, config: &Config) -> bool {
+    let models_dir = effective_models_dir(paths, config);
+    let roots = search_roots(&models_dir, &config.models.search_paths);
+    find(&roots, crate::speakers::SPEAKER_MODEL_FILE).is_some()
+}
+
 /// Category of model in GhostReel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -25,6 +40,8 @@ pub enum ModelKind {
     Vision,
     VisionProjector,
     Embedding,
+    Face,
+    Speaker,
 }
 
 impl std::fmt::Display for ModelKind {
@@ -34,6 +51,8 @@ impl std::fmt::Display for ModelKind {
             ModelKind::Vision => write!(f, "vision"),
             ModelKind::VisionProjector => write!(f, "vision_projector"),
             ModelKind::Embedding => write!(f, "embedding"),
+            ModelKind::Face => write!(f, "face"),
+            ModelKind::Speaker => write!(f, "speaker"),
         }
     }
 }
@@ -68,6 +87,8 @@ pub struct CatalogEntry {
     /// Complete, revision-pinned MLX model folder; absent for native single-file models.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bundle: Option<ModelBundle>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
 }
 
 impl CatalogEntry {
@@ -131,6 +152,7 @@ fn native_catalog() -> Vec<CatalogEntry> {
             mmproj_size_bytes: None,
             vram_mb: None,
             bundle: None,
+            sha256: None,
         },
         CatalogEntry {
             id: "tiny.en".into(),
@@ -147,6 +169,7 @@ fn native_catalog() -> Vec<CatalogEntry> {
             mmproj_size_bytes: None,
             vram_mb: None,
             bundle: None,
+            sha256: None,
         },
         CatalogEntry {
             id: "base".into(),
@@ -163,6 +186,7 @@ fn native_catalog() -> Vec<CatalogEntry> {
             mmproj_size_bytes: None,
             vram_mb: None,
             bundle: None,
+            sha256: None,
         },
         CatalogEntry {
             id: "base.en".into(),
@@ -179,6 +203,7 @@ fn native_catalog() -> Vec<CatalogEntry> {
             mmproj_size_bytes: None,
             vram_mb: None,
             bundle: None,
+            sha256: None,
         },
         CatalogEntry {
             id: "small".into(),
@@ -195,6 +220,7 @@ fn native_catalog() -> Vec<CatalogEntry> {
             mmproj_size_bytes: None,
             vram_mb: None,
             bundle: None,
+            sha256: None,
         },
         CatalogEntry {
             id: "small.en".into(),
@@ -211,6 +237,7 @@ fn native_catalog() -> Vec<CatalogEntry> {
             mmproj_size_bytes: None,
             vram_mb: None,
             bundle: None,
+            sha256: None,
         },
         CatalogEntry {
             id: "medium".into(),
@@ -227,6 +254,7 @@ fn native_catalog() -> Vec<CatalogEntry> {
             mmproj_size_bytes: None,
             vram_mb: None,
             bundle: None,
+            sha256: None,
         },
         CatalogEntry {
             id: "medium.en".into(),
@@ -243,6 +271,7 @@ fn native_catalog() -> Vec<CatalogEntry> {
             mmproj_size_bytes: None,
             vram_mb: None,
             bundle: None,
+            sha256: None,
         },
         CatalogEntry {
             id: "large-v3-turbo".into(),
@@ -259,6 +288,7 @@ fn native_catalog() -> Vec<CatalogEntry> {
             mmproj_size_bytes: None,
             vram_mb: Some(2000),
             bundle: None,
+            sha256: None,
         },
         CatalogEntry {
             id: "large-v3-turbo-q8_0".into(),
@@ -275,6 +305,7 @@ fn native_catalog() -> Vec<CatalogEntry> {
             mmproj_size_bytes: None,
             vram_mb: Some(1500),
             bundle: None,
+            sha256: None,
         },
         CatalogEntry {
             id: "large-v3-turbo-q5_0".into(),
@@ -291,6 +322,7 @@ fn native_catalog() -> Vec<CatalogEntry> {
             mmproj_size_bytes: None,
             vram_mb: Some(1000),
             bundle: None,
+            sha256: None,
         },
         // Vision models: pair of (model, projector) under one id
         CatalogEntry {
@@ -308,6 +340,7 @@ fn native_catalog() -> Vec<CatalogEntry> {
             mmproj_size_bytes: Some(629_246_880),
             vram_mb: Some(6000),
             bundle: None,
+            sha256: None,
         },
         CatalogEntry {
             id: "gemma-3-4b-it".into(),
@@ -324,6 +357,7 @@ fn native_catalog() -> Vec<CatalogEntry> {
             mmproj_size_bytes: Some(851_251_104),
             vram_mb: Some(4500),
             bundle: None,
+            sha256: None,
         },
         CatalogEntry {
             id: "qwen3.5-9b".into(),
@@ -349,6 +383,7 @@ fn native_catalog() -> Vec<CatalogEntry> {
             mmproj_size_bytes: Some(918_166_080),
             vram_mb: Some(7500),
             bundle: None,
+            sha256: None,
         },
         CatalogEntry {
             id: "qwen-agentworld-35b-a3b".into(),
@@ -367,6 +402,7 @@ fn native_catalog() -> Vec<CatalogEntry> {
             mmproj_size_bytes: Some(902_822_592),
             vram_mb: Some(12000),
             bundle: None,
+            sha256: None,
         },
         CatalogEntry {
             id: "qwen2.5-vl-7b".into(),
@@ -383,6 +419,7 @@ fn native_catalog() -> Vec<CatalogEntry> {
             mmproj_size_bytes: Some(853_119_712),
             vram_mb: Some(6500),
             bundle: None,
+            sha256: None,
         },
         CatalogEntry {
             id: "qwen2.5-vl-3b".into(),
@@ -399,6 +436,7 @@ fn native_catalog() -> Vec<CatalogEntry> {
             mmproj_size_bytes: Some(844_757_728),
             vram_mb: Some(3500),
             bundle: None,
+            sha256: None,
         },
         // Search embeddings: embeddinggemma 300M
         CatalogEntry {
@@ -416,6 +454,58 @@ fn native_catalog() -> Vec<CatalogEntry> {
             mmproj_size_bytes: None,
             vram_mb: None,
             bundle: None,
+            sha256: None,
+        },
+        CatalogEntry {
+            id: "yunet".into(),
+            kind: ModelKind::Face,
+            file_name: "face_detection_yunet_2023mar.onnx".into(),
+            url: "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx".into(),
+            size_bytes: 232_589,
+            speed: 5,
+            accuracy: 5,
+            note: "YuNet face detector (ONNX, ~233 KB)".into(),
+            languages: "".into(),
+            mmproj_file_name: None,
+            mmproj_url: None,
+            mmproj_size_bytes: None,
+            vram_mb: None,
+            bundle: None,
+            sha256: Some("8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4".into()),
+        },
+        CatalogEntry {
+            id: "sface".into(),
+            kind: ModelKind::Face,
+            file_name: "face_recognition_sface_2021dec.onnx".into(),
+            url: "https://github.com/opencv/opencv_zoo/raw/main/models/face_recognition_sface/face_recognition_sface_2021dec.onnx".into(),
+            size_bytes: 38_696_353,
+            speed: 5,
+            accuracy: 5,
+            note: "SFace face recogniser (ONNX, ~38 MB)".into(),
+            languages: "".into(),
+            mmproj_file_name: None,
+            mmproj_url: None,
+            mmproj_size_bytes: None,
+            vram_mb: None,
+            bundle: None,
+            sha256: Some("0ba9fbfa01b5270c96627c4ef784da859931e02f04419c829e83484087c34e79".into()),
+        },
+        CatalogEntry {
+            id: "campplus-voice".into(),
+            kind: ModelKind::Speaker,
+            file_name: crate::speakers::SPEAKER_MODEL_FILE.into(),
+            url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/wespeaker_en_voxceleb_CAM%2B%2B.onnx".into(),
+            size_bytes: 29_292_684,
+            speed: 5,
+            accuracy: 5,
+            note: "WeSpeaker CAM++ voice embeddings, tells speakers apart (ONNX, ~29 MB)".into(),
+            languages: "multilingual".into(),
+            mmproj_file_name: None,
+            mmproj_url: None,
+            mmproj_size_bytes: None,
+            vram_mb: None,
+            bundle: None,
+            sha256: Some("c46fad10b5f81e1aa4a60c162714208577093655076c5450f8c469e522ec54ef".into()),
         },
     ]
 }
@@ -497,6 +587,7 @@ fn mlx_catalog() -> Vec<CatalogEntry> {
                 mmproj_size_bytes: None,
                 vram_mb: Some(e.vram_mb),
                 bundle: Some(e.bundle),
+                sha256: None,
             }
         })
         .collect()
@@ -761,7 +852,7 @@ fn external_status(models_dir: &Path, path: &Path) -> Option<ModelStatus> {
             mmproj_file_name: mmproj_path.as_ref().map(|p| p.to_string_lossy().into_owned()),
             mmproj_url: None,
             mmproj_size_bytes: mmproj_path.as_ref().and_then(|p| p.metadata().ok()).map(|m| m.len()),
-            vram_mb: None, bundle: None,
+            vram_mb: None, bundle: None, sha256: None,
         },
         in_own_dir: !models_dir.as_os_str().is_empty() && path.starts_with(models_dir),
         installed_path: Some(path), partial_bytes: None,
@@ -881,6 +972,21 @@ pub fn well_known_dirs() -> Vec<PathBuf> {
     out
 }
 
+/// A model and its image projector, found on disk as a pair. Many repos name the projector the
+/// same (`mmproj-F16.gguf`), so the one beside the model wins over the first of that name
+/// anywhere: a 9B model with a 27B's projector fails to load (`n_embd` mismatch). Without the
+/// model neither counts as found, so both are downloaded together rather than the model being
+/// paired with some other model's projector.
+pub fn find_with_projector(roots: &[PathBuf], model: &str, projector: &str) -> (Option<PathBuf>, Option<PathBuf>) {
+    let Some(model_path) = find(roots, model) else { return (None, None) };
+    let model_path = Some(model_path);
+    let beside = model_path.as_ref().and_then(|m| m.parent()).map(|dir| dir.join(projector)).filter(|p| {
+        p.is_file() && p.metadata().is_ok_and(|m| m.len() > 0)
+    });
+    let projector_path = beside.or_else(|| find(roots, projector));
+    (model_path, projector_path)
+}
+
 /// Look for `file_name` in `roots` (a few levels deep).
 pub fn find(roots: &[PathBuf], file_name: &str) -> Option<PathBuf> {
     let direct = Path::new(file_name);
@@ -984,6 +1090,31 @@ pub async fn download(
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn a_model_gets_the_projector_beside_it_not_the_first_of_that_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("models");
+        // Sorted first, and holding a projector of the same name for a different model.
+        let other = root.join("a-Qwen3.8-27B-GGUF");
+        let mine = root.join("b-Qwen3.5-9B-GGUF");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::create_dir_all(&mine).unwrap();
+        std::fs::write(other.join("mmproj-F16.gguf"), b"27b").unwrap();
+        std::fs::write(mine.join("Qwen3.5-9B-UD-Q4_K_XL.gguf"), b"9b").unwrap();
+        std::fs::write(mine.join("mmproj-F16.gguf"), b"9b projector").unwrap();
+        let roots = vec![root.clone()];
+        let (m, p) = find_with_projector(&roots, "Qwen3.5-9B-UD-Q4_K_XL.gguf", "mmproj-F16.gguf");
+        assert_eq!(m, Some(mine.join("Qwen3.5-9B-UD-Q4_K_XL.gguf")));
+        assert_eq!(p, Some(mine.join("mmproj-F16.gguf")));
+        // No projector beside the model: fall back to one found elsewhere.
+        std::fs::remove_file(mine.join("mmproj-F16.gguf")).unwrap();
+        let (_, p) = find_with_projector(&roots, "Qwen3.5-9B-UD-Q4_K_XL.gguf", "mmproj-F16.gguf");
+        assert_eq!(p, Some(other.join("mmproj-F16.gguf")));
+        // No model at all: neither counts as found, so the pair is downloaded together.
+        std::fs::remove_file(mine.join("Qwen3.5-9B-UD-Q4_K_XL.gguf")).unwrap();
+        assert_eq!(find_with_projector(&roots, "Qwen3.5-9B-UD-Q4_K_XL.gguf", "mmproj-F16.gguf"), (None, None));
+    }
 
     #[test]
     fn external_scan_pairs_classifies_and_keeps_catalog_metadata() {
@@ -1295,7 +1426,7 @@ mod tests {
         let mlx = catalog_for(true);
         assert!(native.iter().all(|e| e.bundle.is_none()));
         assert!(mlx.iter().filter(|e| e.kind == ModelKind::Vision).all(|e| e.bundle.is_some()));
-        for kind in [ModelKind::Whisper, ModelKind::Embedding] {
+        for kind in [ModelKind::Whisper, ModelKind::Embedding, ModelKind::Face, ModelKind::Speaker] {
             assert_eq!(
                 native.iter().filter(|e| e.kind == kind).collect::<Vec<_>>(),
                 mlx.iter().filter(|e| e.kind == kind).collect::<Vec<_>>()

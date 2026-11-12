@@ -12,7 +12,9 @@ dirs = "7.0.0"
 futures-util = "0.3.34"
 image = { version = "0.25.10", default-features = false, features = ["jpeg"] }
 notify = "8.2.0"
+ort = { version = "2.0.0-rc.15", features = ["download-binaries"] }
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "multipart", "rustls", "stream"] }
+rustfft = "6.4.1"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
@@ -21,7 +23,7 @@ sqlite-vec = "0.1.9"
 thiserror = "2.0.20"
 tempfile = "3.27.0"
 tokio = { version = "1.53.1", features = ["rt", "macros", "time", "process", "net", "io-util", "sync", "fs"] }
-toml = "1.1.6"
+toml = { version = "1.1.6", features = ["preserve_order"] }
 tracing = "0.1.44"
 walkdir = "2.5.0"
 

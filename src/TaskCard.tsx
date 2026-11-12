@@ -1,55 +1,42 @@
 import { useEffect, useRef, useState } from "react";
-import { cancelTask, etaText, PHASE_LABELS, type ChatProgress, type Task } from "./api";
+import { cancelTask, etaText, type ChatProgress, type Task } from "./api";
 import { ChevronDown, ChevronRight } from "lucide-react";
 import { onEvent } from "./events";
+import ProgressBar, { progressText } from "./runs/ProgressBar";
+import { RunSteps, STATE_LABEL } from "./runs/RunLog";
+import { RunLinks, type LinkContext } from "./runs/links";
+import { toMs } from "./runs/model";
 
-const STATE_LABEL: Record<string, string> = {
-  queued: "Waiting",
-  running: "Running",
-  done: "Done",
-  failed: "Failed",
-  cancelled: "Cancelled",
+/** "burn_titles" → "Burn titles". */
+const humanise = (key: string) => {
+  const s = key.replace(/_id$/, "").replace(/_/g, " ");
+  return s.charAt(0).toUpperCase() + s.slice(1);
 };
 
-function taskLabel(task: Task): string {
-  if (task.label) return task.label;
-  switch (task.kind.type) {
-    case "index":
-      return "Indexing";
-    case "chat":
-      return "Script chat";
-    case "render_preview":
-      return `Rendering preview (script #${task.kind.script_id})`;
-    case "export":
-      return `Exporting (${task.kind.format})`;
-    case "download_model":
-      return `Downloading model (${task.kind.model_id})`;
+/** A kind field's value as text: ids as "#4", flags as yes/no, small objects as "key value" pairs. */
+function factValue(key: string, v: unknown): string | null {
+  if (v == null || v === "") return null;
+  if (typeof v === "boolean") return v ? "yes" : "no";
+  if (typeof v === "number") return key.endsWith("_id") ? `#${v}` : String(v);
+  if (typeof v === "string") return v;
+  if (Array.isArray(v)) return v.length ? v.join(", ") : null;
+  if (typeof v === "object") {
+    const parts = Object.entries(v as Record<string, unknown>)
+      .filter(([, x]) => ["string", "number", "boolean"].includes(typeof x) && x !== "")
+      .slice(0, 6)
+      .map(([k, x]) => `${humanise(k).toLowerCase()} ${String(x)}`);
+    return parts.length ? parts.join(" · ") : null;
   }
+  return null;
 }
 
 /** The task's own facts, as name/value rows — what it is working on, not how far along it is. */
 function details(task: Task): [string, string][] {
   const rows: [string, string][] = [];
-  const k = task.kind;
-  switch (k.type) {
-    case "index":
-      rows.push(["Project", `#${k.project_id}`]);
-      break;
-    case "chat":
-      rows.push(["Project", `#${k.project_id}`], ["Chat", `#${k.session_id}`]);
-      break;
-    case "render_preview":
-      rows.push(
-        ["Script", `#${k.script_id}`],
-        ["Burn in", [k.burn_titles && "titles", k.burn_narration && "narration"].filter(Boolean).join(", ") || "nothing"],
-      );
-      break;
-    case "export":
-      rows.push(["Script", `#${k.script_id}`], ["Format", k.format], ["To", k.path]);
-      break;
-    case "download_model":
-      rows.push(["Model", k.model_id]);
-      break;
+  for (const [k, v] of Object.entries(task.kind)) {
+    if (k === "type") continue;
+    const value = factValue(k, v);
+    if (value != null) rows.push([humanise(k), value]);
   }
   const p = task.progress;
   if (p) {
@@ -57,12 +44,8 @@ function details(task: Task): [string, string][] {
     if (p.elapsed_secs > 0) rows.push(["Running for", etaText(p.elapsed_secs)]);
     if (p.current) rows.push(["Now", p.current]);
   }
-  rows.push(["Started", new Date((task.created_at < 1e11 ? task.created_at * 1000 : task.created_at)).toLocaleTimeString()]);
-  if (task.finished_at)
-    rows.push([
-      "Finished",
-      new Date(task.finished_at < 1e11 ? task.finished_at * 1000 : task.finished_at).toLocaleTimeString(),
-    ]);
+  rows.push(["Started", new Date(toMs(task.created_at)).toLocaleTimeString()]);
+  if (task.finished_at) rows.push(["Finished", new Date(toMs(task.finished_at)).toLocaleTimeString()]);
   return rows;
 }
 
@@ -84,16 +67,22 @@ function chatLine(e: ChatProgress["event"]): string {
   }
 }
 
-export default function TaskCard({ task, compact = false }: { task: Task; compact?: boolean }) {
+export default function TaskCard({
+  task,
+  compact = false,
+  linkCtx = {},
+}: {
+  task: Task;
+  compact?: boolean;
+  linkCtx?: LinkContext;
+}) {
   const p = task.progress;
   const running = task.state === "running";
-  const pct = Math.round((p?.fraction ?? 0) * 100);
-  const s = task.summary;
   const [open, setOpen] = useState(false);
   const [log, setLog] = useState<string[]>([]);
   const logRef = useRef<HTMLDivElement>(null);
 
-  // A script chat's real progress is the tools it calls; the bar alone says almost nothing.
+  // A script chat's real progress is the tools it calls; its steps alone say almost nothing.
   // Only listened to while the card is open, so closed cards cost nothing.
   const sessionId = task.kind.type === "chat" ? task.kind.session_id : null;
   useEffect(() => {
@@ -117,37 +106,12 @@ export default function TaskCard({ task, compact = false }: { task: Task; compac
         title={open ? "Hide details" : "Show details"}
       >
         <span className="label">
-          <span className="task-caret">{open ? <ChevronDown size={14} strokeWidth={2} aria-hidden /> : <ChevronRight size={14} strokeWidth={2} aria-hidden />}</span> {taskLabel(task)}
+          <span className="task-caret">{open ? <ChevronDown size={14} strokeWidth={2} aria-hidden /> : <ChevronRight size={14} strokeWidth={2} aria-hidden />}</span>{" "}
+          {task.label || humanise(task.kind.type)}
         </span>
-        <span className="muted small">
-          {running && p ? (
-            p.indeterminate ? (
-              // Nothing to count: say what it is doing instead of a number that would be a guess.
-              <>{PHASE_LABELS[p.phase] ?? "Working"}…</>
-            ) : (
-              <>
-                {pct}%{p.eta_secs != null && p.fraction < 1 ? ` · ${etaText(p.eta_secs)} left` : ""}
-              </>
-            )
-          ) : (
-            STATE_LABEL[task.state]
-          )}
-        </span>
+        <span className="muted small">{running && p ? progressText(p) : STATE_LABEL[task.state]}</span>
       </div>
-      {running && (
-        <>
-          <div className={`meter big${p?.indeterminate ? " indeterminate" : ""}`}>
-            <div style={p?.indeterminate ? undefined : { width: `${Math.max(2, pct)}%` }} />
-          </div>
-          {p && (
-            <div className="muted small">
-              {PHASE_LABELS[p.phase] ?? p.phase}
-              {p.phase_total > 0 ? ` · ${p.phase_done} of ${p.phase_total}` : ""}
-              {p.current ? ` · ${p.current.split(/[\\/]/).pop()}` : ""}
-            </div>
-          )}
-        </>
-      )}
+      {running && <ProgressBar progress={p} />}
       {task.note && (running || !compact) && <div className="muted small">{task.note}</div>}
 
       {open && (
@@ -161,10 +125,15 @@ export default function TaskCard({ task, compact = false }: { task: Task; compac
               </div>
             ))}
           </dl>
+          {task.steps.length > 0 ? (
+            <RunSteps steps={task.steps} />
+          ) : (
+            sessionId == null && <div className="muted small">{running ? "Waiting for the first step…" : "No steps recorded."}</div>
+          )}
           {sessionId != null && (
             <div className="task-log" ref={logRef}>
               {log.length === 0 ? (
-                <div className="muted small">{running ? "Waiting for the next step…" : "No steps recorded."}</div>
+                <div className="muted small">{running ? "Waiting for the next tool call…" : "No tool calls recorded."}</div>
               ) : (
                 log.map((line, i) => (
                   <div key={i} className="small">
@@ -177,14 +146,12 @@ export default function TaskCard({ task, compact = false }: { task: Task; compac
         </div>
       )}
 
-      {task.state === "done" && s && !compact && (
-        <div className="muted small">
-          {s.new} new · {s.changed} changed · {s.removed} removed · {s.jobs_done} steps done
-          {s.jobs_failed ? ` · ${s.jobs_failed} failed` : ""}
-        </div>
+      {(task.state === "done" || task.state === "partial") && task.summary && (
+        <div className="muted small">{task.summary}</div>
       )}
-      {task.state === "done" && task.output && <div className="muted small path">Output: {task.output}</div>}
+      {task.state === "done" && task.output && !compact && <div className="muted small path">Output: {task.output}</div>}
       {task.error && <div className="bad-text small">{task.error}</div>}
+      {!compact && task.state === "done" && <RunLinks links={task.links} ctx={linkCtx} />}
       {(task.state === "queued" || running) && (
         <div>
           <button className="ghost small" onClick={() => cancelTask(task.id)}>

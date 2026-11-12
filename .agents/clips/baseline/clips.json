@@ -1,0 +1,50 @@
+[
+ {
+  "in_s": 879.33,
+  "out_s": 932.44,
+  "title": "Lo determinístico, determinístico",
+  "why": "Thumbnails are rendered from HTML templates by a CLI, not generated: 'no es quemar tokens a la buena de Dios'."
+ },
+ {
+  "in_s": 1016.04,
+  "out_s": 1073.38,
+  "title": "Corregite, corregite, corregite",
+  "why": "Why a self-evolving Hermes agent was painful: people keep correcting it until it works."
+ },
+ {
+  "in_s": 1450.03,
+  "out_s": 1498.84,
+  "title": "10 dólares por episodio, fuck it",
+  "why": "Paying ~$10/episode in Opus API for research they could never do by hand."
+ },
+ {
+  "in_s": 1741.39,
+  "out_s": 1780.59,
+  "title": "Analizá tus sesiones",
+  "why": "Mining agent session logs for hidden patterns: where the model systematically fails, what you keep repeating."
+ },
+ {
+  "in_s": 1974.02,
+  "out_s": 2060.29,
+  "title": "Apagué la memoria y simplifiqué",
+  "why": "Memory off because every episode is greenfield; simplifying the system prompts improved results."
+ },
+ {
+  "in_s": 2772.34,
+  "out_s": 2832.12,
+  "title": "No pongas a Claude a ver el video",
+  "why": "Cuts depend on content, but finding transitions and faces is FFmpeg + a face network, not tokens."
+ },
+ {
+  "in_s": 3041.78,
+  "out_s": 3108.31,
+  "title": "Spanglish y un glosario que crece",
+  "why": "Spanglish is valid; a glossary of corrected technical terms grows with every episode."
+ },
+ {
+  "in_s": 3754.59,
+  "out_s": 3821.93,
+  "title": "No voy a firmar lo que no escribí",
+  "why": "Embrace AI-generated content openly instead of pretending you wrote it. 'Aprendan de nuestros errores'."
+ }
+]

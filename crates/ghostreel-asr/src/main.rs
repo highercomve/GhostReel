@@ -25,6 +25,7 @@ struct Args {
     threads: i32,
     cpu: bool,
     serve: bool,
+    prompt: Option<String>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -33,6 +34,7 @@ fn parse_args() -> Result<Args, String> {
     let mut threads = std::thread::available_parallelism().map(|n| n.get() as i32).unwrap_or(4).min(8);
     let mut cpu = false;
     let mut serve = false;
+    let mut prompt = None;
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -41,6 +43,7 @@ fn parse_args() -> Result<Args, String> {
             "--threads" => {
                 threads = it.next().and_then(|v| v.parse().ok()).ok_or("--threads needs a number")?;
             }
+            "--prompt" => prompt = it.next(),
             // Force CPU inference (GPU out of memory, or no usable GPU).
             "--cpu" => cpu = true,
             "--serve" => serve = true,
@@ -50,14 +53,14 @@ fn parse_args() -> Result<Args, String> {
             }
             "-h" | "--help" => {
                 println!(
-                    "usage: ghostreel-asr --model <ggml-*.bin> [--language auto|en|es…] [--threads N] [--cpu] [--serve] < pcm_f32le_16k_mono"
+                    "usage: ghostreel-asr --model <ggml-*.bin> [--language auto|en|es…] [--threads N] [--cpu] [--serve] [--prompt <text>] < pcm_f32le_16k_mono"
                 );
                 std::process::exit(0);
             }
             other => return Err(format!("unknown argument {other}")),
         }
     }
-    Ok(Args { model: model.ok_or("--model is required")?, language, threads, cpu, serve })
+    Ok(Args { model: model.ok_or("--model is required")?, language, threads, cpu, serve, prompt })
 }
 
 fn emit(v: serde_json::Value) {
@@ -90,8 +93,9 @@ fn run() -> Result<(), String> {
                 let request: serde_json::Value =
                     serde_json::from_str(&line).map_err(|e| format!("invalid request: {e}"))?;
                 let path = request["audio"].as_str().ok_or("request needs an audio path")?;
+                let prompt = request["prompt"].as_str().map(|s| s.to_string());
                 let raw = std::fs::read(path).map_err(|e| format!("reading decoded audio: {e}"))?;
-                transcribe(&ctx, &args, &raw)
+                transcribe(&ctx, &args, &raw, prompt.as_deref())
             })();
             if let Err(error) = result {
                 emit(json!({ "type": "error", "error": error }));
@@ -101,11 +105,11 @@ fn run() -> Result<(), String> {
     } else {
         let mut raw = Vec::new();
         std::io::stdin().read_to_end(&mut raw).map_err(|e| format!("reading audio from stdin: {e}"))?;
-        transcribe(&ctx, &args, &raw)
+        transcribe(&ctx, &args, &raw, args.prompt.as_deref())
     }
 }
 
-fn transcribe(ctx: &WhisperContext, args: &Args, raw: &[u8]) -> Result<(), String> {
+fn transcribe(ctx: &WhisperContext, args: &Args, raw: &[u8], prompt: Option<&str>) -> Result<(), String> {
     if !raw.len().is_multiple_of(4) {
         return Err("audio is not f32le PCM (length not a multiple of 4)".into());
     }
@@ -121,6 +125,9 @@ fn transcribe(ctx: &WhisperContext, args: &Args, raw: &[u8]) -> Result<(), Strin
     params.set_n_threads(args.threads);
     let lang = (!args.language.eq_ignore_ascii_case("auto")).then_some(args.language.as_str());
     params.set_language(lang);
+    if let Some(p) = prompt.filter(|p| !p.trim().is_empty()) {
+        params.set_initial_prompt(p);
+    }
     params.set_print_special(false);
     params.set_print_progress(false);
     params.set_print_realtime(false);

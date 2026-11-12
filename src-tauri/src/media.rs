@@ -52,7 +52,7 @@ fn allowed(path: &std::path::Path) -> bool {
         return false;
     }
     let Ok(paths) = Paths::resolve() else { return false };
-    for name in ["previews", "proxies", "frames", "chat_images"] {
+    for name in ["previews", "proxies", "frames", "chat_images", "people"] {
         if std::fs::canonicalize(paths.data_dir.join(name)).is_ok_and(|root| canonical.starts_with(root)) {
             return true;
         }

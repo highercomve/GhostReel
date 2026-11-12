@@ -18,6 +18,7 @@ import {
   getScriptPreview,
   mediaUrl,
   previewPlan,
+  type Overlays,
   type PlannedSegment,
   type Script,
   type VideoRow,
@@ -43,6 +44,14 @@ interface PreviewPlayerProps {
   onControls?: (controls: { seek: (s: number) => void; toggle: () => void }) => void;
   /** Timeline lane mute/solo, passed through to the live viewer. */
   trackMonitor?: TrackMonitor;
+  /** Titles and captions as the render lays them out, and their selection and edits. */
+  overlays?: Overlays | null;
+  selectedOverlay?: string | null;
+  onSelectOverlay?: (key: string | null) => void;
+  onOverlayMove?: (key: string, x: number, y: number) => void;
+  onOverlayResize?: (key: string, size: number) => void;
+  /** The viewer's caption and title switches, shared with the editor (they set what renders burn). */
+  onShowFlags?: (flags: { titles: boolean; captions: boolean }) => void;
 }
 
 export default function PreviewPlayer({
@@ -56,11 +65,21 @@ export default function PreviewPlayer({
   onTime,
   onControls,
   trackMonitor,
+  overlays,
+  selectedOverlay,
+  onSelectOverlay,
+  onOverlayMove,
+  onOverlayResize,
+  onShowFlags,
 }: PreviewPlayerProps) {
   // Remembered across cuts and sessions: most edits go out the same way every time.
   const [burnTitles, setBurnTitles] = useStoredFlag("ghostreel.burnTitles", false);
   const [burnNarration, setBurnNarration] = useStoredFlag("ghostreel.burnNarration", false);
+  const [showCaptions, setShowCaptions] = useStoredFlag("ghostreel.showCaptions", true);
   const [normalizeAudio, setNormalizeAudio] = useStoredFlag("ghostreel.normalizeAudio", false);
+  useEffect(() => {
+    onShowFlags?.({ titles: burnTitles, captions: showCaptions });
+  }, [burnTitles, showCaptions, onShowFlags]);
   const [previewTaskId, setPreviewTaskId] = useState<number | null>(null);
   const [exportTaskId, setExportTaskId] = useState<number | null>(null);
   const [previewVideoSrc, setPreviewVideoSrc] = useState<string | null>(null);
@@ -180,7 +199,7 @@ export default function PreviewPlayer({
     }
 
     try {
-      const taskId = await enqueuePreview(targetScriptId, burnTitles, burnNarration, normalizeAudio);
+      const taskId = await enqueuePreview(targetScriptId, burnTitles, burnNarration, showCaptions, normalizeAudio);
       setPreviewTaskId(taskId);
       previewPlan(targetScriptId).then(setPlan).catch(() => {});
     } catch (err) {
@@ -208,7 +227,7 @@ export default function PreviewPlayer({
         filters: [{ name: "MP4 video", extensions: ["mp4"] }],
       });
       if (typeof path === "string") {
-        const taskId = await enqueuePreview(targetScriptId, burnTitles, burnNarration, normalizeAudio, path);
+        const taskId = await enqueuePreview(targetScriptId, burnTitles, burnNarration, showCaptions, normalizeAudio, path);
         setExportTaskId(taskId);
       }
     } catch (err) {
@@ -337,6 +356,7 @@ export default function PreviewPlayer({
     renderKind != null &&
     (renderKind.burn_titles !== burnTitles ||
       renderKind.burn_narration !== burnNarration ||
+      renderKind.burn_captions !== showCaptions ||
       renderKind.normalize_audio !== normalizeAudio);
   const freshness: { tone: "ok" | "stale" | "busy"; text: string; hint: string } = busy
     ? { tone: "busy", text: "Rendering…", hint: "The viewer switches to the new render when it is done" }
@@ -345,7 +365,7 @@ export default function PreviewPlayer({
       : isDirty
         ? { tone: "stale", text: "Out of date · unsaved edits", hint: "Re-render saves a new version and renders it" }
         : optionsChanged
-          ? { tone: "stale", text: "Out of date · burn-in changed", hint: "Titles, subtitles or audio levelling changed since this render" }
+          ? { tone: "stale", text: "Out of date · burn-in changed", hint: "Titles, subtitles, captions or audio levelling changed since this render" }
           : {
               tone: "ok",
               text: lastRender?.finished_at ? `Up to date · rendered ${relativeTime(lastRender.finished_at, now)}` : "Up to date",
@@ -394,7 +414,7 @@ export default function PreviewPlayer({
                 title={
                   isAiWorking
                     ? "Rendering waits until Sonar AI finishes"
-                    : `Render this version again (titles ${burnTitles ? "on" : "off"}, subtitles ${burnNarration ? "on" : "off"}${normalizeAudio ? ", audio evened out" : ""})`
+                    : `Render this version again (titles ${burnTitles ? "on" : "off"}, subtitles ${burnNarration ? "on" : "off"}, captions ${showCaptions ? "on" : "off"}${normalizeAudio ? ", audio evened out" : ""})`
                 }
               >
                 {busy ? "Rendering…" : "Re-render"}
@@ -447,6 +467,13 @@ export default function PreviewPlayer({
             onShowTitles={setBurnTitles}
             showNarration={burnNarration}
             onShowNarration={setBurnNarration}
+            overlays={overlays}
+            showCaptions={showCaptions}
+            onShowCaptions={setShowCaptions}
+            selectedOverlay={selectedOverlay}
+            onSelectOverlay={onSelectOverlay}
+            onOverlayMove={onOverlayMove}
+            onOverlayResize={onOverlayResize}
             trackMonitor={trackMonitor}
           />
           {error && <div className="banner bad small">{error}</div>}

@@ -158,6 +158,11 @@ mod tests {
             .unwrap();
 
         let script = script::Script {
+            framing: None,
+            captions: None,
+            title_style: None,
+            caption_edits: Vec::new(),
+            agents: None,
             title: "Integration Test".into(),
             target_duration_s: Some(5.0),
             fps: Some(script::Fps::new(25, 1)),
@@ -168,7 +173,9 @@ mod tests {
                 purpose: "intro".into(),
                 narration: Some("Hello".into()),
                 on_screen_text: Some("Title".into()),
+                title_layout: None,
                 clips: vec![script::ScriptClip {
+                    framing: None,
                     video_id: 1,
                     in_s: 0.0,
                     out_s: 4.0,

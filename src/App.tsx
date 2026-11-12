@@ -151,9 +151,13 @@ export default function App() {
   // Cross-page links (e.g. "Set up on the Models page" on Status) dispatch ghostreel:navigate.
   useEffect(() => {
     const onPageNavigate = (e: Event) => {
-      const kind = (e as CustomEvent<{ kind?: unknown }>).detail?.kind;
+      const { kind, anchor } = (e as CustomEvent<{ kind?: unknown; anchor?: unknown }>).detail ?? {};
       if (kind === "models" || kind === "settings" || kind === "storage" || kind === "activity" || kind === "status") {
         setPage({ kind });
+        // After the page renders, bring the named section into view.
+        if (typeof anchor === "string") {
+          window.setTimeout(() => document.getElementById(anchor)?.scrollIntoView({ block: "start" }), 50);
+        }
       }
     };
     window.addEventListener(NAVIGATE_EVENT, onPageNavigate);

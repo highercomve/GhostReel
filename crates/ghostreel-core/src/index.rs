@@ -25,6 +25,10 @@ use crate::stt::{self, Engine};
 /// Pipeline stages in execution order.
 pub const STAGES: &[&str] = &["probe", "transcribe", "frames", "describe", "embed"];
 
+/// All indexing stages including post-index analysis.
+pub const ALL_STAGES: &[&str] =
+    &["probe", "transcribe", "frames", "describe", "embed", "steadiness", "faces", "speakers"];
+
 /// The stage whose completion a stage waits for.
 fn prerequisite(stage: &str) -> Option<&'static str> {
     match stage {
@@ -82,8 +86,69 @@ pub enum Event {
     DownloadingModel {
         file: String,
     },
+    /// A stage is waiting on something outside it (a free slot on a busy model endpoint, a model
+    /// loading): said so the run never sits silent.
+    Waiting {
+        stage: String,
+        what: String,
+    },
+    /// Files in watched folders that GhostReel rendered itself (previews, exports) and that were
+    /// left out of the library instead of indexed as footage.
+    RendersSkipped {
+        count: usize,
+    },
     /// Overall progress and time remaining (throttled to ~4 per second).
     Progress(Progress),
+}
+
+/// What an indexer event means for whoever keeps a run's log (`runs`): a progress snapshot, or a
+/// status line for the current step.
+#[derive(Debug, Clone, PartialEq)]
+pub enum EventReport {
+    Progress(Progress),
+    Note(String),
+    /// Something to keep on `phase`'s step: a stage postponed, a video that failed.
+    Event {
+        phase: String,
+        event: crate::runs::StepEvent,
+    },
+}
+
+impl Event {
+    /// The event as a run report; `None` for events a run log has no use for.
+    pub fn run_report(&self) -> Option<EventReport> {
+        let label = crate::runs::phase_label;
+        let file = |p: &Path| p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        Some(match self {
+            Event::Progress(p) => EventReport::Progress(p.clone()),
+            Event::StageBackend { stage, backend } => EventReport::Note(format!("{}: {backend}", label(stage))),
+            Event::StageUnavailable { stage, reason } => EventReport::Event {
+                phase: stage.clone(),
+                event: crate::runs::StepEvent::warning(format!("{} postponed: {reason}", label(stage))),
+            },
+            Event::JobFailed { video_id, stage, error } => EventReport::Event {
+                phase: stage.clone(),
+                event: crate::runs::StepEvent::warning(format!("Video #{video_id}: {error}")),
+            },
+            Event::DownloadingModel { file } => EventReport::Note(format!("Downloading {file} (once)…")),
+            Event::Waiting { stage, what } => EventReport::Note(format!("{}: waiting for {what}", label(stage))),
+            Event::RendersSkipped { count } => EventReport::Event {
+                phase: "hash".into(),
+                event: crate::runs::StepEvent::new(
+                    crate::runs::EventLevel::Info,
+                    format!(
+                        "Skipped {count} {} GhostReel rendered itself (previews, exports): not footage",
+                        if *count == 1 { "file" } else { "files" }
+                    ),
+                ),
+            },
+            // Per-file passes say which file they are on; the main stages are too quick for that.
+            Event::JobStarted { stage, path, .. } if matches!(stage.as_str(), "steadiness" | "faces" | "speakers") => {
+                EventReport::Note(format!("{}: {}", label(stage), file(path)))
+            }
+            _ => return None,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -96,8 +161,98 @@ pub struct Summary {
     pub jobs_failed: usize,
     /// Files skipped because they were modified less than `settle_secs` ago (still copying).
     pub unsettled: usize,
+    /// Files skipped because GhostReel rendered them (a preview or export saved into a watched
+    /// folder): they are its own output, not footage.
+    pub renders: usize,
     /// The run was stopped early by [`Options::cancel`].
     pub cancelled: bool,
+    /// Stages that could not do all their work: postponed (backend unavailable) or with videos
+    /// that failed. A run with problems is [`RunState::Partial`](crate::runs::RunState), not done.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub problems: Vec<StageProblem>,
+}
+
+/// How a stage fell short in a run.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum StageProblem {
+    /// The stage could not run now (its backend is unavailable); its work stays pending.
+    Postponed { stage: String, reason: String },
+    /// Some videos failed in it.
+    Failed { stage: String, videos: usize, error: String },
+}
+
+impl StageProblem {
+    pub fn stage(&self) -> &str {
+        match self {
+            StageProblem::Postponed { stage, .. } | StageProblem::Failed { stage, .. } => stage,
+        }
+    }
+
+    /// "Describing frames postponed: …" / "Finding faces failed on 2 videos: …".
+    pub fn message(&self) -> String {
+        let label = crate::runs::phase_label(self.stage());
+        match self {
+            StageProblem::Postponed { reason, .. } => format!("{label} postponed: {reason}"),
+            StageProblem::Failed { videos, error, .. } => {
+                format!("{label} failed on {videos} video{}: {error}", if *videos == 1 { "" } else { "s" })
+            }
+        }
+    }
+
+    /// Fold an indexer event into a run's problems.
+    pub fn observe(problems: &mut Vec<StageProblem>, e: &Event) {
+        // Phase keys name a stage's backend ("describe_server"); problems are per stage.
+        let stage_of = |s: &str| s.split('_').next().unwrap_or(s).to_string();
+        match e {
+            Event::StageUnavailable { stage, reason } => {
+                let stage = stage_of(stage);
+                if !problems.iter().any(|p| matches!(p, StageProblem::Postponed { stage: s, .. } if *s == stage)) {
+                    problems.push(StageProblem::Postponed { stage, reason: reason.clone() });
+                }
+            }
+            Event::JobFailed { stage, error, .. } => {
+                let stage = stage_of(stage);
+                match problems.iter_mut().find(|p| matches!(p, StageProblem::Failed { stage: s, .. } if *s == stage)) {
+                    Some(StageProblem::Failed { videos, .. }) => *videos += 1,
+                    _ => problems.push(StageProblem::Failed { stage, videos: 1, error: error.clone() }),
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Summary {
+    /// How the run ended, in a run's terms: stopped, finished short (problems), or done.
+    pub fn run_state(&self) -> crate::runs::RunState {
+        use crate::runs::RunState;
+        if self.cancelled {
+            RunState::Cancelled
+        } else if self.problems.is_empty() {
+            RunState::Done
+        } else {
+            RunState::Partial
+        }
+    }
+
+    /// The reason a partial run gives, one line per problem; `None` when there were none.
+    pub fn problems_line(&self) -> Option<String> {
+        (!self.problems.is_empty())
+            .then(|| self.problems.iter().map(StageProblem::message).collect::<Vec<_>>().join("; "))
+    }
+
+    /// "0 new · 1 changed · 0 removed · 3 steps done · 1 failed".
+    pub fn line(&self) -> String {
+        let mut line = format!(
+            "{} new · {} changed · {} removed · {} steps done",
+            self.new, self.changed, self.removed, self.jobs_done
+        );
+        if self.jobs_failed > 0 {
+            line.push_str(&format!(" · {} failed", self.jobs_failed));
+        }
+        line
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -121,14 +276,24 @@ impl Options {
         self.cancel.as_ref().is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
     }
 
+    /// [`stage_enabled`] for this run's explicit stages.
     pub fn is_stage_enabled(&self, stage: &str, project_pipeline: Option<&crate::projects::PipelineConfig>) -> bool {
-        if let Some(ref stages) = self.stages {
-            return stages.iter().any(|s| s == stage);
-        }
-        if let Some(pipeline) = project_pipeline {
-            return pipeline.is_enabled(stage);
-        }
-        true
+        stage_enabled(stage, self.stages.as_deref(), project_pipeline)
+    }
+}
+
+/// Whether `stage` is to run: the explicit list a caller gave (`ghostreel index --stages`), else
+/// the project's pipeline, else every stage. The one gate the index pipeline, its follow-up
+/// analysis passes and the Project menu's stage status all ask.
+pub fn stage_enabled(
+    stage: &str,
+    explicit: Option<&[String]>,
+    project_pipeline: Option<&crate::projects::PipelineConfig>,
+) -> bool {
+    match (explicit, project_pipeline) {
+        (Some(stages), _) => stages.iter().any(|s| s == stage),
+        (None, Some(pipeline)) => pipeline.is_enabled(stage),
+        (None, None) => true,
     }
 }
 
@@ -187,6 +352,120 @@ pub async fn run(db: &mut Db, rt: &Runtime, opts: &Options, on_event: impl FnMut
     result
 }
 
+/// The whole indexing pipeline for a scope: the scan and per-video stages ([`run`]), then the
+/// analysis passes (camera shake, faces, speakers) that [`stage_enabled`] lets through. The one
+/// sequence the app's queue, `ghostreel index` and the MCP tool run, so they agree on what an
+/// index run is and how it ended.
+///
+/// Every stage reports problems through its events; they are collected into
+/// [`Summary::problems`] (a run with any is partial, not done) and a postponed stage's reason is
+/// kept on its pending jobs for the Project menu. A stop anywhere sets [`Summary::cancelled`].
+/// Callers hold an [`IndexLock`].
+pub async fn run_pipeline(
+    db: &mut Db,
+    paths: &crate::paths::Paths,
+    config: &crate::config::Config,
+    rt: &Runtime,
+    opts: &Options,
+    mut on_event: impl FnMut(Event),
+) -> Result<Summary, Error> {
+    let mut problems = Vec::new();
+    let mut sink = |e: Event| {
+        StageProblem::observe(&mut problems, &e);
+        on_event(e)
+    };
+    let mut summary = run(db, rt, opts, &mut sink).await?;
+    if !summary.cancelled && !opts.cancelled() {
+        let pipeline = opts.project_id.and_then(|pid| db.project(pid).ok()).map(|p| p.pipeline);
+        let enabled = |stage: &str| opts.is_stage_enabled(stage, pipeline.as_ref()) && !opts.cancelled();
+        // A pass that errors out as a whole (its model would not load) is a postponed stage, not
+        // a reason to hide what the other passes did.
+        let failed = |stage: &str, e: Error, sink: &mut dyn FnMut(Event)| {
+            if !e.is_cancelled() {
+                sink(Event::StageUnavailable { stage: stage.into(), reason: e.to_string() });
+            }
+        };
+        if enabled("steadiness") {
+            let mut tracker = Tracker::new(&[("steadiness", 1.0)]);
+            if let Err(e) = run_steadiness_jobs(db, rt, opts, false, &mut tracker, &mut sink).await {
+                failed("steadiness", e, &mut sink);
+            }
+        }
+        if enabled("faces") {
+            let mut tracker = Tracker::new(&[("faces", 1.0)]);
+            if let Err(e) = run_face_jobs(db, paths, config, rt, opts, false, &mut tracker, &mut sink).await {
+                failed("faces", e, &mut sink);
+            }
+        }
+        if enabled("speakers") {
+            let mut tracker = Tracker::new(&[("speakers", 1.0)]);
+            if let Err(e) = run_speaker_jobs(db, paths, config, rt, opts, false, &mut tracker, &mut sink).await {
+                failed("speakers", e, &mut sink);
+            }
+        }
+    }
+    summary.cancelled |= opts.cancelled();
+    note_postponed(db, opts, &problems)?;
+    summary.problems = problems;
+    Ok(summary)
+}
+
+/// Keep a postponed stage's reason on its pending jobs in scope, so the Project menu can say why
+/// the stage is still pending. Starting the job again clears it.
+fn note_postponed(db: &Db, opts: &Options, problems: &[StageProblem]) -> Result<(), Error> {
+    for p in problems {
+        let StageProblem::Postponed { stage, reason } = p else { continue };
+        if !STAGES.contains(&stage.as_str()) {
+            continue;
+        }
+        db.conn.execute(
+            "UPDATE jobs SET last_error = ?1
+              WHERE stage = ?2 AND state = 'pending'
+                AND (?3 IS NULL OR video_id IN (SELECT vf.video_id FROM video_files vf
+                                                  JOIN project_folders pf ON pf.folder_id = vf.folder_id
+                                                 WHERE pf.project_id = ?3))",
+            params![format!("postponed: {reason}"), stage, opts.project_id],
+        )?;
+    }
+    Ok(())
+}
+
+/// Record how an analysis pass (camera shake, faces) went for a video as its job row, so the
+/// status and the next run know the video was analysed even when there was nothing to find —
+/// a video with no faces stores no face tracks, and without this it was analysed again on every
+/// run and shown as pending for ever.
+fn record_analysis(db: &Db, video_id: i64, stage: &str, error: Option<&str>) -> Result<(), Error> {
+    let (state, bump) = if error.is_some() { ("failed", 1) } else { ("done", 0) };
+    db.conn.execute(
+        "INSERT INTO jobs(video_id, stage, state, attempts, last_error, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(video_id, stage) DO UPDATE SET state = excluded.state, last_error = excluded.last_error,
+             attempts = CASE WHEN excluded.state = 'done' THEN 0 ELSE jobs.attempts + 1 END,
+             updated_at = excluded.updated_at",
+        params![video_id, stage, state, bump, error, now()],
+    )?;
+    Ok(())
+}
+
+/// SQL: video `v` still needs analysis pass `stage` (`?` placeholders bound by the caller are not
+/// used: the stage is a constant). `output` is the table its results live in.
+fn needs_analysis_sql(stage: &str, output: &str, retry_failed: bool) -> String {
+    let max_attempts = if retry_failed { i64::MAX } else { MAX_ATTEMPTS };
+    format!(
+        "NOT EXISTS (SELECT 1 FROM {output} o WHERE o.video_id = v.id)
+         AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.video_id = v.id AND j.stage = '{stage}'
+                            AND (j.state = 'done' OR (j.state = 'failed' AND j.attempts >= {max_attempts})))"
+    )
+}
+
+/// SQL: the video in column `video` has been through analysis pass `stage` — it has results in
+/// `output`, or its job row says it was done (with nothing to find).
+fn analysed_sql(stage: &str, output: &str, video: &str) -> String {
+    format!(
+        "(EXISTS (SELECT 1 FROM {output} o WHERE o.video_id = {video})
+          OR EXISTS (SELECT 1 FROM jobs aj WHERE aj.video_id = {video} AND aj.stage = '{stage}' AND aj.state = 'done'))"
+    )
+}
+
 async fn run_jobs(
     db: &mut Db,
     rt: &Runtime,
@@ -242,9 +521,14 @@ async fn run_jobs(
     // 2. Hash new/changed files (all folders together).
     tracker.start("hash");
     on_event(Event::Progress(tracker.snapshot(None)));
-    let (new, changed) = hash_and_store(db, to_hash, &mut tracker, &mut on_event).await?;
+    let (new, changed, renders) = hash_and_store(db, to_hash, &mut tracker, &mut on_event).await?;
     summary.new = new;
     summary.changed = changed;
+    // Renders indexed before they were recognised leave the library too.
+    summary.renders = renders + forget_indexed_renders(db)?;
+    if summary.renders > 0 {
+        on_event(Event::RendersSkipped { count: summary.renders });
+    }
     for w in &pending {
         summary.removed += db
             .conn
@@ -455,13 +739,53 @@ async fn walk_folder(
     Ok(w)
 }
 
-/// Hash files concurrently and record videos, file locations and their pending jobs.
+/// Remember that GhostReel wrote `path` (a preview or an export render), by content hash, so a
+/// scan of a folder it lands in skips it. `script_id` is the cut it was rendered from.
+pub fn record_render(db: &Db, path: &Path, script_id: Option<i64>) -> Result<(), Error> {
+    let hash = media::content_hash(path)?;
+    db.conn.execute(
+        "INSERT INTO rendered_outputs(content_hash, script_id, path, created_at) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(content_hash) DO UPDATE SET script_id = excluded.script_id, path = excluded.path,
+             created_at = excluded.created_at",
+        params![hash, script_id, path.to_string_lossy(), now()],
+    )?;
+    Ok(())
+}
+
+/// Whether a file is GhostReel's own render: its content was recorded by [`record_render`], or
+/// it sits where a recorded preview/export render was written (renders made before the hashes
+/// were kept).
+fn is_render(conn: &rusqlite::Connection, content_hash: &str, path: &Path) -> Result<bool, Error> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 WHERE EXISTS (SELECT 1 FROM rendered_outputs WHERE content_hash = ?1)
+                         OR EXISTS (SELECT 1 FROM exports WHERE format = 'preview_mp4' AND path = ?2)",
+            params![content_hash, path.to_string_lossy()],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+/// Drop the file locations of renders indexed as footage before they were recognised (their
+/// index stays, unused, like any file no folder holds). Returns how many.
+fn forget_indexed_renders(db: &Db) -> Result<usize, Error> {
+    Ok(db.conn.execute(
+        "DELETE FROM video_files
+          WHERE video_id IN (SELECT v.id FROM videos v JOIN rendered_outputs r ON r.content_hash = v.content_hash)
+             OR path IN (SELECT path FROM exports WHERE format = 'preview_mp4')",
+        [],
+    )?)
+}
+
+/// Hash files concurrently and record videos, file locations and their pending jobs. Files that
+/// are GhostReel's own renders are left out. Returns (new, changed, renders skipped).
 async fn hash_and_store(
     db: &mut Db,
     files: Vec<ToHash>,
     tracker: &mut Tracker,
     on_event: &mut impl FnMut(Event),
-) -> Result<(usize, usize), Error> {
+) -> Result<(usize, usize, usize), Error> {
     let sem = Arc::new(Semaphore::new(PARALLEL_HASH));
     let mut set = JoinSet::new();
     for mut f in files {
@@ -478,7 +802,7 @@ async fn hash_and_store(
             (f, true, hash)
         });
     }
-    let (mut new, mut changed) = (0, 0);
+    let (mut new, mut changed, mut renders) = (0, 0, 0);
     while let Some(joined) = set.join_next().await {
         let Ok((f, hashed, hash)) = joined else { continue };
         if hashed {
@@ -489,6 +813,10 @@ async fn hash_and_store(
         }
         // A file that vanished or can't be read mid-scan is skipped; next scan retries it.
         let Ok(hash) = hash else { continue };
+        if is_render(&db.conn, &hash, &f.path)? {
+            renders += 1;
+            continue;
+        }
         let tx = db.conn.transaction()?;
         tx.execute("INSERT OR IGNORE INTO videos(content_hash, size) VALUES (?1, ?2)", params![hash, f.size])?;
         let video_id: i64 = tx.query_row("SELECT id FROM videos WHERE content_hash = ?1", [&hash], |r| r.get(0))?;
@@ -508,7 +836,7 @@ async fn hash_and_store(
         tx.commit()?;
         if f.existed { changed += 1 } else { new += 1 }
     }
-    Ok((new, changed))
+    Ok((new, changed, renders))
 }
 
 /// Videos indexed before a stage existed get its job rows now.
@@ -926,26 +1254,46 @@ async fn run_transcribe_jobs(
         let duration = durations.get(&video_id).copied().unwrap_or(0.0);
         set_job(db, video_id, STAGE, "running", None)?;
         on_event(Event::JobStarted { video_id, stage: STAGE.into(), path: path.clone() });
+        let g = db.glossary_for_video(video_id).unwrap_or_default();
+        let prompt = g.whisper_prompt();
         let mut credited = 0.0f64;
-        let result = transcriber
-            .transcribe(&rt.ffmpeg, &path, duration, |secs| {
-                let secs = secs.min(duration);
-                if secs > credited {
-                    tracker.advance(phase, (secs - credited).round() as u64);
-                    credited = secs.round();
-                }
-                if tracker.should_emit() {
-                    on_event(Event::Progress(tracker.snapshot(Some(path.clone()))));
-                }
-            })
-            .await;
+        // A stop drops the transcription mid-video (its decoder and worker are killed below); the
+        // video stays pending and is transcribed from the start next run.
+        let result = crate::cancel::race(
+            opts.cancel.as_ref(),
+            transcriber.transcribe(
+                &rt.ffmpeg,
+                &path,
+                duration,
+                |secs| {
+                    let secs = secs.min(duration);
+                    if secs > credited {
+                        tracker.advance(phase, (secs - credited).round() as u64);
+                        credited = secs.round();
+                    }
+                    if tracker.should_emit() {
+                        on_event(Event::Progress(tracker.snapshot(Some(path.clone()))));
+                    }
+                },
+                prompt.as_deref(),
+            ),
+        )
+        .await;
+        let Ok(result) = result else {
+            set_job(db, video_id, STAGE, "pending", None)?;
+            break;
+        };
         match result {
-            Ok(t) => {
+            Ok(mut t) => {
+                for seg in &mut t.segments {
+                    seg.text = g.correct(&seg.text);
+                }
                 store_transcript(db, video_id, &t)?;
                 // Which track carries the speech, and who is close to the microphone. Measured
                 // here because the transcript gives the stretches worth measuring; a failure is
                 // not worth failing the stage for, it only leaves the editor less informed.
                 if rt.measure_audio
+                    && !opts.cancelled()
                     && let Ok(tracks) = crate::audio::track_count(&rt.ffprobe, &path).await
                     && tracks > 0
                 {
@@ -1093,17 +1441,26 @@ async fn run_frame_jobs(
         // Start clean: a previous interrupted run may have left files.
         let _ = tokio::fs::remove_dir_all(&dir).await;
         let mut credited = 0.0f64;
-        let result = crate::frames::extract_keyframes(&rt.ffmpeg, &path, duration, &dir, &frame_opts, |fraction| {
-            let secs = (fraction * duration).floor();
-            if secs > credited {
-                tracker.advance(STAGE, (secs - credited) as u64);
-                credited = secs;
-            }
-            if tracker.should_emit() {
-                on_event(Event::Progress(tracker.snapshot(Some(path.clone()))));
-            }
-        })
+        let result = crate::cancel::race(
+            opts.cancel.as_ref(),
+            crate::frames::extract_keyframes(&rt.ffmpeg, &path, duration, &dir, &frame_opts, |fraction| {
+                let secs = (fraction * duration).floor();
+                if secs > credited {
+                    tracker.advance(STAGE, (secs - credited) as u64);
+                    credited = secs;
+                }
+                if tracker.should_emit() {
+                    on_event(Event::Progress(tracker.snapshot(Some(path.clone()))));
+                }
+            }),
+        )
         .await;
+        // Stopped mid-video: its half-written frames go, the video is redone next run.
+        let Ok(result) = result else {
+            let _ = tokio::fs::remove_dir_all(&dir).await;
+            set_job(db, video_id, STAGE, "pending", None)?;
+            break;
+        };
         match result {
             Ok(frames) => {
                 store_frames(db, video_id, &rt.data_dir, &frames)?;
@@ -1181,12 +1538,12 @@ pub async fn run_steadiness_jobs(
                  FROM videos v
                  JOIN video_files vf ON vf.video_id = v.id
                  JOIN project_folders pf ON pf.folder_id = vf.folder_id AND pf.project_id = ?1
-                 WHERE v.duration_s > 0
-                   AND NOT EXISTS (SELECT 1 FROM motion_windows mw WHERE mw.video_id = v.id)
+                 WHERE v.duration_s > 0 AND {needs}
                  GROUP BY v.id
                  ORDER BY v.id"
             };
-            let mut st = db.conn.prepare(sql)?;
+            let sql = sql.replace("{needs}", &needs_analysis_sql(STAGE, "motion_windows", opts.retry_failed));
+            let mut st = db.conn.prepare(&sql)?;
             let rows = st.query_map([pid], |r| Ok((r.get(0)?, PathBuf::from(r.get::<_, String>(1)?), r.get(2)?)))?;
             rows.collect::<Result<_, _>>()?
         }
@@ -1202,12 +1559,12 @@ pub async fn run_steadiness_jobs(
                 "SELECT v.id, vf.path, COALESCE(v.duration_s, 0)
                  FROM videos v
                  JOIN video_files vf ON vf.video_id = v.id
-                 WHERE v.duration_s > 0
-                   AND NOT EXISTS (SELECT 1 FROM motion_windows mw WHERE mw.video_id = v.id)
+                 WHERE v.duration_s > 0 AND {needs}
                  GROUP BY v.id
                  ORDER BY v.id"
             };
-            let mut st = db.conn.prepare(sql)?;
+            let sql = sql.replace("{needs}", &needs_analysis_sql(STAGE, "motion_windows", opts.retry_failed));
+            let mut st = db.conn.prepare(&sql)?;
             let rows = st.query_map([], |r| Ok((r.get(0)?, PathBuf::from(r.get::<_, String>(1)?), r.get(2)?)))?;
             rows.collect::<Result<_, _>>()?
         }
@@ -1229,31 +1586,367 @@ pub async fn run_steadiness_jobs(
             break;
         }
         on_event(Event::JobStarted { video_id, stage: STAGE.into(), path: path.clone() });
-        match crate::steadiness::measure(
-            &rt.ffmpeg,
-            &path,
-            duration,
-            steadiness_opts.window_s,
-            steadiness_opts.stride_s,
+        // One video is one long decode: progress comes from inside it, and a stop drops it (and
+        // kills its ffmpeg) at once. A stopped video stores nothing; it is measured next run.
+        let mut credited = 0u64;
+        let measured = crate::cancel::race(
+            opts.cancel.as_ref(),
+            crate::steadiness::measure(
+                &rt.ffmpeg,
+                &path,
+                duration,
+                steadiness_opts.window_s,
+                steadiness_opts.stride_s,
+                |secs| {
+                    let secs = secs.min(duration).floor() as u64;
+                    if secs > credited {
+                        tracker.advance(STAGE, secs - credited);
+                        credited = secs;
+                    }
+                    if tracker.should_emit() {
+                        on_event(Event::Progress(tracker.snapshot(Some(path.clone()))));
+                    }
+                },
+            ),
         )
-        .await
-        {
-            Ok(windows) => {
-                let _ = db.set_motion_windows(video_id, &windows);
+        .await;
+        match measured {
+            Err(_) => break,
+            Ok(Ok(windows)) => {
+                db.set_motion_windows(video_id, &windows)?;
+                record_analysis(db, video_id, STAGE, None)?;
                 on_event(Event::JobDone { video_id, stage: STAGE.into() });
                 done += 1;
             }
-            Err(e) => {
+            Ok(Err(e)) => {
+                record_analysis(db, video_id, STAGE, Some(&e.to_string()))?;
                 on_event(Event::JobFailed { video_id, stage: STAGE.into(), error: e.to_string() });
                 failed += 1;
             }
         }
-        tracker.advance(STAGE, duration.ceil() as u64);
-        if tracker.should_emit() {
-            on_event(Event::Progress(tracker.snapshot(Some(path))));
-        }
+        tracker.advance(STAGE, (duration.ceil() as u64).saturating_sub(credited));
+        on_event(Event::Progress(tracker.snapshot(Some(path))));
     }
     Ok(SteadinessSummary { measured: done, failed, total: total_in_scope })
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct FaceSummary {
+    pub measured: usize,
+    pub failed: usize,
+    pub total: usize,
+}
+
+/// Find and track faces for videos that haven't been processed yet (or all videos if `force` is true).
+#[allow(clippy::too_many_arguments)]
+pub async fn run_face_jobs(
+    db: &mut Db,
+    paths: &crate::paths::Paths,
+    config: &crate::config::Config,
+    rt: &Runtime,
+    opts: &Options,
+    force: bool,
+    tracker: &mut Tracker,
+    on_event: &mut impl FnMut(Event),
+) -> Result<FaceSummary, Error> {
+    const STAGE: &str = "faces";
+    let total_in_scope: usize = match opts.project_id {
+        Some(pid) => {
+            let mut st = db.conn.prepare(
+                "SELECT COUNT(DISTINCT v.id)
+                 FROM videos v
+                 JOIN video_files vf ON vf.video_id = v.id
+                 JOIN project_folders pf ON pf.folder_id = vf.folder_id AND pf.project_id = ?1
+                 WHERE v.duration_s > 0",
+            )?;
+            st.query_row([pid], |r| r.get::<_, i64>(0)).map(|v| v as usize).unwrap_or(0)
+        }
+        None => {
+            let mut st = db.conn.prepare("SELECT COUNT(DISTINCT id) FROM videos WHERE duration_s > 0")?;
+            st.query_row([], |r| r.get::<_, i64>(0)).map(|v| v as usize).unwrap_or(0)
+        }
+    };
+
+    // Find videos for the project (or all) that have duration > 0.
+    let unmeasured: Vec<(i64, PathBuf, f64, u32, u32)> = match opts.project_id {
+        Some(pid) => {
+            let sql = if force {
+                "SELECT v.id, vf.path, COALESCE(v.duration_s, 0), COALESCE(v.width, 1280), COALESCE(v.height, 720)
+                 FROM videos v
+                 JOIN video_files vf ON vf.video_id = v.id
+                 JOIN project_folders pf ON pf.folder_id = vf.folder_id AND pf.project_id = ?1
+                 WHERE v.duration_s > 0
+                 GROUP BY v.id
+                 ORDER BY v.id"
+            } else {
+                "SELECT v.id, vf.path, COALESCE(v.duration_s, 0), COALESCE(v.width, 1280), COALESCE(v.height, 720)
+                 FROM videos v
+                 JOIN video_files vf ON vf.video_id = v.id
+                 JOIN project_folders pf ON pf.folder_id = vf.folder_id AND pf.project_id = ?1
+                 WHERE v.duration_s > 0 AND {needs}
+                 GROUP BY v.id
+                 ORDER BY v.id"
+            };
+            let sql = sql.replace("{needs}", &needs_analysis_sql(STAGE, "face_tracks", opts.retry_failed));
+            let mut st = db.conn.prepare(&sql)?;
+            let rows = st.query_map([pid], |r| {
+                Ok((
+                    r.get(0)?,
+                    PathBuf::from(r.get::<_, String>(1)?),
+                    r.get(2)?,
+                    r.get::<_, i64>(3)? as u32,
+                    r.get::<_, i64>(4)? as u32,
+                ))
+            })?;
+            rows.collect::<Result<_, _>>()?
+        }
+        None => {
+            let sql = if force {
+                "SELECT v.id, vf.path, COALESCE(v.duration_s, 0), COALESCE(v.width, 1280), COALESCE(v.height, 720)
+                 FROM videos v
+                 JOIN video_files vf ON vf.video_id = v.id
+                 WHERE v.duration_s > 0
+                 GROUP BY v.id
+                 ORDER BY v.id"
+            } else {
+                "SELECT v.id, vf.path, COALESCE(v.duration_s, 0), COALESCE(v.width, 1280), COALESCE(v.height, 720)
+                 FROM videos v
+                 JOIN video_files vf ON vf.video_id = v.id
+                 WHERE v.duration_s > 0 AND {needs}
+                 GROUP BY v.id
+                 ORDER BY v.id"
+            };
+            let sql = sql.replace("{needs}", &needs_analysis_sql(STAGE, "face_tracks", opts.retry_failed));
+            let mut st = db.conn.prepare(&sql)?;
+            let rows = st.query_map([], |r| {
+                Ok((
+                    r.get(0)?,
+                    PathBuf::from(r.get::<_, String>(1)?),
+                    r.get(2)?,
+                    r.get::<_, i64>(3)? as u32,
+                    r.get::<_, i64>(4)? as u32,
+                ))
+            })?;
+            rows.collect::<Result<_, _>>()?
+        }
+    };
+
+    if unmeasured.is_empty() {
+        tracker.set_total(STAGE, 0);
+        return Ok(FaceSummary { measured: 0, failed: 0, total: total_in_scope });
+    }
+
+    let models_dir = crate::models::effective_models_dir(paths, config);
+    let roots = crate::models::search_roots(&models_dir, &config.models.search_paths);
+    let yunet_path = crate::models::find(&roots, "face_detection_yunet_2023mar.onnx");
+    let sface_path = crate::models::find(&roots, "face_recognition_sface_2021dec.onnx");
+
+    let (Some(yunet_file), Some(sface_file)) = (yunet_path, sface_path) else {
+        on_event(Event::StageUnavailable {
+            stage: STAGE.into(),
+            reason: "face models not downloaded — Models page".into(),
+        });
+        return Ok(FaceSummary { measured: 0, failed: 0, total: total_in_scope });
+    };
+
+    let env = crate::onnx::environment()?;
+    let detector = crate::faces::OrtDetector::new(&env, &yunet_file.to_string_lossy())?;
+    let embedder = crate::faces::OrtEmbedder::new(&env, &sface_file.to_string_lossy())?;
+    // The models travel to the blocking thread with each video and come back with its tracks.
+    let mut models = Some((detector, embedder));
+
+    let total: f64 = unmeasured.iter().map(|(_, _, d, _, _)| *d).sum();
+    tracker.set_total(STAGE, total.ceil() as u64);
+    tracker.start(STAGE);
+    on_event(Event::Progress(tracker.snapshot(None)));
+
+    let (mut done, mut failed) = (0, 0);
+    for (video_id, path, duration, w, h) in unmeasured {
+        if opts.cancelled() {
+            break;
+        }
+        on_event(Event::JobStarted { video_id, stage: STAGE.into(), path: path.clone() });
+
+        // Decoding and ONNX inference are blocking: on their own thread, so the run's progress
+        // and Stop keep flowing. The loop checks the stop flag every frame and kills its ffmpeg.
+        let Some((mut detector, mut embedder)) = models.take() else { break };
+        let (ffmpeg, video, cancel) = (rt.ffmpeg.clone(), path.clone(), opts.cancel.clone());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<f64>();
+        let job = tokio::task::spawn_blocking(move || {
+            let res = crate::faces::process_video_faces(
+                &ffmpeg,
+                &video,
+                video_id,
+                w,
+                h,
+                &mut detector,
+                &mut embedder,
+                cancel.as_ref(),
+                |t| {
+                    let _ = tx.send(t);
+                },
+            );
+            (res, detector, embedder)
+        });
+        tokio::pin!(job);
+        let mut credited = 0u64;
+        let joined = loop {
+            tokio::select! {
+                j = &mut job => break j,
+                Some(t) = rx.recv() => {
+                    let secs = t.min(duration).floor() as u64;
+                    if secs > credited {
+                        tracker.advance(STAGE, secs - credited);
+                        credited = secs;
+                    }
+                    if tracker.should_emit() {
+                        on_event(Event::Progress(tracker.snapshot(Some(path.clone()))));
+                    }
+                }
+            }
+        };
+        let (res, detector, embedder) =
+            joined.map_err(|e| Error::Invalid(format!("face tracking thread failed: {e}")))?;
+        models = Some((detector, embedder));
+
+        match res {
+            Err(e) if e.is_cancelled() => break,
+            Ok(tracks) => {
+                db.set_face_tracks(video_id, &tracks)?;
+                record_analysis(db, video_id, STAGE, None)?;
+                on_event(Event::JobDone { video_id, stage: STAGE.into() });
+                done += 1;
+            }
+            Err(e) => {
+                record_analysis(db, video_id, STAGE, Some(&e.to_string()))?;
+                on_event(Event::JobFailed { video_id, stage: STAGE.into(), error: e.to_string() });
+                failed += 1;
+            }
+        }
+        tracker.advance(STAGE, (duration.ceil() as u64).saturating_sub(credited));
+        on_event(Event::Progress(tracker.snapshot(Some(path))));
+    }
+    Ok(FaceSummary { measured: done, failed, total: total_in_scope })
+}
+
+/// Analyse who speaks when (voice), who is on screen (people) and which face each voice is, for
+/// one project or every project. Needs transcripts; uses face tracks when there are any. Only
+/// runs again when voices or faces changed since the last run, unless `force`.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_speaker_jobs(
+    db: &mut Db,
+    paths: &crate::paths::Paths,
+    config: &crate::config::Config,
+    rt: &Runtime,
+    opts: &Options,
+    force: bool,
+    tracker: &mut Tracker,
+    on_event: &mut impl FnMut(Event),
+) -> Result<Vec<(i64, crate::speakers::SpeakersReport)>, Error> {
+    const STAGE: &str = "speakers";
+    let projects: Vec<i64> = match opts.project_id {
+        Some(pid) => vec![pid],
+        None => db.projects()?.into_iter().map(|p| p.id).collect(),
+    };
+    // Progress counts seconds of speech-bearing video to embed.
+    let mut total = 0.0f64;
+    let mut need_model = false;
+    for &pid in &projects {
+        for vid in db.project_video_ids(pid)? {
+            let has_speech: bool = db.conn.query_row(
+                "SELECT EXISTS (SELECT 1 FROM transcript_segments WHERE video_id = ?1)",
+                [vid],
+                |r| r.get(0),
+            )?;
+            if !has_speech {
+                continue;
+            }
+            let has_windows: bool =
+                db.conn.query_row("SELECT EXISTS (SELECT 1 FROM speaker_windows WHERE video_id = ?1)", [vid], |r| {
+                    r.get(0)
+                })?;
+            if force || !has_windows {
+                need_model = true;
+                total += db.conn.query_row("SELECT COALESCE(duration_s, 0) FROM videos WHERE id = ?1", [vid], |r| {
+                    r.get::<_, f64>(0)
+                })?;
+            }
+        }
+    }
+
+    let models_dir = crate::models::effective_models_dir(paths, config);
+    let roots = crate::models::search_roots(&models_dir, &config.models.search_paths);
+    let mut model_path = crate::models::find(&roots, crate::speakers::SPEAKER_MODEL_FILE);
+    if model_path.is_none() && need_model {
+        // Small (~29 MB): fetch it on first use rather than send people to the Models page.
+        let entry = crate::models::catalog().into_iter().find(|e| e.file_name == crate::speakers::SPEAKER_MODEL_FILE);
+        if let Some(entry) = entry {
+            on_event(Event::DownloadingModel { file: entry.file_name.clone() });
+            let spec = crate::models::ModelSpec { file_name: entry.file_name.clone(), url: entry.url.clone() };
+            match crate::models::download(&spec, &models_dir, |_, _| {}).await {
+                Ok(p) => model_path = Some(p),
+                Err(e) => {
+                    on_event(Event::StageUnavailable {
+                        stage: STAGE.into(),
+                        reason: format!("voice model not downloaded ({e}) — Models page"),
+                    });
+                }
+            }
+        }
+    }
+    let env;
+    let mut embedder = match &model_path {
+        Some(p) => {
+            env = crate::onnx::environment()?;
+            Some(crate::speakers::OrtSpeakerEmbedder::new(&env, &p.to_string_lossy())?)
+        }
+        None => None,
+    };
+    if need_model && embedder.is_none() {
+        return Ok(Vec::new());
+    }
+
+    tracker.set_total(STAGE, total.ceil() as u64);
+    tracker.start(STAGE);
+    on_event(Event::Progress(tracker.snapshot(None)));
+    let mut reports = Vec::new();
+    for pid in projects {
+        if opts.cancelled() {
+            break;
+        }
+        let mut current: Option<PathBuf> = None;
+        let mut step = |s: crate::speakers::Step<'_>| match s {
+            crate::speakers::Step::Started { video_id, path, phase: _ } => {
+                current = Some(path.to_path_buf());
+                on_event(Event::JobStarted { video_id, stage: STAGE.into(), path: path.to_path_buf() });
+            }
+            crate::speakers::Step::Advanced { seconds } => {
+                tracker.advance(STAGE, seconds.round() as u64);
+                if tracker.should_emit() {
+                    on_event(Event::Progress(tracker.snapshot(current.clone())));
+                }
+            }
+            crate::speakers::Step::Done { video_id } => on_event(Event::JobDone { video_id, stage: STAGE.into() }),
+            crate::speakers::Step::Failed { video_id, error } => {
+                on_event(Event::JobFailed { video_id, stage: STAGE.into(), error })
+            }
+        };
+        let report = crate::speakers::analyse_project(
+            db,
+            &rt.ffmpeg,
+            pid,
+            embedder.as_mut(),
+            force,
+            opts.cancel.as_ref(),
+            &mut step,
+        );
+        match report {
+            Ok(r) => reports.push((pid, r)),
+            Err(e) if opts.cancelled() || e.is_cancelled() => break,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(reports)
 }
 
 // ---- describe -----------------------------------------------------------------------------
@@ -1344,7 +2037,10 @@ async fn start_describer(
         VisionSetup::Local { helper, models_dir, model, mmproj, found, runtime } => {
             let mut paths = Vec::new();
             for spec in std::iter::once(model).chain(mmproj.iter()) {
-                if let Some(p) = found.iter().find(|p| p == &std::path::Path::new(&spec.file_name) || p.file_name().is_some_and(|n| n == spec.file_name.as_str())) {
+                if let Some(p) = found.iter().find(|p| {
+                    p == &std::path::Path::new(&spec.file_name)
+                        || p.file_name().is_some_and(|n| n == spec.file_name.as_str())
+                }) {
                     paths.push(p.clone());
                     continue;
                 }
@@ -1372,6 +2068,7 @@ async fn start_describer(
                 cpu: false,
                 runtime: runtime.clone(),
                 concurrency: describe_concurrency(rt),
+                free_ghostpen: crate::ghost_service::models_to_free(Some(rt)),
             };
             LocalLlm::start(&models).await.map(|l| Describer::Local(Box::new(l))).map_err(|e| e.to_string())
         }
@@ -1411,7 +2108,39 @@ async fn run_describe_jobs(
         return Ok((0, 0));
     }
 
-    let mut describer = match start_describer(rt, tracker, on_event).await {
+    // Every frame description takes a slot on the model's endpoint, shared with script chat and
+    // clip runs. A local model (and a server asked one frame at a time) is held for the whole
+    // stage: its helper keeps the model loaded between frames.
+    let n_at_once = describe_concurrency(rt);
+    let hold_stage_slot = match &rt.vision {
+        VisionSetup::Local { .. } | VisionSetup::Mlx { .. } => true,
+        VisionSetup::Server(_) => n_at_once < 2,
+        _ => false,
+    };
+    // The endpoint may be busy with a script chat or a clip run: say so while waiting, and let a
+    // stop through.
+    let _stage_slot = if hold_stage_slot {
+        let wait = crate::agents::acquire_for(&rt.vision, 1);
+        tokio::pin!(wait);
+        match tokio::time::timeout(std::time::Duration::from_millis(500), &mut wait).await {
+            Ok(slot) => slot,
+            Err(_) => {
+                let what = crate::agents::EndpointKey::for_setup(&rt.vision)
+                    .map(|k| format!("a free slot on {}", k.label()))
+                    .unwrap_or_else(|| "the model".into());
+                on_event(Event::Waiting { stage: STAGE.into(), what });
+                match crate::cancel::race(opts.cancel.as_ref(), wait).await {
+                    Ok(slot) => slot,
+                    Err(_) => return Ok((0, 0)),
+                }
+            }
+        }
+    } else {
+        None
+    };
+    let started = crate::cancel::race(opts.cancel.as_ref(), start_describer(rt, tracker, on_event)).await;
+    let Ok(started) = started else { return Ok((0, 0)) };
+    let mut describer = match started {
         Ok(d) => d,
         Err(reason) => {
             on_event(Event::StageUnavailable { stage: STAGE.into(), reason });
@@ -1430,7 +2159,7 @@ async fn run_describe_jobs(
     if let Some(concurrency) = cli_concurrency {
         // CLI backend: run up to `concurrency` frames at a time across all videos.
         use std::sync::Arc;
-        let sem = Arc::new(Semaphore::new(concurrency.max(1)));
+        let sem = Arc::new(crate::agents::EndpointSlots::for_setup(&rt.vision, concurrency.max(1)));
         let agent_cfg = if let VisionSetup::Cli(c) = &rt.vision { c.clone() } else { unreachable!() };
 
         'videos: for (video_id, path, frames) in work {
@@ -1451,7 +2180,7 @@ async fn run_describe_jobs(
                 let agent = crate::cliagent::CliAgent::new(agent_cfg.clone());
                 let sem = sem.clone();
                 tasks.spawn(async move {
-                    let _permit = sem.acquire_owned().await;
+                    let _permit = sem.acquire().await;
                     use crate::vision::schema;
                     let schema_hint = serde_json::to_string(&schema()).unwrap_or_default();
                     // Mirror Describer::Cli: pass schema + speech context as the schema_hint.
@@ -1465,7 +2194,15 @@ async fn run_describe_jobs(
                 });
             }
 
-            while let Some(joined) = tasks.join_next().await {
+            loop {
+                // A stop drops the frames still in flight; those already back are saved, the
+                // rest stay undescribed for the next run.
+                let Ok(next) = crate::cancel::race(opts.cancel.as_ref(), tasks.join_next()).await else {
+                    tasks.abort_all();
+                    set_job(db, video_id, STAGE, "pending", None)?;
+                    break 'videos;
+                };
+                let Some(joined) = next else { break };
                 let Ok((frame_id, result)) = joined else { continue };
                 let result = result.and_then(|j| crate::vision::parse_description(&j));
                 match result {
@@ -1527,7 +2264,7 @@ async fn run_describe_jobs(
         // queue. Queuing is harmless — measured at 2.87 s a frame against 3.03 s sequential — so
         // over-asking costs nothing and under-asking leaves the GPU idle.
         use std::sync::Arc;
-        let sem = Arc::new(Semaphore::new(n));
+        let sem = Arc::new(crate::agents::EndpointSlots::for_setup(&rt.vision, n));
 
         'videos: for (video_id, path, frames) in work {
             if frames.is_empty() {
@@ -1552,7 +2289,7 @@ async fn run_describe_jobs(
                 }
                 let (sem, server) = (sem.clone(), server.clone());
                 tasks.spawn(async move {
-                    let _permit = sem.acquire_owned().await;
+                    let _permit = sem.acquire().await;
                     let speech = (!speech.is_empty()).then_some(speech.as_str());
                     // One retry for a bad answer; a transport error is the server's problem.
                     let mut r = server.describe(&image, speech).await;
@@ -1564,7 +2301,15 @@ async fn run_describe_jobs(
             }
 
             let mut gone = None;
-            while let Some(joined) = tasks.join_next().await {
+            loop {
+                // A stop drops the frames still in flight; those already back are saved, the
+                // rest stay undescribed for the next run.
+                let Ok(next) = crate::cancel::race(opts.cancel.as_ref(), tasks.join_next()).await else {
+                    tasks.abort_all();
+                    set_job(db, video_id, STAGE, "pending", None)?;
+                    break 'videos;
+                };
+                let Some(joined) = next else { break };
                 let Ok((frame_id, result)) = joined else { continue };
                 match result {
                     Ok(d) => {
@@ -1646,7 +2391,13 @@ async fn run_describe_jobs(
                     .map(|(_, img, sp)| (img.as_path(), (!sp.is_empty()).then_some(sp.as_str())))
                     .collect();
 
-                let results = match local_llm.batch_describe(&batch_input).await {
+                let Ok(results) =
+                    crate::cancel::race(opts.cancel.as_ref(), local_llm.batch_describe(&batch_input)).await
+                else {
+                    set_job(db, video_id, STAGE, "pending", None)?;
+                    break 'videos;
+                };
+                let results = match results {
                     Ok(r) => r,
                     Err(e) => {
                         set_job(db, video_id, STAGE, "pending", Some(&e.to_string()))?;
@@ -1742,10 +2493,18 @@ async fn run_describe_jobs(
                 let speech = speech_near(db, video_id, t_s)?;
                 let speech = (!speech.is_empty()).then_some(speech.as_str());
                 // One retry for a bad/unparseable answer; transport errors stop the stage.
-                let mut result = describer.describe(&image, speech).await;
-                if matches!(&result, Err(e) if !is_transport_error(e)) {
-                    result = describer.describe(&image, speech).await;
-                }
+                let attempt = crate::cancel::race(opts.cancel.as_ref(), async {
+                    let mut result = describer.describe(&image, speech).await;
+                    if matches!(&result, Err(e) if !is_transport_error(e)) {
+                        result = describer.describe(&image, speech).await;
+                    }
+                    result
+                })
+                .await;
+                let Ok(result) = attempt else {
+                    set_job(db, video_id, STAGE, "pending", None)?;
+                    break 'videos;
+                };
                 match result {
                     Ok(d) => {
                         let json = serde_json::to_string(&d).unwrap_or_default();
@@ -1911,15 +2670,19 @@ async fn run_embed_jobs(
         None
     } else {
         let mut last = 0u64;
-        let started = crate::runtime::start_embedder(&rt.embed, |done, len| {
-            if let Some(len) = len {
-                tracker.set_total("download_embed", len);
-            }
-            tracker.start("download_embed");
-            tracker.advance("download_embed", done.saturating_sub(last));
-            last = done;
-        })
+        let started = crate::cancel::race(
+            opts.cancel.as_ref(),
+            crate::runtime::start_embedder(&rt.embed, |done, len| {
+                if let Some(len) = len {
+                    tracker.set_total("download_embed", len);
+                }
+                tracker.start("download_embed");
+                tracker.advance("download_embed", done.saturating_sub(last));
+                last = done;
+            }),
+        )
         .await;
+        let Ok(started) = started else { return Ok((0, 0)) };
         match started {
             Ok(e) => Some(e),
             Err(reason) => {
@@ -1955,8 +2718,15 @@ async fn run_embed_jobs(
         let texts: Vec<String> = chunks.iter().map(|c| crate::embed::doc_text(&c.text)).collect();
         let mut vectors = Vec::with_capacity(texts.len());
         let mut error = None;
+        let mut stopped = false;
         for batch in texts.chunks(BATCH) {
-            match embedder.as_mut().expect("checked above").embed(batch).await {
+            let Ok(res) =
+                crate::cancel::race(opts.cancel.as_ref(), embedder.as_mut().expect("checked above").embed(batch)).await
+            else {
+                stopped = true;
+                break;
+            };
+            match res {
                 Ok(v) => vectors.extend(v),
                 Err(e) => {
                     error = Some(e.to_string());
@@ -1967,6 +2737,11 @@ async fn run_embed_jobs(
             if tracker.should_emit() {
                 on_event(Event::Progress(tracker.snapshot(Some(path.clone()))));
             }
+        }
+        if stopped {
+            // Nothing of this video is stored; it is embedded again next run.
+            set_job(db, video_id, STAGE, "pending", None)?;
+            break;
         }
         match error {
             None => {
@@ -2042,6 +2817,10 @@ pub struct Status {
     pub total_duration_s: f64,
     pub vfr_videos: i64,
     pub stages: Vec<StageCounts>,
+    #[serde(default)]
+    pub steadiness_measured: i64,
+    #[serde(default)]
+    pub faces_measured: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2072,6 +2851,8 @@ pub struct VideoRow {
     pub shaky_s: f64,
     /// Whether the camera was measured at all: "steady" is only a verdict when it was.
     pub steadiness_measured: bool,
+    /// Whether faces were tracked for this video.
+    pub faces_measured: bool,
     /// static, tripod, stabilised, handheld, or unknown.
     pub camera: String,
     /// Category: interview, broll, screencast, drone, audio, other, or custom.
@@ -2121,7 +2902,175 @@ pub fn status(db: &Db, project_id: Option<i64>) -> Result<Status, Error> {
         }
         s.stages.push(c);
     }
+    s.steadiness_measured = db
+        .conn
+        .query_row(
+            &format!(
+                "SELECT COUNT(DISTINCT sc.video_id)
+                   FROM ({SCOPE}) sc
+                  WHERE {}",
+                analysed_sql("steadiness", "motion_windows", "sc.video_id")
+            ),
+            [project_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    s.faces_measured = db
+        .conn
+        .query_row(
+            &format!(
+                "SELECT COUNT(DISTINCT sc.video_id)
+                   FROM ({SCOPE}) sc
+                  WHERE {}",
+                analysed_sql("faces", "face_tracks", "sc.video_id")
+            ),
+            [project_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
     Ok(s)
+}
+
+/// Where a stage stands for a project.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StageState {
+    /// Turned off for the project (or by a setting it depends on): never run, never pending.
+    Off,
+    /// On, but cannot run on this machine yet (its models are missing).
+    Unavailable,
+    /// Work left for the next run (possibly postponed: see the reason).
+    Pending,
+    /// Every remaining video failed it as often as it is retried.
+    Failed,
+    Done,
+}
+
+/// One stage of a project's pipeline as the Project menu shows it. Whether a stage is *running*
+/// is the queue's to say; this is what the database says.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct StageStatus {
+    pub stage: String,
+    /// The stage's name in the menu ("Camera shake").
+    pub label: String,
+    pub state: StageState,
+    /// Videos done and in scope for the stage.
+    pub done: i64,
+    pub total: i64,
+    /// Why it is off, unavailable, pending or failed ("postponed: vision server …").
+    pub reason: Option<String>,
+}
+
+/// The stages the Project menu lists, in pipeline order, with their names there.
+pub const MENU_STAGES: &[(&str, &str)] = &[
+    ("frames", "Keyframes"),
+    ("transcribe", "Transcription"),
+    ("describe", "Frame descriptions"),
+    ("embed", "Search embeddings"),
+    ("steadiness", "Camera shake"),
+    ("faces", "Faces"),
+    ("speakers", "Speakers"),
+];
+
+/// Every menu stage's status for a project. A stage the project turned off is `off` — through
+/// [`stage_enabled`], the same gate the pipeline uses — whatever its videos' state.
+/// `face_models`: whether the face models are installed.
+pub fn stage_statuses(
+    db: &Db,
+    project_id: i64,
+    config: &crate::config::Config,
+    face_models: bool,
+) -> Result<Vec<StageStatus>, Error> {
+    let pipeline = db.project(project_id)?.pipeline;
+    let scope =
+        |extra: &str| format!("SELECT COUNT(*) FROM ({SCOPE}) sc JOIN videos v ON v.id = sc.video_id WHERE {extra}");
+    let count = |sql: String| -> Result<i64, Error> { Ok(db.conn.query_row(&sql, [project_id], |r| r.get(0))?) };
+    let mut out = Vec::new();
+    for &(stage, label) in MENU_STAGES {
+        let mut st = StageStatus {
+            stage: stage.into(),
+            label: label.into(),
+            state: StageState::Done,
+            done: 0,
+            total: 0,
+            reason: None,
+        };
+        if !stage_enabled(stage, None, Some(&pipeline)) {
+            st.state = StageState::Off;
+            out.push(st);
+            continue;
+        }
+        match stage {
+            "steadiness" | "faces" => {
+                let output = if stage == "steadiness" { "motion_windows" } else { "face_tracks" };
+                st.total = count(scope("COALESCE(v.duration_s, 0) > 0"))?;
+                st.done = count(scope(&format!(
+                    "COALESCE(v.duration_s, 0) > 0 AND {}",
+                    analysed_sql(stage, output, "v.id")
+                )))?;
+                let given_up = count(scope(&format!(
+                    "EXISTS (SELECT 1 FROM jobs j WHERE j.video_id = v.id AND j.stage = '{stage}'
+                                AND j.state = 'failed' AND j.attempts >= {MAX_ATTEMPTS})"
+                )))?;
+                if stage == "steadiness" && config.script.max_shake_jerk <= 0.0 {
+                    st.state = StageState::Off;
+                    st.reason = Some("the camera shake check is off in Settings".into());
+                } else if stage == "faces" && !face_models {
+                    st.state = StageState::Unavailable;
+                    st.reason = Some("face models not downloaded — Models page".into());
+                } else if st.done < st.total {
+                    st.state = if given_up >= st.total - st.done { StageState::Failed } else { StageState::Pending };
+                    st.reason = last_error(db, project_id, stage)?;
+                }
+            }
+            "speakers" => {
+                let pending = crate::speakers::pending_videos(db, project_id)? as i64;
+                st.total = count(scope("EXISTS (SELECT 1 FROM transcript_segments t WHERE t.video_id = v.id)"))?;
+                st.done = (st.total - pending).max(0);
+                if pending > 0 {
+                    st.state = StageState::Pending;
+                }
+            }
+            _ => {
+                let by_state = |state: &str| {
+                    count(scope(&format!(
+                        "EXISTS (SELECT 1 FROM jobs j WHERE j.video_id = v.id AND j.stage = '{stage}' AND j.state = '{state}')"
+                    )))
+                };
+                // A job left `running` by a run that was cut short is pending work.
+                let (pending, done, failed) =
+                    (by_state("pending")? + by_state("running")?, by_state("done")?, by_state("failed")?);
+                st.total = pending + done + failed;
+                st.done = done;
+                if pending > 0 {
+                    st.state = StageState::Pending;
+                } else if failed > 0 {
+                    st.state = StageState::Failed;
+                }
+                if st.state != StageState::Done {
+                    st.reason = last_error(db, project_id, stage)?;
+                }
+            }
+        }
+        out.push(st);
+    }
+    Ok(out)
+}
+
+/// The most recent reason a not-done job of `stage` in the project gave.
+fn last_error(db: &Db, project_id: i64, stage: &str) -> Result<Option<String>, Error> {
+    Ok(db
+        .conn
+        .query_row(
+            &format!(
+                "SELECT j.last_error FROM ({SCOPE}) sc JOIN jobs j ON j.video_id = sc.video_id
+                  WHERE j.stage = ?2 AND j.state <> 'done' AND j.last_error IS NOT NULL
+                  ORDER BY j.updated_at DESC LIMIT 1"
+            ),
+            params![project_id, stage],
+            |r| r.get(0),
+        )
+        .optional()?)
 }
 
 pub fn videos(db: &Db, project_id: Option<i64>) -> Result<Vec<VideoRow>, Error> {
@@ -2145,7 +3094,9 @@ pub fn videos_with_shake(
                 (SELECT j.state FROM jobs j WHERE j.video_id = v.id AND j.stage = 'transcribe'),
                 (SELECT COUNT(*) FROM frames f WHERE f.video_id = v.id),
                 COALESCE(v.category, 'other'), COALESCE(v.category_confidence, 0.0), COALESCE(v.category_source, 'auto'),
-                v.category_tag, sc.folder_ids
+                v.category_tag, sc.folder_ids,
+                (EXISTS (SELECT 1 FROM face_tracks ft WHERE ft.video_id = v.id)
+                 OR EXISTS (SELECT 1 FROM jobs fj WHERE fj.video_id = v.id AND fj.stage = 'faces' AND fj.state = 'done'))
            FROM ({SCOPE}) sc JOIN videos v ON v.id = sc.video_id
           ORDER BY sc.path"
     ))?;
@@ -2171,6 +3122,7 @@ pub fn videos_with_shake(
             frames: r.get(16)?,
             shaky_s: 0.0,
             steadiness_measured: false,
+            faces_measured: r.get(22)?,
             camera: String::new(),
             category: r.get(17)?,
             category_confidence: r.get(18)?,
@@ -2210,7 +3162,9 @@ pub fn video_by_id(
                 (SELECT j.state FROM jobs j WHERE j.video_id = v.id AND j.stage = \x27transcribe\x27),
                 (SELECT COUNT(*) FROM frames f WHERE f.video_id = v.id),
                 COALESCE(v.category, 'other'), COALESCE(v.category_confidence, 0.0), COALESCE(v.category_source, 'auto'),
-                v.category_tag, sc.folder_ids
+                v.category_tag, sc.folder_ids,
+                (EXISTS (SELECT 1 FROM face_tracks ft WHERE ft.video_id = v.id)
+                 OR EXISTS (SELECT 1 FROM jobs fj WHERE fj.video_id = v.id AND fj.stage = 'faces' AND fj.state = 'done'))
            FROM (
              SELECT vf.video_id, MIN(vf.path) AS path, COUNT(DISTINCT vf.path) AS copies, json_group_array(DISTINCT vf.folder_id) AS folder_ids
                FROM video_files vf
@@ -2240,6 +3194,7 @@ pub fn video_by_id(
             frames: r.get(16)?,
             shaky_s: 0.0,
             steadiness_measured: false,
+            faces_measured: r.get(22)?,
             camera: String::new(),
             category: r.get(17)?,
             category_confidence: r.get(18)?,
@@ -2313,6 +3268,59 @@ echo '{"streams":[{"codec_type":"video","codec_name":"h264","width":1920,"height
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn ghostreels_own_renders_are_not_indexed_as_footage() {
+        let tmp = tempfile::tempdir().unwrap();
+        let media = tmp.path().join("media");
+        write(&media.join("interview.mp4"), b"real footage");
+        let bin = fake_ffprobe(tmp.path());
+        let mut db = Db::open_in_memory().unwrap();
+        let p = db.create_project(&NewProject::named("P")).unwrap();
+        db.add_folder(p.id, &media, true).unwrap();
+        let opts = Options { project_id: Some(p.id), ..Default::default() };
+        let s = run(&mut db, &rt(&bin), &opts, |_| {}).await.unwrap();
+        assert_eq!((s.new, s.renders), (1, 0));
+
+        // A clip export rendered elsewhere, recorded, then moved into the watched folder.
+        let rendered = tmp.path().join("out/01-hook.mp4");
+        write(&rendered, b"a ghostreel render");
+        record_render(&db, &rendered, None).unwrap();
+        std::fs::create_dir_all(media.join("clips")).unwrap();
+        std::fs::rename(&rendered, media.join("clips/01-hook-renamed.mp4")).unwrap();
+        // A render indexed as footage before renders were recognised.
+        let old = media.join("previews/script_3_v1.mp4");
+        write(&old, b"an older render");
+        let s = run(&mut db, &rt(&bin), &opts, |_| {}).await.unwrap();
+        assert_eq!((s.new, s.renders), (1, 1), "the moved render is skipped, the older one indexed");
+        assert_eq!(videos(&db, Some(p.id)).unwrap().len(), 2);
+
+        // Once it is known as a render (its exports row), the next scan takes it out of the library.
+        db.conn
+            .execute(
+                "INSERT INTO scripts(id, project_id, title, version, script_json, created_at) VALUES (3, ?1, 't', 1, '{}', 0)",
+                [p.id],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO exports(script_id, format, path, created_at) VALUES (3, 'preview_mp4', ?1, 0)",
+                [old.to_string_lossy()],
+            )
+            .unwrap();
+        let mut events = Vec::new();
+        let s = run(&mut db, &rt(&bin), &opts, |e| events.push(e)).await.unwrap();
+        assert_eq!((s.new, s.renders), (0, 2), "both renders are skipped, reported, not failed");
+        assert!(events.iter().any(|e| matches!(e, Event::RendersSkipped { count: 2 })));
+        let left: Vec<String> = videos(&db, Some(p.id))
+            .unwrap()
+            .into_iter()
+            .map(|v| v.path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(left, vec!["interview.mp4".to_string()]);
+        assert_eq!(s.jobs_failed, 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn scan_probe_rescan_move_delete() {
         let tmp = tempfile::tempdir().unwrap();
         let media = tmp.path().join("media");
@@ -2377,6 +3385,257 @@ echo '{"streams":[{"codec_type":"video","codec_name":"h264","width":1920,"height
         let last = last.expect("progress events emitted");
         assert_eq!(last.fraction, 1.0);
         assert_eq!(last.phase_done, last.phase_total);
+    }
+
+    /// A fake ffmpeg that writes its pid to `pidfile` and then hangs without output: a decode
+    /// that never ends, to prove a stop reaches inside a long per-video stage.
+    #[cfg(unix)]
+    fn hanging_ffmpeg(dir: &Path, pidfile: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let p = dir.join("ffmpeg-hang");
+        std::fs::write(&p, format!("#!/bin/sh\necho $$ > '{}'\nexec sleep 60\n", pidfile.display())).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        p
+    }
+
+    #[cfg(unix)]
+    fn process_gone(pid: u32) -> bool {
+        (0..100).any(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+                Err(_) => true,
+                Ok(stat) => stat.contains(") Z"),
+            }
+        })
+    }
+
+    /// A project with one probed 10-minute video, at `media`.
+    #[cfg(unix)]
+    async fn one_probed_video(db: &mut Db, tmp: &Path, pipeline: Option<crate::projects::PipelineConfig>) -> i64 {
+        let media = tmp.join("media");
+        write(&media.join("long.mp4"), b"video-long");
+        let mut np = NewProject::named("P");
+        if let Some(pl) = pipeline {
+            np = np.with_pipeline(pl);
+        }
+        let p = db.create_project(&np).unwrap();
+        db.add_folder(p.id, &media, true).unwrap();
+        let opts = Options { project_id: Some(p.id), ..Default::default() };
+        run(db, &rt(&fake_ffprobe(tmp)), &opts, |_| {}).await.unwrap();
+        db.conn.execute("UPDATE videos SET duration_s = 600", []).unwrap();
+        p.id
+    }
+
+    /// Stop reaches inside one long video: the camera-shake decode is dropped within the poll,
+    /// its ffmpeg is killed, and nothing is stored for the video (it is measured next run).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_reaches_inside_a_long_video_and_kills_its_child() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = Db::open_in_memory().unwrap();
+        let pid = one_probed_video(&mut db, tmp.path(), None).await;
+        let pidfile = tmp.path().join("ffmpeg.pid");
+        let mut runtime = rt(&fake_ffprobe(tmp.path()));
+        runtime.ffmpeg = hanging_ffmpeg(tmp.path(), &pidfile);
+        runtime.steadiness = Some(crate::runtime::SteadinessOptions { window_s: 2.0, stride_s: 1.0 });
+
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopper = flag.clone();
+        let pidfile2 = pidfile.clone();
+        tokio::spawn(async move {
+            // Stop once the decode is under way.
+            while !pidfile2.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            stopper.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        let opts = Options { project_id: Some(pid), cancel: Some(flag), ..Default::default() };
+        let mut tracker = Tracker::new(&[("steadiness", 1.0)]);
+        let started = std::time::Instant::now();
+        let s = run_steadiness_jobs(&mut db, &runtime, &opts, false, &mut tracker, &mut |_| {}).await.unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "took {:?}", started.elapsed());
+        assert_eq!((s.measured, s.failed), (0, 0));
+        let child: u32 = std::fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
+        assert!(process_gone(child), "ffmpeg {child} survived the stop");
+        let rows: i64 = db.conn.query_row("SELECT COUNT(*) FROM motion_windows", [], |r| r.get(0)).unwrap();
+        let jobs: i64 =
+            db.conn.query_row("SELECT COUNT(*) FROM jobs WHERE stage = 'steadiness'", [], |r| r.get(0)).unwrap();
+        assert_eq!((rows, jobs), (0, 0), "a stopped video stores nothing and stays to do");
+    }
+
+    /// A decode that ffmpeg did not finish is a failure, not a short (and falsely steady)
+    /// measurement; the failure is recorded so the status can say why.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_decode_is_a_failure_not_a_short_measurement() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = Db::open_in_memory().unwrap();
+        let pid = one_probed_video(&mut db, tmp.path(), None).await;
+        // Some frames, then a crash.
+        let bad = tmp.path().join("ffmpeg-crash");
+        std::fs::write(&bad, "#!/bin/sh\nhead -c 2000000 /dev/zero\nexit 1\n").unwrap();
+        std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut runtime = rt(&fake_ffprobe(tmp.path()));
+        runtime.ffmpeg = bad;
+        runtime.steadiness = Some(crate::runtime::SteadinessOptions { window_s: 2.0, stride_s: 1.0 });
+        let opts = Options { project_id: Some(pid), ..Default::default() };
+        let mut tracker = Tracker::new(&[("steadiness", 1.0)]);
+        let mut events = Vec::new();
+        let s =
+            run_steadiness_jobs(&mut db, &runtime, &opts, false, &mut tracker, &mut |e| events.push(e)).await.unwrap();
+        assert_eq!((s.measured, s.failed), (0, 1));
+        let rows: i64 = db.conn.query_row("SELECT COUNT(*) FROM motion_windows", [], |r| r.get(0)).unwrap();
+        assert_eq!(rows, 0);
+        let mut problems = Vec::new();
+        for e in &events {
+            StageProblem::observe(&mut problems, e);
+        }
+        assert!(matches!(&problems[..], [StageProblem::Failed { stage, videos: 1, .. }] if stage == "steadiness"));
+    }
+
+    /// A stage the project turned off never runs — not in the pipeline, not as a follow-up — and
+    /// the Project menu shows it `off`, through the same gate.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_disabled_stage_never_runs_and_shows_off() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = Db::open_in_memory().unwrap();
+        let pipeline = crate::projects::PipelineConfig { steadiness: false, ..Default::default() };
+        let pid = one_probed_video(&mut db, tmp.path(), Some(pipeline)).await;
+        let pidfile = tmp.path().join("ffmpeg.pid");
+        let mut runtime = rt(&fake_ffprobe(tmp.path()));
+        // Were steadiness to run, this ffmpeg would hang the test.
+        runtime.ffmpeg = hanging_ffmpeg(tmp.path(), &pidfile);
+        runtime.steadiness = Some(crate::runtime::SteadinessOptions { window_s: 2.0, stride_s: 1.0 });
+        let paths =
+            crate::paths::Paths { config_file: tmp.path().join("config.toml"), data_dir: tmp.path().to_path_buf() };
+        let mut config = crate::config::Config::default();
+        config.script.max_shake_jerk = 1.0;
+        let opts = Options { project_id: Some(pid), stages: None, ..Default::default() };
+        let mut events = Vec::new();
+        let s = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            run_pipeline(&mut db, &paths, &config, &runtime, &opts, |e| events.push(e)),
+        )
+        .await
+        .expect("a disabled stage must not run")
+        .unwrap();
+        assert!(!pidfile.exists(), "camera shake ran although the project turned it off");
+        assert!(!events.iter().any(|e| matches!(e, Event::JobStarted { stage, .. } if stage == "steadiness")));
+        assert!(!s.cancelled);
+
+        let statuses = stage_statuses(&db, pid, &config, false).unwrap();
+        let shake = statuses.iter().find(|s| s.stage == "steadiness").unwrap();
+        assert_eq!(shake.state, StageState::Off);
+        let faces = statuses.iter().find(|s| s.stage == "faces").unwrap();
+        assert_eq!(faces.state, StageState::Unavailable, "on, but its models are missing");
+        assert!(stage_enabled("steadiness", Some(&["steadiness".to_string()]), Some(&pipeline_off_shake())));
+    }
+
+    fn pipeline_off_shake() -> crate::projects::PipelineConfig {
+        crate::projects::PipelineConfig { steadiness: false, ..Default::default() }
+    }
+
+    /// A stage postponed because its backend is unavailable makes the run partial with the
+    /// reason, keeps its jobs pending and lets the Project menu say why.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_postponed_stage_makes_the_run_partial() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = Db::open_in_memory().unwrap();
+        let pipeline =
+            crate::projects::PipelineConfig { steadiness: false, faces: false, speakers: false, ..Default::default() };
+        let pid = one_probed_video(&mut db, tmp.path(), Some(pipeline)).await;
+        // Its keyframes exist and wait to be described.
+        let vid: i64 = db.conn.query_row("SELECT id FROM videos", [], |r| r.get(0)).unwrap();
+        db.conn.execute("UPDATE jobs SET state = 'done' WHERE stage = 'frames'", []).unwrap();
+        db.conn
+            .execute("INSERT INTO frames(video_id, t_s, thumb_path, phash) VALUES (?1, 1.0, 'f.jpg', 0)", [vid])
+            .unwrap();
+        let mut runtime = rt(&fake_ffprobe(tmp.path()));
+        runtime.vision = VisionSetup::Unavailable("the built-in model can't read images".into());
+        let paths =
+            crate::paths::Paths { config_file: tmp.path().join("config.toml"), data_dir: tmp.path().to_path_buf() };
+        let config = crate::config::Config::default();
+        let opts = Options { project_id: Some(pid), ..Default::default() };
+        let mut events = Vec::new();
+        let s = run_pipeline(&mut db, &paths, &config, &runtime, &opts, |e| events.push(e)).await.unwrap();
+
+        assert_eq!(s.run_state(), crate::runs::RunState::Partial);
+        assert!(
+            s.problems_line().unwrap().contains("Describing frames postponed: the built-in model can't read images")
+        );
+        let describe =
+            stage_statuses(&db, pid, &config, true).unwrap().into_iter().find(|s| s.stage == "describe").unwrap();
+        assert_eq!(describe.state, StageState::Pending);
+        assert!(describe.reason.unwrap().contains("can't read images"));
+
+        // The run log puts the warning on its own step, which ends as a warning.
+        let mut log = crate::runs::StepLog::new();
+        log.report("probe", "1 of 1");
+        for e in &events {
+            if let Some(EventReport::Event { phase, event }) = e.run_report() {
+                log.event_in(&phase, event);
+            }
+        }
+        log.finish(s.run_state(), "");
+        let step = log.steps().iter().find(|st| st.label == "Describing frames").expect("its own step");
+        assert_eq!(step.state, crate::runs::StepState::Warning);
+        assert_eq!(log.steps()[0].state, crate::runs::StepState::Done, "the warning did not land on probe");
+    }
+
+    /// Faces in the pipeline: a video with no faces is recorded as analysed (not redone on every
+    /// run nor shown pending for ever). Needs the face models; skipped unless
+    /// `GHOSTREEL_FACE_MODELS` names their folder.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn faces_are_recorded_even_when_there_are_none() {
+        let models = std::env::var_os("GHOSTREEL_FACE_MODELS").map(PathBuf::from).filter(|d| {
+            d.join("face_detection_yunet_2023mar.onnx").is_file()
+                && d.join("face_recognition_sface_2021dec.onnx").is_file()
+        });
+        let ffmpeg_ok = std::process::Command::new("ffmpeg").arg("-version").output().is_ok_and(|o| o.status.success());
+        let (Some(models), true) = (models, ffmpeg_ok) else {
+            eprintln!("skipped: face models or ffmpeg not available");
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let media = tmp.path().join("media");
+        std::fs::create_dir_all(&media).unwrap();
+        let video = media.join("bars.mp4");
+        let ok = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=320x240:rate=10:duration=3"])
+            .args(["-f", "lavfi", "-i", "sine=frequency=440:duration=3", "-shortest", "-pix_fmt", "yuv420p"])
+            .arg(&video)
+            .status()
+            .unwrap();
+        assert!(ok.success());
+        let mut db = Db::open_in_memory().unwrap();
+        let p = db.create_project(&NewProject::named("P")).unwrap();
+        db.add_folder(p.id, &media, true).unwrap();
+        let mut runtime = rt(&fake_ffprobe(tmp.path()));
+        runtime.ffmpeg = "ffmpeg".into();
+        run(&mut db, &runtime, &Options { project_id: Some(p.id), ..Default::default() }, |_| {}).await.unwrap();
+        db.conn.execute("UPDATE videos SET duration_s = 3, width = 320, height = 240", []).unwrap();
+
+        let paths =
+            crate::paths::Paths { config_file: tmp.path().join("config.toml"), data_dir: tmp.path().to_path_buf() };
+        let mut config = crate::config::Config::default();
+        config.models.search_paths = vec![models];
+        let opts = Options { project_id: Some(p.id), ..Default::default() };
+        let mut tracker = Tracker::new(&[("faces", 1.0)]);
+        let s =
+            run_face_jobs(&mut db, &paths, &config, &runtime, &opts, false, &mut tracker, &mut |_| {}).await.unwrap();
+        assert_eq!((s.measured, s.failed), (1, 0));
+        let state: String =
+            db.conn.query_row("SELECT state FROM jobs WHERE stage = 'faces'", [], |r| r.get(0)).unwrap();
+        assert_eq!(state, "done");
+        assert_eq!(status(&db, Some(p.id)).unwrap().faces_measured, 1, "analysed, with nothing to find");
+        let again =
+            run_face_jobs(&mut db, &paths, &config, &runtime, &opts, false, &mut tracker, &mut |_| {}).await.unwrap();
+        assert_eq!(again.measured, 0, "not analysed again");
     }
 
     #[cfg(unix)]
@@ -2809,6 +4068,9 @@ done
             frames: true,
             describe: false,
             embed: true,
+            steadiness: true,
+            faces: true,
+            speakers: true,
         };
         let p = db.create_project(&NewProject::named("NoSpeech").with_pipeline(custom_pipeline)).unwrap();
 

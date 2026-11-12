@@ -97,6 +97,32 @@
   text-align: center;
   pointer-events: none;
 }
+.lp-subtitle.lp-subtitle-above {
+  bottom: 16%;
+}
+.lp-caption {
+  position: absolute;
+  left: 50%;
+  bottom: 5%;
+  z-index: 2;
+  transform: translateX(-50%);
+  max-width: 80%;
+  padding: 0.25em 0.6em;
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.75);
+  color: #fff;
+  font-size: clamp(14px, 3.2cqh, 32px);
+  font-weight: 700;
+  line-height: 1.25;
+  text-align: center;
+  white-space: pre-wrap;
+  text-shadow: 0 1px 2px #000, 0 0 2px #000;
+  pointer-events: none;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
 /* One row at every width: secondary controls fold into the ⋯ menu instead of wrapping. */
 .lp-transport { flex-wrap: nowrap; container-type: inline-size; min-width: 0; }
 .lp-transport .nle-transport-buttons,
@@ -187,3 +213,48 @@
 .lp-chip { opacity: 1; background: var(--bg); color: var(--text); }
 .lp-chip-beat { color: var(--text); flex-shrink: 0; }
 .lp-chip > span:not(.lp-chip-beat) { overflow: hidden; text-overflow: ellipsis; }
+
+/* Framing: a vertical (or square) cut plays inside a frame of its own shape. The videos are
+   placed so the crop fills it; overlays size off the frame, like a render's burn-in. */
+.lp-frame { position: absolute; inset: 0; container-type: size; overflow: hidden; }
+.lp-frame.is-framed,
+.lp-frame.is-sized {
+  margin: auto;
+  width: min(100cqw, calc(100cqh * var(--lp-frame-ratio)));
+  height: min(100cqh, calc(100cqw / var(--lp-frame-ratio)));
+  background: #000;
+}
+.lp-vwrap { position: absolute; inset: 0; overflow: hidden; }
+.lp-frame.is-framed .lp-vwrap[data-stacked="1"] { bottom: 50%; }
+.lp-stack-bottom { position: absolute; left: 0; right: 0; bottom: 0; width: 100%; height: 50%; display: none; }
+.lp-frame:not(.is-framed) .lp-stack-bottom { display: none !important; }
+/* Fit: the whole picture over a blurred copy of itself filling the frame (as the render does). */
+.lp-fit-blur { position: absolute; inset: 0; width: 100%; height: 100%; display: none; filter: blur(12px); transform: scale(1.08); }
+.lp-frame:not(.is-framed) .lp-fit-blur { display: none !important; }
+/* Burnt-in titles and captions, placed and sized by the backend's layout (same as the render).
+   Sizes and positions come inline; this only makes them selectable and draggable. */
+.lp-ovl {
+  position: absolute;
+  z-index: 2;
+  white-space: pre;
+  pointer-events: none;
+  user-select: none;
+}
+.lp-ovl.editable { pointer-events: auto; cursor: move; touch-action: none; }
+.lp-ovl.editable:hover { outline: 1px dashed rgba(255, 255, 255, 0.6); outline-offset: 3px; }
+.lp-ovl.selected { outline: 2px solid var(--accent); outline-offset: 4px; }
+.lp-ovl-line > span { display: inline; }
+.lp-ovl-handle {
+  position: absolute;
+  right: -9px;
+  bottom: -9px;
+  width: 10px;
+  height: 10px;
+  border: 2px solid #fff;
+  border-radius: 2px;
+  background: var(--accent);
+  cursor: nwse-resize;
+}
+.lp-guide { position: absolute; z-index: 3; pointer-events: none; background: #ff4fa3; }
+.lp-guide.v { top: 0; bottom: 0; width: 1px; }
+.lp-guide.h { left: 0; right: 0; height: 1px; }

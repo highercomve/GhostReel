@@ -1,8 +1,9 @@
 import DurationField from "./editor/DurationField";
+import { confirmAction, notify } from "./dialogs";
 import { fullTime } from "./editor/relativeTime";
 import MediaImage from "./MediaImage";
 import ChatAnswerStats from "./ChatAnswerStats";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useMemo } from "react";
 import {
   getAiSettings,
@@ -17,11 +18,21 @@ import {
   saveScript,
   getScript,
   deleteScript, deleteScriptCut,
+  clipsPreflight,
+  generateClips,
+  listClipSets,
+  deleteClipSet,
+  listTrash,
+  restoreTrash,
   projectView,
   clock,
   fileName,
   type Script,
   type AiSettings,
+  type ClipFormat,
+  type ClipSet,
+  type AgentSelection,
+  type ClipOptions,
   type VisionSettings,
   type ChatEvent,
   type ChatMessage,
@@ -32,14 +43,25 @@ import {
   type ModelStatus,
   type ScriptSummary,
   type ToolCallRecord,
+  type TrashItem,
   type VisionSettingsPatch,
 } from "./api";
 import { onEvent } from "./events";
 import ChatLogModal from "./ChatLogModal";
+import ClipSetGrid from "./editor/ClipSetGrid";
 import CutsPanel from "./editor/CutsPanel";
 import ModelSelect from "./editor/ModelSelect";
 import ScriptEditor, { type ScriptEditorHandle } from "./ScriptEditor";
 import TaskCard from "./TaskCard";
+import Modal from "./ui/Modal";
+import AgentPicker, { agentSelectionProblem } from "./agents/AgentPicker";
+import { useAgents, useResolvedAgents } from "./agents/useAgents";
+import RunLog from "./runs/RunLog";
+import PreflightList, { usePreflight } from "./runs/PreflightList";
+import { useProjectRuns } from "./runs/useRuns";
+import { toMs, type RunView } from "./runs/model";
+import type { LinkContext } from "./runs/links";
+import { onTrashChanged, trashChanged } from "./runs/trashEvents";
 import { useQueue } from "./useQueue";
 import {
   Check,
@@ -55,6 +77,7 @@ import {
   PictureInPicture2,
   Plus,
   Radar,
+  Scissors,
   Settings2,
   Sparkles,
   SquarePen,
@@ -138,6 +161,12 @@ const MODES: { id: Mode; label: string; short: string; action: string; hint: str
     hint: "Builds a first cut from interview quotes, then AI improves it. Takes a few minutes.",
   },
 ];
+
+/** How long "Clip set deleted · Undo" stays after a delete. */
+const UNDO_MS = 8000;
+
+/** Runs shown in the Sonar thread (the newest; older ones are on the Activity page). */
+const SONAR_RUNS = 5;
 
 const NEW_CHAT_EXAMPLES = [
   "A 30-second teaser that opens on a strong spoken hook",
@@ -288,7 +317,24 @@ function UserText({ text }: { text: string }) {
   );
 }
 
-export default function ScriptsPanel({ projectId }: { projectId: number }) {
+const CLIP_FORMATS: { id: ClipFormat; label: string }[] = [
+  { id: "original", label: "Original" },
+  { id: "9:16", label: "9:16" },
+  { id: "1:1", label: "1:1" },
+];
+
+const clampInt = (value: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, Math.round(value)));
+
+export default function ScriptsPanel({
+  projectId,
+  selectedVideoIds = [],
+  videoCount = 0,
+}: {
+  projectId: number;
+  /** Videos picked in the library; empty means every video. */
+  selectedVideoIds?: number[];
+  videoCount?: number;
+}) {
   const [sessions, setSessions] = useState<ChatSession[]>([]);
   const [selectedSessionId, setSelectedSessionId] = useState<number | null>(null);
   const [scripts, setScripts] = useState<ScriptSummary[]>([]);
@@ -341,7 +387,7 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
   const [selectedPreset, setSelectedPreset] = useState<CutPreset | null>("social_30s");
   const [newCutTitle, setNewCutTitle] = useState(CUT_PRESETS[0].title);
   const [newCutTargetS, setNewCutTargetS] = useState(CUT_PRESETS[0].target);
-  const [newCutType, setNewCutType] = useState<"ai" | "blank" | "branch">("ai");
+  const [newCutType, setNewCutType] = useState<"ai" | "blank" | "branch" | "clips">("ai");
   const [newCutPrompt, setNewCutPrompt] = useState(CUT_PRESETS[0].prompt);
 
   const applyPreset = (preset: CutPreset) => {
@@ -353,7 +399,91 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
     setNewCutPrompt(p.prompt);
   };
 
-  const chooseCutMethod = (method: "ai" | "blank" | "branch") => {
+  // Clip sets: the generated-clips form, the sets themselves, and the one open in the grid.
+  const [clipBrief, setClipBrief] = useState("");
+  const [clipCount, setClipCount] = useState(8);
+  const [clipMinS, setClipMinS] = useState(20);
+  const [clipMaxS, setClipMaxS] = useState(60);
+  const [clipFormat, setClipFormat] = useState<ClipFormat>("original");
+  /** This run's agents; `null` = the app default. */
+  const [clipAgents, setClipAgents] = useState<AgentSelection | null>(null);
+  const [clipLayout, setClipLayout] = useState<"follow_speaker" | "stacked">("follow_speaker");
+  const [clipSets, setClipSets] = useState<ClipSet[]>([]);
+  const [openClipSetId, setOpenClipSetId] = useState<string | null>(null);
+  // The lists as of the latest render: a handler that waits on a dialog reads these afterwards
+  // instead of the values its closure captured before the wait.
+  const latest = useRef({ scripts, selectedScriptId, clipSets });
+  latest.current = { scripts, selectedScriptId, clipSets };
+
+  const reloadClipSets = () => {
+    listClipSets(projectId).then(setClipSets).catch(() => {});
+  };
+  useEffect(() => {
+    setClipSets([]);
+    setOpenClipSetId(null);
+    reloadClipSets();
+  }, [projectId]);
+
+  // Deletes go to the trash: what is in it (Recently deleted), and the last delete, offered for
+  // undo for a few seconds.
+  const [trash, setTrash] = useState<TrashItem[]>([]);
+  const [undoItem, setUndoItem] = useState<TrashItem | null>(null);
+  // Restores in flight. The undo toast stays up meanwhile, so it never vanishes mid-restore.
+  const [restoresPending, setRestoresPending] = useState(0);
+  useEffect(() => {
+    let alive = true;
+    const reload = () => {
+      listTrash(projectId)
+        .then((t) => alive && setTrash(t))
+        .catch(() => {});
+    };
+    setTrash([]);
+    setUndoItem(null);
+    reload();
+    // A restore from anywhere in this window (a run's link, Recently deleted) brings rows back.
+    const off = onTrashChanged(() => {
+      reload();
+      listScripts(projectId)
+        .then((s) => alive && setScripts(s))
+        .catch(() => {});
+      listClipSets(projectId)
+        .then((c) => alive && setClipSets(c))
+        .catch(() => {});
+    });
+    return () => {
+      alive = false;
+      off();
+    };
+  }, [projectId]);
+  useEffect(() => {
+    if (!undoItem || restoresPending > 0) return;
+    const t = window.setTimeout(() => setUndoItem(null), UNDO_MS);
+    return () => window.clearTimeout(t);
+  }, [undoItem, restoresPending]);
+  const afterDelete = (item: TrashItem) => {
+    setUndoItem(item);
+    trashChanged();
+  };
+  const restoreFromTrash = async (trashId: string) => {
+    setRestoresPending((n) => n + 1);
+    try {
+      await restoreTrash(trashId);
+      trashChanged();
+    } catch (err) {
+      setTurnError(String(err));
+    } finally {
+      // Done either way: the toast for this item has served its purpose (on failure the item is
+      // still in Recently deleted, and the error is shown).
+      setUndoItem((u) => (u?.id === trashId ? null : u));
+      setRestoresPending((n) => n - 1);
+    }
+  };
+
+  const chooseCutMethod = (method: "ai" | "blank" | "branch" | "clips") => {
+    if (method === "clips") {
+      setNewCutType("clips");
+      return;
+    }
     if (method === "ai") {
       applyPreset(selectedPreset ?? "social_30s");
       return;
@@ -371,15 +501,8 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
     }
   };
 
-  // Escape closes the dialog.
-  useEffect(() => {
-    if (!newCutModalOpen) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setNewCutModalOpen(false);
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [newCutModalOpen]);
+  // Stable, so the dialog's Escape listener is not re-registered on every render.
+  const closeNewCutModal = useCallback(() => setNewCutModalOpen(false), []);
 
   // Names for the clips Sonar researched; read once per project.
   const [videoNames, setVideoNames] = useState<Map<number, string>>(
@@ -503,6 +626,7 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
 
   const messagesRef = useRef<HTMLDivElement>(null);
   const tasks = useQueue();
+  const projectRuns = useProjectRuns(projectId, 20);
   const userSelectedRef = useRef<boolean>(false);
 
   // A turn's session exists from the moment it is queued — the backend creates it before the
@@ -531,7 +655,7 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
   const isTurnRunning = turnRunning || Boolean(activeChatTask);
 
   const removeSession = async (id: number) => {
-    if (!window.confirm("Remove this chat? Scripts drafted in it are kept.")) return;
+    if (!(await confirmAction("Remove this chat? Scripts drafted in it are kept.", { okLabel: "Remove", destructive: true }))) return;
     try {
       await deleteChatSession(id);
     } catch (e) {
@@ -594,8 +718,9 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
 
   const saveResearchLimit = (raw: string) => {
     if (researchLimitTimer.current) clearTimeout(researchLimitTimer.current);
-    const value = Number(raw);
-    if (!Number.isInteger(value) || value < 0 || value > 100) {
+    // Empty means no cap.
+    const value = raw.trim() === "" ? 0 : Number(raw);
+    if (!Number.isInteger(value) || value < 0) {
       setResearchLimit(aiSettings?.chat_model.max_tool_rounds ?? 0);
       return;
     }
@@ -741,6 +866,7 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
   // Also listen for task-finished event as a fallback
   useEffect(() => {
     return onEvent<number>("task-finished", async () => {
+      reloadClipSets();
       const [sessList, scriptList] = await Promise.all([
         chatSessions(projectId).catch(() => [] as ChatSession[]),
         listScripts(projectId).catch(() => [] as ScriptSummary[]),
@@ -929,13 +1055,14 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
       ? scripts.filter((s) => s.session_id === selectedSessionId)
       : [];
   const otherScripts = scripts.filter(
-    (s) => s.session_id == null || !sessions.some((sess) => sess.id === s.session_id),
+    (s) => s.kind !== "clip" && (s.session_id == null || !sessions.some((sess) => sess.id === s.session_id)),
   );
 
   // Multi-script grouping: Group all script versions by title into distinct Script Cuts
   const scriptCuts = useMemo(() => {
     const map = new Map<string, { title: string; latestScript: ScriptSummary; versions: ScriptSummary[] }>();
     for (const s of scripts) {
+      if (s.kind === "clip") continue; // clip scripts are shown as part of their clip set
       const existing = map.get(s.title);
       if (!existing) {
         map.set(s.title, { title: s.title, latestScript: s, versions: [s] });
@@ -956,18 +1083,44 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
 
   const activeScript = scripts.find((s) => s.id === selectedScriptId);
 
+  // The open cut's own agent choice: Sonar writes with the agent it resolves to.
+  const [cutAgents, setCutAgents] = useState<AgentSelection | null>(null);
+  useEffect(() => {
+    let alive = true;
+    if (selectedScriptId == null) {
+      setCutAgents(null);
+      return;
+    }
+    getScript(selectedScriptId)
+      .then(({ stored }) => alive && setCutAgents(stored.script.agents ?? null))
+      .catch(() => alive && setCutAgents(null));
+    return () => {
+      alive = false;
+    };
+  }, [selectedScriptId]);
+  const { view: agentsView } = useAgents();
+  const { resolved: cutResolved } = useResolvedAgents(null, cutAgents, agentsView);
+  const chatAgent = agentsView?.agents.find((a) => a.spec.id === cutResolved?.chat) ?? null;
+  // The app's chat model answers unless the cut (or the app default) picked another agent.
+  const chatIsAppModel = !chatAgent || chatAgent.spec.source === "chat_model";
+  const chatEngineLabel = (ai: AiSettings) =>
+    chatIsAppModel || !chatAgent
+      ? brainSummary(ai.chat_model)
+      : `${chatAgent.spec.name || chatAgent.spec.id}${cutAgents ? " (this cut)" : ""}`;
+
   // Robust guard against losing manual edits when switching cuts, versions, sessions, or starting fresh
   const guardUnsaved = async (): Promise<boolean> => {
     if (scriptEditorRef.current?.isDirty()) {
-      const saveNow = window.confirm(
-        "You have unsaved manual edits in the script editor.\n\nClick \x27OK\x27 to save changes as a new version before switching.\nClick \x27Cancel\x27 to keep editing your current draft without switching."
+      const saveNow = await confirmAction(
+        "You have unsaved edits in the script editor. Save them as a new version before switching? Cancel keeps you on this draft.",
+        { title: "Unsaved edits", okLabel: "Save and switch", cancelLabel: "Keep editing" },
       );
       if (!saveNow) {
         return false;
       }
       const savedId = await scriptEditorRef.current.save();
       if (savedId == null) {
-        alert("Failed to save changes. Navigation cancelled.");
+        await notify("Failed to save changes, so you stay on this draft.");
         return false;
       }
       const updated = await listScripts(projectId).catch(() => [] as ScriptSummary[]);
@@ -1011,19 +1164,23 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
   const handleDeleteVersion = async (scriptId: number) => {
     const s = scripts.find((x) => x.id === scriptId);
     if (!s) return;
-    if (!window.confirm(`Delete version v${s.version} of "${s.title}"?`)) return;
+    if (!(await confirmAction(`Delete version v${s.version} of "${s.title}"? It goes to Recently deleted for 30 days.`, { okLabel: "Delete", destructive: true }))) return;
+    // Look again: the list may have changed while the question was open.
+    const current = latest.current.scripts.find((x) => x.id === scriptId);
+    if (!current) return;
     try {
-      if (selectedScriptId === scriptId) {
+      if (latest.current.selectedScriptId === scriptId) {
         scriptEditorRef.current?.resetDirty();
       }
-      await deleteScript(scriptId);
+      afterDelete(await deleteScript(scriptId));
       const updated = await listScripts(projectId).catch(() => [] as ScriptSummary[]);
       setScripts(updated);
-      const cutVersions = updated.filter((x) => x.title === s.title);
+      const cutVersions = updated.filter((x) => x.title === current.title && x.kind !== "clip");
+      const plainCuts = updated.filter((x) => x.kind !== "clip");
       if (cutVersions.length > 0) {
         void selectScript(cutVersions[0].id, cutVersions[0].session_id, true);
-      } else if (updated.length > 0) {
-        void selectScript(updated[0].id, updated[0].session_id, true);
+      } else if (plainCuts.length > 0) {
+        void selectScript(plainCuts[0].id, plainCuts[0].session_id, true);
       } else {
         void selectScript(null, null, true);
       }
@@ -1032,7 +1189,80 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
     }
   };
 
+  const clipOptions = (): ClipOptions => {
+    const min_s = clampInt(clipMinS, 3, 600);
+    const max_s = Math.max(min_s + 2, clampInt(clipMaxS, 5, 900));
+    return {
+      brief: clipBrief.trim(),
+      count: clampInt(clipCount, 1, 50),
+      min_s,
+      max_s,
+      format: clipFormat,
+      video_ids: selectedVideoIds,
+      // "No model — pick by score" is part of the agent choice (`pick_by_score`).
+      worker_only: false,
+      layout: clipLayout,
+      ...(clipAgents ? { agents: clipAgents } : {}),
+    };
+  };
+  // What the run would run into (agents that cannot be used, indexing still to do), shown before
+  // Start. Only what changes the answer re-runs it.
+  const clipPreflight = usePreflight(
+    newCutModalOpen && newCutType === "clips" ? () => clipsPreflight(projectId, clipOptions()) : null,
+    JSON.stringify([projectId, selectedVideoIds, clipAgents]),
+  );
+
+  const clipAgentProblem = agentSelectionProblem(clipAgents);
+
+  const handleGenerateClips = async () => {
+    setNewCutModalOpen(false);
+    try {
+      await generateClips(projectId, clipOptions());
+      // Follow the run in Sonar: every phase with its last note, then the result.
+      setSonarOpen(true);
+    } catch (err) {
+      setTurnError(String(err));
+    }
+  };
+
+  const handleDeleteClipSet = async (setId: string) => {
+    const set = clipSets.find((c) => c.id === setId);
+    if (!set) return;
+    if (
+      !(await confirmAction(
+        `Delete this clip set and its ${set.items.length === 1 ? "clip" : `${set.items.length} clips`}? It goes to Recently deleted for 30 days; your footage is not touched.`,
+        { okLabel: "Delete", destructive: true },
+      ))
+    )
+      return;
+    // Look again: the set or the open cut may have changed while the question was open.
+    const current = latest.current.clipSets.find((c) => c.id === setId);
+    if (!current) return;
+    try {
+      if (current.items.some((i) => i.script_id === latest.current.selectedScriptId)) {
+        scriptEditorRef.current?.resetDirty();
+        void selectScript(null, null, true);
+      }
+      afterDelete(await deleteClipSet(setId));
+      if (openClipSetId === setId) setOpenClipSetId(null);
+      reloadClipSets();
+      setScripts(await listScripts(projectId).catch(() => [] as ScriptSummary[]));
+    } catch (err) {
+      setTurnError(String(err));
+    }
+  };
+
+  const openClipInEditor = async (scriptId: number) => {
+    if (!(await guardUnsaved())) return;
+    setOpenClipSetId(null);
+    await selectScript(scriptId, null, true);
+  };
+
   const handleCreateNewCut = async () => {
+    if (newCutType === "clips") {
+      await handleGenerateClips();
+      return;
+    }
     const title = newCutTitle.trim() || "Untitled cut";
     setNewCutModalOpen(false);
 
@@ -1093,11 +1323,11 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
   };
 
   const handleDeleteCut = async (cutTitle: string) => {
-    if (!window.confirm(`Delete the cut "${cutTitle}" and all its versions? This can't be undone.`)) {
+    if (!(await confirmAction(`Delete the cut "${cutTitle}" and all its versions? It goes to Recently deleted for 30 days.`, { okLabel: "Delete", destructive: true }))) {
       return;
     }
     try {
-      await deleteScriptCut(projectId, cutTitle);
+      afterDelete(await deleteScriptCut(projectId, cutTitle));
       const updated = await listScripts(projectId).catch(() => [] as ScriptSummary[]);
       setScripts(updated);
       if (activeScript?.title === cutTitle) {
@@ -1123,8 +1353,46 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
     setNewCutModalOpen(true);
   };
 
+  const clipTasks = tasks.filter(
+    (t) =>
+      (t.state === "running" || t.state === "queued") &&
+      ((t.kind.type === "clips" && t.kind.project_id === projectId) ||
+        (t.kind.type === "export_clips" && clipSets.some((c) => c.id === (t.kind as { set_id: string }).set_id))),
+  );
+
+  // This project's runs (clip generation, indexing, faces, renders… from the app or the CLI) in the
+  // Sonar thread, in time order among the messages. Chat turns are left out: they already show as
+  // messages.
+  const sonarRuns = projectRuns
+    .filter((r) => r.kind !== "chat")
+    .slice(0, SONAR_RUNS)
+    .reverse();
+  type ThreadItem = { at: number; msg: (typeof messages)[number]; run?: undefined } | { at: number; run: RunView; msg?: undefined };
+  const threadItems: ThreadItem[] = [
+    ...messages.map((msg) => ({ at: toMs(msg.created_at), msg })),
+    ...sonarRuns.map((run) => ({ at: toMs(run.createdAt), run })),
+  ].sort((a, b) => a.at - b.at);
+  const runLinks: LinkContext = {
+    openClipSet: (id) => {
+      if (!clipSets.some((c) => c.id === id)) reloadClipSets();
+      setOpenClipSetId(id);
+    },
+    openScript: (id) => void selectScript(id),
+  };
+
   const cutsPanel = (
+    <>
+    {clipTasks.length > 0 && (
+      <div className="clips-tasks">
+        {clipTasks.map((t) => (
+          <TaskCard key={t.id} task={t} compact />
+        ))}
+      </div>
+    )}
     <CutsPanel
+      clipSets={clipSets}
+      onOpenClipSet={setOpenClipSetId}
+      onDeleteClipSet={(id) => void handleDeleteClipSet(id)}
       cuts={scriptCuts}
       selectedScriptId={selectedScriptId}
       onSelect={(id, sid) => void selectScript(id, sid)}
@@ -1140,8 +1408,15 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
         } catch (error) { setTurnError(String(error)); }
       }}
       onDeleteVersion={handleDeleteVersion}
+      trash={trash}
+      onRestoreTrash={restoreFromTrash}
+      undoItem={undoItem}
+      onDismissUndo={() => setUndoItem(null)}
     />
+    </>
   );
+
+  const openClipSet = clipSets.find((c) => c.id === openClipSetId) ?? null;
 
   const currentMode = MODES.find((m) => m.id === mode) ?? MODES[0];
   const judgingOn = Boolean(jevReady && judging);
@@ -1504,7 +1779,11 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
                     </div>
                   )}
 
-                  {messages.map((msg) => (
+                  {threadItems.map(({ msg, run }) => run ? (
+                    <div key={run.key} className="chat-message-row assistant run">
+                      <RunLog run={run} ctx={runLinks} compact />
+                    </div>
+                  ) : (
                     <div key={msg.id} className={`chat-message-row ${msg.role}`}>
                       {msg.tool_calls && msg.tool_calls.length > 0 && (
                         <ResearchSummary calls={msg.tool_calls} names={videoNames} />
@@ -1714,7 +1993,7 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
                       <Settings2 size={14} strokeWidth={2} aria-hidden="true" className="composer-options-icon" />
                       <span className="composer-options-summary">
                         <strong>{currentMode.short}</strong>
-                        {aiSettings && mode !== "jev" && <span> · {brainSummary(aiSettings.chat_model)}</span>}
+                        {aiSettings && mode !== "jev" && <span> · {chatEngineLabel(aiSettings)}</span>}
                         {style.broll && <span> · B-roll montage</span>}
                         {judgingOn && <span> · Review on</span>}
                       </span>
@@ -1816,8 +2095,15 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
                         <details className="composer-advanced">
                           <summary>
                             <span>Advanced: engine</span>
-                            <span className="muted">{brainSummary(aiSettings.chat_model)}</span>
+                            <span className="muted">{chatEngineLabel(aiSettings)}</span>
                           </summary>
+                          {!chatIsAppModel && chatAgent && (
+                            <p className="composer-engine-hint small muted">
+                              This cut writes with the agent “{chatAgent.spec.name || chatAgent.spec.id}” ({chatAgent.summary}),
+                              chosen in the cut&apos;s Inspector › Agents{cutAgents ? "" : " or Models › Agents"}. The engine
+                              below is the app&apos;s script chat model.
+                            </p>
+                          )}
                           <div className="composer-model-bar">
                             <div className="composer-backend-pills" role="radiogroup" aria-label="Where the AI runs">
                               {(["auto", "local", "server", "cli"] as const).map((b) => (
@@ -1920,16 +2206,16 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
 
                               <label
                                 className="composer-think-label"
-                                title="How many lookups (searches, transcripts, clips) the AI may make while researching. 0 lets the AI research until it is done."
+                                title="The most rounds of lookups (searches, transcripts, pictures) the AI may make while researching. Leave it empty for no cap: it stops when it has what it needs, when you stop it, or when it keeps asking for the same thing."
                               >
                                 Research limit
                                 <input
                                   type="number"
                                   className="composer-budget-input"
-                                  min={0}
-                                  max={100}
+                                  min={1}
                                   step={1}
-                                  value={researchLimit}
+                                  placeholder="Unlimited"
+                                  value={researchLimit === 0 ? "" : researchLimit}
                                   disabled={isTurnRunning}
                                   onChange={(e) => {
                                     const raw = e.currentTarget.value;
@@ -1940,7 +2226,7 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
                                   onKeyDown={(e) => { if (e.key === "Enter") saveResearchLimit(e.currentTarget.value); }}
                                   onBlur={(e) => saveResearchLimit(e.currentTarget.value)}
                                 />
-                                lookups · 0 = unlimited
+                                rounds · empty = unlimited
                               </label>
                             </div>
                           </div>
@@ -2005,14 +2291,7 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
 
       {/* 4. New cut dialog: how to start first; presets only for a Sonar draft. */}
       {newCutModalOpen && (
-        <div className="nle-modal-backdrop" onClick={() => setNewCutModalOpen(false)}>
-          <div
-            className="nle-modal-content nle-new-cut card"
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="new-cut-title"
-            onClick={(e) => e.stopPropagation()}
-          >
+        <Modal onClose={closeNewCutModal} className="nle-new-cut" labelledBy="new-cut-title">
             <div className="nle-modal-header">
               <h3 id="new-cut-title">New cut</h3>
               <button
@@ -2043,6 +2322,7 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
                     "Copy current cut",
                     activeScript ? `Start from “${activeScript.title}” and change it from there.` : "Open a cut first to copy it.",
                   ],
+                  ["clips", Scissors, "Clips", "Pick short self-contained clips from the footage for social media."],
                 ] as const
               ).map(([id, MethodIcon, label, hint]) => (
                 <button
@@ -2073,7 +2353,7 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
                       type="button"
                       className={`nle-preset-chip${selectedPreset === p.id ? " on" : ""}`}
                       aria-pressed={selectedPreset === p.id}
-                      onClick={() => applyPreset(p.id)}
+                      onClick={(e) => { e.currentTarget.focus(); applyPreset(p.id); }}
                     >
                       {p.label}
                     </button>
@@ -2082,6 +2362,113 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
               </>
             )}
 
+            {newCutType === "clips" && (
+              <div className="clips-form">
+                <label className="nle-field">
+                  <span className="nle-field-label">Brief (optional)</span>
+                  <textarea
+                    className="nle-brief"
+                    rows={3}
+                    autoFocus
+                    value={clipBrief}
+                    onChange={(e) => setClipBrief(e.target.value)}
+                    placeholder="What the clips should be about; leave empty for the strongest moments"
+                  />
+                </label>
+                <div className="nle-modal-row">
+                  <label className="nle-field">
+                    <span className="nle-field-label">Count</span>
+                    <input
+                      type="number"
+                      min={1}
+                      max={50}
+                      value={clipCount}
+                      onChange={(e) => setClipCount(Number(e.target.value))}
+                    />
+                  </label>
+                  <label className="nle-field">
+                    <span className="nle-field-label">Shortest (s)</span>
+                    <input
+                      type="number"
+                      min={1}
+                      max={600}
+                      value={clipMinS}
+                      onChange={(e) => setClipMinS(Number(e.target.value))}
+                    />
+                  </label>
+                  <label className="nle-field">
+                    <span className="nle-field-label">Longest (s)</span>
+                    <input
+                      type="number"
+                      min={1}
+                      max={600}
+                      value={clipMaxS}
+                      onChange={(e) => setClipMaxS(Number(e.target.value))}
+                    />
+                  </label>
+                </div>
+                {/* Chips take focus on click (WebKit leaves it on the previous one), so the focus
+                    ring never sits on a chip other than the selected one. */}
+                <div className="nle-field-label" id="clips-format">Format</div>
+                <div className="nle-preset-row" role="group" aria-labelledby="clips-format">
+                  {CLIP_FORMATS.map((f) => (
+                    <button
+                      key={f.id}
+                      type="button"
+                      className={`nle-preset-chip${clipFormat === f.id ? " on" : ""}`}
+                      aria-pressed={clipFormat === f.id}
+                      onClick={(e) => { e.currentTarget.focus(); setClipFormat(f.id); }}
+                    >
+                      {f.label}
+                    </button>
+                  ))}
+                </div>
+                {clipFormat !== "original" && (
+                  <>
+                    <div className="nle-field-label" id="clips-layout">Framing</div>
+                    <div className="nle-preset-row" role="group" aria-labelledby="clips-layout">
+                      {([
+                        ["follow_speaker", "Follow the speaker"],
+                        ["stacked", "Speaker and listener stacked"],
+                      ] as const).map(([id, label]) => (
+                        <button
+                          key={id}
+                          type="button"
+                          className={`nle-preset-chip${clipLayout === id ? " on" : ""}`}
+                          aria-pressed={clipLayout === id}
+                          onClick={(e) => { e.currentTarget.focus(); setClipLayout(id); }}
+                        >
+                          {label}
+                        </button>
+                      ))}
+                    </div>
+                  </>
+                )}
+                <div className="small clips-videos">
+                  <span className="nle-field-label">Videos</span>
+                  {selectedVideoIds.length > 0
+                    ? `${selectedVideoIds.length} selected ${selectedVideoIds.length === 1 ? "video" : "videos"}`
+                    : `All ${videoCount} ${videoCount === 1 ? "video" : "videos"} in the library`}
+                </div>
+                <div className="clips-engines small">
+                  <span className="nle-field-label">Agents</span>
+                  <AgentPicker
+                    level="run"
+                    value={clipAgents}
+                    onChange={setClipAgents}
+                    target={{ count: clampInt(clipCount, 1, 50), format: clipFormat }}
+                    onManage={() => setNewCutModalOpen(false)}
+                  />
+                </div>
+                {clipPreflight.checking && clipPreflight.checks.length === 0 ? (
+                  <div className="small muted">Checking the agents and the project…</div>
+                ) : (
+                  <PreflightList checks={clipPreflight.checks} />
+                )}
+              </div>
+            )}
+
+            {newCutType !== "clips" && (
             <div className="nle-modal-row">
               <label className="nle-field nle-field-grow">
                 <span className="nle-field-label">Name</span>
@@ -2110,6 +2497,7 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
                 </span>
               </label>
             </div>
+            )}
 
             {newCutType === "ai" && (
               <label className="nle-field">
@@ -2125,20 +2513,42 @@ export default function ScriptsPanel({ projectId }: { projectId: number }) {
             )}
 
             <div className="nle-modal-actions">
+              {newCutType === "clips" && clipAgentProblem && (
+                <span className="small warn-text nle-modal-actions-reason">{clipAgentProblem}</span>
+              )}
               <button type="button" onClick={() => setNewCutModalOpen(false)}>
                 Cancel
               </button>
               <button
                 type="button"
                 className="primary"
-                disabled={!(newCutTargetS >= 5) || (newCutType === "branch" && !activeScript)}
+                title={newCutType === "clips" && clipAgentProblem ? clipAgentProblem : undefined}
+                disabled={
+                  newCutType === "clips"
+                    ? !(clipCount >= 1 && clipMinS >= 1 && clipMaxS >= 1) || clipPreflight.blocked || clipAgentProblem != null
+                    : !(newCutTargetS >= 5) || (newCutType === "branch" && !activeScript)
+                }
                 onClick={handleCreateNewCut}
               >
-                {newCutType === "ai" ? "Start with Sonar" : newCutType === "branch" ? "Copy cut" : "Create blank cut"}
+                {newCutType === "ai"
+                  ? "Start with Sonar"
+                  : newCutType === "branch"
+                    ? "Copy cut"
+                    : newCutType === "clips"
+                      ? "Generate clips"
+                      : "Create blank cut"}
               </button>
             </div>
-          </div>
-        </div>
+        </Modal>
+      )}
+
+      {openClipSet && (
+        <ClipSetGrid
+          set={openClipSet}
+          onChange={(next) => setClipSets((prev) => prev.map((c) => (c.id === next.id ? next : c)))}
+          onClose={() => setOpenClipSetId(null)}
+          onOpenInEditor={(id) => void openClipInEditor(id)}
+        />
       )}
     </div>
   );

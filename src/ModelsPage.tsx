@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Check, ChevronDown, Download, Trash2, X } from "lucide-react";
+import AgentsCard from "./agents/AgentsCard";
 import {
   cancelTask,
   enqueueModelDownload,
@@ -1065,6 +1066,15 @@ export default function ModelsPage() {
         onDownload={handleDownload}
         onRemove={handleRemove}
       />
+
+      {/* ── Agents ── */}
+      <h2 id="agents">Agents</h2>
+      <p className="muted small">
+        Models that share the work: clip runs spread their jobs over every worker with a free slot, the orchestrator
+        makes the final choice, and Sonar writes with the chat agent. A model is never asked for more at once than set
+        here, whichever feature calls it.
+      </p>
+      <AgentsCard />
 
       {/* ── Search embeddings ── */}
       <h2>Search embeddings</h2>

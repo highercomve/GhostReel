@@ -109,6 +109,19 @@ export interface PipelineConfig {
   frames: boolean;
   describe: boolean;
   embed: boolean;
+  steadiness: boolean;
+  faces: boolean;
+  speakers?: boolean;
+}
+
+export interface GlossaryTerm {
+  term: string;
+  heard_as: string[];
+  note?: string;
+}
+
+export interface Glossary {
+  terms: GlossaryTerm[];
 }
 
 export interface Project {
@@ -121,6 +134,7 @@ export interface Project {
   height: number;
   created_at: number;
   pipeline: PipelineConfig;
+  glossary?: Glossary;
 }
 
 export interface StageCounts {
@@ -139,6 +153,8 @@ export interface Status {
   total_duration_s: number;
   vfr_videos: number;
   stages: StageCounts[];
+  steadiness_measured?: number;
+  faces_measured?: number;
 }
 
 export interface ProjectSummary {
@@ -177,6 +193,8 @@ export interface VideoRow {
   shaky_s: number;
   /** False until the camera has been measured; "steady" means nothing before that. */
   steadiness_measured: boolean;
+  /** Whether faces were tracked for this video. */
+  faces_measured: boolean;
   /** static, tripod, stabilised, handheld, or unknown. */
   camera: string;
   /** Category: interview, broll, screencast, drone, audio, other, or custom. */
@@ -281,6 +299,24 @@ export interface ProjectView {
   status: Status;
   videos: VideoRow[];
   excluded: ExcludedVideo[];
+  face_models_available?: boolean;
+  /** Videos with speech whose voices are not analysed yet. */
+  speakers_pending?: number;
+  /** People found in the project so far. */
+  people_count?: number;
+  /** Each pipeline stage's status (index::stage_statuses), from the pipeline's own stage gate. */
+  stages?: StageStatus[];
+}
+
+/** Where a stage stands for a project (`index::StageStatus`). Running is the queue's to say. */
+export interface StageStatus {
+  stage: string;
+  label: string;
+  state: "off" | "unavailable" | "pending" | "failed" | "done";
+  done: number;
+  total: number;
+  /** Why it is off, unavailable, pending (e.g. "postponed: …") or failed. */
+  reason: string | null;
 }
 
 export type ExclusionRole = "removed" | "reference";
@@ -308,6 +344,8 @@ export type IndexEvent =
 
 export interface Progress {
   phase: string;
+  /** The phase's human name, from the core (`runs::phase_label`). */
+  label: string;
   phase_done: number;
   phase_total: number;
   fraction: number;
@@ -318,20 +356,6 @@ export interface Progress {
   indeterminate?: boolean;
 }
 
-export const PHASE_LABELS: Record<string, string> = {
-  researching: "Reading the footage",
-  drafting: "Writing the script",
-  hash: "Reading new files",
-  probe: "Reading video details",
-  download: "Downloading speech model",
-  download_model: "Downloading model",
-  transcribe_server: "Transcribing (GhostPen)",
-  transcribe_local: "Transcribing",
-  frames: "Picking keyframes",
-  download_vision: "Downloading vision model",
-  describe_server: "Describing frames",
-  describe_local: "Describing frames",
-};
 
 /** "a few seconds", "42 s", "about 2 min", "about 1 h 20 min" — same wording as the CLI. */
 export const etaText = (secs: number) => {
@@ -342,34 +366,138 @@ export const etaText = (secs: number) => {
   return `about ${Math.floor(s / 3600)} h ${String(Math.floor((s % 3600) / 60)).padStart(2, "0")} min`;
 };
 
-export interface IndexSummary {
-  new: number;
-  changed: number;
-  unchanged: number;
-  removed: number;
-  jobs_done: number;
-  jobs_failed: number;
-  unsettled: number;
-  cancelled: boolean;
+/** `partial`: finished, but some work could not be done now (a stage postponed, videos that
+ *  failed); the reason is in `error`. */
+export type TaskState = "queued" | "running" | "done" | "partial" | "failed" | "cancelled";
+
+// Mirrors ghostreel-core's runs.rs: every long job, from the app's queue or the CLI.
+export type RunState = TaskState;
+/** `warning`: the step finished but kept warnings (its events say which). */
+export type StepState = "running" | "done" | "warning" | "failed" | "stopped";
+
+/** Why an agent's call failed (`agents::AgentError`): a kind to act on and show as a chip, a
+ *  short line in the tool's own words and the raw tail for details. */
+export type AgentErrorKind =
+  | { kind: "invalid_model"; model: string }
+  | { kind: "quota_exhausted"; resets_in_s?: number }
+  | { kind: "busy"; retry_after_s?: number }
+  | { kind: "auth" }
+  | { kind: "not_installed" }
+  | { kind: "timeout"; after_s: number }
+  | { kind: "bad_answer" }
+  | { kind: "unreachable" }
+  | { kind: "http"; status: number }
+  | { kind: "exit"; code?: number }
+  | { kind: "no_agent_left"; role: string; agents: AgentError[] }
+  | { kind: "other" };
+
+export type AgentError = AgentErrorKind & {
+  agent: string;
+  message: string;
+  details?: string;
+};
+
+export type EventLevel = "info" | "warning" | "error";
+
+/** Something a step keeps beside its last note (a warning, a rerouted agent, the failure). */
+export interface StepEvent {
+  level: EventLevel;
+  message: string;
+  error?: AgentError | null;
+  at: number;
 }
 
-export type TaskState = "queued" | "running" | "done" | "failed" | "cancelled";
+export interface RunStep {
+  phase: string;
+  label: string;
+  note: string;
+  state: StepState;
+  started_at: number;
+  finished_at: number | null;
+  events?: StepEvent[];
+}
+
+/** Something a run made or worked on (`runs::RunLink`); src/runs/links.tsx knows how to open each kind. */
+export type RunLink =
+  | { kind: "clip_set"; id: string }
+  | { kind: "script"; id: number }
+  | { kind: "file"; path: string }
+  | { kind: "video"; id: number }
+  | { kind: "project"; id: number };
+
+/** Where a link's target stands (`runs::LinkState`): there, in the trash (restorable), or gone. */
+export type LinkState = { state: "live" } | { state: "trashed"; trash_id: string } | { state: "gone" };
+
+/** For each link, where what it points at stands now (`runs::RunLink::state`). */
+export const runLinksState = (links: RunLink[]) => call<LinkState[]>("run_links_state", { links });
+
+/** One delete in the trash (`trash::TrashItem`), restorable until `purge_at`. */
+export interface TrashItem {
+  id: string;
+  project_id: number;
+  kind: "cut" | "script_version" | "clip_set";
+  title: string;
+  /** What was deleted, in words: "Clip set “Launch” (8 clips)". */
+  label: string;
+  scripts: number;
+  clips: number;
+  version?: number;
+  deleted_at: number;
+  purge_at: number;
+  link: RunLink;
+}
+
+export const listTrash = (projectId: number) => call<TrashItem[]>("list_trash", { projectId });
+export const restoreTrash = (trashId: string) => call<TrashItem>("restore_trash", { trashId });
+/** Restore what a run link points at from the trash. */
+export const restoreRunLink = (link: RunLink) => call<TrashItem>("restore_run_link", { link });
+
+/** A saved run (`runs::Run`). */
+export interface Run {
+  id: string;
+  project_id: number | null;
+  kind: string;
+  label: string;
+  state: RunState;
+  steps: RunStep[];
+  links: RunLink[];
+  summary: string | null;
+  error: string | null;
+  source: "app" | "cli" | string;
+  created_at: number;
+  finished_at: number | null;
+}
+
+/** Saved runs, newest first: one project's, or every project's. */
+export const listRuns = (projectId?: number | null, limit?: number) =>
+  call<Run[]>("list_runs", { projectId: projectId ?? null, limit: limit ?? null });
 
 export type TaskKind =
   | { type: "index"; project_id: number }
   | { type: "chat"; project_id: number; session_id: number }
-  | { type: "render_preview"; script_id: number; burn_titles: boolean; burn_narration: boolean; normalize_audio: boolean }
+  | { type: "render_preview"; script_id: number; burn_titles: boolean; burn_narration: boolean; burn_captions: boolean; normalize_audio: boolean }
   | { type: "export"; script_id: number; format: string; path: string }
-  | { type: "download_model"; model_id: string };
+  | { type: "download_model"; model_id: string }
+  | { type: "steadiness"; project_id: number; force?: boolean }
+  | { type: "faces"; project_id: number; force?: boolean }
+  | { type: "speakers"; project_id: number; force?: boolean }
+  | { type: "clips"; project_id: number; options: ClipOptions }
+  | { type: "export_clips"; set_id: string; dir: string; accepted_only: boolean };
 
 export interface Task {
   id: number;
+  /** The run this task is; a saved run keeps it after the queue forgets the task. */
+  run_id: string;
+  project_id: number | null;
   kind: TaskKind;
   label: string;
   state: TaskState;
   progress: Progress | null;
   note: string | null;
-  summary: IndexSummary | null;
+  steps: RunStep[];
+  links: RunLink[];
+  summary: string | null;
+  /** The raw result (a rendered file's path). */
   output: string | null;
   error: string | null;
   created_at: number;
@@ -391,14 +519,19 @@ export interface PlannedSegment {
 export const enqueueIndex = (projectId: number) => call<number>("enqueue_index", { projectId });
 export const enqueueSteadiness = (projectId: number, force = false) =>
   call<number>("enqueue_steadiness", { projectId, force });
+export const enqueueFaces = (projectId: number, force = false) =>
+  call<number>("enqueue_faces", { projectId, force });
+export const enqueueSpeakers = (projectId: number, force = false) =>
+  call<number>("enqueue_speakers", { projectId, force });
 /** `out`: save the rendered MP4 there (demo export) instead of the previews folder. */
 export const enqueuePreview = (
   scriptId: number,
   burnTitles: boolean,
   burnNarration: boolean,
+  burnCaptions: boolean,
   normalizeAudio: boolean,
   out?: string,
-) => call<number>("enqueue_preview", { scriptId, burnTitles, burnNarration, normalizeAudio, out: out ?? null });
+) => call<number>("enqueue_preview", { scriptId, burnTitles, burnNarration, burnCaptions, normalizeAudio, out: out ?? null });
 export const enqueueExport = (scriptId: number, format: string, path: string) =>
   call<number>("enqueue_export", { scriptId, format, path });
 export const previewPlan = (scriptId: number) => call<PlannedSegment[]>("preview_plan", { scriptId });
@@ -515,6 +648,50 @@ export const createProject = (
   });
 export const setProjectPipeline = (projectId: number, pipeline: PipelineConfig) =>
   call<Project>("set_project_pipeline", { projectId, pipeline });
+export const getProjectGlossary = (projectId: number) =>
+  call<Glossary>("get_project_glossary", { projectId });
+/** A person in a project: face tracks grouped by identity, named for lower-third name tags. */
+export interface PersonSummary {
+  id: number;
+  name: string | null;
+  handle: string | null;
+  role: string | null;
+  videos: number[];
+  tracks: number;
+  screen_time_s: number;
+  speaking_time_s: number;
+}
+export interface Person {
+  id: number;
+  project_id: number;
+  name: string | null;
+  handle: string | null;
+  role: string | null;
+}
+export interface SpeakerTurn {
+  start_s: number;
+  end_s: number;
+  speaker: number;
+  person_id: number | null;
+  name: string | null;
+  confidence: number | null;
+}
+export const projectPeople = (projectId: number) => call<PersonSummary[]>("project_people", { projectId });
+/** Omitted fields stay as they are; an empty string clears one. */
+export const setPerson = (
+  projectId: number,
+  personId: number,
+  fields: { name?: string; handle?: string; role?: string },
+) => call<Person>("set_person", { projectId, personId, ...fields });
+export const mergePeople = (projectId: number, keepId: number, mergeId: number) =>
+  call<Person>("merge_people", { projectId, keepId, mergeId });
+export const videoSpeakers = (videoId: number, fromS?: number, toS?: number) =>
+  call<SpeakerTurn[]>("video_speakers", { videoId, fromS, toS });
+/** Path of a cached face thumbnail, or null when the person has no usable face box. */
+export const personThumbnail = (projectId: number, personId: number) =>
+  call<string | null>("person_thumbnail", { projectId, personId });
+export const setProjectGlossary = (projectId: number, glossary: Glossary) =>
+  call<Glossary>("set_project_glossary", { projectId, glossary });
 export const renameProject = (projectId: number, name: string) =>
   call<Project>("rename_project", { projectId, name });
 export interface PurgeStats {
@@ -542,6 +719,8 @@ export interface StorageReport {
   usage: StorageUsage;
   models: number;
   database: number;
+  /** Daily database snapshots under backups/ (never removed by cleanup). */
+  backups: number;
   other: number;
   /** Files no project uses: footage no project watches, deleted scripts and chats, scratch. */
   unused: StorageUsage;
@@ -615,6 +794,81 @@ export interface ScriptClip {
    * automatic track; empty = silent. `audio: "mute"` silences the clip regardless. */
   tracks?: number[];
   why?: string;
+  /** How the clip is cropped to the cut's shape; absent = the script's framing. */
+  framing?: Framing;
+}
+
+/** How a stretch is framed: follow the speaker, speaker over listener, a still crop, screen over
+ * the speaker's camera tile, or the whole picture over a blurred copy of itself. */
+export type Layout = "follow_speaker" | "stacked" | "fixed" | "screen" | "fit";
+
+/** What a stretch of picture is, from the face boxes. */
+export type Scene = "two_shot" | "single_face" | "screen_share" | "no_face";
+
+/** Cropping a wide picture to a vertical or square cut. */
+export interface Framing {
+  layout: Layout;
+  person_id?: number;
+  /** For `fixed`: the part of the picture to show, 0..1 of the source. */
+  box?: { x: number; y: number; w: number; h: number };
+  /** Stretches (source seconds) framed with a chosen layout instead of their picture's. */
+  overrides?: { from_s: number; to_s: number; layout: Layout }[];
+}
+
+/** A point of a crop path: the crop's corner in source pixels, `t` seconds into the clip. */
+export interface CropKeyframe {
+  t: number;
+  x: number;
+  y: number;
+  /** Jump here instead of moving from the previous keyframe. */
+  cut?: boolean;
+}
+
+export interface CropPath {
+  w: number;
+  h: number;
+  keyframes: CropKeyframe[];
+}
+
+/** One stretch of a clip with its own layout and crop size; stretches cut hard into each other. */
+export interface PlanSegment {
+  /** Clip seconds. */
+  start: number;
+  end: number;
+  scene: Scene;
+  layout: Layout;
+  /** One path; two for stacked and screen (top, bottom); none for fit. */
+  paths: CropPath[];
+}
+
+export interface FramePlan {
+  layout: Layout;
+  src_w: number;
+  src_h: number;
+  out_w: number;
+  out_h: number;
+  /** The picture without black bars, in source pixels. */
+  content: { x: number; y: number; w: number; h: number };
+  segments: PlanSegment[];
+}
+
+/** One frame of a plan (`framing::FrameView`): the source rectangles that fill the frame in equal
+ * bands top to bottom (one crop, or two stacked), or none to fit the whole `content` picture. */
+export interface FrameView {
+  src_w: number;
+  src_h: number;
+  out_w: number;
+  out_h: number;
+  content: { x: number; y: number; w: number; h: number };
+  crops: { x: number; y: number; w: number; h: number }[];
+}
+
+export interface ClipFraming {
+  beat_index: number;
+  clip_index: number;
+  video_id: number;
+  in_s: number;
+  plan: FramePlan;
 }
 
 /** Sound that runs across a beat while its pictures change under it — a J-cut. */
@@ -634,9 +888,65 @@ export interface Beat {
   purpose: string;
   narration?: string;
   on_screen_text?: string;
+  /** When, where and how the on-screen text shows; absent = whole beat, default place and style. */
+  title_layout?: TitleLayout | null;
   clips: ScriptClip[];
   bed?: AudioBed | null;
   notes?: string;
+}
+
+/** Burnt-in text style; every field optional (falls back to the title or caption defaults). */
+export interface TextStyle {
+  font?: string;
+  /** Line height as a fraction of the output frame's height. */
+  size?: number;
+  bold?: boolean;
+  uppercase?: boolean;
+  color?: string;
+  outline_color?: string;
+  /** Fraction of the font size. */
+  outline?: number;
+  /** Fraction of the font size. */
+  shadow?: number;
+  box?: boolean;
+  box_color?: string;
+  box_opacity?: number;
+  align?: "left" | "center" | "right";
+  /** Fraction of the frame's width. */
+  max_width?: number;
+}
+
+export interface TitleLayout {
+  /** Seconds after the beat starts. */
+  start_s?: number;
+  end_s?: number;
+  /** 0..1 of the output frame; x follows the alignment, y is the text's middle. */
+  x?: number;
+  y?: number;
+  style?: TextStyle;
+}
+
+export interface CaptionStyle {
+  position?: "bottom" | "center" | string;
+  size?: number;
+  style?: TextStyle;
+  /** 0..1 of the output frame; y is the bottom of the text. */
+  x?: number;
+  y?: number;
+  max_chars?: number;
+  max_lines?: number;
+}
+
+/** A hand edit of one caption cue, tied to the source footage it was heard in. */
+export interface CueEdit {
+  video_id: number;
+  src_start_s: number;
+  src_end_s: number;
+  text?: string;
+  /** Source seconds. */
+  start_s?: number;
+  end_s?: number;
+  hidden?: boolean;
 }
 
 export interface Script {
@@ -645,7 +955,76 @@ export interface Script {
   fps?: Fps;
   width?: number;
   height?: number;
+  /** Default framing for every clip (a clip's own wins). */
+  framing?: Framing;
   beats: Beat[];
+  /** Speech captions burnt into every render with this style. */
+  captions?: CaptionStyle | null;
+  title_style?: TextStyle | null;
+  caption_edits?: CueEdit[];
+  /** Which agents work on this cut; absent = the app's choice. */
+  agents?: AgentSelection | null;
+}
+
+export interface Cue {
+  start_s: number;
+  end_s: number;
+  text: string;
+  video_id?: number;
+  src_start_s?: number;
+  src_end_s?: number;
+  /** Cut time minus source time: source = cut time - offset. */
+  offset_s?: number;
+  /** How far the cue may move on the cut's clock (its clip). */
+  min_s?: number;
+  max_s?: number;
+  edited?: boolean;
+  hidden?: boolean;
+}
+
+/** A text style with every value decided by the backend. */
+export interface ResolvedStyle {
+  font: string;
+  size: number;
+  bold: boolean;
+  uppercase: boolean;
+  color: string;
+  outline_color: string;
+  outline: number;
+  shadow: number;
+  box: boolean;
+  box_color: string;
+  box_opacity: number;
+  align: "left" | "center" | "right";
+  max_width: number;
+  box_pad: number;
+  cell_em: number;
+}
+
+export type VAnchor = "middle" | "bottom";
+
+export interface Overlay {
+  kind: "title" | "caption";
+  beat_index?: number;
+  start_s: number;
+  end_s: number;
+  lines: string[];
+  x: number;
+  y: number;
+  v_anchor: VAnchor;
+  style: ResolvedStyle;
+  cue?: Cue;
+}
+
+export interface Overlays {
+  width: number;
+  height: number;
+  titles: Overlay[];
+  captions: Overlay[];
+  caption_style: ResolvedStyle;
+  caption_x: number;
+  caption_y: number;
+  caption_v_anchor: VAnchor;
 }
 
 export interface Issue {
@@ -653,6 +1032,23 @@ export interface Issue {
   beat_id: string | null;
   clip_index: number | null;
   message: string;
+  /** Deterministic ways to fix it, shown as buttons; applying one checks the script again. */
+  fixes?: Fix[];
+}
+
+/** A change that fixes an issue: move a clip's bounds, frame a stretch another way, or run an
+ * indexing stage (turning it on first when `enable`). Times are source seconds. */
+export type FixAction =
+  | { kind: "trim"; beat_id: string; clip_index: number; in_s: number; out_s: number }
+  | { kind: "set_layout"; beat_id: string; clip_index: number; from_s: number; to_s: number; layout: Layout }
+  | { kind: "run_stage"; stage: string; enable: boolean };
+
+export type Fix = FixAction & { label: string };
+
+export interface FixedScriptView {
+  script: Script;
+  issues: Issue[];
+  note: string;
 }
 
 export interface StoredScript {
@@ -674,6 +1070,10 @@ export interface ScriptSummary {
   beats: number;
   clips: number;
   duration_s: number;
+  /** The clip set this script belongs to; null for ordinary cuts. */
+  set_id?: string | null;
+  /** "clip" = belongs to a clip set. */
+  kind?: string | null;
 }
 
 /** How a chat builds its cuts; kept on the chat for every turn in it. */
@@ -740,6 +1140,10 @@ export interface ScriptView {
 export interface SaveScriptView {
   script_id: number;
   issues: Issue[];
+  /** What the deterministic repair changed before saving (empty: saved as given). */
+  notes: string[];
+  /** The script as saved. */
+  script: Script;
 }
 
 export type ChatEvent =
@@ -821,15 +1225,34 @@ export const getScript = (scriptId: number) =>
 export const saveScript = (projectId: number, script: Script, sessionId: number | null) =>
   call<SaveScriptView>("save_script", { projectId, script, sessionId });
 
+/** Check an (unsaved) script against the index as it is now. */
+export const checkScript = (projectId: number, script: Script) =>
+  call<Issue[]>("check_script", { projectId, script });
+
+/** Apply one fix to an (unsaved) script; the result is checked again but not saved. */
+export const applyScriptFix = (projectId: number, script: Script, fix: FixAction) =>
+  call<FixedScriptView>("apply_script_fix", { projectId, script, fix });
+
+/** Deletes go to the trash: each returns the entry, so the caller can offer Undo. */
 export const deleteScript = (scriptId: number) =>
-  call<boolean>("delete_script", { scriptId });
+  call<TrashItem>("delete_script", { scriptId });
 
 export const deleteScriptCut = (projectId: number, title: string) =>
-  call<number>("delete_script_cut", { projectId, title });
+  call<TrashItem>("delete_script_cut", { projectId, title });
+
+export const scriptCaptions = (script: Script) =>
+  call<Cue[]>("script_captions", { script });
+
+/** Titles and captions laid out as a render burns them (hidden cues included, flagged). */
+export const scriptOverlays = (script: Script) =>
+  call<Overlays>("script_overlays", { script });
+
+export const scriptFraming = (script: Script) =>
+  call<ClipFraming[]>("script_framing", { script });
 
 // ---- models management -------------------------------------------------------------------
 
-export type ModelKind = "whisper" | "vision" | "vision_projector" | "embedding";
+export type ModelKind = "whisper" | "vision" | "vision_projector" | "embedding" | "face" | "speaker";
 
 export interface CatalogEntry {
   id: string;
@@ -880,6 +1303,7 @@ export interface VisionSettings {
   flash_attn: string;
   cpu_moe_layers: number;
   moe_blocks?: number | null;
+  /** Optional cap on rounds of tool calls a model run may make; 0 = no cap (the default). */
   max_tool_rounds: number;
   think: boolean;
   /** Frames described at once against a server; only meaningful when the server has slots. */
@@ -953,7 +1377,9 @@ export interface AiSettings {
   frames: FrameSettings;
   jev: JevSettings;
   vision_caps: ServerCaps;
+  /** Clip workers: many small scoring jobs run in parallel. */
 }
+
 
 export interface BackendsResolution {
   vision: Resolution;
@@ -1080,3 +1506,213 @@ export interface PlaybackProgress {
 }
 export const videoPlaybackProgress = (videoId: number) =>
   call<PlaybackProgress | null>("video_playback_progress", { videoId });
+
+// ---- Clip sets ---------------------------------------------------------------------------
+
+export type ClipFormat = "original" | "9:16" | "1:1";
+
+export interface ClipOptions {
+  brief: string;
+  count: number;
+  min_s: number;
+  max_s: number;
+  format: ClipFormat;
+  /** Empty = every video in the library. */
+  video_ids: number[];
+  window_s?: number;
+  /** Let code pick the clips instead of the orchestrator model. */
+  worker_only: boolean;
+  /** Framing for 9:16 / 1:1 clips. */
+  layout?: "follow_speaker" | "stacked" | "fixed";
+  /** This run's agents; what it leaves out comes from the app's choice. */
+  agents?: AgentSelection;
+}
+
+export interface ClipVisual {
+  label: "faces" | "screen" | "mixed" | "unknown" | string;
+  screen_share: number;
+  frames: number;
+  faces?: { faces: number; avg_box_h: number } | null;
+  /** Shares of the range by picture kind, measured from the faces (absent: not indexed). */
+  layout?: { two_shot: number; single_face: number; screen_share: number; no_face: number } | null;
+}
+
+export type ClipStatus = "new" | "accepted" | "rejected";
+
+export interface ClipItem {
+  script_id: number;
+  title: string;
+  hook: string;
+  quote: string;
+  why: string;
+  score: number;
+  video_id: number;
+  in_s: number;
+  out_s: number;
+  visual: ClipVisual;
+  status: ClipStatus;
+  /** Warnings the checks find now (recomputed whenever the set is shown). */
+  warnings: number;
+  issues?: Issue[];
+  thumb?: string | null;
+  /** For a clip that crops its footage: what its framing plan shows of `thumb`. */
+  thumb_view?: FrameView | null;
+}
+
+export interface ClipSet {
+  id: string;
+  project_id: number;
+  brief: string;
+  created_at: number;
+  options: Partial<ClipOptions> & Record<string, unknown>;
+  items: ClipItem[];
+  log: Record<string, unknown>;
+}
+
+export const generateClips = (projectId: number, options: ClipOptions) =>
+  call<number>("generate_clips", { projectId, options });
+export const clipsPreflight = (projectId: number, options: ClipOptions) =>
+  call<Preflight>("clips_preflight", { projectId, options });
+export const listClipSets = (projectId: number) => call<ClipSet[]>("list_clip_sets", { projectId });
+export const getClipSet = (setId: string) => call<ClipSet>("get_clip_set", { setId });
+export const setClipStatus = (setId: string, scriptId: number, status: ClipStatus) =>
+  call<ClipSet>("set_clip_status", { setId, scriptId, status });
+export const deleteClipSet = (setId: string) => call<TrashItem>("delete_clip_set", { setId });
+export const exportClipSet = (setId: string, dir: string, acceptedOnly: boolean) =>
+  call<number>("export_clip_set", { setId, dir, acceptedOnly });
+
+// ---- Agent pool ----------------------------------------------------------------------------
+
+export type AgentRole = "orchestrator" | "worker" | "chat" | "vision";
+
+export type Effort = "low" | "medium" | "high" | "xhigh" | "max";
+export const EFFORTS: Effort[] = ["low", "medium", "high", "xhigh", "max"];
+/** The CLI tools that take an effort; the others ignore it. */
+export const EFFORT_TOOLS = ["claude", "codex"];
+
+/** One configured agent (`[[agents]]`). */
+export interface AgentSpec {
+  id: string;
+  name?: string;
+  /** Linked to a config section whose model settings it uses. */
+  source?: "chat_model" | "chat_worker" | "vision" | null;
+  backend: Backend;
+  tool?: string;
+  model?: string;
+  /** How hard the model thinks (claude, codex); absent = the tool's default. */
+  effort?: Effort | null;
+  url?: string;
+  /** Write-only: never sent back; empty keeps the stored key. */
+  api_key?: string;
+  local_model?: string;
+  ctx_tokens?: number;
+  timeout_secs?: number;
+  max_concurrent: number;
+  roles: AgentRole[];
+  enabled: boolean;
+  priority: number;
+}
+
+/** A choice of agents; every field optional (run overrides cut overrides app). */
+export interface AgentSelection {
+  orchestrator?: string | null;
+  /** No orchestrator model: code picks from the workers' scores. */
+  pick_by_score?: boolean | null;
+  workers?: string[] | null;
+  max_parallel?: number | null;
+  /** Calls at once per worker, by agent id (a local model stays at one). */
+  concurrency?: Record<string, number> | null;
+}
+
+/** What a run makes, so the summary can name it (`agents::WorkTarget`). */
+export interface WorkTarget {
+  count?: number | null;
+  format?: ClipFormat | null;
+}
+
+export type SelectionSource = "run" | "cut" | "app" | "default";
+
+export interface ResolvedAgents {
+  orchestrator: string | null;
+  orchestrator_from: SelectionSource;
+  workers: string[];
+  workers_from: SelectionSource;
+  chat: string | null;
+  max_parallel: number;
+  capacity: number;
+  /** "up to 6 at once: claude ×2 · codex ×2 · ghostpen ×2" */
+  capacity_line: string;
+  /** Chosen to run without an orchestrator model. */
+  picks_by_score: boolean;
+  /** Calls at once each worker takes, by id. */
+  concurrency: Record<string, number>;
+  /** One plain sentence on who does what, from the backend. */
+  summary: string;
+}
+
+/** Where an agent stands now (`agents::AgentStatus`). */
+export type AgentState =
+  | { state: "ready" }
+  | { state: "busy"; in_use: number; capacity: number }
+  | { state: "out_of_quota"; until: number }
+  | { state: "not_installed" }
+  | { state: "unreachable" }
+  | { state: "unavailable" };
+
+export type AgentStatus = AgentState & { id: string; label: string; detail: string };
+
+export interface AgentView {
+  spec: AgentSpec;
+  effective: AgentSpec;
+  has_api_key: boolean;
+  capacity: number;
+  capacity_locked: string | null;
+  linked_to: string | null;
+  summary: string;
+  /** Its name, or its id when it has none. */
+  display_name: string;
+}
+
+export interface AgentsView {
+  implicit: boolean;
+  agents: AgentView[];
+  app_selection: AgentSelection;
+  resolved: ResolvedAgents | null;
+  error: string | null;
+  roles: AgentRole[];
+  cli_tools: string[];
+}
+
+export type CheckLevel = "ok" | "warn" | "error";
+
+export interface AgentAvailability {
+  id: string;
+  ok: boolean;
+  level: CheckLevel;
+  resolved: string;
+  detail: string;
+  model_listed: boolean | null;
+  error?: AgentError | null;
+}
+
+/** One thing checked before a run (`preflight::Check`). */
+export interface PreflightCheck {
+  level: CheckLevel;
+  scope: "agent" | "project";
+  /** The agent id, or the indexing stage. */
+  subject: string;
+  message: string;
+  error?: AgentError | null;
+}
+
+export interface Preflight {
+  checks: PreflightCheck[];
+}
+
+export const listAgents = () => call<AgentsView>("list_agents");
+export const saveAgents = (agents: AgentSpec[], selection: AgentSelection) =>
+  call<AgentsView>("save_agents", { agents, selection });
+export const testAgent = (id: string) => call<AgentAvailability>("test_agent", { id });
+export const resolveAgents = (run?: AgentSelection | null, cut?: AgentSelection | null, target?: WorkTarget | null) =>
+  call<ResolvedAgents>("resolve_agents", target ? { run: run ?? null, cut: cut ?? null, target } : { run: run ?? null, cut: cut ?? null });
+export const agentStatus = () => call<AgentStatus[]>("agent_status");

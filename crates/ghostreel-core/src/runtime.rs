@@ -132,6 +132,7 @@ pub async fn start_embedder(
                 cpu: true,
                 runtime: crate::vision::HelperRuntime { kv_cache: "f16".into(), ..Default::default() },
                 concurrency: 1,
+                free_ghostpen: Vec::new(),
             };
             Embedder::local(&models).await.map_err(|e| e.to_string())
         }
@@ -216,8 +217,12 @@ pub async fn resolve(paths: &Paths, config: &Config) -> Result<Runtime, crate::E
     );
     let total_vram = gpus.first().map(|g| g.vram_total_mib);
     let model_mb = crate::models::find_entry(&config.vision.local_model).and_then(|e| e.vram_mb);
-    let describe_concurrency =
-        crate::doctor::calculate_describe_concurrency(config.vision.describe_concurrency, total_vram, model_mb);
+    // An explicit vision agent's `max_concurrent` is the frames-at-once setting for it.
+    let requested = match crate::agents::with_role(&config.agents(), crate::agents::AgentRole::Vision).first() {
+        Some(a) if a.source.is_none() => a.max_concurrent as u32,
+        _ => config.vision.describe_concurrency,
+    };
+    let describe_concurrency = crate::doctor::calculate_describe_concurrency(requested, total_vram, model_mb);
     Ok(Runtime {
         ffmpeg,
         ffprobe,
@@ -270,7 +275,7 @@ async fn resolve_embed_with(paths: &Paths, config: &Config, svc: Option<&GhostSe
 /// Frame descriptions (indexing): `[vision]`.
 pub async fn resolve_vision(paths: &Paths, config: &Config) -> VisionSetup {
     let svc = ghost_service::discover(config);
-    resolve_llm_with(paths, config, &config.vision, svc.as_ref(), Capability::Vision).await
+    resolve_vision_with(paths, config, svc.as_ref()).await
 }
 
 /// Script chat: `[chat_model]`, or `[vision]` with a bigger window on older configs.
@@ -279,8 +284,28 @@ pub async fn resolve_chat(paths: &Paths, config: &Config) -> VisionSetup {
     resolve_llm_with(paths, config, &config.chat_model(), svc.as_ref(), Capability::Chat).await
 }
 
+/// Clip/fan-out workers: `[chat_worker]` over `[chat_model]` (see `Config::chat_worker`).
+pub async fn resolve_worker(paths: &Paths, config: &Config) -> VisionSetup {
+    let svc = ghost_service::discover(config);
+    resolve_llm_with(paths, config, &config.chat_worker(), svc.as_ref(), Capability::Chat).await
+}
+
+/// One agent for one role: its model settings resolved like any capability's (GhostPen's shared
+/// service for `auto`, the CLI binary for `cli`, the server probe, the local model files).
+pub async fn resolve_agent(
+    paths: &Paths,
+    config: &Config,
+    spec: &crate::agents::AgentSpec,
+    role: crate::agents::AgentRole,
+) -> VisionSetup {
+    let svc = ghost_service::discover(config);
+    let cap = if role == crate::agents::AgentRole::Vision { Capability::Vision } else { Capability::Chat };
+    resolve_llm_with(paths, config, &spec.llm_config(config, role), svc.as_ref(), cap).await
+}
+
 async fn resolve_vision_with(paths: &Paths, config: &Config, svc: Option<&GhostService>) -> VisionSetup {
-    resolve_llm_with(paths, config, &config.vision, svc, Capability::Vision).await
+    // The vision agent's settings: `[vision]` unless an explicit agent took the role.
+    resolve_llm_with(paths, config, &config.vision_llm(), svc, Capability::Vision).await
 }
 
 async fn resolve_llm_with(
@@ -375,7 +400,8 @@ async fn resolve_llm_with(
     };
     let models_dir = models::effective_models_dir(paths, config);
     let roots = models::search_roots(&models_dir, &config.models.search_paths);
-    let found = [&model, &mmproj].iter().filter_map(|s| models::find(&roots, &s.file_name)).collect();
+    let (model_path, projector_path) = models::find_with_projector(&roots, &model.file_name, &mmproj.file_name);
+    let found = [model_path, projector_path].into_iter().flatten().collect();
     VisionSetup::Local { helper, models_dir, model, mmproj: Some(mmproj), found, runtime: cfg.into() }
 }
 

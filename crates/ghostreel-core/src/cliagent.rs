@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::Error;
+use crate::agents::{AgentError, AgentErrorKind, Effort, classify_cli};
 use crate::config::CliAgentConfig;
 
 /// Resolves a binary path for a named CLI tool.
@@ -246,6 +247,7 @@ impl CliAgent {
                     args.push("--model".into());
                     args.push(self.cfg.model.clone().into());
                 }
+                args.extend(self.effort_args());
             }
             "agy" => {
                 args.push(bin.as_os_str().to_owned());
@@ -286,6 +288,7 @@ impl CliAgent {
                     args.push("-m".into());
                     args.push(self.cfg.model.clone().into());
                 }
+                args.extend(self.effort_args());
                 args.push(format!("Describe this image. Reply with ONLY compact JSON: {prompt}").into());
             }
             other => {
@@ -399,6 +402,7 @@ impl CliAgent {
                     args.push("--model".into());
                     args.push(self.cfg.model.clone().into());
                 }
+                args.extend(self.effort_args());
             }
             "agy" => {
                 args.push(bin.as_os_str().to_owned());
@@ -436,6 +440,7 @@ impl CliAgent {
                     args.push("-m".into());
                     args.push(self.cfg.model.clone().into());
                 }
+                args.extend(self.effort_args());
                 args.push(effective_prompt.into());
             }
             other => {
@@ -446,6 +451,20 @@ impl CliAgent {
             args.push(extra.clone().into());
         }
         args
+    }
+
+    /// The effort flag for the tools that take one: claude `--effort <level>`, codex
+    /// `-c model_reasoning_effort=<level>` (which has no "max": its top is "xhigh"). Others none.
+    fn effort_args(&self) -> Vec<std::ffi::OsString> {
+        let Some(effort) = self.cfg.effort else { return Vec::new() };
+        match self.cfg.tool.as_str() {
+            "claude" => vec!["--effort".into(), effort.as_str().into()],
+            "codex" => {
+                let level = if effort == Effort::Max { Effort::Xhigh } else { effort };
+                vec!["-c".into(), format!("model_reasoning_effort=\"{level}\"").into()]
+            }
+            _ => Vec::new(),
+        }
     }
 
     /// What to write to the tool's stdin for a complete call. claude reads its prompt there, as a
@@ -469,7 +488,7 @@ impl CliAgent {
     /// Run a CLI and return stdout.
     async fn run_cli(&self, bin: &Path, args: &[std::ffi::OsString], stdin: Option<String>) -> Result<String, Error> {
         if args.is_empty() {
-            return Err(Error::Vision(format!("unknown CLI tool '{}'", self.cfg.tool)));
+            return Err(self.fail(AgentErrorKind::NotInstalled, format!("unknown CLI tool '{}'", self.cfg.tool)));
         }
         // args[0] is the binary itself; pass args[1..] to the command.
         let mut cmd = crate::proc::command(bin);
@@ -490,7 +509,14 @@ impl CliAgent {
             }
             other => other,
         }
-        .map_err(|e| Error::Vision(format!("cannot run {}: {e}", bin.display())))?;
+        .map_err(|e| {
+            let kind = if e.kind() == std::io::ErrorKind::NotFound {
+                AgentErrorKind::NotInstalled
+            } else {
+                AgentErrorKind::Exit { code: None }
+            };
+            self.fail(kind, format!("cannot run {}: {e}", bin.display()))
+        })?;
         let mut child = child;
         if let (Some(text), Some(mut pipe)) = (stdin, child.stdin.take()) {
             use tokio::io::AsyncWriteExt as _;
@@ -501,19 +527,37 @@ impl CliAgent {
                 let _ = pipe.shutdown().await;
             });
         }
-        let output = tokio::time::timeout(Duration::from_secs(self.cfg.timeout_secs), child.wait_with_output())
+        let after_s = self.cfg.timeout_secs;
+        let output = tokio::time::timeout(Duration::from_secs(after_s), child.wait_with_output())
             .await
-            .map_err(|_| Error::Vision(format!("{} timed out after {}s", self.cfg.tool, self.cfg.timeout_secs)))?
-            .map_err(|e| Error::Vision(format!("{} I/O error: {e}", self.cfg.tool)))?;
+            .map_err(|_| {
+                self.fail(AgentErrorKind::Timeout { after_s }, format!("no answer within {after_s} s"))
+            })?
+            .map_err(|e| self.fail(AgentErrorKind::Other, format!("I/O error: {e}")))?;
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         if !output.status.success() {
-            // codex reports why on stdout, as a JSON event; its stderr opens with a harmless
-            // "Reading additional input from stdin" that used to be the only thing shown.
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let reason = jsonl_error(&stdout).unwrap_or_else(|| String::from_utf8_lossy(&output.stderr).into_owned());
-            let preview: String = reason.chars().take(300).collect();
-            return Err(Error::Vision(format!("{} exited {:?}: {preview}", self.cfg.tool, output.status.code())));
+            // Why it failed may be on stdout (claude's JSON `result`, codex's JSONL events) or
+            // stderr (agy); `classify_cli` reads both.
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(Error::Agent(classify_cli(&self.cfg.tool, &self.cfg.model, output.status.code(), &stdout, &stderr)));
         }
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        // claude can exit 0 and still report an error (an unknown model, say) in its JSON.
+        if self.cfg.tool == "claude"
+            && serde_json::from_str::<serde_json::Value>(stdout.trim()).is_ok_and(|v| v["is_error"] == true)
+        {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(Error::Agent(classify_cli(&self.cfg.tool, &self.cfg.model, Some(0), &stdout, &stderr)));
+        }
+        Ok(stdout)
+    }
+
+    /// A typed failure of this tool.
+    fn fail(&self, kind: AgentErrorKind, message: impl Into<String>) -> Error {
+        Error::Agent(AgentError::new(self.cfg.tool.clone(), kind, message))
+    }
+
+    fn not_installed(&self) -> Error {
+        self.fail(AgentErrorKind::NotInstalled, format!("'{}' was not found on PATH", self.cfg.tool))
     }
 
     /// Extract the model's text answer from the tool's stdout.
@@ -522,19 +566,19 @@ impl CliAgent {
             "claude" => {
                 // stdout is JSON: {"result": "<answer>", ...}
                 let v: serde_json::Value = serde_json::from_str(raw)
-                    .map_err(|e| Error::Vision(format!("claude: bad JSON: {e}: {}", preview(raw))))?;
+                    .map_err(|_| unusable("claude", raw))?;
                 let text = v["result"]
                     .as_str()
-                    .ok_or_else(|| Error::Vision(format!("claude: no `result` field: {}", preview(raw))))?;
+                    .ok_or_else(|| unusable("claude", raw))?;
                 Ok(text.to_string())
             }
             "agy" => {
                 // stdout is JSON: {"response": "<answer>", ...}
                 let v: serde_json::Value = serde_json::from_str(raw)
-                    .map_err(|e| Error::Vision(format!("agy: bad JSON: {e}: {}", preview(raw))))?;
+                    .map_err(|_| unusable("agy", raw))?;
                 let text = v["response"]
                     .as_str()
-                    .ok_or_else(|| Error::Vision(format!("agy: no `response` field: {}", preview(raw))))?;
+                    .ok_or_else(|| unusable("agy", raw))?;
                 Ok(text.to_string())
             }
             "opencode" => {
@@ -564,9 +608,9 @@ impl CliAgent {
                         answer = Some(t.to_string());
                     }
                 }
-                answer.ok_or_else(|| Error::Vision(format!("codex: no agent_message: {}", preview(raw))))
+                answer.ok_or_else(|| unusable("codex", raw))
             }
-            other => Err(Error::Vision(format!("unknown CLI tool '{other}'"))),
+            other => Err(Error::Agent(AgentError::new(other, AgentErrorKind::NotInstalled, format!("unknown CLI tool '{other}'")))),
         }
     }
 
@@ -579,14 +623,13 @@ impl CliAgent {
         let end = haystack.rfind('}');
         match (start, end) {
             (Some(s), Some(e)) if e > s => Ok(haystack[s..=e].to_string()),
-            _ => Err(Error::Vision(format!("no JSON object in CLI output: {}", preview(text)))),
+            _ => Err(Error::Invalid(format!("no JSON object in the answer: {}", preview(text)))),
         }
     }
 
     /// Describe a frame image: returns the extracted JSON string (matching `vision::parse_description`).
     pub async fn describe(&self, image: &Path, schema_hint: &str) -> Result<String, Error> {
-        let bin =
-            self.available().ok_or_else(|| Error::Vision(format!("CLI tool '{}' not found on PATH", self.cfg.tool)))?;
+        let bin = self.available().ok_or_else(|| self.not_installed())?;
         let args = self.build_argv_describe(&bin, image, schema_hint);
         let raw = self.run_cli(&bin, &args, None).await?;
         let text = Self::extract_text(&self.cfg.tool, &raw)?;
@@ -601,8 +644,7 @@ impl CliAgent {
     /// `complete`, optionally continuing the tool's own most recent conversation so only the new
     /// message is sent.
     pub async fn complete_continuing(&self, prompt: &str, continued: bool) -> Result<String, Error> {
-        let bin =
-            self.available().ok_or_else(|| Error::Vision(format!("CLI tool '{}' not found on PATH", self.cfg.tool)))?;
+        let bin = self.available().ok_or_else(|| self.not_installed())?;
         let args = self.build_argv_complete_from(&bin, prompt, continued);
         let stdin = self.stdin_prompt(prompt, continued);
         let shown = args.iter().skip(1).map(|a| a.to_string_lossy()).collect::<Vec<_>>().join(" ");
@@ -624,7 +666,7 @@ impl CliAgent {
 /// dir), read-only sandbox — it only has to look, never edit.
 /// The last error a JSONL-speaking tool reported on stdout, with any nested API error unwrapped
 /// to its message: `{"type":"error","message":"{\"error\":{\"message\":\"…\"}}"}`.
-fn jsonl_error(stdout: &str) -> Option<String> {
+pub(crate) fn jsonl_error(stdout: &str) -> Option<String> {
     let mut found = None;
     for line in stdout.lines() {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) else { continue };
@@ -659,6 +701,16 @@ fn tracing_warn(tool: &str) {
     #[cfg(debug_assertions)]
     eprintln!("cliagent: unknown tool '{tool}'");
     let _ = tool;
+}
+
+/// Output a tool printed that is not the answer shape: an error it reported in plain words
+/// (an unknown model, a used-up quota) when it reads as one, else an unusable answer.
+fn unusable(tool: &str, raw: &str) -> Error {
+    let mut e = classify_cli(tool, "", Some(0), raw, "");
+    if e.kind == AgentErrorKind::BadAnswer {
+        e.message = format!("{tool} answered in an unexpected shape: {}", preview(raw));
+    }
+    Error::Agent(e)
 }
 
 fn preview(s: &str) -> String {
@@ -753,6 +805,74 @@ mod tests {
     #[test]
     fn extract_json_object_no_json_is_err() {
         assert!(CliAgent::extract_json_object("no json here").is_err());
+    }
+
+    // ---- effort ----------------------------------------------------------------
+
+    #[test]
+    fn effort_reaches_the_tools_that_take_it() {
+        let bin = Path::new("/bin/true");
+        let with = |tool: &str, effort| {
+            let agent = CliAgent::new(CliAgentConfig { tool: tool.into(), effort, ..Default::default() });
+            let mut argv = agent.build_argv_complete(bin, "hi", false);
+            argv.extend(agent.build_argv_describe(bin, Path::new("/tmp/f.jpg"), "{}"));
+            argv.iter().map(|a| a.to_string_lossy().into_owned()).collect::<Vec<_>>()
+        };
+        let claude = with("claude", Some(Effort::Medium));
+        assert_eq!(claude.iter().filter(|a| *a == "--effort").count(), 2, "complete and describe: {claude:?}");
+        assert!(claude.windows(2).any(|w| w[0] == "--effort" && w[1] == "medium"));
+        // codex tops out at xhigh.
+        let codex = with("codex", Some(Effort::Max));
+        assert!(codex.windows(2).any(|w| w[0] == "-c" && w[1] == "model_reasoning_effort=\"xhigh\""), "{codex:?}");
+        for tool in ["agy", "opencode"] {
+            let argv = with(tool, Some(Effort::High));
+            assert!(!argv.iter().any(|a| a.contains("effort")), "{tool} has no effort flag: {argv:?}");
+        }
+        assert!(!with("claude", None).iter().any(|a| a == "--effort"));
+    }
+
+    // ---- typed failures from fake CLIs (unix only) -----------------------------
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fake_cli_failures_come_back_typed() {
+        let tmp = tempfile::tempdir().unwrap();
+        // agy with a used-up quota: the reason on stderr, exit 3.
+        let agy = write_fake_cli(
+            tmp.path(),
+            "agy",
+            r#"echo 'error: Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 2h2m31s. AGY_ERROR: {"short_error":"RESOURCE_EXHAUSTED (code 429)"}' >&2; exit 3"#,
+        );
+        let e = CliAgent::new(cfg("agy", &agy)).complete("hi").await.unwrap_err();
+        let a = e.agent_error().expect("typed");
+        assert_eq!(a.kind, AgentErrorKind::QuotaExhausted { resets_in_s: Some(7351) });
+        assert!(!e.to_string().starts_with("vision:"), "{e}");
+
+        // claude with an unknown model: the reason on stdout as JSON, exit 1, stderr empty.
+        let claude = write_fake_cli(
+            tmp.path(),
+            "claude",
+            r#"cat >/dev/null; echo '{"type":"result","is_error":true,"result":"There'"'"'s an issue with the selected model (claude-opus-5-5-medium). It may not exist or you may not have access to it."}'; exit 1"#,
+        );
+        let mut c = cfg("claude", &claude);
+        c.model = "claude-opus-5-5-medium".into();
+        let e = CliAgent::new(c.clone()).complete("hi").await.unwrap_err();
+        assert_eq!(e.agent_error().unwrap().kind, AgentErrorKind::InvalidModel { model: "claude-opus-5-5-medium".into() });
+        assert!(!e.to_string().contains("Some("), "{e}");
+
+        // The same with exit 0: claude still says is_error.
+        let claude0 = write_fake_cli(
+            tmp.path(),
+            "claude0",
+            r#"cat >/dev/null; echo '{"type":"result","is_error":true,"result":"There'"'"'s an issue with the selected model (x). It may not exist."}'"#,
+        );
+        let e = CliAgent::new(CliAgentConfig { tool: "claude".into(), ..cfg("claude", &claude0) }).complete("hi").await.unwrap_err();
+        assert_eq!(e.agent_error().unwrap().kind.key(), "invalid_model");
+
+        // Nothing printed at all: an exit code in words, never Rust's Debug.
+        let mute = write_fake_cli(tmp.path(), "mute", "exit 1");
+        let e = CliAgent::new(CliAgentConfig { tool: "agy".into(), ..cfg("agy", &mute) }).complete("hi").await.unwrap_err();
+        assert_eq!(e.to_string(), "agy: exit code 1 — agy exited with code 1 and printed nothing");
     }
 
     // ---- integration: fake CLI scripts (unix only) ---------------------------

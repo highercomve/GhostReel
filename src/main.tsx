@@ -3,6 +3,7 @@ import ReactDOM from "react-dom/client";
 import App from "./App";
 import SearchWindow from "./SearchWindow";
 import "./styles.css";
+import "./ui/scrollbars.css";
 
 function isSearchWindow(): boolean {
   if (typeof window === "undefined") return false;

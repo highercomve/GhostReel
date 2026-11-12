@@ -6,7 +6,7 @@ export type NavigateKind = "models" | "settings" | "storage" | "activity" | "sta
 
 export const NAVIGATE_EVENT = "ghostreel:navigate";
 
-/** Ask the app shell to switch to another page. */
-export function navigate(kind: NavigateKind) {
-  window.dispatchEvent(new CustomEvent(NAVIGATE_EVENT, { detail: { kind } }));
+/** Ask the app shell to switch to another page, scrolled to the element `anchor` names. */
+export function navigate(kind: NavigateKind, anchor?: string) {
+  window.dispatchEvent(new CustomEvent(NAVIGATE_EVENT, { detail: { kind, anchor } }));
 }

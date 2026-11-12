@@ -59,6 +59,10 @@ pub struct CliAgentConfig {
     pub command: String,
     /// Model to pass via `--model`; empty = CLI default.
     pub model: String,
+    /// How hard the model thinks, for the tools that take it (claude `--effort`, codex
+    /// `model_reasoning_effort`); the others ignore it. `None` = the tool's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<crate::agents::Effort>,
     /// Extra flags appended verbatim to every invocation.
     pub extra_args: Vec<String>,
     /// Hard timeout for one describe/complete call, in seconds (default 180).
@@ -73,6 +77,7 @@ impl Default for CliAgentConfig {
             tool: String::new(),
             command: String::new(),
             model: String::new(),
+            effort: None,
             extra_args: Vec::new(),
             timeout_secs: 180,
             concurrency: 2,
@@ -81,6 +86,19 @@ impl Default for CliAgentConfig {
 }
 
 impl CliAgentConfig {
+    /// A legacy model id with the effort in it ("claude-opus-5-5-medium") becomes the model and
+    /// the effort. Returns whether anything changed.
+    pub fn normalize_effort(&mut self) -> bool {
+        match crate::agents::Effort::split_model(&self.tool, &self.model) {
+            Some((model, effort)) => {
+                self.model = model;
+                self.effort.get_or_insert(effort);
+                true
+            }
+            None => false,
+        }
+    }
+
     pub fn validate(&self, section: &str) -> Result<(), String> {
         if !self.tool.is_empty() && !CLI_TOOLS.contains(&self.tool.as_str()) {
             return Err(format!("{section}.cli.tool must be one of {}, got '{}'", CLI_TOOLS.join(", "), self.tool));
@@ -120,9 +138,11 @@ pub struct VisionConfig {
     /// Keep this many blocks' MoE expert weights in system RAM. Dense models are unaffected.
     /// 0 lets llama.cpp fit the model to available GPU memory automatically.
     pub cpu_moe_layers: u32,
-    /// How many tool calls the script chat may make before it has to draft: how much footage it
-    /// gets to search, watch and read transcripts of. 0 = pick from the backend (a local model
-    /// gets fewer, since every round costs it context it cannot spare).
+    /// An optional cap on the rounds of tool calls a model run (the script chat, a clip worker,
+    /// the orchestrator) may make before it has to answer. 0, the default, is no cap: with the
+    /// whole tool registry to use a small number makes no sense, and a run still ends when the
+    /// model answers, when it is stopped, when the backend times out, or when it is caught
+    /// repeating the same call.
     pub max_tool_rounds: u32,
     /// Let the local model reason before it answers. Worth its cost for a whole script, not for
     /// a keyframe: descriptions run once per frame, so they default to off and scripts to on.
@@ -255,7 +275,8 @@ pub struct ScriptConfig {
     /// How much of each tool's description to send: `auto`, `full` or `short`. Rich descriptions
     /// — what a result means, what the repair passes will do to a draft that misuses it — are
     /// worth far more than their tokens, but a small local model's window is already half
-    /// transcripts, so `auto` shortens them there.
+    /// transcripts, so `auto` shortens them there (and for any local window under 64k, since the
+    /// whole registry's full descriptions are about 10k tokens).
     pub tool_docs: String,
     /// Picture held after the last voice stops, in silence, so the piece lands instead of
     /// stopping (s). 0 turns it off. Every brain tested ends on the last word; an editor holds
@@ -650,6 +671,10 @@ pub struct Config {
     /// chat's bigger context window.
     #[serde(default)]
     pub chat_model: Option<VisionConfig>,
+    /// Parallel workers for fan-out jobs (clip scoring). Absent = the orchestrator's
+    /// (`[chat_model]`) backend and model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_worker: Option<WorkerConfig>,
     pub embed: EmbedConfig,
     pub stt: SttConfig,
     pub models: ModelsConfig,
@@ -667,9 +692,82 @@ pub struct Config {
     /// Sharing GhostPen's model service.
     #[serde(default)]
     pub ai: AiConfig,
+    /// The agent pool (`[[agents]]`). Empty = the implicit agents the sections above stand for
+    /// (see [`crate::agents::implicit_agents`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agents: Vec<crate::agents::AgentSpec>,
+    /// The app-wide agent choice; a cut's and a run's choices override it field by field.
+    #[serde(default, skip_serializing_if = "crate::agents::AgentSelection::is_empty")]
+    pub agent_selection: crate::agents::AgentSelection,
+}
+
+/// `[chat_worker]`: the model that runs many small structured-JSON jobs in parallel (scoring a
+/// window of transcript for clips). Every field is an override of the orchestrator's
+/// `[chat_model]`: an empty string, a zero or an absent value inherits it, so a section with only
+/// `concurrency = 6` keeps the orchestrator's backend and just runs more at once.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WorkerConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend: Option<Backend>,
+    pub url: String,
+    pub model: String,
+    pub api_key: String,
+    pub local_model: String,
+    /// 0 = inherit.
+    pub ctx_tokens: u32,
+    /// Jobs in flight at once. 0 = pick from the backend: 4 for a server, the CLI's own
+    /// `concurrency` for an agent, 1 for a local model (one helper process, one job at a time).
+    pub concurrency: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cli: Option<CliAgentConfig>,
 }
 
 impl Config {
+    /// The worker model: `[chat_worker]` laid over `[chat_model]`. Workers never think — they
+    /// score a window, they do not write a script.
+    pub fn chat_worker(&self) -> VisionConfig {
+        let mut base = self.chat_model();
+        base.think = false;
+        let Some(w) = &self.chat_worker else { return base };
+        if let Some(b) = w.backend {
+            base.backend = b;
+        }
+        if !w.url.trim().is_empty() {
+            base.url = w.url.clone();
+        }
+        if !w.model.trim().is_empty() {
+            base.model = w.model.clone();
+        }
+        if !w.api_key.trim().is_empty() {
+            base.api_key = w.api_key.clone();
+        }
+        if !w.local_model.trim().is_empty() {
+            base.local_model = w.local_model.clone();
+        }
+        if w.ctx_tokens > 0 {
+            base.ctx_tokens = w.ctx_tokens;
+        }
+        if let Some(cli) = &w.cli {
+            base.cli = cli.clone();
+        }
+        base
+    }
+
+    /// How many worker jobs run at once (see [`WorkerConfig::concurrency`]).
+    pub fn worker_concurrency(&self) -> usize {
+        let set = self.chat_worker.as_ref().map(|w| w.concurrency).unwrap_or(0);
+        if set > 0 {
+            return set.min(32);
+        }
+        let llm = self.chat_worker();
+        match llm.backend {
+            Backend::Local => 1,
+            Backend::Cli => llm.cli.concurrency.max(1),
+            Backend::Server | Backend::Auto => 4,
+        }
+    }
+
     /// The script chat's model settings: its own `[chat_model]` section, or the frame-description
     /// settings with the chat's larger context window when the file predates the split.
     pub fn chat_model(&self) -> VisionConfig {
@@ -711,7 +809,11 @@ impl Config {
             match sub {
                 "tool" => llm.cli.tool = value.to_string(),
                 "command" => llm.cli.command = value.to_string(),
-                "model" => llm.cli.model = value.to_string(),
+                "model" => {
+                    llm.cli.model = value.to_string();
+                    llm.cli.normalize_effort();
+                }
+                "effort" => llm.cli.effort = crate::agents::Effort::parse_opt(value)?,
                 "timeout_secs" => llm.cli.timeout_secs = num(key, value)?,
                 "concurrency" => llm.cli.concurrency = num(key, value)?,
                 "extra_args" => {
@@ -739,7 +841,7 @@ impl Config {
                 "flash_attn" => llm.flash_attn = value.to_string(),
                 "cpu_moe_layers" => llm.cpu_moe_layers = num(key, value)?,
                 "think" => llm.think = flag(value),
-                "max_tool_rounds" => llm.max_tool_rounds = num::<u32>(key, value)?.min(100),
+                "max_tool_rounds" => llm.max_tool_rounds = num::<u32>(key, value)?,
                 "describe_concurrency" => llm.describe_concurrency = num(key, value)?,
                 other => return Err(format!("unknown config key '{section}.{other}'")),
             }
@@ -750,6 +852,49 @@ impl Config {
                 self.chat_model = Some(llm)
             }
             return Ok(());
+        }
+        if matches!(section, "agents" | "agent_selection") {
+            let rest: Vec<&str> = key.splitn(3, '.').skip(1).collect();
+            // On a copy: a rejected value leaves the config as it was.
+            let mut next = self.clone();
+            next.set_agent_key(section, &rest, value)?;
+            *self = next;
+            return Ok(());
+        }
+        if matches!(section, "chat_worker" | "chat-worker") {
+            if !self.agents.is_empty() {
+                return Err(format!(
+                    "{key}: workers are configured as agents now; set agents.<id>.* (see `ghostreel agents list`)"
+                ));
+            }
+            let mut w = self.chat_worker.clone().unwrap_or_default();
+            match (field, sub) {
+                ("backend", _) => {
+                    w.backend = if value.trim().is_empty() || value == "inherit" { None } else { Some(backend(value)?) }
+                }
+                ("url", _) => w.url = value.to_string(),
+                ("model", _) => w.model = value.to_string(),
+                ("api_key", _) => w.api_key = value.to_string(),
+                ("local_model", _) => w.local_model = value.to_string(),
+                ("ctx_tokens", _) => w.ctx_tokens = num(key, value)?,
+                ("concurrency", _) => w.concurrency = num(key, value)?,
+                ("cli", sub) => {
+                    let mut cli = w.cli.clone().unwrap_or_else(|| self.chat_model().cli);
+                    match sub {
+                        "tool" => cli.tool = value.to_string(),
+                        "command" => cli.command = value.to_string(),
+                        "model" => cli.model = value.to_string(),
+                        "timeout_secs" => cli.timeout_secs = num(key, value)?,
+                        "concurrency" => cli.concurrency = num(key, value)?,
+                        other => return Err(format!("unknown config key 'chat_worker.cli.{other}'")),
+                    }
+                    cli.validate("chat_worker")?;
+                    w.cli = Some(cli);
+                }
+                (other, _) => return Err(format!("unknown config key 'chat_worker.{other}'")),
+            }
+            self.chat_worker = Some(w);
+            return self.chat_worker().validate("chat_worker");
         }
         if section == "jev" {
             let f = &mut self.jev;
@@ -855,8 +1000,15 @@ impl Config {
     pub fn validate(&self) -> Result<(), String> {
         self.vision.validate("vision")?;
         self.chat_model().validate("chat_model")?;
+        if self.chat_worker.is_some() {
+            self.chat_worker().validate("chat_worker")?;
+        }
         self.script.validate()?;
         self.jev.validate()?;
+        for a in &self.agents {
+            a.validate()?;
+        }
+        crate::agents::validate_selection(&self.agents(), &self.agent_selection).map_err(|e| e.to_string())?;
         self.frames.validate()
     }
 
@@ -867,11 +1019,10 @@ impl Config {
                 let mut config: Self =
                     toml::from_str(&text).map_err(|e| Error::Config(format!("{}: {e}", path.display())))?;
                 config.vision.local_model = crate::models::platform_vision_model(&config.vision.local_model).into();
-                config.vision.max_tool_rounds = config.vision.max_tool_rounds.min(100);
                 if let Some(chat) = &mut config.chat_model {
                     chat.local_model = crate::models::platform_vision_model(&chat.local_model).into();
-                    chat.max_tool_rounds = chat.max_tool_rounds.min(100);
                 }
+                config.normalize();
                 Ok(config)
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
@@ -879,8 +1030,38 @@ impl Config {
         }
     }
 
+    /// Bring an older file's values to their current shape, in memory: effort out of legacy
+    /// model ids, and linked agents' model fields derived from their sections (see
+    /// [`crate::agents::AgentSource`]). Nothing is written until the next save.
+    pub fn normalize(&mut self) {
+        self.vision.cli.normalize_effort();
+        if let Some(chat) = &mut self.chat_model {
+            chat.cli.normalize_effort();
+        }
+        if let Some(cli) = self.chat_worker.as_mut().and_then(|w| w.cli.as_mut()) {
+            cli.normalize_effort();
+        }
+        for a in &mut self.agents {
+            a.normalize_effort();
+        }
+        let derived: Vec<_> = self.agents.iter().map(|a| a.effective(self)).collect();
+        self.agents = derived;
+    }
+
+    /// The file's text. A linked agent's model fields are left out: its section holds them, and
+    /// writing a copy would give the file two answers to "which model does this agent use".
     pub fn to_toml(&self) -> Result<String, Error> {
-        toml::to_string_pretty(self).map_err(|e| Error::Config(e.to_string()))
+        let mut value = toml::Value::try_from(self).map_err(|e| Error::Config(e.to_string()))?;
+        if let Some(agents) = value.get_mut("agents").and_then(|a| a.as_array_mut()) {
+            for a in agents.iter_mut().filter_map(|a| a.as_table_mut()) {
+                if a.contains_key("source") {
+                    for k in crate::agents::LINKED_FIELDS {
+                        a.remove(*k);
+                    }
+                }
+            }
+        }
+        toml::to_string_pretty(&value).map_err(|e| Error::Config(e.to_string()))
     }
 
     pub fn save(&self, path: &Path) -> Result<(), Error> {
@@ -897,18 +1078,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn loading_clamps_research_limit() {
+    fn the_tool_round_cap_is_off_by_default_and_not_clamped_when_set() {
+        assert_eq!(Config::default().chat_model().max_tool_rounds, 0);
+        assert_eq!(Config::default().vision.max_tool_rounds, 0);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "[chat_model]\nmax_tool_rounds = 250\n").unwrap();
-        assert_eq!(Config::load(&path).unwrap().chat_model().max_tool_rounds, 100);
+        assert_eq!(Config::load(&path).unwrap().chat_model().max_tool_rounds, 250);
     }
 
     #[test]
-    fn setting_clamps_research_limit() {
+    fn setting_the_tool_round_cap_keeps_what_was_asked_for() {
         let mut cfg = Config::default();
         cfg.set_key("chat_model.max_tool_rounds", "250").unwrap();
-        assert_eq!(cfg.chat_model().max_tool_rounds, 100);
+        assert_eq!(cfg.chat_model().max_tool_rounds, 250);
+        cfg.set_key("chat_model.max_tool_rounds", "0").unwrap();
+        assert_eq!(cfg.chat_model().max_tool_rounds, 0);
     }
 
     #[test]

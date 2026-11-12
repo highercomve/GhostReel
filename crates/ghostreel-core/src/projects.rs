@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::Error;
 use crate::db::Db;
+use crate::glossary::Glossary;
 
 fn default_true() -> bool {
     true
@@ -29,11 +30,26 @@ pub struct PipelineConfig {
     pub describe: bool,
     #[serde(default = "default_true")]
     pub embed: bool,
+    #[serde(default = "default_true")]
+    pub steadiness: bool,
+    #[serde(default = "default_true")]
+    pub faces: bool,
+    #[serde(default = "default_true")]
+    pub speakers: bool,
 }
 
 impl Default for PipelineConfig {
     fn default() -> Self {
-        Self { probe: true, transcribe: true, frames: true, describe: true, embed: true }
+        Self {
+            probe: true,
+            transcribe: true,
+            frames: true,
+            describe: true,
+            embed: true,
+            steadiness: true,
+            faces: true,
+            speakers: true,
+        }
     }
 }
 
@@ -45,6 +61,9 @@ impl PipelineConfig {
             "frames" => self.frames,
             "describe" => self.describe,
             "embed" => self.embed,
+            "steadiness" => self.steadiness,
+            "faces" => self.faces,
+            "speakers" => self.speakers,
             _ => true,
         }
     }
@@ -56,6 +75,9 @@ impl PipelineConfig {
             "frames" => self.frames = enabled,
             "describe" => self.describe = enabled,
             "embed" => self.embed = enabled,
+            "steadiness" => self.steadiness = enabled,
+            "faces" => self.faces = enabled,
+            "speakers" => self.speakers = enabled,
             _ => return Err(Error::Invalid(format!("unknown pipeline stage '{stage}'"))),
         }
         Ok(())
@@ -78,6 +100,15 @@ impl PipelineConfig {
         if self.embed {
             stages.push("embed");
         }
+        if self.steadiness {
+            stages.push("steadiness");
+        }
+        if self.faces {
+            stages.push("faces");
+        }
+        if self.speakers {
+            stages.push("speakers");
+        }
         stages
     }
 }
@@ -93,6 +124,8 @@ pub struct Project {
     pub height: i64,
     pub created_at: i64,
     pub pipeline: PipelineConfig,
+    #[serde(default)]
+    pub glossary: Glossary,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -151,6 +184,8 @@ pub fn now() -> i64 {
 fn row_to_project(r: &rusqlite::Row) -> rusqlite::Result<Project> {
     let pipeline_json: String = r.get(8)?;
     let pipeline = serde_json::from_str(&pipeline_json).unwrap_or_default();
+    let glossary_json: String = r.get(9)?;
+    let glossary = serde_json::from_str(&glossary_json).unwrap_or_default();
     Ok(Project {
         id: r.get(0)?,
         name: r.get(1)?,
@@ -161,11 +196,11 @@ fn row_to_project(r: &rusqlite::Row) -> rusqlite::Result<Project> {
         height: r.get(6)?,
         created_at: r.get(7)?,
         pipeline,
+        glossary,
     })
 }
 
-const PROJECT_COLS: &str =
-    "id, name, description, fps_num, fps_den, width, height, created_at, COALESCE(pipeline_json, '')";
+const PROJECT_COLS: &str = "id, name, description, fps_num, fps_den, width, height, created_at, COALESCE(pipeline_json, ''), COALESCE(glossary_json, '')";
 
 impl Db {
     pub fn create_project(&self, p: &NewProject) -> Result<Project, Error> {
@@ -180,10 +215,11 @@ impl Db {
             return Err(Error::Invalid(format!("project '{name}' already exists")));
         }
         let pipeline_json = serde_json::to_string(&p.pipeline.clone().unwrap_or_default()).unwrap_or_default();
+        let glossary_json = serde_json::to_string(&Glossary::default()).unwrap_or_default();
         self.conn.execute(
-            "INSERT INTO projects(name, description, fps_num, fps_den, width, height, created_at, pipeline_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![name, p.description, p.fps_num, p.fps_den, p.width, p.height, now(), pipeline_json],
+            "INSERT INTO projects(name, description, fps_num, fps_den, width, height, created_at, pipeline_json, glossary_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![name, p.description, p.fps_num, p.fps_den, p.width, p.height, now(), pipeline_json, glossary_json],
         )?;
         let project = self.project(self.conn.last_insert_rowid())?;
         let _ = crate::index::sync_pipeline_jobs(self, Some(project.id));
@@ -198,6 +234,17 @@ impl Db {
         }
         crate::index::sync_pipeline_jobs(self, Some(id))?;
         self.project(id)
+    }
+
+    /// Update the transcription glossary for a project. Normalizes terms before saving.
+    pub fn set_project_glossary(&mut self, id: i64, glossary: &Glossary) -> Result<Glossary, Error> {
+        let mut normalized = glossary.clone();
+        normalized.normalize();
+        let glossary_json = serde_json::to_string(&normalized).map_err(|e| Error::Invalid(e.to_string()))?;
+        if self.conn.execute("UPDATE projects SET glossary_json = ?1 WHERE id = ?2", params![glossary_json, id])? == 0 {
+            return Err(Error::NotFound(format!("project #{id}")));
+        }
+        Ok(normalized)
     }
 
     pub fn projects(&self) -> Result<Vec<Project>, Error> {
@@ -530,14 +577,29 @@ mod tests {
         assert!(default_proj.pipeline.frames);
         assert!(default_proj.pipeline.describe);
         assert!(default_proj.pipeline.embed);
-        assert_eq!(default_proj.pipeline.enabled_stages(), vec!["probe", "transcribe", "frames", "describe", "embed"]);
+        assert!(default_proj.pipeline.steadiness);
+        assert!(default_proj.pipeline.faces);
+        assert_eq!(
+            default_proj.pipeline.enabled_stages(),
+            vec!["probe", "transcribe", "frames", "describe", "embed", "steadiness", "faces", "speakers"]
+        );
 
-        let custom_pipeline =
-            PipelineConfig { probe: true, transcribe: false, frames: true, describe: false, embed: true };
+        let custom_pipeline = PipelineConfig {
+            probe: true,
+            transcribe: false,
+            frames: true,
+            describe: false,
+            embed: true,
+            steadiness: false,
+            faces: false,
+            speakers: false,
+        };
         let b_roll = db.create_project(&NewProject::named("BRoll").with_pipeline(custom_pipeline)).unwrap();
         assert!(!b_roll.pipeline.transcribe);
         assert!(!b_roll.pipeline.describe);
         assert!(b_roll.pipeline.frames);
+        assert!(!b_roll.pipeline.steadiness);
+        assert!(!b_roll.pipeline.faces);
         assert_eq!(b_roll.pipeline.enabled_stages(), vec!["probe", "frames", "embed"]);
 
         // Update pipeline on existing project
@@ -546,5 +608,11 @@ mod tests {
         let updated = db.update_project_pipeline(b_roll.id, &updated_pipeline).unwrap();
         assert!(updated.pipeline.transcribe);
         assert!(db.project(b_roll.id).unwrap().pipeline.transcribe);
+
+        // Deserializing older project JSON without steadiness/faces defaults both to true.
+        let old_json = r#"{"probe":true,"transcribe":false,"frames":true,"describe":false,"embed":true}"#;
+        let deserialized: PipelineConfig = serde_json::from_str(old_json).unwrap();
+        assert!(deserialized.steadiness);
+        assert!(deserialized.faces);
     }
 }

@@ -67,7 +67,7 @@
 .tl-name { display: flex; align-items: center; gap: 4px; padding-left: 2px; font-size: 11px; color: var(--muted); }
 .tl-name > svg { flex: 0 0 auto; color: var(--muted); }
 .tl-name-ruler { height: var(--tl-ruler); }
-.tl-name-title { height: var(--tl-title); }
+.tl-name-title, .tl-name-cue { height: var(--tl-title); }
 .tl-name-picture { height: var(--tl-picture); }
 .tl-name-bed { height: var(--tl-sound); }
 
@@ -161,7 +161,7 @@
   border: 1px solid var(--border);
   cursor: crosshair;
 }
-.tl-lane-title { height: var(--tl-title); }
+.tl-lane-title, .tl-lane-cue { height: var(--tl-title); }
 .tl-lane-picture { height: var(--tl-picture); }
 .tl-lane-bed { height: var(--tl-sound); }
 
@@ -190,6 +190,31 @@
 }
 .tl-block.tl-title:hover {
   border-color: color-mix(in srgb, var(--text) 30%, var(--border));
+}
+/* Speech captions: one block per cue. Edited ones carry an accent edge, hidden ones are dashed. */
+.tl-block.tl-cue {
+  background: color-mix(in srgb, var(--panel) 85%, var(--text));
+  border-color: var(--border);
+  color: var(--text);
+  gap: 3px;
+}
+.tl-block.tl-cue.edited { border-left: 3px solid var(--accent); }
+.tl-block.tl-cue.muted { background: var(--panel); border-style: dashed; opacity: 0.75; }
+.tl-block.tl-cue .tl-label { font-size: 10.5px; }
+.tl-cue-hidden { flex: 0 0 auto; color: var(--muted); position: relative; z-index: 1; }
+.tl-block.item-dragging { z-index: 3; box-shadow: 0 0 0 1px var(--accent); }
+.tl-cue-editor {
+  position: absolute;
+  top: 1px;
+  bottom: 1px;
+  z-index: 5;
+  min-width: 260px;
+  padding: 0 6px;
+  font-size: 11.5px;
+  border: 1px solid var(--accent);
+  border-radius: 3px;
+  background: var(--panel);
+  color: var(--text);
 }
 .tl-block.tl-bed {
   background: color-mix(in srgb, var(--accent-2) 22%, var(--panel));

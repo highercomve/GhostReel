@@ -228,6 +228,9 @@ pub struct LocalModels {
     /// and the script chat run the same binary with different values (see `config::VisionConfig`).
     pub runtime: HelperRuntime,
     pub concurrency: usize,
+    /// GhostPen models to release before a GPU load, so this helper gets the VRAM (see
+    /// `ghost_service::models_to_free`). Empty asks nothing of GhostPen.
+    pub free_ghostpen: Vec<crate::ghost_service::GhostModel>,
 }
 
 /// How much room the helper gets, and how it spends VRAM on it.
@@ -269,6 +272,10 @@ impl LocalLlm {
     pub fn model_name(&self) -> &str { &self.model_name }
 
     pub async fn start(m: &LocalModels) -> Result<Self, Error> {
+        // A chat/vision model on the GPU needs the VRAM a running GhostPen may be holding.
+        if m.vision.is_some() && !m.cpu {
+            crate::ghost_service::free_gpu_for_local_model(&m.free_ghostpen).await;
+        }
         let mut cmd = crate::proc::command(&m.helper);
         if let Some((model, mmproj)) = &m.vision {
             cmd.arg("--model").arg(model);
@@ -778,6 +785,7 @@ echo '{"id":1,"ok":true,"tokens":17}'
             cpu: true,
             runtime: Default::default(),
             concurrency: 1,
+            free_ghostpen: Vec::new(),
         })
         .await
         .unwrap();
@@ -802,7 +810,7 @@ cat >/dev/null
         for mmproj in [None, Some(projector.clone())] {
             let llm = LocalLlm::start(&LocalModels {
                 helper: helper.clone(), vision: Some((model.clone(), mmproj.clone())),
-                embed: None, cpu: true, runtime: Default::default(), concurrency: 1,
+                embed: None, cpu: true, runtime: Default::default(), concurrency: 1, free_ghostpen: Vec::new(),
             }).await.unwrap();
             let args = std::fs::read_to_string(dir.path().join("helper.args")).unwrap();
             let args: Vec<_> = args.lines().collect();
@@ -922,6 +930,7 @@ done
             cpu: false,
             runtime: Default::default(),
             concurrency: 1,
+            free_ghostpen: Vec::new(),
         };
         let mut llm = LocalLlm::start(&models).await.unwrap();
         assert_eq!(llm.embed_dim, Some(3));
@@ -968,6 +977,7 @@ done
             cpu: false,
             runtime: Default::default(),
             concurrency: 1,
+            free_ghostpen: Vec::new(),
         };
         let mut llm = LocalLlm::start(&models).await.unwrap();
 
@@ -1005,6 +1015,7 @@ done
             cpu: false,
             runtime: Default::default(),
             concurrency: 1,
+            free_ghostpen: Vec::new(),
         };
         let err = LocalLlm::start(&models).await.err().unwrap();
         assert!(err.to_string().contains("out of memory"), "{err}");

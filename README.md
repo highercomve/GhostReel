@@ -169,12 +169,14 @@ A real Greet Mag script-agent trial used an initial 28,275-token prompt, 128k al
 prefill took 39.7 seconds; cached later prefills took 0.6–2.5 seconds. The saved 57.6-second draft
 passed structural validation after repairs. This checks the agent pipeline, not editorial quality.
 
-Local script agents default to 30 research tool calls. Planning replies do not use this budget;
-a separate model-call ceiling prevents endless retries. Proposed shots are checked with
-`get_video`, spoken quotes with `get_transcript`, and the model reviews the resulting evidence
-before finalizing. Revisions introducing new ranges are checked again within the same budget.
-Missing coverage after repairs is flagged as incomplete research. Adjust the limit in Settings
-or `chat_model.max_tool_rounds`; 0 uses `script.local_tool_rounds` / `script.roomy_tool_rounds`.
+Script agents, clip workers and the clip orchestrator have no cap on research tool calls by
+default. A run ends when the model gives its answer, when you stop it, when the backend's
+timeout fires, or when the model keeps repeating the identical call (it is told to answer, then
+stopped). Planning replies do not count. Proposed shots are checked with `get_video`, spoken
+quotes with `get_transcript`, and the model reviews the resulting evidence before finalizing.
+Revisions introducing new ranges are checked again. Missing coverage after repairs is flagged as
+incomplete research. To cap the rounds of tool calls, set a number in Settings or
+`chat_model.max_tool_rounds`; 0 means no cap.
 
 New chat answers persist the actual model name, token count, decode rate and whole-turn time.
 When a server supplies token usage but no decode time, the footer explicitly labels its rate

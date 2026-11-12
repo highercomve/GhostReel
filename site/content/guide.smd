@@ -1,6 +1,6 @@
 ---
 .title = "Guide",
-.description = "Install GhostReel, set up its models, index your footage, search it, draft a script, and export the cut. Plus the command line and the MCP server for AI agents.",
+.description = "Install GhostReel, set up its models, index your footage, search it, draft a script, generate social clips, and export the cut. Plus the command line and the MCP server for AI agents.",
 .date = .date("2026-10-21T00:00:00"),
 .authors = ["GhostReel"],
 .layout = "page.shtml",
@@ -156,6 +156,45 @@ new version.
 Mark a finished video (for example, an edit someone already made by hand) as a
 **reference**: the chat studies its length, pacing and structure, but never
 uses it as footage. You can also remove a video from a project's library.
+
+# [Generate clips]($heading.id('clips'))
+
+Clips are short, self-contained moments for social media, taken from every
+selected video in a project. In the **Scripts** tab click **New cut**, choose
+**Clips**, and set how many you want, their shortest and longest length, the
+**Format** (original, 9:16 or 1:1) and, optionally, a brief such as *the
+strongest opinions about AI*. Then click **Generate clips**.
+
+[How a clip run works, from indexing to your review.](<$image.siteAsset("clips-pipeline.svg").alt("Indexing feeds five steps. Code finds candidates, workers score them in parallel, an orchestrator picks the best, code checks, frames and saves them as a clip set, and you review and export.")>)
+
+Code does everything that has a right answer, and models only make the
+editorial choices:
+
+1. **Candidates (code).** Sentence-bounded windows from each transcript.
+   A window never starts on an off-mic line, never spans a hole in the
+   transcript and avoids shaky stretches. Each one records what is on
+   screen, which faces are visible and who is speaking.
+2. **Workers (model, in parallel).** Each worker reads about ten minutes of
+   footage: the brief, the project glossary, the transcript and its
+   candidates. It returns the moments worth posting, scored. Workers can
+   call every GhostReel tool, the same tools as Sonar and MCP agents.
+3. **Orchestrator (model).** Merges the workers' picks, drops overlaps,
+   spreads the clips across videos and speakers, prefers faces for vertical
+   formats, keeps the best and writes each one's hook. If no orchestrator is
+   available, code picks instead.
+4. **Check, frame and save (code).** Each clip keeps whole sentences with a
+   breath before the cut and a short hold at the end. For 9:16 and 1:1 the
+   crop follows whoever is speaking, stacks two people, or puts a screen
+   share over the speaker's camera. The clips are saved together as a
+   **clip set**.
+5. **Review.** The clip set opens as a grid. **Accept** or **Reject** each
+   clip, open one in the editor to adjust it, then **Export accepted…** to
+   write full-size MP4s.
+
+Workers and the orchestrator can each use the built-in model, a model server
+or a coding-agent CLI. Pick them under **Agents** in the dialog. When several
+agents are available, the jobs are shared between them. A deleted clip set
+goes to **Recently deleted**, where you can restore it for 30 days.
 
 # [Preview and export]($heading.id('export'))
 

@@ -286,6 +286,153 @@ const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE videos ADD COLUMN category_tag TEXT;
     "#,
+    // v15 — transcription glossary (technical terms, names, Spanglish words and Whisper mishearings)
+    r#"
+    ALTER TABLE projects ADD COLUMN glossary_json TEXT;
+    "#,
+    // v16 — face tracking: face_tracks (track duration, face count, mean embedding, avg box height)
+    // and face_boxes (box normalized coordinates, score, landmarks, sharpness, cut_off).
+    r#"
+    CREATE TABLE face_tracks (
+        id INTEGER PRIMARY KEY,
+        video_id INTEGER NOT NULL REFERENCES videos(id) ON DELETE CASCADE,
+        start_s REAL NOT NULL,
+        end_s REAL NOT NULL,
+        n_faces INTEGER NOT NULL,
+        mean_embedding BLOB NOT NULL,
+        avg_box_h REAL NOT NULL
+    );
+    CREATE INDEX idx_face_tracks_video ON face_tracks(video_id);
+
+    CREATE TABLE face_boxes (
+        track_id INTEGER NOT NULL REFERENCES face_tracks(id) ON DELETE CASCADE,
+        t_s REAL NOT NULL,
+        x REAL NOT NULL,
+        y REAL NOT NULL,
+        w REAL NOT NULL,
+        h REAL NOT NULL,
+        score REAL NOT NULL,
+        landmarks_json TEXT NOT NULL,
+        sharpness REAL NOT NULL,
+        cut_off INTEGER NOT NULL
+    );
+    CREATE INDEX idx_face_boxes_track_ts ON face_boxes(track_id, t_s);
+    "#,
+    // v17 — people (project identities grouping face tracks, with name/handle/role for name
+    // tags), speaker turns (who talks when, by voice) and the link between them. `speaker` is a
+    // 1-based voice cluster label, stable within one run over a project. speaker_windows caches
+    // the voice embedding of every ~2 s window of speech so a re-run only embeds new videos;
+    // person_embeddings remembers faces merged into a person by hand so re-clustering keeps them
+    // together.
+    r#"
+    CREATE TABLE people (
+        id INTEGER PRIMARY KEY,
+        project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        name TEXT, handle TEXT, role TEXT,
+        face_embedding BLOB,
+        voice_embedding BLOB
+    );
+    CREATE INDEX idx_people_project ON people(project_id);
+    ALTER TABLE face_tracks ADD COLUMN person_id INTEGER REFERENCES people(id) ON DELETE SET NULL;
+    CREATE TABLE speaker_turns (
+        id INTEGER PRIMARY KEY,
+        video_id INTEGER NOT NULL REFERENCES videos(id) ON DELETE CASCADE,
+        start_s REAL NOT NULL, end_s REAL NOT NULL,
+        speaker INTEGER NOT NULL,
+        person_id INTEGER REFERENCES people(id) ON DELETE SET NULL,
+        confidence REAL
+    );
+    CREATE INDEX idx_speaker_turns_video ON speaker_turns(video_id, start_s);
+    ALTER TABLE transcript_segments ADD COLUMN speaker INTEGER;
+    ALTER TABLE transcript_segments ADD COLUMN person_id INTEGER;
+
+    CREATE TABLE speaker_windows (
+        id INTEGER PRIMARY KEY,
+        video_id INTEGER NOT NULL REFERENCES videos(id) ON DELETE CASCADE,
+        segment_id INTEGER REFERENCES transcript_segments(id) ON DELETE CASCADE,
+        start_s REAL NOT NULL,
+        end_s REAL NOT NULL,
+        embedding BLOB NOT NULL
+    );
+    CREATE INDEX idx_speaker_windows_video ON speaker_windows(video_id, start_s);
+    CREATE TABLE person_embeddings (
+        person_id INTEGER NOT NULL REFERENCES people(id) ON DELETE CASCADE,
+        embedding BLOB NOT NULL
+    );
+    CREATE INDEX idx_person_embeddings_person ON person_embeddings(person_id);
+    "#,
+    // v18 — clips. A clip set is one "Generate clips" run: its clips are ordinary one-clip scripts tagged with the set and `kind = 'clip'`, so
+    // check, preview, export and the editor work on them unchanged. `items_json` keeps what the
+    // run said about each clip (score, quote, why, accepted/rejected) for the grid.
+    r#"
+    ALTER TABLE scripts ADD COLUMN set_id TEXT;
+    ALTER TABLE scripts ADD COLUMN kind TEXT;
+    CREATE INDEX scripts_set ON scripts(set_id);
+    CREATE TABLE clip_sets (
+        id TEXT PRIMARY KEY,
+        project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        brief TEXT NOT NULL DEFAULT '',
+        created_at INTEGER NOT NULL,
+        options_json TEXT NOT NULL DEFAULT '{}',
+        items_json TEXT NOT NULL DEFAULT '[]',
+        log_json TEXT NOT NULL DEFAULT '{}'
+    );
+    CREATE INDEX clip_sets_project ON clip_sets(project_id);
+    "#,
+    // v19 — runs (`runs.rs`): every long job's label, state, steps, links to what it made and
+    // summary, whoever ran it (the app's queue or the CLI), so the history survives restarts.
+    r#"
+    CREATE TABLE runs (
+        id TEXT PRIMARY KEY,
+        project_id INTEGER REFERENCES projects(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL,
+        label TEXT NOT NULL,
+        state TEXT NOT NULL,
+        source TEXT NOT NULL DEFAULT 'app',
+        steps_json TEXT NOT NULL DEFAULT '[]',
+        links_json TEXT NOT NULL DEFAULT '[]',
+        summary TEXT,
+        error TEXT,
+        created_at INTEGER NOT NULL,
+        finished_at INTEGER
+    );
+    CREATE INDEX runs_project ON runs(project_id, created_at);
+    CREATE INDEX runs_created ON runs(created_at);
+    "#,
+    // v20 — the trash (`trash.rs`): deleting a cut, a script version or a clip set moves its rows
+    // here instead of removing them. One `trash` row per delete; the rows it took carry its id in
+    // `trash_id` (NULL = live) and every listing skips them. Restoring clears the id; rows trashed
+    // longer than `trash::KEEP_DAYS` are purged for good. No foreign key on `trash_id`: dropping a
+    // trash row must never bring its rows back by itself.
+    r#"
+    CREATE TABLE trash (
+        id TEXT PRIMARY KEY,
+        project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL,
+        title TEXT NOT NULL,
+        scripts INTEGER NOT NULL DEFAULT 0,
+        clips INTEGER NOT NULL DEFAULT 0,
+        link_json TEXT NOT NULL,
+        deleted_at INTEGER NOT NULL
+    );
+    CREATE INDEX trash_project ON trash(project_id, deleted_at);
+    ALTER TABLE scripts ADD COLUMN trash_id TEXT;
+    ALTER TABLE clip_sets ADD COLUMN trash_id TEXT;
+    CREATE INDEX scripts_trash ON scripts(trash_id);
+    CREATE INDEX clip_sets_trash ON clip_sets(trash_id);
+    "#,
+    // v21 — what GhostReel rendered itself (previews, clip and cut exports), by content hash, so
+    // the scanner never indexes its own output as footage when it lands in a watched folder.
+    // Hash, not path: a render moved or renamed is still a render. No foreign key on the script:
+    // a render stays one after its cut is deleted.
+    r#"
+    CREATE TABLE rendered_outputs (
+        content_hash TEXT PRIMARY KEY,
+        script_id INTEGER,
+        path TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+    );
+    "#,
 ];
 
 static REGISTER_VEC: Once = Once::new();
@@ -361,6 +508,122 @@ impl Db {
                 jerk: r.get(2)?,
                 motion: r.get(3)?,
                 sway: r.get(4)?,
+            })
+        })?;
+        Ok(rows.filter_map(Result::ok).collect())
+    }
+
+    /// Record face tracks for a video, replacing any earlier tracks.
+    pub fn set_face_tracks(&self, video_id: i64, tracks: &[crate::faces::FaceTrack]) -> Result<(), Error> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM face_tracks WHERE video_id = ?1", [video_id])?;
+        {
+            let mut insert_track = tx.prepare(
+                "INSERT INTO face_tracks (video_id, start_s, end_s, n_faces, mean_embedding, avg_box_h)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )?;
+            let mut insert_box = tx.prepare(
+                "INSERT INTO face_boxes (track_id, t_s, x, y, w, h, score, landmarks_json, sharpness, cut_off)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            )?;
+            for track in tracks {
+                let blob = crate::faces::embedding_to_blob(&track.mean_embedding);
+                insert_track.execute(rusqlite::params![
+                    video_id,
+                    track.start_s,
+                    track.end_s,
+                    track.n_faces as i64,
+                    blob,
+                    track.avg_box_h as f64,
+                ])?;
+                let track_id = tx.last_insert_rowid();
+                for b in &track.boxes {
+                    insert_box.execute(rusqlite::params![
+                        track_id,
+                        b.t_s,
+                        b.x as f64,
+                        b.y as f64,
+                        b.w as f64,
+                        b.h as f64,
+                        b.score as f64,
+                        b.landmarks_json,
+                        b.sharpness as f64,
+                        if b.cut_off { 1 } else { 0 },
+                    ])?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The face tracks of a video, ordered by start time.
+    pub fn face_tracks(&self, video_id: i64) -> Result<Vec<crate::faces::FaceTrack>, Error> {
+        let mut st = self.conn.prepare(
+            "SELECT id, video_id, start_s, end_s, n_faces, mean_embedding, avg_box_h
+             FROM face_tracks WHERE video_id = ?1 ORDER BY start_s, id",
+        )?;
+        let rows = st.query_map([video_id], |r| {
+            let blob: Vec<u8> = r.get(5)?;
+            let mean_embedding = crate::faces::blob_to_embedding(&blob).unwrap_or_default();
+            Ok(crate::faces::FaceTrack {
+                id: r.get(0)?,
+                video_id: r.get(1)?,
+                start_s: r.get(2)?,
+                end_s: r.get(3)?,
+                n_faces: r.get::<_, i64>(4)? as usize,
+                mean_embedding,
+                avg_box_h: r.get::<_, f64>(6)? as f32,
+                boxes: Vec::new(),
+            })
+        })?;
+        Ok(rows.filter_map(Result::ok).collect())
+    }
+
+    /// The face boxes for a video within [from_s, to_s].
+    pub fn face_boxes(&self, video_id: i64, from_s: f64, to_s: f64) -> Result<Vec<crate::faces::FaceBoxRecord>, Error> {
+        let mut st = self.conn.prepare(
+            "SELECT fb.track_id, fb.t_s, fb.x, fb.y, fb.w, fb.h, fb.score, fb.landmarks_json, fb.sharpness, fb.cut_off
+             FROM face_boxes fb
+             JOIN face_tracks ft ON ft.id = fb.track_id
+             WHERE ft.video_id = ?1 AND fb.t_s >= ?2 AND fb.t_s <= ?3
+             ORDER BY fb.t_s, fb.track_id",
+        )?;
+        let rows = st.query_map(rusqlite::params![video_id, from_s, to_s], |r| {
+            Ok(crate::faces::FaceBoxRecord {
+                track_id: r.get(0)?,
+                t_s: r.get(1)?,
+                x: r.get::<_, f64>(2)? as f32,
+                y: r.get::<_, f64>(3)? as f32,
+                w: r.get::<_, f64>(4)? as f32,
+                h: r.get::<_, f64>(5)? as f32,
+                score: r.get::<_, f64>(6)? as f32,
+                landmarks_json: r.get(7)?,
+                sharpness: r.get::<_, f64>(8)? as f32,
+                cut_off: r.get::<_, i32>(9)? != 0,
+            })
+        })?;
+        Ok(rows.filter_map(Result::ok).collect())
+    }
+
+    /// All face boxes for a specific track, ordered by time.
+    pub fn face_boxes_for_track(&self, track_id: i64) -> Result<Vec<crate::faces::FaceBoxRecord>, Error> {
+        let mut st = self.conn.prepare(
+            "SELECT track_id, t_s, x, y, w, h, score, landmarks_json, sharpness, cut_off
+             FROM face_boxes WHERE track_id = ?1 ORDER BY t_s",
+        )?;
+        let rows = st.query_map([track_id], |r| {
+            Ok(crate::faces::FaceBoxRecord {
+                track_id: r.get(0)?,
+                t_s: r.get(1)?,
+                x: r.get::<_, f64>(2)? as f32,
+                y: r.get::<_, f64>(3)? as f32,
+                w: r.get::<_, f64>(4)? as f32,
+                h: r.get::<_, f64>(5)? as f32,
+                score: r.get::<_, f64>(6)? as f32,
+                landmarks_json: r.get(7)?,
+                sharpness: r.get::<_, f64>(8)? as f32,
+                cut_off: r.get::<_, i32>(9)? != 0,
             })
         })?;
         Ok(rows.filter_map(Result::ok).collect())
@@ -544,6 +807,91 @@ mod tests {
     }
 
     #[test]
+    fn clip_migration_keeps_scripts_and_adds_sets() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v16.db");
+        register_sqlite_vec();
+        {
+            let mut conn = Connection::open(&path).unwrap();
+            let tx = conn.transaction().unwrap();
+            for sql in &MIGRATIONS[0..16] {
+                tx.execute_batch(sql).unwrap();
+            }
+            tx.pragma_update(None, "user_version", 16).unwrap();
+            tx.execute_batch(
+                "INSERT INTO projects(id, name, created_at) VALUES (1, 'P', 100);
+                 INSERT INTO scripts(id, project_id, title, version, script_json, created_at)
+                     VALUES (5, 1, 'Cut', 1, '{\"title\":\"Cut\",\"beats\":[]}', 1);",
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.schema_version().unwrap(), MIGRATIONS.len() as u32);
+        let (set_id, kind): (Option<String>, Option<String>) =
+            db.conn.query_row("SELECT set_id, kind FROM scripts WHERE id = 5", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert_eq!((set_id, kind), (None, None));
+        let sets: i64 = db.conn.query_row("SELECT count(*) FROM clip_sets", [], |r| r.get(0)).unwrap();
+        assert_eq!(sets, 0);
+        let s = crate::script::load(&db, 5).unwrap();
+        assert!(s.script.captions.is_none(), "old scripts keep captions off");
+    }
+
+    #[test]
+    fn runs_migration_keeps_clip_sets() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v18.db");
+        register_sqlite_vec();
+        {
+            let mut conn = Connection::open(&path).unwrap();
+            let tx = conn.transaction().unwrap();
+            for sql in &MIGRATIONS[0..18] {
+                tx.execute_batch(sql).unwrap();
+            }
+            tx.pragma_update(None, "user_version", 18).unwrap();
+            tx.execute_batch(
+                "INSERT INTO projects(id, name, created_at) VALUES (1, 'P', 100);
+                 INSERT INTO clip_sets(id, project_id, created_at) VALUES ('cs1', 1, 5);",
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.schema_version().unwrap(), MIGRATIONS.len() as u32);
+        let sets: i64 = db.conn.query_row("SELECT count(*) FROM clip_sets", [], |r| r.get(0)).unwrap();
+        assert_eq!(sets, 1);
+        assert!(db.runs_for_project(1, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn trash_migration_keeps_every_cut_and_clip_set_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v19.db");
+        register_sqlite_vec();
+        {
+            let mut conn = Connection::open(&path).unwrap();
+            let tx = conn.transaction().unwrap();
+            for sql in &MIGRATIONS[0..19] {
+                tx.execute_batch(sql).unwrap();
+            }
+            tx.pragma_update(None, "user_version", 19).unwrap();
+            tx.execute_batch(
+                "INSERT INTO projects(id, name, created_at) VALUES (1, 'P', 100);
+                 INSERT INTO clip_sets(id, project_id, created_at) VALUES ('cs1', 1, 5);
+                 INSERT INTO scripts(id, project_id, title, version, script_json, created_at, set_id, kind)
+                     VALUES (5, 1, 'Clip', 1, '{\"title\":\"Clip\",\"beats\":[]}', 1, 'cs1', 'clip');",
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.schema_version().unwrap(), MIGRATIONS.len() as u32);
+        assert_eq!(crate::script::list(&db, 1).unwrap().len(), 1);
+        assert_eq!(crate::clips::list_sets(&db, 1).unwrap().len(), 1);
+        assert!(crate::trash::list(&db, None).unwrap().is_empty());
+    }
+
+    #[test]
     fn v2_to_v3_adds_chat_and_scripts() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("v2.db");
@@ -600,6 +948,14 @@ mod tests {
             })
             .unwrap();
         assert!(pipeline_col_exists);
+
+        let glossary_col_exists: bool = db
+            .conn
+            .query_row("SELECT count(*) FROM pragma_table_info('projects') WHERE name = 'glossary_json'", [], |r| {
+                Ok(r.get::<_, i64>(0)? > 0)
+            })
+            .unwrap();
+        assert!(glossary_col_exists);
 
         let fk: bool = db.conn.pragma_query_value(None, "foreign_keys", |r| r.get(0)).unwrap();
         assert!(fk);

@@ -422,6 +422,14 @@ async fn dispatch(app: &AppHandle, cmd: &str, args: Value) -> Result<Value, Stri
             let (project_id,) = args!(args; project_id: i64);
             ok(crate::project_view(project_id)?)
         }
+        "get_project_glossary" => {
+            let (project_id,) = args!(args; project_id: i64);
+            ok(crate::get_project_glossary(project_id)?)
+        }
+        "set_project_glossary" => {
+            let (project_id, glossary) = args!(args; project_id: i64, glossary: ghostreel_core::glossary::Glossary);
+            ok(crate::set_project_glossary(project_id, glossary)?)
+        }
         "exclude_video" => {
             let (project_id, video_id, role) = args!(args; project_id: i64, video_id: i64, role: String);
             ok(crate::exclude_video(project_id, video_id, role)?)
@@ -477,6 +485,35 @@ async fn dispatch(app: &AppHandle, cmd: &str, args: Value) -> Result<Value, Stri
             let (project_id, force) = args!(args; project_id: i64, force: Option<bool>);
             ok(crate::enqueue_steadiness(app.clone(), queue(), project_id, force).await?)
         }
+        "enqueue_faces" => {
+            let (project_id, force) = args!(args; project_id: i64, force: Option<bool>);
+            ok(crate::enqueue_faces(app.clone(), queue(), project_id, force).await?)
+        }
+        "enqueue_speakers" => {
+            let (project_id, force) = args!(args; project_id: i64, force: Option<bool>);
+            ok(crate::enqueue_speakers(app.clone(), queue(), project_id, force).await?)
+        }
+        "project_people" => {
+            let (project_id,) = args!(args; project_id: i64);
+            ok(crate::project_people(project_id)?)
+        }
+        "set_person" => {
+            let (project_id, person_id, name, handle, role) = args!(args; project_id: i64, person_id: i64,
+                name: Option<String>, handle: Option<String>, role: Option<String>);
+            ok(crate::set_person(project_id, person_id, name, handle, role)?)
+        }
+        "merge_people" => {
+            let (project_id, keep_id, merge_id) = args!(args; project_id: i64, keep_id: i64, merge_id: i64);
+            ok(crate::merge_people(project_id, keep_id, merge_id)?)
+        }
+        "video_speakers" => {
+            let (video_id, from_s, to_s) = args!(args; video_id: i64, from_s: Option<f64>, to_s: Option<f64>);
+            ok(crate::video_speakers(video_id, from_s, to_s)?)
+        }
+        "person_thumbnail" => {
+            let (project_id, person_id) = args!(args; project_id: i64, person_id: i64);
+            ok(crate::person_thumbnail(project_id, person_id).await?)
+        }
         "redo_project_stage" => {
             let (project_id, stage) = args!(args; project_id: i64, stage: String);
             ok(crate::redo_project_stage(app.clone(), queue(), project_id, stage).await?)
@@ -487,8 +524,8 @@ async fn dispatch(app: &AppHandle, cmd: &str, args: Value) -> Result<Value, Stri
             ok(crate::set_chat_system_prompt(prompt)?)
         }
         "enqueue_preview" => {
-            let (script_id, burn_titles, burn_narration, normalize_audio, out) = args!(args;
-                script_id: i64, burn_titles: bool, burn_narration: bool, normalize_audio: bool,
+            let (script_id, burn_titles, burn_narration, burn_captions, normalize_audio, out) = args!(args;
+                script_id: i64, burn_titles: bool, burn_narration: bool, burn_captions: bool, normalize_audio: bool,
                 out: Option<String>);
             ok(crate::enqueue_preview(
                 app.clone(),
@@ -496,10 +533,56 @@ async fn dispatch(app: &AppHandle, cmd: &str, args: Value) -> Result<Value, Stri
                 script_id,
                 burn_titles,
                 burn_narration,
+                burn_captions,
                 normalize_audio,
                 out,
             )
             .await?)
+        }
+        "list_agents" => ok(crate::agents::list_agents()?),
+        "save_agents" => {
+            let (agents, selection) = args!(args; agents: Vec<ghostreel_core::agents::AgentSpec>, selection: ghostreel_core::agents::AgentSelection);
+            ok(crate::agents::save_agents(agents, selection)?)
+        }
+        "test_agent" => {
+            let (id,) = args!(args; id: String);
+            ok(crate::agents::test_agent(id).await?)
+        }
+        "resolve_agents" => {
+            let (run, cut, target) = args!(args;
+                run: Option<ghostreel_core::agents::AgentSelection>,
+                cut: Option<ghostreel_core::agents::AgentSelection>,
+                target: Option<ghostreel_core::agents::WorkTarget>);
+            ok(crate::agents::resolve_agents(run, cut, target)?)
+        }
+        "agent_status" => ok(crate::agents::agent_status().await?),
+        "generate_clips" => {
+            let (project_id, options) = args!(args; project_id: i64, options: ghostreel_core::clips::ClipOptions);
+            ok(crate::generate_clips(app.clone(), queue(), project_id, options).await?)
+        }
+        "clips_preflight" => {
+            let (project_id, options) = args!(args; project_id: i64, options: ghostreel_core::clips::ClipOptions);
+            ok(crate::clips_preflight(project_id, options).await?)
+        }
+        "list_clip_sets" => {
+            let (project_id,) = args!(args; project_id: i64);
+            ok(crate::list_clip_sets(project_id)?)
+        }
+        "get_clip_set" => {
+            let (set_id,) = args!(args; set_id: String);
+            ok(crate::get_clip_set(set_id)?)
+        }
+        "set_clip_status" => {
+            let (set_id, script_id, status) = args!(args; set_id: String, script_id: i64, status: String);
+            ok(crate::set_clip_status(set_id, script_id, status)?)
+        }
+        "delete_clip_set" => {
+            let (set_id,) = args!(args; set_id: String);
+            ok(crate::delete_clip_set(set_id)?)
+        }
+        "export_clip_set" => {
+            let (set_id, dir, accepted_only) = args!(args; set_id: String, dir: String, accepted_only: bool);
+            ok(crate::export_clip_set(app.clone(), queue(), set_id, dir, accepted_only).await?)
         }
         "enqueue_export" => {
             let (script_id, format, path) = args!(args; script_id: i64, format: String, path: String);
@@ -514,6 +597,26 @@ async fn dispatch(app: &AppHandle, cmd: &str, args: Value) -> Result<Value, Stri
             ok(crate::get_script_preview(script_id)?)
         }
         "queue_list" => ok(crate::queue_list(queue()).await?),
+        "list_runs" => {
+            let (project_id, limit) = args!(args; project_id: Option<i64>, limit: Option<usize>);
+            ok(crate::list_runs(project_id, limit)?)
+        }
+        "run_links_state" => {
+            let (links,) = args!(args; links: Vec<ghostreel_core::runs::RunLink>);
+            ok(crate::run_links_state(links)?)
+        }
+        "list_trash" => {
+            let (project_id,) = args!(args; project_id: i64);
+            ok(crate::list_trash(project_id)?)
+        }
+        "restore_trash" => {
+            let (trash_id,) = args!(args; trash_id: String);
+            ok(crate::restore_trash(trash_id)?)
+        }
+        "restore_run_link" => {
+            let (link,) = args!(args; link: ghostreel_core::runs::RunLink);
+            ok(crate::restore_run_link(link)?)
+        }
         "cancel_task" => {
             let (id,) = args!(args; id: u64);
             ok(crate::cancel_task(app.clone(), queue(), id).await?)
@@ -613,12 +716,21 @@ async fn dispatch(app: &AppHandle, cmd: &str, args: Value) -> Result<Value, Stri
         }
         "get_script" => {
             let (script_id,) = args!(args; script_id: i64);
-            ok(crate::get_script(script_id)?)
+            ok(crate::get_script(app.clone(), queue(), script_id).await?)
+        }
+        "check_script" => {
+            let (project_id, script) = args!(args; project_id: i64, script: Script);
+            ok(crate::check_script(app.clone(), queue(), project_id, script).await?)
+        }
+        "apply_script_fix" => {
+            let (project_id, script, fix) = args!(args;
+                project_id: i64, script: Script, fix: ghostreel_core::script::FixAction);
+            ok(crate::apply_script_fix(app.clone(), queue(), project_id, script, fix).await?)
         }
         "save_script" => {
             let (project_id, script, session_id) = args!(args;
                 project_id: i64, script: Script, session_id: Option<i64>);
-            ok(crate::save_script(project_id, script, session_id)?)
+            ok(crate::save_script(app.clone(), queue(), project_id, script, session_id).await?)
         }
         "delete_script" => {
             let (script_id,) = args!(args; script_id: i64);
@@ -627,6 +739,18 @@ async fn dispatch(app: &AppHandle, cmd: &str, args: Value) -> Result<Value, Stri
         "delete_script_cut" => {
             let (project_id, title) = args!(args; project_id: i64, title: String);
             ok(crate::delete_script_cut(project_id, title)?)
+        }
+        "script_captions" => {
+            let (script,) = args!(args; script: Script);
+            ok(crate::script_captions(script)?)
+        }
+        "script_overlays" => {
+            let (script,) = args!(args; script: Script);
+            ok(crate::script_overlays(script)?)
+        }
+        "script_framing" => {
+            let (script,) = args!(args; script: Script);
+            ok(crate::script_framing(script)?)
         }
         "web_status" => ok(crate::web_status(app.state::<WebServer>())?),
         // Changing who can reach the server is left to someone at the machine.
