@@ -43,6 +43,7 @@ pub fn phase_label(phase: &str) -> String {
         "steadiness" => "Measuring camera shake",
         "faces" => "Finding faces",
         "speakers" => "Finding speakers",
+        "speech" => "Finding speech",
         // Clips.
         "candidates" => "Finding candidate moments",
         "workers" => "Scoring candidates",
@@ -611,8 +612,7 @@ impl Db {
     /// Call once at start-up, before that source starts new runs. Returns how many.
     pub fn interrupt_stale_runs(&self, source: &str) -> Result<usize, Error> {
         let now = crate::projects::now();
-        let mut stmt =
-            self.conn.prepare("SELECT * FROM runs WHERE source = ?1 AND state IN ('running', 'queued')")?;
+        let mut stmt = self.conn.prepare("SELECT * FROM runs WHERE source = ?1 AND state IN ('running', 'queued')")?;
         let stale = stmt.query_map([source], row_to_run)?.collect::<Result<Vec<_>, _>>()?;
         for mut run in stale.iter().cloned() {
             let mut log = StepLog { steps: run.steps };
@@ -780,6 +780,7 @@ mod tests {
         assert_eq!(phase_label("transcribe_local"), "Transcribing");
         assert_eq!(phase_label("orchestrator"), "Choosing the best clips");
         assert_eq!(phase_label("steadiness"), "Measuring camera shake");
+        assert_eq!(phase_label("speech"), "Finding speech");
         assert_eq!(phase_label("export_clips"), "Export clips");
         assert_eq!(phase_label(""), "");
     }

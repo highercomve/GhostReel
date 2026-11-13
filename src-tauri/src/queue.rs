@@ -76,6 +76,18 @@ pub enum TaskKind {
         #[serde(default)]
         force: bool,
     },
+    /// Find where speech is from the audio itself (`speech.rs`).
+    Speech {
+        project_id: i64,
+        #[serde(default)]
+        force: bool,
+    },
+    /// Split speech videos into titled chapters (`chapters.rs`).
+    Chapters {
+        project_id: i64,
+        #[serde(default)]
+        force: bool,
+    },
     /// Generate a clip set (`clips::run`).
     Clips {
         project_id: i64,
@@ -101,6 +113,8 @@ impl TaskKind {
             TaskKind::Steadiness { .. } => "steadiness",
             TaskKind::Faces { .. } => "faces",
             TaskKind::Speakers { .. } => "speakers",
+            TaskKind::Speech { .. } => "speech",
+            TaskKind::Chapters { .. } => "chapters",
             TaskKind::Clips { .. } => "clips",
             TaskKind::ExportClips { .. } => "export_clips",
         }
@@ -116,6 +130,8 @@ impl TaskKind {
             | TaskKind::Steadiness { project_id, .. }
             | TaskKind::Faces { project_id, .. }
             | TaskKind::Speakers { project_id, .. }
+            | TaskKind::Speech { project_id, .. }
+            | TaskKind::Chapters { project_id, .. }
             | TaskKind::Clips { project_id, .. } => Some(*project_id),
             TaskKind::RenderPreview { script_id, .. } | TaskKind::Export { script_id, .. } => {
                 db()?.conn.query_row("SELECT project_id FROM scripts WHERE id = ?1", [script_id], |r| r.get(0)).ok()
@@ -332,7 +348,7 @@ impl Reporter {
         self.send(Report::Chat { progress, note, events });
     }
 
-    /// What the indexer (and its steadiness / faces / speakers passes) says, as reports.
+    /// What the indexer (and its steadiness / faces / speakers / speech passes) says, as reports.
     pub fn index_event(&self, e: &index::Event) {
         match e.run_report() {
             Some(index::EventReport::Progress(p)) => self.snapshot(p, None),
@@ -627,6 +643,10 @@ async fn run_task(
             run_analysis(rep, project_id, force, cancel, Analysis::Steadiness).await
         }
         TaskKind::Faces { project_id, force } => run_analysis(rep, project_id, force, cancel, Analysis::Faces).await,
+        TaskKind::Speech { project_id, force } => run_analysis(rep, project_id, force, cancel, Analysis::Speech).await,
+        TaskKind::Chapters { project_id, force } => {
+            run_analysis(rep, project_id, force, cancel, Analysis::Chapters).await
+        }
         TaskKind::Speakers { project_id, force } => {
             run_analysis(rep, project_id, force, cancel, Analysis::Speakers).await
         }
@@ -726,6 +746,8 @@ enum Analysis {
     Steadiness,
     Faces,
     Speakers,
+    Speech,
+    Chapters,
 }
 
 /// "Measured camera steadiness on 3 of 5 videos" / "All 5 videos already … (up to date)".
@@ -784,6 +806,31 @@ async fn run_analysis(
                 "Tracked faces on",
                 "already tracked for faces",
             )
+        }
+        Analysis::Speech => {
+            let mut tracker = Tracker::new(&[("speech", 1.0)]);
+            let s = index::run_speech_jobs(&mut db, &rt, &opts, force, &mut tracker, &mut sink)
+                .await
+                .map_err(|e| e.to_string())?;
+            measured_line(s.measured, s.total, "Found speech on all", "Found speech on", "already measured for speech")
+        }
+        Analysis::Chapters => {
+            let mut tracker = Tracker::new(&[("chapters", 1.0)]);
+            let run = index::ChaptersRun { paths: &p, config: &config, force, refresh_titles: false };
+            let s = index::run_chapter_jobs(&mut db, &opts, &run, &mut tracker, &mut sink)
+                .await
+                .map_err(|e| e.to_string())?;
+            let mut line = measured_line(
+                s.videos,
+                s.total,
+                "Split chapters of all",
+                "Split chapters of",
+                "already split into chapters",
+            );
+            if let Some(note) = &s.model_note {
+                line.push_str(&format!(" ({note})"));
+            }
+            line
         }
         Analysis::Speakers => {
             let mut tracker = Tracker::new(&[("speakers", 1.0)]);
@@ -969,8 +1016,8 @@ async fn run_export_clips(
             files.len(),
             if files.len() == 1 { "clip" } else { "clips" }
         ))
-            .link(RunLink::ClipSet { id: set_id })
-            .file(dir)),
+        .link(RunLink::ClipSet { id: set_id })
+        .file(dir)),
         Err(ghostreel_core::Error::Preview(s)) if s == "cancelled" => Ok(Outcome::cancelled()),
         Err(e) if e.to_string().contains(ghostreel_core::chat::CANCELLED) => Ok(Outcome::cancelled()),
         Err(e) => Err(e.to_string()),
@@ -1014,9 +1061,10 @@ async fn run_chat(
     let db = Db::open(&p.db_file()).map_err(|e| e.to_string())?;
     // The cut's agent choice (else the app's) answers, holding its endpoint's slot for the turn.
     let cut = ghostreel_core::chat::cut_agents(&db, script_id, Some(session_id));
-    let lease = ghostreel_core::chat::lease_backend(&p, &config, None, cut.as_ref(), |w| rep.working(0.0, "waiting", w))
-        .await
-        .map_err(|e| e.to_string())?;
+    let lease =
+        ghostreel_core::chat::lease_backend(&p, &config, None, cut.as_ref(), |w| rep.working(0.0, "waiting", w))
+            .await
+            .map_err(|e| e.to_string())?;
     let (backend, _slot, max_tool_rounds) = (lease.backend, lease.slot, lease.max_tool_rounds);
     let setup = runtime::resolve_embed(&p, &config).await;
     let embedder = runtime::start_embedder(&setup, |_, _| {}).await.ok();

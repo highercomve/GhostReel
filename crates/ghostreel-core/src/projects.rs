@@ -36,6 +36,12 @@ pub struct PipelineConfig {
     pub faces: bool,
     #[serde(default = "default_true")]
     pub speakers: bool,
+    /// Where speech is, from the audio itself (`speech.rs`): the cuts are placed on it.
+    #[serde(default = "default_true")]
+    pub speech: bool,
+    /// Each speech video split into topical chapters with titles (`chapters.rs`): `get_outline`.
+    #[serde(default = "default_true")]
+    pub chapters: bool,
 }
 
 impl Default for PipelineConfig {
@@ -49,6 +55,8 @@ impl Default for PipelineConfig {
             steadiness: true,
             faces: true,
             speakers: true,
+            speech: true,
+            chapters: true,
         }
     }
 }
@@ -64,6 +72,8 @@ impl PipelineConfig {
             "steadiness" => self.steadiness,
             "faces" => self.faces,
             "speakers" => self.speakers,
+            "speech" => self.speech,
+            "chapters" => self.chapters,
             _ => true,
         }
     }
@@ -78,6 +88,8 @@ impl PipelineConfig {
             "steadiness" => self.steadiness = enabled,
             "faces" => self.faces = enabled,
             "speakers" => self.speakers = enabled,
+            "speech" => self.speech = enabled,
+            "chapters" => self.chapters = enabled,
             _ => return Err(Error::Invalid(format!("unknown pipeline stage '{stage}'"))),
         }
         Ok(())
@@ -108,6 +120,12 @@ impl PipelineConfig {
         }
         if self.speakers {
             stages.push("speakers");
+        }
+        if self.speech {
+            stages.push("speech");
+        }
+        if self.chapters {
+            stages.push("chapters");
         }
         stages
     }
@@ -581,7 +599,18 @@ mod tests {
         assert!(default_proj.pipeline.faces);
         assert_eq!(
             default_proj.pipeline.enabled_stages(),
-            vec!["probe", "transcribe", "frames", "describe", "embed", "steadiness", "faces", "speakers"]
+            vec![
+                "probe",
+                "transcribe",
+                "frames",
+                "describe",
+                "embed",
+                "steadiness",
+                "faces",
+                "speakers",
+                "speech",
+                "chapters"
+            ]
         );
 
         let custom_pipeline = PipelineConfig {
@@ -593,6 +622,8 @@ mod tests {
             steadiness: false,
             faces: false,
             speakers: false,
+            speech: false,
+            chapters: false,
         };
         let b_roll = db.create_project(&NewProject::named("BRoll").with_pipeline(custom_pipeline)).unwrap();
         assert!(!b_roll.pipeline.transcribe);
@@ -614,5 +645,8 @@ mod tests {
         let deserialized: PipelineConfig = serde_json::from_str(old_json).unwrap();
         assert!(deserialized.steadiness);
         assert!(deserialized.faces);
+        // An existing project picks the speech stage up as soon as it is shipped.
+        assert!(deserialized.speech);
+        assert!(deserialized.chapters);
     }
 }

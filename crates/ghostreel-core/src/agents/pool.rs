@@ -47,7 +47,12 @@ pub struct AgentJob {
 /// How a resolved agent is reached.
 #[derive(Clone)]
 pub enum AgentTarget {
-    Server { url: String, model: String, api_key: String, timeout_s: u64 },
+    Server {
+        url: String,
+        model: String,
+        api_key: String,
+        timeout_s: u64,
+    },
     Cli(CliAgentConfig),
     /// Local / MLX helper: started on the agent's first job, stopped after its last.
     Local(VisionSetup),
@@ -87,7 +92,14 @@ impl PoolAgent {
             }),
             other => AgentTarget::Local(other.clone()),
         };
-        Ok(Self { capacity: key.capacity(spec.max_concurrent), describe: setup.describe(), key, target, spec, max_tool_rounds: 0 })
+        Ok(Self {
+            capacity: key.capacity(spec.max_concurrent),
+            describe: setup.describe(),
+            key,
+            target,
+            spec,
+            max_tool_rounds: 0,
+        })
     }
 }
 
@@ -199,7 +211,11 @@ pub fn share_line(agents: &[AgentLoad]) -> String {
         .iter()
         .filter(|a| a.done + a.failed > 0)
         .map(|a| {
-            if a.failed > 0 { format!("{} {} ({} failed)", a.id, a.done, a.failed) } else { format!("{} {}", a.id, a.done) }
+            if a.failed > 0 {
+                format!("{} {} ({} failed)", a.id, a.done, a.failed)
+            } else {
+                format!("{} {}", a.id, a.done)
+            }
         })
         .collect::<Vec<_>>()
         .join(" · ")
@@ -264,7 +280,9 @@ impl JobRunner for ModelRunner {
                 })
             }
             AgentTarget::External => {
-                Box::pin(async move { Err(AgentError::new(id, AgentErrorKind::Other, "this agent has no model runner")) })
+                Box::pin(
+                    async move { Err(AgentError::new(id, AgentErrorKind::Other, "this agent has no model runner")) },
+                )
             }
         }
     }
@@ -325,10 +343,9 @@ impl AgentPool {
         max_parallel: usize,
         timeout_s: u64,
     ) -> Result<Self, Error> {
-        let setups = futures_util::future::join_all(
-            specs.iter().map(|s| crate::runtime::resolve_agent(paths, config, s, role)),
-        )
-        .await;
+        let setups =
+            futures_util::future::join_all(specs.iter().map(|s| crate::runtime::resolve_agent(paths, config, s, role)))
+                .await;
         let mut agents = Vec::new();
         let mut skipped = Vec::new();
         let cooldowns = Cooldowns::global();
@@ -358,7 +375,12 @@ impl AgentPool {
         Ok(pool)
     }
 
-    pub fn new(agents: Vec<PoolAgent>, max_parallel: usize, slots: Arc<SlotRegistry>, runner: Arc<dyn JobRunner>) -> Self {
+    pub fn new(
+        agents: Vec<PoolAgent>,
+        max_parallel: usize,
+        slots: Arc<SlotRegistry>,
+        runner: Arc<dyn JobRunner>,
+    ) -> Self {
         let cap: usize = agents.iter().map(|a| a.capacity).sum();
         Self {
             agents: agents.into_iter().map(Arc::new).collect(),
@@ -427,7 +449,8 @@ impl AgentPool {
             })
         });
         order.into_iter().find_map(|i| {
-            let slot = held.remove(&i).or_else(|| self.slots.try_acquire(&self.agents[i].key, self.agents[i].capacity))?;
+            let slot =
+                held.remove(&i).or_else(|| self.slots.try_acquire(&self.agents[i].key, self.agents[i].capacity))?;
             Some((i, slot))
         })
     }
@@ -457,12 +480,26 @@ impl AgentPool {
         let mut pending: VecDeque<Pending> = jobs
             .into_iter()
             .enumerate()
-            .map(|(index, job)| Pending { index, job: Arc::new(job), avoid: None, attempts: Vec::new(), failures: 0, busy: 0 })
+            .map(|(index, job)| Pending {
+                index,
+                job: Arc::new(job),
+                avoid: None,
+                attempts: Vec::new(),
+                failures: 0,
+                busy: 0,
+            })
             .collect();
         let mut loads: Vec<AgentLoad> = self
             .agents
             .iter()
-            .map(|a| AgentLoad { id: a.spec.id.clone(), capacity: a.capacity, running: 0, done: 0, failed: 0, busy_s: 0.0 })
+            .map(|a| AgentLoad {
+                id: a.spec.id.clone(),
+                capacity: a.capacity,
+                running: 0,
+                done: 0,
+                failed: 0,
+                busy_s: 0.0,
+            })
             .collect();
         let mut running = vec![0usize; self.agents.len()];
         let mut health = vec![Health::Ready; self.agents.len()];
@@ -487,7 +524,8 @@ impl AgentPool {
                 running[ai] += 1;
                 loads[ai].running += 1;
                 used[ai] = true;
-                let (agent, job, runner, index) = (self.agents[ai].clone(), p.job.clone(), self.runner.clone(), p.index);
+                let (agent, job, runner, index) =
+                    (self.agents[ai].clone(), p.job.clone(), self.runner.clone(), p.index);
                 in_flight.insert(index, p);
                 set.spawn(async move {
                     let t0 = Instant::now();
@@ -599,7 +637,13 @@ impl AgentPool {
                         attempts: p.attempts,
                     });
                     let last = outcomes.last().expect("just pushed");
-                    on_progress(&PoolProgress { done: outcomes.len(), total, finished: Some(last), agents: &loads, event: None });
+                    on_progress(&PoolProgress {
+                        done: outcomes.len(),
+                        total,
+                        finished: Some(last),
+                        agents: &loads,
+                        event: None,
+                    });
                 }
             }
             let out = matches!(health[ai], Health::Out(_));

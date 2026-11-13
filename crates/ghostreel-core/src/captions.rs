@@ -272,9 +272,9 @@ fn split_piece_into_cues(text: &str, piece_start_s: f64, piece_end_s: f64, shape
 }
 
 /// Retrieve and format speech caption cues for a script cut.
-/// The words of a transcript segment spoken between `from` and `to`, when only part of the
-/// segment is inside a clip. Segments carry one time range for all their text (some run 20–50 s),
-/// so the share is estimated by character position, cut at word boundaries. Keeping the whole
+/// The words of a sentence spoken between `from` and `to`, when only part of the sentence is
+/// inside a clip. A sentence carries one time range for all its text, so the share is estimated by
+/// character position, cut at word boundaries. Keeping the whole
 /// text instead crammed 40 s of words into the 5 s a clip actually contained.
 fn words_in_range(text: &str, seg_start: f64, seg_end: f64, from: f64, to: f64) -> String {
     let len = seg_end - seg_start;
@@ -321,8 +321,14 @@ pub fn all_cues_for_script(db: &Db, script: &Script) -> Result<Vec<Cue>, Error> 
     sources.extend(bed_spans.iter().map(|b| (b.video_id, b.in_s, b.out_s, b.timeline_start_s)));
 
     let mut all_cues = Vec::new();
+    // Sentences, not Whisper's segments: a segment can run 30 s with one time range for all of it,
+    // so a clip that starts inside one got captions seconds out of step with the voice. A sentence's
+    // edges sit on the pauses of the measured speech (`sentence_split`).
+    for (video_id, ..) in &sources {
+        crate::sentence_split::ensure(db, *video_id)?;
+    }
     let mut st = db.conn.prepare(
-        "SELECT start_s, end_s, text FROM transcript_segments
+        "SELECT start_s, end_s, text FROM transcript_sentences
          WHERE video_id = ?1 AND start_s < ?2 AND end_s > ?3
          ORDER BY start_s ASC",
     )?;
@@ -478,7 +484,9 @@ mod tests {
                 clips,
                 notes: None,
                 bed,
+                card: None,
             }],
+            card_style: None,
         }
     }
 
@@ -504,7 +512,8 @@ mod tests {
 
         // Clip from 6.0 to 9.0 in source video, starting at timeline 0.0
         let script = make_script(
-            vec![ScriptClip {
+            vec![ScriptClip { exact: false,
+                sentences: None,
                 framing: None,
                 video_id: 1,
                 in_s: 6.0,
@@ -547,7 +556,8 @@ mod tests {
             .unwrap();
 
         let script = make_script(
-            vec![ScriptClip {
+            vec![ScriptClip { exact: false,
+                sentences: None,
                 framing: None,
                 video_id: 1,
                 in_s: 0.0,
@@ -606,7 +616,8 @@ mod tests {
             .unwrap();
 
         let script = make_script(
-            vec![ScriptClip {
+            vec![ScriptClip { exact: false,
+                sentences: None,
                 framing: None,
                 video_id: 1,
                 in_s: 0.0,
@@ -643,7 +654,8 @@ mod tests {
             .unwrap();
 
         let script = make_script(
-            vec![ScriptClip {
+            vec![ScriptClip { exact: false,
+                sentences: None,
                 framing: None,
                 video_id: 1,
                 in_s: 0.0,
@@ -652,7 +664,15 @@ mod tests {
                 why: None,
                 tracks: None,
             }],
-            Some(AudioBed { video_id: 2, in_s: 2.0, out_s: 6.0, why: None, inferred: false, tracks: None }),
+            Some(AudioBed {
+                sentences: None,
+                video_id: 2,
+                in_s: 2.0,
+                out_s: 6.0,
+                why: None,
+                inferred: false,
+                tracks: None,
+            }),
         );
 
         let cues = cues_for_script(&db, &script).unwrap();
@@ -712,7 +732,16 @@ Another cue\n\
     }
 
     fn clip(video_id: i64, in_s: f64, out_s: f64) -> ScriptClip {
-        ScriptClip { framing: None, video_id, in_s, out_s, audio: Audio::Source, why: None, tracks: None }
+        ScriptClip { exact: false,
+            sentences: None,
+            framing: None,
+            video_id,
+            in_s,
+            out_s,
+            audio: Audio::Source,
+            why: None,
+            tracks: None,
+        }
     }
 
     #[test]
@@ -742,7 +771,13 @@ Another cue\n\
                 end_s: Some(32.0),
                 hidden: false,
             },
-            crate::script::CueEdit { video_id: 1, src_start_s: 10.0, src_end_s: 12.0, hidden: true, ..Default::default() },
+            crate::script::CueEdit {
+                video_id: 1,
+                src_start_s: 10.0,
+                src_end_s: 12.0,
+                hidden: true,
+                ..Default::default()
+            },
         ];
         let cues = cues_for_script(&db, &script).unwrap();
         assert_eq!(cues.len(), 1, "the hidden cue is left out");

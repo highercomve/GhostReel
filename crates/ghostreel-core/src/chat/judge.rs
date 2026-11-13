@@ -583,7 +583,8 @@ mod tests {
                 narration: None,
                 on_screen_text: None,
                 title_layout: None,
-                clips: vec![ScriptClip {
+                clips: vec![ScriptClip { exact: false,
+                    sentences: None,
                     framing: None,
                     video_id: 2,
                     in_s: 0.0,
@@ -592,9 +593,19 @@ mod tests {
                     why: None,
                     tracks: None,
                 }],
-                bed: Some(AudioBed { video_id: 1, in_s: 0.0, out_s: 4.0, why: None, inferred: true, tracks: None }),
+                bed: Some(AudioBed {
+                    sentences: None,
+                    video_id: 1,
+                    in_s: 0.0,
+                    out_s: 4.0,
+                    why: None,
+                    inferred: true,
+                    tracks: None,
+                }),
                 notes: None,
+                card: None,
             }],
+            card_style: None,
         }
     }
 
@@ -842,7 +853,8 @@ mod tests {
             .unwrap();
 
         let mut script = bedded_script();
-        script.beats[0].clips[0] = ScriptClip {
+        script.beats[0].clips[0] = ScriptClip { exact: false,
+            sentences: None,
             framing: None,
             video_id: 1,
             in_s: 20.0,

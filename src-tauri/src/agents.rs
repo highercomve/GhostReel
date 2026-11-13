@@ -5,9 +5,9 @@ use ghostreel_core::agents::{
     self, AgentRole, AgentSelection, AgentSpec, AgentStatus, Availability, ResolvedSelection, SelectionSource,
     WorkTarget,
 };
-use std::collections::BTreeMap;
 use ghostreel_core::config::{Backend, Config};
 use serde::Serialize;
+use std::collections::BTreeMap;
 
 use crate::{CmdResult, err, paths};
 

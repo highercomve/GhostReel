@@ -396,11 +396,7 @@ async fn enqueue_faces(
 ) -> CmdResult<u64> {
     let name = open_db()?.project(project_id).map_err(err)?.name;
     let force = force.unwrap_or(false);
-    let label = if force {
-        format!("Re-analyze faces “{name}”")
-    } else {
-        format!("Analyze faces “{name}”")
-    };
+    let label = if force { format!("Re-analyze faces “{name}”") } else { format!("Analyze faces “{name}”") };
     Ok(queue.enqueue(&app, queue::TaskKind::Faces { project_id, force }, label).await)
 }
 
@@ -413,8 +409,35 @@ async fn enqueue_speakers(
 ) -> CmdResult<u64> {
     let name = open_db()?.project(project_id).map_err(err)?.name;
     let force = force.unwrap_or(false);
-    let label = if force { format!("Re-analyze speakers “{name}”") } else { format!("Analyze speakers “{name}”") };
+    let label =
+        if force { format!("Re-analyze speakers “{name}”") } else { format!("Analyze speakers “{name}”") };
     Ok(queue.enqueue(&app, queue::TaskKind::Speakers { project_id, force }, label).await)
+}
+
+#[tauri::command]
+async fn enqueue_speech(
+    app: AppHandle,
+    queue: State<'_, queue::Queue>,
+    project_id: i64,
+    force: Option<bool>,
+) -> CmdResult<u64> {
+    let name = open_db()?.project(project_id).map_err(err)?.name;
+    let force = force.unwrap_or(false);
+    let label = if force { format!("Re-analyze speech “{name}”") } else { format!("Analyze speech “{name}”") };
+    Ok(queue.enqueue(&app, queue::TaskKind::Speech { project_id, force }, label).await)
+}
+
+#[tauri::command]
+async fn enqueue_chapters(
+    app: AppHandle,
+    queue: State<'_, queue::Queue>,
+    project_id: i64,
+    force: Option<bool>,
+) -> CmdResult<u64> {
+    let name = open_db()?.project(project_id).map_err(err)?.name;
+    let force = force.unwrap_or(false);
+    let label = if force { format!("Re-split chapters “{name}”") } else { format!("Split chapters “{name}”") };
+    Ok(queue.enqueue(&app, queue::TaskKind::Chapters { project_id, force }, label).await)
 }
 
 #[tauri::command]
@@ -430,9 +453,7 @@ fn set_person(
     handle: Option<String>,
     role: Option<String>,
 ) -> CmdResult<ghostreel_core::speakers::Person> {
-    open_db()?
-        .set_person(project_id, person_id, name.as_deref(), handle.as_deref(), role.as_deref())
-        .map_err(err)
+    open_db()?.set_person(project_id, person_id, name.as_deref(), handle.as_deref(), role.as_deref()).map_err(err)
 }
 
 #[tauri::command]
@@ -477,6 +498,8 @@ async fn redo_project_stage(
     // Project-level analysis stages re-run in place rather than through the job pipeline.
     match stage.as_str() {
         "speakers" => return enqueue_speakers(app, queue, project_id, Some(true)).await,
+        "speech" => return enqueue_speech(app, queue, project_id, Some(true)).await,
+        "chapters" => return enqueue_chapters(app, queue, project_id, Some(true)).await,
         "faces" => return enqueue_faces(app, queue, project_id, Some(true)).await,
         _ => {}
     }
@@ -500,7 +523,7 @@ fn get_chat_settings() -> CmdResult<ChatSettingsView> {
     let config = Config::load(&paths()?.config_file).map_err(err)?;
     Ok(ChatSettingsView {
         system_prompt: config.chat.system_prompt,
-        default_system_prompt: ghostreel_core::chat::DEFAULT_EDITOR_PROMPT,
+        default_system_prompt: ghostreel_core::tools::INSTRUCTIONS,
     })
 }
 
@@ -511,7 +534,7 @@ fn set_chat_system_prompt(prompt: String) -> CmdResult<ChatSettingsView> {
     let mut config = Config::load(&p.config_file).map_err(err)?;
     let trimmed = prompt.trim();
     config.chat.system_prompt =
-        if trimmed == ghostreel_core::chat::DEFAULT_EDITOR_PROMPT.trim() { String::new() } else { trimmed.to_string() };
+        if trimmed == ghostreel_core::tools::INSTRUCTIONS.trim() { String::new() } else { trimmed.to_string() };
     config.save(&p.config_file).map_err(err)?;
     get_chat_settings()
 }
@@ -536,7 +559,14 @@ async fn enqueue_preview(
     Ok(queue
         .enqueue(
             &app,
-            queue::TaskKind::RenderPreview { script_id, burn_titles, burn_narration, burn_captions, normalize_audio, out },
+            queue::TaskKind::RenderPreview {
+                script_id,
+                burn_titles,
+                burn_narration,
+                burn_captions,
+                normalize_audio,
+                out,
+            },
             label,
         )
         .await)
@@ -1681,12 +1711,20 @@ async fn export_clip_set(
 ) -> CmdResult<u64> {
     let db = open_db()?;
     let set = ghostreel_core::clips::load_set(&db, &set_id).map_err(err)?;
-    let n = set.items.iter().filter(|i| if accepted_only { i.status == "accepted" } else { i.status != "rejected" }).count();
+    let n = set
+        .items
+        .iter()
+        .filter(|i| if accepted_only { i.status == "accepted" } else { i.status != "rejected" })
+        .count();
     if n == 0 {
         return Err(if accepted_only { "no accepted clips to export".into() } else { "no clips to export".into() });
     }
     Ok(queue
-        .enqueue(&app, queue::TaskKind::ExportClips { set_id, dir, accepted_only }, format!("Export {n} {}", if n == 1 { "clip" } else { "clips" }))
+        .enqueue(
+            &app,
+            queue::TaskKind::ExportClips { set_id, dir, accepted_only },
+            format!("Export {n} {}", if n == 1 { "clip" } else { "clips" }),
+        )
         .await)
 }
 
@@ -1755,6 +1793,8 @@ async fn save_script(
 ) -> CmdResult<SaveScriptView> {
     agents::check_selection(script.agents.as_ref())?;
     let db = open_db()?;
+    // A clip the editor wrote with sentence ids has no seconds yet.
+    ghostreel_core::sentences::resolve_script(&db, &mut script).map_err(|e| e.to_string())?;
     let _ = ghostreel_core::script::snap_to_segments(&db, &mut script).map_err(err)?;
     // The deterministic framing work (a vertical clip off a screen share, the closing hold on a
     // face), the same pass clip runs and imports get; what it did comes back as notes.
@@ -1781,6 +1821,22 @@ fn delete_script_cut(project_id: i64, title: String) -> CmdResult<ghostreel_core
     ghostreel_core::script::delete_cut(&db, project_id, &title, "app").map_err(err)
 }
 
+/// The script with its section cards generated (`on`) or the generated ones removed: a card before
+/// each beat that moves to another chapter, titled after it. Cards someone edited are kept.
+#[tauri::command]
+fn script_section_cards(
+    mut script: ghostreel_core::script::Script,
+    on: bool,
+) -> CmdResult<ghostreel_core::script::Script> {
+    if on {
+        let db = open_db()?;
+        ghostreel_core::cards::generate(&db, &mut script);
+    } else {
+        ghostreel_core::cards::clear(&mut script, false);
+    }
+    Ok(script)
+}
+
 #[tauri::command]
 fn script_captions(script: ghostreel_core::script::Script) -> CmdResult<Vec<ghostreel_core::captions::Cue>> {
     let db = open_db()?;
@@ -1798,9 +1854,7 @@ fn script_overlays(script: ghostreel_core::script::Script) -> CmdResult<ghostree
 /// The crop path of every framed clip in a script (vertical cuts of wide footage), so the live
 /// player crops exactly as a render will.
 #[tauri::command]
-fn script_framing(
-    script: ghostreel_core::script::Script,
-) -> CmdResult<Vec<ghostreel_core::framing::ClipFraming>> {
+fn script_framing(script: ghostreel_core::script::Script) -> CmdResult<Vec<ghostreel_core::framing::ClipFraming>> {
     let db = open_db()?;
     let ffmpeg = doctor::locate("ffmpeg");
     ghostreel_core::framing::plans_for_script(&db, ffmpeg.as_deref(), &script).map_err(err)
@@ -1998,6 +2052,8 @@ pub fn run() {
             enqueue_steadiness,
             enqueue_faces,
             enqueue_speakers,
+            enqueue_speech,
+            enqueue_chapters,
             project_people,
             set_person,
             merge_people,
@@ -2054,6 +2110,7 @@ pub fn run() {
             delete_script_cut,
             script_captions,
             script_overlays,
+            script_section_cards,
             script_framing,
             models_status,
             enqueue_model_download,

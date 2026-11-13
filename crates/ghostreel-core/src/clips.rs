@@ -826,6 +826,17 @@ fn format_line(opts: &ClipOptions) -> String {
 }
 
 /// One worker's prompt: a slice of one video's transcript and the candidates inside it.
+/// What a clip is judged on, and what code decides for the model so it does not fight it. In both
+/// the workers' and the orchestrator's prompts. Steers; the model still chooses.
+const CLIP_CRAFT: &str = "You choose the sentences; the exact cut points, breaths, holds and framing are placed by \
+code on the measured speech, so cut on sentence edges and do not pad. A sentence ends at a full stop, a change of \
+speaker or a real pause, so whole sentences are whole thoughts. What makes a clip work: a hook in its first 3 seconds \
+that stands alone (not a reply such as \"Exactly...\" or a connective leaning on a line before it), one idea, an \
+ending on a complete thought, a face on screen while someone speaks, and in a vertical (9:16) clip no \
+screen share unless the screen is the point. When tools are offered, a video's chapters and standout lines \
+(get_outline) show where its best moments are, and text is far cheaper than pictures: look at a frame \
+(get_frames) only when the picture decides.\n";
+
 pub fn worker_prompt(
     survey: &VideoSurvey,
     from_s: f64,
@@ -842,6 +853,7 @@ pub fn worker_prompt(
          attention in its first seconds, lands one complete thought, story or punchline, and ends on a \
          finished sentence.\n",
     );
+    p.push_str(CLIP_CRAFT);
     if opts.brief.trim().is_empty() {
         p.push_str("Brief: none — pick the strongest self-contained moments.\n");
     } else {
@@ -1020,6 +1032,7 @@ pub fn orchestrator_prompt(pool: &[Pick], opts: &ClipOptions, glossary: Option<&
         opts.count,
         format_line(opts)
     ));
+    p.push_str(CLIP_CRAFT);
     if !opts.brief.trim().is_empty() {
         p.push_str(&format!("Brief: {}\n", opts.brief.trim()));
     }
@@ -1130,22 +1143,26 @@ pub fn clip_script(pick: &Pick, index: usize, total: usize, opts: &ClipOptions) 
             narration: None,
             on_screen_text: Some(hook),
             title_layout: None,
-            clips: vec![ScriptClip {
+            clips: vec![ScriptClip { exact: false,
+                sentences: None,
                 video_id: pick.video_id,
                 in_s: pick.in_s,
                 out_s: pick.out_s,
                 audio: Audio::Source,
                 why: (!pick.quote.is_empty()).then(|| pick.quote.clone()),
-                tracks: None, framing: None,
+                tracks: None,
+                framing: None,
             }],
             bed: None,
             notes: None,
+            card: None,
         }],
         captions: Some(CaptionStyle::default()),
         title_style: None,
         caption_edits: Vec::new(),
         agents: None,
         framing,
+        card_style: None,
     }
 }
 
@@ -1171,7 +1188,11 @@ pub fn check_clips(
             project.id,
             &script,
             cfg,
-            &crate::script_check::CheckOptions { forbid_overlap: true, trim_min_s: Some(opts.min_s), ..Default::default() },
+            &crate::script_check::CheckOptions {
+                forbid_overlap: true,
+                trim_min_s: Some(opts.min_s),
+                ..Default::default()
+            },
         )?;
         let speech: f64 = script
             .beats
@@ -1565,9 +1586,12 @@ impl Backends {
             let llm = agent.llm_config(config, AgentRole::Orchestrator);
             orchestrator_timeout_s = llm.cli.timeout_secs.max(orchestrator_timeout_s);
             match crate::runtime::resolve_agent(paths, config, agent, AgentRole::Orchestrator).await {
-                crate::runtime::VisionSetup::Unavailable(why) => orchestrator_skipped = Some(format!("{}: {why}", agent.id)),
+                crate::runtime::VisionSetup::Unavailable(why) => {
+                    orchestrator_skipped = Some(format!("{}: {why}", agent.id))
+                }
                 setup => {
-                    orchestrator = Some(Orchestrator { agent: agent.clone(), setup, max_tool_rounds: llm.max_tool_rounds })
+                    orchestrator =
+                        Some(Orchestrator { agent: agent.clone(), setup, max_tool_rounds: llm.max_tool_rounds })
                 }
             }
         }
@@ -1816,14 +1840,20 @@ pub async fn run(
         let mut cb = |p: &PoolProgress| {
             // A rest, a drop or a busy pause: kept in the step, not just its passing note.
             if let Some(ev) = p.event {
-                let level =
-                    if matches!(ev.action, crate::agents::PoolAction::Retrying { .. }) { crate::runs::EventLevel::Info } else { crate::runs::EventLevel::Warning };
+                let level = if matches!(ev.action, crate::agents::PoolAction::Retrying { .. }) {
+                    crate::runs::EventLevel::Info
+                } else {
+                    crate::runs::EventLevel::Warning
+                };
                 on_progress.event(crate::runs::StepEvent::new(level, ev.message()).with_error(ev.error.clone()));
                 return;
             }
             let note = match p.finished {
                 Some(r) => match &r.value {
-                    Ok(_) => format!("Scored {}/{} windows ({} on {}: {:.0} s)", p.done, p.total, r.label, r.agent, r.seconds),
+                    Ok(_) => format!(
+                        "Scored {}/{} windows ({} on {}: {:.0} s)",
+                        p.done, p.total, r.label, r.agent, r.seconds
+                    ),
                     Err(e) => format!("Window {} failed: {}", r.label, shorten(&e.to_string(), 160)),
                 },
                 None => format!("Scored {}/{} windows", p.done, p.total),
@@ -1885,18 +1915,25 @@ pub async fn run(
             // Busy: asked again after a pause; quota gone: the endpoint rests for every feature.
             let key = crate::agents::EndpointKey::for_setup(setup);
             let timeout_s = backends.orchestrator_timeout_s;
-            let (orchestrator_access, orchestrator_trail) = match access.as_ref().map(|a| a.with_max_rounds(*max_tool_rounds).with_trail()) {
-                Some((a, t)) => (Some(a), Some(t)),
-                None => (None, None),
-            };
+            let (orchestrator_access, orchestrator_trail) =
+                match access.as_ref().map(|a| a.with_max_rounds(*max_tool_rounds).with_trail()) {
+                    Some((a, t)) => (Some(a), Some(t)),
+                    None => (None, None),
+                };
             let answer = crate::agents::call_once(&agent.id, key.as_ref(), || {
                 let prompt = &prompt;
                 let access = orchestrator_access.as_ref();
                 async move {
                     let mut backend = crate::chat::ChatBackend::from_vision_setup(setup, timeout_s).await?;
-                    let v =
-                        crate::tools::run_agent_json(&mut backend, prompt, &orchestrator_schema(), 4096, timeout_s, access)
-                            .await;
+                    let v = crate::tools::run_agent_json(
+                        &mut backend,
+                        prompt,
+                        &orchestrator_schema(),
+                        4096,
+                        timeout_s,
+                        access,
+                    )
+                    .await;
                     if let crate::chat::ChatBackend::Local { helper, .. } = &mut backend {
                         helper.kill().await;
                     }
@@ -2018,17 +2055,7 @@ pub fn export_set(
         let name = if item.title.is_empty() { item.hook.clone() } else { item.title.clone() };
         let path = dir.join(format!("{:02}-{}.mp4", k + 1, slug(&name)));
         on_progress(k, items.len(), &name);
-        let opts = crate::preview::PreviewOptions {
-            burn_titles: true,
-            burn_narration: false,
-            burn_captions: true,
-            normalize_audio: true,
-            audio_fade_s: cfg.audio_fade_s,
-            speech_overrun_s: cfg.speech_overrun_s,
-            out: Some(path.clone()),
-            cancel: cancel.clone(),
-            size: crate::preview::RenderSize::Full,
-        };
+        let opts = crate::preview::PreviewOptions::deliverable(cfg, path.clone(), cancel.clone());
         crate::preview::render_preview(db, data_dir, ffmpeg, item.script_id, &opts, |_, _| {})?;
         out.push(path);
     }
@@ -2054,6 +2081,30 @@ pub fn overlap_count(picks: &[(i64, f64, f64)], others: &[(i64, f64, f64)]) -> u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn unit(a: f64, b: f64, t: &str) -> Unit {
+        Unit { start_s: a, end_s: b, text: t.into(), starts_off_mic: false, strong_end: true, speakers: Vec::new() }
+    }
+
+    #[test]
+    fn workers_and_the_orchestrator_are_told_what_code_decides_and_what_makes_a_clip_work() {
+        let survey =
+            VideoSurvey::from_units(1, vec![unit(0.0, 6.0, "Primera frase completa."), unit(6.0, 12.0, "Otra.")]);
+        let o = opts(5.0, 60.0);
+        let worker = worker_prompt(&survey, 0.0, 12.0, &[], &o, None, 2);
+        let orchestrator = orchestrator_prompt(&[], &o, None);
+        for (who, prompt) in [("worker", &worker), ("orchestrator", &orchestrator)] {
+            assert!(prompt.contains("placed by code on the measured speech"), "{who}: what code guarantees");
+            assert!(
+                prompt.contains("a hook in its first 3 seconds") && prompt.contains("ending on a complete thought"),
+                "{who}"
+            );
+            assert!(prompt.contains("no screen share unless the screen is the point"), "{who}");
+            assert!(prompt.contains("get_outline") && prompt.contains("only when the picture decides"), "{who}: cost");
+        }
+        // Gentle: it says what code does, it does not forbid looking.
+        assert!(!worker.to_lowercase().contains("you must not"));
+    }
 
     fn seg(a: f64, b: f64, t: &str) -> Segment {
         Segment { start_s: a, end_s: b, text: t.into(), off_mic: false, speaker: None }
@@ -2230,7 +2281,9 @@ mod tests {
 
     #[test]
     fn a_cropped_set_leaves_screen_shares_out_when_it_can() {
-        let mut merged: Vec<Pick> = (0..5).map(|i| pick(&format!("p{i}"), 1, i as f64 * 100.0, i as f64 * 100.0 + 30.0, 5.0, "faces")).collect();
+        let mut merged: Vec<Pick> = (0..5)
+            .map(|i| pick(&format!("p{i}"), 1, i as f64 * 100.0, i as f64 * 100.0 + 30.0, 5.0, "faces"))
+            .collect();
         merged.push(pick("s", 1, 900.0, 930.0, 10.0, "screen"));
         let o = ClipOptions { count: 3, format: ClipFormat::Vertical, ..ClipOptions::default() };
         assert!(orchestrator_pool(&merged, &o).iter().all(|p| p.id != "s"));
@@ -2322,7 +2375,9 @@ mod tests {
         let folder = db.add_folder(project.id, dir.path(), true).unwrap();
         let path = dir.path().join("talk.mp4");
         std::fs::write(&path, b"x").unwrap();
-        db.conn.execute("INSERT INTO videos(id, content_hash, size, duration_s) VALUES (1, 'h1', 1, 600.0)", []).unwrap();
+        db.conn
+            .execute("INSERT INTO videos(id, content_hash, size, duration_s) VALUES (1, 'h1', 1, 600.0)", [])
+            .unwrap();
         db.conn
             .execute(
                 "INSERT INTO video_files(video_id, folder_id, path, size, mtime, last_seen) VALUES (1, ?1, ?2, 1, 0, 0)",
@@ -2333,7 +2388,11 @@ mod tests {
             db.conn
                 .execute(
                     "INSERT INTO transcript_segments(video_id, start_s, end_s, text) VALUES (1, ?1, ?2, ?3)",
-                    params![i as f64 * 5.0, i as f64 * 5.0 + 5.0, format!("Esta es la frase número {i} con varias palabras.")],
+                    params![
+                        i as f64 * 5.0,
+                        i as f64 * 5.0 + 5.0,
+                        format!("Esta es la frase número {i} con varias palabras.")
+                    ],
                 )
                 .unwrap();
         }
@@ -2350,7 +2409,9 @@ mod tests {
         assert_eq!(set.items.len(), 2);
         assert!(checked.iter().all(|c| !c.issues.iter().any(|i| i.severity == IssueSeverity::Error)), "{checked:?}");
         let listed = crate::script::list(&db, pid).unwrap();
-        assert!(listed.iter().all(|s| s.kind.as_deref() == Some("clip") && s.set_id.as_deref() == Some(set.id.as_str())));
+        assert!(
+            listed.iter().all(|s| s.kind.as_deref() == Some("clip") && s.set_id.as_deref() == Some(set.id.as_str()))
+        );
         let stored = crate::script::load(&db, set.items[0].script_id).unwrap();
         assert_eq!((stored.script.width, stored.script.height), (Some(1080), Some(1080)));
         assert!(stored.script.captions.is_some());
@@ -2360,7 +2421,8 @@ mod tests {
         let set2 = set_item_status(&db, &set.id, v2, "accepted").unwrap();
         assert_eq!(set2.items[0].script_id, v2);
         assert_eq!(set2.items[0].status, "accepted");
-        let kind: Option<String> = db.conn.query_row("SELECT kind FROM scripts WHERE id = ?1", [v2], |r| r.get(0)).unwrap();
+        let kind: Option<String> =
+            db.conn.query_row("SELECT kind FROM scripts WHERE id = ?1", [v2], |r| r.get(0)).unwrap();
         assert_eq!(kind.as_deref(), Some("clip"));
         assert_eq!(list_sets(&db, pid).unwrap().len(), 1);
         let trashed = delete_set(&db, &set.id, "app").unwrap();
@@ -2418,8 +2480,9 @@ mod tests {
         let (db, pid, _dir) = library();
         let project = db.project(pid).unwrap();
         let o = ClipOptions { format: ClipFormat::Square, ..opts(20.0, 40.0) };
-        let (set, _) = save_clips(&db, &project, &cfg(), &[pick("p1", 1, 100.0, 130.0, 8.0, "faces")], &o, None, json!({}))
-            .unwrap();
+        let (set, _) =
+            save_clips(&db, &project, &cfg(), &[pick("p1", 1, 100.0, 130.0, 8.0, "faces")], &o, None, json!({}))
+                .unwrap();
         let v1 = set.items[0].script_id;
         let stored = crate::script::load(&db, v1).unwrap();
 
@@ -2458,9 +2521,16 @@ mod tests {
                 s.beats[0].clips
             );
             let target = s.target_duration_s.unwrap();
-            assert!((s.total_duration_s() - target).abs() < 0.011, "{format:?}: runs {} against {target}", s.total_duration_s());
             assert!(
-                !checked[0].issues.iter().any(|i| i.severity != IssueSeverity::Info && i.message.starts_with("total duration")),
+                (s.total_duration_s() - target).abs() < 0.011,
+                "{format:?}: runs {} against {target}",
+                s.total_duration_s()
+            );
+            assert!(
+                !checked[0]
+                    .issues
+                    .iter()
+                    .any(|i| i.severity != IssueSeverity::Info && i.message.starts_with("total duration")),
                 "{:?}",
                 checked[0].issues
             );
@@ -2537,7 +2607,11 @@ mod tests {
                         if let Some(h) = t.find("\r\n\r\n") {
                             let len = t[..h]
                                 .lines()
-                                .find_map(|l| l.to_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0)))
+                                .find_map(|l| {
+                                    l.to_lowercase()
+                                        .strip_prefix("content-length:")
+                                        .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                                })
                                 .unwrap_or(0);
                             if got.len() >= h + 4 + len {
                                 break;
@@ -2546,10 +2620,17 @@ mod tests {
                     }
                     let t = String::from_utf8_lossy(&got).to_string();
                     // Pick the first candidate the prompt lists.
-                    let id = t.split("v1c").nth(1).map(|r| format!("v1c{}", r.chars().take_while(|c| c.is_ascii_digit()).collect::<String>())).unwrap_or_default();
+                    let id = t
+                        .split("v1c")
+                        .nth(1)
+                        .map(|r| format!("v1c{}", r.chars().take_while(|c| c.is_ascii_digit()).collect::<String>()))
+                        .unwrap_or_default();
                     let content = json!({ "picks": [{ "candidate": id, "in_s": 0, "out_s": 0, "title": "T", "quote": "Q", "why": "W", "score": 7, "hook": "H" }] }).to_string();
                     let body = json!({ "choices": [{ "message": { "content": content } }] }).to_string();
-                    let resp = format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
                     let _ = sock.write_all(resp.as_bytes()).await;
                 });
             }
@@ -2575,11 +2656,10 @@ mod tests {
         job("faces", "pending");
         job("speakers", "pending");
         let checks = project_readiness(&db, pid, &[], needs).unwrap();
-        assert_eq!(checks.iter().map(|c| (c.subject.as_str(), c.level)).collect::<Vec<_>>(), [
-            ("describe", Level::Warn),
-            ("faces", Level::Warn),
-            ("speakers", Level::Warn)
-        ]);
+        assert_eq!(
+            checks.iter().map(|c| (c.subject.as_str(), c.level)).collect::<Vec<_>>(),
+            [("describe", Level::Warn), ("faces", Level::Warn), ("speakers", Level::Warn)]
+        );
         job("transcribe", "pending");
         let pre = crate::preflight::Preflight { checks: project_readiness(&db, pid, &[], needs).unwrap() };
         assert_eq!(pre.level(), Level::Error);
@@ -2593,20 +2673,21 @@ mod tests {
         let url = fake_worker_server().await;
         use crate::agents::{AgentTarget, EndpointKey, ModelRunner, PoolAgent, SlotRegistry};
         let agent = PoolAgent {
-            spec: AgentSpec { id: "srv".into(), max_concurrent: 2, roles: [AgentRole::Worker].into(), ..AgentSpec::default() },
+            spec: AgentSpec {
+                id: "srv".into(),
+                max_concurrent: 2,
+                roles: [AgentRole::Worker].into(),
+                ..AgentSpec::default()
+            },
             key: EndpointKey::Server { url: url.clone(), model: String::new() },
             capacity: 2,
             target: AgentTarget::Server { url, model: String::new(), api_key: String::new(), timeout_s: 10 },
             describe: "srv".into(),
             max_tool_rounds: 0,
         };
-        let selection = crate::agents::resolve_selection(
-            std::slice::from_ref(&agent.spec),
-            None,
-            None,
-            &AgentSelection::default(),
-        )
-        .unwrap();
+        let selection =
+            crate::agents::resolve_selection(std::slice::from_ref(&agent.spec), None, None, &AgentSelection::default())
+                .unwrap();
         let backends = Backends {
             workers: AgentPool::new(vec![agent], 2, SlotRegistry::new(), Arc::new(ModelRunner::default())),
             orchestrator: None,
@@ -2617,7 +2698,11 @@ mod tests {
         };
         let o = ClipOptions { count: 2, window_s: 200.0, ..opts(20.0, 40.0) };
         let mut phases = Vec::new();
-        let res = run(&mut db, pid, &cfg(), &backends, &o, None, &mut |_: f64, phase: &str, _: &str| phases.push(phase.to_string())).await.unwrap();
+        let res = run(&mut db, pid, &cfg(), &backends, &o, None, &mut |_: f64, phase: &str, _: &str| {
+            phases.push(phase.to_string())
+        })
+        .await
+        .unwrap();
         assert_eq!(res.set.items.len(), 2);
         assert_eq!(res.log["worker_jobs"], 3);
         assert!(phases.contains(&"workers".to_string()) && phases.last().map(String::as_str) == Some("done"));
@@ -2660,15 +2745,30 @@ mod tests {
         .await;
         use crate::agents::{AgentTarget, EndpointKey, ModelRunner, PoolAgent, SlotRegistry};
         let worker = PoolAgent {
-            spec: AgentSpec { id: "srv".into(), max_concurrent: 2, roles: [AgentRole::Worker].into(), ..AgentSpec::default() },
+            spec: AgentSpec {
+                id: "srv".into(),
+                max_concurrent: 2,
+                roles: [AgentRole::Worker].into(),
+                ..AgentSpec::default()
+            },
             key: EndpointKey::Server { url: url.clone(), model: String::new() },
             capacity: 2,
-            target: AgentTarget::Server { url: url.clone(), model: String::new(), api_key: String::new(), timeout_s: 10 },
+            target: AgentTarget::Server {
+                url: url.clone(),
+                model: String::new(),
+                api_key: String::new(),
+                timeout_s: 10,
+            },
             describe: "srv".into(),
             max_tool_rounds: 0,
         };
-        let selection =
-            crate::agents::resolve_selection(std::slice::from_ref(&worker.spec), None, None, &AgentSelection::default()).unwrap();
+        let selection = crate::agents::resolve_selection(
+            std::slice::from_ref(&worker.spec),
+            None,
+            None,
+            &AgentSelection::default(),
+        )
+        .unwrap();
         let backends = Backends {
             workers: AgentPool::new(vec![worker], 2, SlotRegistry::new(), Arc::new(ModelRunner::default())),
             orchestrator: Some(Orchestrator {
@@ -2695,11 +2795,31 @@ mod tests {
                 .map(|m| m["content"].as_str().unwrap_or_default().to_string())
                 .collect()
         };
-        assert!(tool_answers("Candidate clips").iter().any(|t| t.contains("Esta es la frase")), "a worker read the transcript");
-        assert!(tool_answers("Proposals").iter().any(|t| t.contains("keyframes_total")), "the orchestrator opened a video");
+        assert!(
+            tool_answers("Candidate clips").iter().any(|t| t.contains("Esta es la frase")),
+            "a worker read the transcript"
+        );
+        assert!(
+            tool_answers("Proposals").iter().any(|t| t.contains("keyframes_total")),
+            "the orchestrator opened a video"
+        );
         // The run log says which tools each job called.
-        let calls = |v: &Value| v["tool_calls"].as_array().unwrap().iter().map(|c| c.as_str().unwrap().to_string()).collect::<Vec<_>>();
-        assert!(res.log["workers"].as_array().unwrap().iter().all(|w| calls(w).iter().any(|c| c.starts_with("get_transcript: "))), "{}", res.log["workers"]);
-        assert!(calls(&res.log["orchestrator"]).iter().any(|c| c.starts_with("get_video: ")), "{}", res.log["orchestrator"]);
+        let calls = |v: &Value| {
+            v["tool_calls"].as_array().unwrap().iter().map(|c| c.as_str().unwrap().to_string()).collect::<Vec<_>>()
+        };
+        assert!(
+            res.log["workers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|w| calls(w).iter().any(|c| c.starts_with("get_transcript: "))),
+            "{}",
+            res.log["workers"]
+        );
+        assert!(
+            calls(&res.log["orchestrator"]).iter().any(|c| c.starts_with("get_video: ")),
+            "{}",
+            res.log["orchestrator"]
+        );
     }
 }

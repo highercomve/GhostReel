@@ -32,7 +32,7 @@ use rusqlite::{OptionalExtension, params};
 use serde::Serialize;
 
 pub use embedder::OrtSpeakerEmbedder;
-pub use people::{Person, PersonSummary, PeopleReport};
+pub use people::{PeopleReport, Person, PersonSummary};
 pub use turns::{Turn, WindowSpan};
 
 use crate::Error;
@@ -191,8 +191,7 @@ impl Db {
             for t in turns {
                 ins.execute(params![video_id, t.start_s, t.end_s, t.speaker])?;
             }
-            let mut upd =
-                tx.prepare("UPDATE transcript_segments SET speaker = ?2, person_id = NULL WHERE id = ?1")?;
+            let mut upd = tx.prepare("UPDATE transcript_segments SET speaker = ?2, person_id = NULL WHERE id = ?1")?;
             for (id, s, e) in segs {
                 upd.execute(params![id, turns::majority_speaker(s, e, turns)])?;
             }
@@ -243,9 +242,8 @@ impl Db {
 
     /// Person id per face track of a video (tracks not assigned to anyone are absent).
     pub fn face_track_people(&self, video_id: i64) -> Result<HashMap<i64, i64>, Error> {
-        let mut st = self
-            .conn
-            .prepare("SELECT id, person_id FROM face_tracks WHERE video_id = ?1 AND person_id IS NOT NULL")?;
+        let mut st =
+            self.conn.prepare("SELECT id, person_id FROM face_tracks WHERE video_id = ?1 AND person_id IS NOT NULL")?;
         let rows = st.query_map([video_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
@@ -360,9 +358,9 @@ pub fn pending_videos(db: &Db, project_id: i64) -> Result<usize, Error> {
     let videos = project_videos(db, project_id)?;
     let mut n = 0;
     for v in &videos {
-        let has: bool = db
-            .conn
-            .query_row("SELECT EXISTS (SELECT 1 FROM speaker_windows WHERE video_id = ?1)", [v.id], |r| r.get(0))?;
+        let has: bool =
+            db.conn
+                .query_row("SELECT EXISTS (SELECT 1 FROM speaker_windows WHERE video_id = ?1)", [v.id], |r| r.get(0))?;
         if !has && !eligible_windows(db, v.id)?.is_empty() {
             n += 1;
         }
@@ -397,9 +395,9 @@ pub fn analyse_project(
             continue;
         }
         report.total += 1;
-        let has: bool = db
-            .conn
-            .query_row("SELECT EXISTS (SELECT 1 FROM speaker_windows WHERE video_id = ?1)", [v.id], |r| r.get(0))?;
+        let has: bool =
+            db.conn
+                .query_row("SELECT EXISTS (SELECT 1 FROM speaker_windows WHERE video_id = ?1)", [v.id], |r| r.get(0))?;
         if force || !has {
             todo.push((v, spans));
         } else {
@@ -680,7 +678,9 @@ mod tests {
         assert_eq!(got[0].person_id, None);
         let seg: (Option<i64>, Option<i64>) = db
             .conn
-            .query_row("SELECT speaker, person_id FROM transcript_segments WHERE id = 2", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .query_row("SELECT speaker, person_id FROM transcript_segments WHERE id = 2", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
             .unwrap();
         assert_eq!(seg, (Some(2), Some(5)));
         let short: Option<i64> =

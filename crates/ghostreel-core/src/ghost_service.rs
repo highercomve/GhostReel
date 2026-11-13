@@ -302,11 +302,18 @@ mod tests {
             // Read until the JSON body has arrived.
             while !got.contains("]}") {
                 let n = sock.read(&mut buf).unwrap();
-                if n == 0 { break; }
+                if n == 0 {
+                    break;
+                }
                 got.push_str(&String::from_utf8_lossy(&buf[..n]));
             }
             let body = r#"{"unloaded":{"chat":true,"stt":true}}"#;
-            write!(sock, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}", body.len()).unwrap();
+            write!(
+                sock,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
             got
         });
         let svc = GhostService {

@@ -19,8 +19,14 @@ use crate::runtime::VisionSetup;
 pub enum EndpointKey {
     /// Any model run in-process (llama.cpp or MLX helper): one for the whole app.
     Local,
-    Server { url: String, model: String },
-    Cli { tool: String, model: String },
+    Server {
+        url: String,
+        model: String,
+    },
+    Cli {
+        tool: String,
+        model: String,
+    },
 }
 
 impl EndpointKey {

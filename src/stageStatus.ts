@@ -11,7 +11,13 @@ export interface StageDisplay {
  *  ("describe_server" → "describe"). */
 function runningStage(task: Task | undefined): string | null {
   if (!task) return null;
-  if (task.kind.type === "steadiness" || task.kind.type === "faces" || task.kind.type === "speakers") {
+  if (
+    task.kind.type === "steadiness" ||
+    task.kind.type === "faces" ||
+    task.kind.type === "speakers" ||
+    task.kind.type === "speech" ||
+    task.kind.type === "chapters"
+  ) {
     return task.kind.type;
   }
   if (task.kind.type !== "index") return null;

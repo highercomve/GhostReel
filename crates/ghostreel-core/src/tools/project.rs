@@ -119,10 +119,7 @@ static DELETE_PROJECT: ToolSpec = ToolSpec {
          cuts, versions and clip sets while the project exists). purge=true cannot be undone either.",
     ],
     chains_with: &[],
-    params: &[
-        PROJECT,
-        ToolParam::new("purge", T::Boolean, false, "default false: keep the index for reuse."),
-    ],
+    params: &[PROJECT, ToolParam::new("purge", T::Boolean, false, "default false: keep the index for reuse.")],
 };
 
 async fn delete_project(ctx: &mut ToolCtx<'_>, a: Args<'_>) -> ToolResult {
@@ -207,7 +204,7 @@ pub(super) async fn run_stage(ctx: &mut ToolCtx<'_>, project_id: i64, stage: &st
 static INDEX: ToolSpec = ToolSpec {
     name: "index",
     effect: Effect::Write,
-    summary: "Run pending indexing work (scan, transcribe, keyframes, descriptions, embeddings, faces, speakers) for \
+    summary: "Run pending indexing work (scan, transcribe, keyframes, descriptions, embeddings, faces, speakers, speech activity, chapters) for \
               up to max_seconds, then report progress.",
     when: "After add_folder, and again whenever it reports pending work. Resumable. The glossary is used when \
            transcribing; after changing it, redo: transcribe applies it to videos already transcribed.",
@@ -221,7 +218,12 @@ static INDEX: ToolSpec = ToolSpec {
     params: &[
         PROJECT,
         ToolParam::new("max_seconds", T::Integer, false, "Stop after this long (default 900)."),
-        ToolParam::new("redo", T::String, false, "Reset this stage and later ones first: frames | transcribe | describe | embed."),
+        ToolParam::new(
+            "redo",
+            T::String,
+            false,
+            "Reset this stage and later ones first: frames | transcribe | describe | embed.",
+        ),
     ],
 };
 
@@ -268,7 +270,11 @@ async fn index_status(ctx: &mut ToolCtx<'_>, a: Args<'_>) -> ToolResult {
     let p = ctx.project_for(a)?;
     let status = index::status(ctx.db, Some(p.id))?;
     let pending: i64 = status.stages.iter().map(|s| s.pending).sum();
-    let videos = if a.bool_or("videos", false) { serde_json::to_value(index::videos(ctx.db, Some(p.id))?)? } else { Value::Null };
+    let videos = if a.bool_or("videos", false) {
+        serde_json::to_value(index::videos(ctx.db, Some(p.id))?)?
+    } else {
+        Value::Null
+    };
     Ok(ToolOutput::json(json!({ "status": status, "videos": videos })).summary(format!("{pending} jobs pending")))
 }
 

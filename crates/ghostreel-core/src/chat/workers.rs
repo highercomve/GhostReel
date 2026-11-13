@@ -187,7 +187,9 @@ mod tests {
                 });
             }
         });
-        use crate::agents::{AgentJob, AgentPool, AgentSpec, AgentTarget, EndpointKey, ModelRunner, PoolAgent, SlotRegistry};
+        use crate::agents::{
+            AgentJob, AgentPool, AgentSpec, AgentTarget, EndpointKey, ModelRunner, PoolAgent, SlotRegistry,
+        };
         let url = format!("http://{addr}");
         let agent = PoolAgent {
             spec: AgentSpec { id: "srv".into(), max_concurrent: 3, ..AgentSpec::default() },

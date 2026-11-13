@@ -497,7 +497,14 @@ impl FramePlan {
             },
             _ => Vec::new(),
         };
-        FrameView { src_w: self.src_w, src_h: self.src_h, out_w: self.out_w, out_h: self.out_h, content: self.content, crops }
+        FrameView {
+            src_w: self.src_w,
+            src_h: self.src_h,
+            out_w: self.out_w,
+            out_h: self.out_h,
+            content: self.content,
+            crops,
+        }
     }
 
     /// This plan with every path held still where it is at `t` (one stretch), for a still frame.
@@ -1587,9 +1594,15 @@ pub fn plan_clip(
     out_h: f64,
 ) -> Result<Option<FramePlan>, Error> {
     let Some((src_w, src_h)) = video_size(db, video_id)? else { return Ok(None) };
-    if !needs_crop(src_w, src_h, out_w, out_h) {
+    // A cut the shape of its footage plays the whole picture, except where an override asks for a
+    // crop: a speaker's own camera tile over a screen share, so a line said there keeps its face
+    // and its lips in sync.
+    let same_shape = !needs_crop(src_w, src_h, out_w, out_h);
+    if same_shape && framing.overrides.is_empty() {
         return Ok(None);
     }
+    let whole = Framing { layout: Layout::Fit, box_: None, ..framing.clone() };
+    let framing = if same_shape { &whole } else { framing };
     let content = match (ffmpeg, path) {
         (Some(f), Some(p)) if p.is_file() => detect_content(f, p, in_s, out_s, src_w, src_h),
         _ => None,

@@ -19,6 +19,8 @@ pub fn round1(x: f64) -> f64 {
     (x * 10.0).round() / 10.0
 }
 
+pub use crate::sentences::clock;
+
 /// The `description` field of a keyframe's description JSON.
 pub fn frame_description(json: Option<&str>) -> Option<String> {
     json.and_then(|j| serde_json::from_str::<Value>(j).ok())

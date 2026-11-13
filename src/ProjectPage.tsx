@@ -11,6 +11,8 @@ import {
   enqueueFaces,
   enqueueIndex,
   enqueueSpeakers,
+  enqueueChapters,
+  enqueueSpeech,
   enqueueSteadiness,
   fileName,
   fpsLabel,
@@ -285,7 +287,12 @@ export default function ProjectPage({ projectId, onChanged, openVideo }: {
   // Keep the table fresh while this project's task runs, and once it finishes.
   const myTasks = tasks.filter(
     (t) =>
-      (t.kind.type === "index" || t.kind.type === "steadiness" || t.kind.type === "faces" || t.kind.type === "speakers") &&
+      (t.kind.type === "index" ||
+        t.kind.type === "steadiness" ||
+        t.kind.type === "faces" ||
+        t.kind.type === "speakers" ||
+        t.kind.type === "speech" ||
+        t.kind.type === "chapters") &&
       t.kind.project_id === projectId,
   );
   const running = myTasks.find((t) => t.state === "running");
@@ -648,6 +655,10 @@ export default function ProjectPage({ projectId, onChanged, openVideo }: {
                   const speakersPending = view.speakers_pending ?? 0;
                   const speakersEverRan = (view.people_count ?? 0) > 0 || (totalVideos > 0 && speakersPending === 0);
                   const speakersStatus = shown("speakers");
+                  const speechStatus = shown("speech");
+                  const speechMeasured = view.stages?.find((x) => x.stage === "speech")?.state === "done";
+                  const chaptersStatus = shown("chapters");
+                  const chaptersDone = view.stages?.find((x) => x.stage === "chapters")?.state === "done";
                   const tag = (d: { state: string; reason: string | null }) => (
                     <span className={`tag ${stageTagClass(d.state)} small`} title={d.reason ?? undefined}>
                       {d.state}
@@ -850,6 +861,58 @@ export default function ProjectPage({ projectId, onChanged, openVideo }: {
                           {speakersEverRan && speakersPending === 0 ? "Re-run…" : "Run"}
                         </button>
                       </div>
+
+                      <div className="project-menu-stage-row">
+                        <div className="project-menu-stage-info">
+                          <span className="project-menu-stage-name">Speech activity</span>
+                          {tag(speechStatus)}
+                        </div>
+                        <button
+                          type="button"
+                          className="small"
+                          onClick={async () => {
+                            setMenuOpen(false);
+                            if (speechMeasured) {
+                              const ok = await confirmAction("Measure where people speak again for all videos in this project?", {
+                                title: "Re-analyze speech activity",
+                              });
+                              if (ok) run(() => enqueueSpeech(projectId, true));
+                            } else {
+                              run(() => enqueueSpeech(projectId, false));
+                            }
+                          }}
+                          disabled={!!running || !!queued || totalVideos === 0}
+                          title="Find where speech is from the audio itself, so cuts land on it and not on the transcript's approximate times"
+                        >
+                          {speechMeasured ? "Re-run…" : "Run"}
+                        </button>
+                      </div>
+
+                      <div className="project-menu-stage-row">
+                        <div className="project-menu-stage-info">
+                          <span className="project-menu-stage-name">Chapters</span>
+                          {tag(chaptersStatus)}
+                        </div>
+                        <button
+                          type="button"
+                          className="small"
+                          onClick={async () => {
+                            setMenuOpen(false);
+                            if (chaptersDone) {
+                              const ok = await confirmAction("Split every speech video in this project into chapters again?", {
+                                title: "Re-split chapters",
+                              });
+                              if (ok) run(() => enqueueChapters(projectId, true));
+                            } else {
+                              run(() => enqueueChapters(projectId, false));
+                            }
+                          }}
+                          disabled={!!running || !!queued || totalVideos === 0}
+                          title="Split each speech video into titled chapters, so an editing agent can read the project in one call"
+                        >
+                          {chaptersDone ? "Re-run…" : "Run"}
+                        </button>
+                      </div>
                     </>
                   );
                 })()}
@@ -956,6 +1019,44 @@ export default function ProjectPage({ projectId, onChanged, openVideo }: {
                   </label>
                   <div className="project-menu-hint">
                     Tells voices apart, groups faces into people and links them. ~1 min per hour of video.
+                  </div>
+                </div>
+
+                <div>
+                  <label className="project-menu-checkbox" title="Find where speech is from the audio itself">
+                    <input
+                      type="checkbox"
+                      checked={p.pipeline.speech ?? true}
+                      disabled={!!running || !!queued}
+                      onChange={async (e) => {
+                        const next = { ...p.pipeline, speech: e.target.checked };
+                        await run(() => setProjectPipeline(projectId, next));
+                      }}
+                    />
+                    <span>Speech activity</span>
+                  </label>
+                  <div className="project-menu-hint">
+                    Finds where people speak from the sound, so cuts avoid the next speaker's first word. A few seconds
+                    per hour of video.
+                  </div>
+                </div>
+
+                <div>
+                  <label className="project-menu-checkbox" title="Split each speech video into titled chapters">
+                    <input
+                      type="checkbox"
+                      checked={p.pipeline.chapters ?? true}
+                      disabled={!!running || !!queued}
+                      onChange={async (e) => {
+                        const next = { ...p.pipeline, chapters: e.target.checked };
+                        await run(() => setProjectPipeline(projectId, next));
+                      }}
+                    />
+                    <span>Chapters</span>
+                  </label>
+                  <div className="project-menu-hint">
+                    Splits each video that speaks into titled chapters with a summary and standout lines, for the
+                    project outline an editing agent reads first. Titles come from the chat model.
                   </div>
                 </div>
 

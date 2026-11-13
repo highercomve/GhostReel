@@ -366,11 +366,17 @@ async fn resolve_llm_with(
             return VisionSetup::Unavailable("local model helper ghostreel-llm not found".into());
         };
         let mut found = vec![status.installed_path.unwrap()];
-        if let Some(p) = &mmproj { found.push(p.clone()); }
+        if let Some(p) = &mmproj {
+            found.push(p.clone());
+        }
         return VisionSetup::Local {
-            helper, models_dir: models::effective_models_dir(paths, config), model: status.entry.spec(),
-            mmproj: mmproj.map(|p| models::ModelSpec { file_name: p.to_string_lossy().into_owned(), url: String::new() }),
-            found, runtime: cfg.into(),
+            helper,
+            models_dir: models::effective_models_dir(paths, config),
+            model: status.entry.spec(),
+            mmproj: mmproj
+                .map(|p| models::ModelSpec { file_name: p.to_string_lossy().into_owned(), url: String::new() }),
+            found,
+            runtime: cfg.into(),
         };
     }
     if models::uses_mlx() {
@@ -598,8 +604,10 @@ mod tests {
         std::fs::remove_file(&projector_path).unwrap();
         assert!(matches!(resolve_llm_with(&paths, &cfg, &cfg.vision, None, Capability::Vision).await,
             VisionSetup::Unavailable(why) if why.contains("no image projector")));
-        assert!(matches!(resolve_llm_with(&paths, &cfg, &cfg.vision, None, Capability::Chat).await,
-            VisionSetup::Local { mmproj: None, .. }));
+        assert!(matches!(
+            resolve_llm_with(&paths, &cfg, &cfg.vision, None, Capability::Chat).await,
+            VisionSetup::Local { mmproj: None, .. }
+        ));
         std::fs::remove_file(&model_path).unwrap();
         assert!(matches!(resolve_llm_with(&paths, &cfg, &cfg.vision, None, Capability::Chat).await,
             VisionSetup::Unavailable(why) if why.contains("missing")));

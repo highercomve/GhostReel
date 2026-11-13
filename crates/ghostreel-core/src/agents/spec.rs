@@ -33,9 +33,10 @@ impl AgentRole {
     }
 
     pub fn parse(s: &str) -> Result<Self, String> {
-        Self::ALL.into_iter().find(|r| r.as_str() == s.trim()).ok_or_else(|| {
-            format!("unknown agent role '{s}'; expected orchestrator, worker, chat or vision")
-        })
+        Self::ALL
+            .into_iter()
+            .find(|r| r.as_str() == s.trim())
+            .ok_or_else(|| format!("unknown agent role '{s}'; expected orchestrator, worker, chat or vision"))
     }
 }
 
@@ -315,18 +316,19 @@ impl AgentSpec {
     pub fn summary(&self) -> String {
         match self.backend {
             Backend::Cli => {
-                let mut line =
-                    if self.model.is_empty() { format!("cli {}", self.tool) } else { format!("cli {} · {}", self.tool, self.model) };
+                let mut line = if self.model.is_empty() {
+                    format!("cli {}", self.tool)
+                } else {
+                    format!("cli {} · {}", self.tool, self.model)
+                };
                 if let Some(e) = self.effort {
                     line.push_str(&format!(" · {e} effort"));
                 }
                 line
             }
-            Backend::Server => format!(
-                "server {} @ {}",
-                if self.model.is_empty() { "(default model)" } else { &self.model },
-                self.url
-            ),
+            Backend::Server => {
+                format!("server {} @ {}", if self.model.is_empty() { "(default model)" } else { &self.model }, self.url)
+            }
             Backend::Local => format!("local {}", self.local_model),
             Backend::Auto => format!("auto (server {} or local {})", self.url, self.local_model),
         }

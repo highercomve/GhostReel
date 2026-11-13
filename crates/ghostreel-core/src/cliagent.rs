@@ -530,16 +530,20 @@ impl CliAgent {
         let after_s = self.cfg.timeout_secs;
         let output = tokio::time::timeout(Duration::from_secs(after_s), child.wait_with_output())
             .await
-            .map_err(|_| {
-                self.fail(AgentErrorKind::Timeout { after_s }, format!("no answer within {after_s} s"))
-            })?
+            .map_err(|_| self.fail(AgentErrorKind::Timeout { after_s }, format!("no answer within {after_s} s")))?
             .map_err(|e| self.fail(AgentErrorKind::Other, format!("I/O error: {e}")))?;
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         if !output.status.success() {
             // Why it failed may be on stdout (claude's JSON `result`, codex's JSONL events) or
             // stderr (agy); `classify_cli` reads both.
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(Error::Agent(classify_cli(&self.cfg.tool, &self.cfg.model, output.status.code(), &stdout, &stderr)));
+            return Err(Error::Agent(classify_cli(
+                &self.cfg.tool,
+                &self.cfg.model,
+                output.status.code(),
+                &stdout,
+                &stderr,
+            )));
         }
         // claude can exit 0 and still report an error (an unknown model, say) in its JSON.
         if self.cfg.tool == "claude"
@@ -565,20 +569,14 @@ impl CliAgent {
         match tool {
             "claude" => {
                 // stdout is JSON: {"result": "<answer>", ...}
-                let v: serde_json::Value = serde_json::from_str(raw)
-                    .map_err(|_| unusable("claude", raw))?;
-                let text = v["result"]
-                    .as_str()
-                    .ok_or_else(|| unusable("claude", raw))?;
+                let v: serde_json::Value = serde_json::from_str(raw).map_err(|_| unusable("claude", raw))?;
+                let text = v["result"].as_str().ok_or_else(|| unusable("claude", raw))?;
                 Ok(text.to_string())
             }
             "agy" => {
                 // stdout is JSON: {"response": "<answer>", ...}
-                let v: serde_json::Value = serde_json::from_str(raw)
-                    .map_err(|_| unusable("agy", raw))?;
-                let text = v["response"]
-                    .as_str()
-                    .ok_or_else(|| unusable("agy", raw))?;
+                let v: serde_json::Value = serde_json::from_str(raw).map_err(|_| unusable("agy", raw))?;
+                let text = v["response"].as_str().ok_or_else(|| unusable("agy", raw))?;
                 Ok(text.to_string())
             }
             "opencode" => {
@@ -610,7 +608,11 @@ impl CliAgent {
                 }
                 answer.ok_or_else(|| unusable("codex", raw))
             }
-            other => Err(Error::Agent(AgentError::new(other, AgentErrorKind::NotInstalled, format!("unknown CLI tool '{other}'")))),
+            other => Err(Error::Agent(AgentError::new(
+                other,
+                AgentErrorKind::NotInstalled,
+                format!("unknown CLI tool '{other}'"),
+            ))),
         }
     }
 
@@ -857,7 +859,10 @@ mod tests {
         let mut c = cfg("claude", &claude);
         c.model = "claude-opus-5-5-medium".into();
         let e = CliAgent::new(c.clone()).complete("hi").await.unwrap_err();
-        assert_eq!(e.agent_error().unwrap().kind, AgentErrorKind::InvalidModel { model: "claude-opus-5-5-medium".into() });
+        assert_eq!(
+            e.agent_error().unwrap().kind,
+            AgentErrorKind::InvalidModel { model: "claude-opus-5-5-medium".into() }
+        );
         assert!(!e.to_string().contains("Some("), "{e}");
 
         // The same with exit 0: claude still says is_error.
@@ -866,12 +871,16 @@ mod tests {
             "claude0",
             r#"cat >/dev/null; echo '{"type":"result","is_error":true,"result":"There'"'"'s an issue with the selected model (x). It may not exist."}'"#,
         );
-        let e = CliAgent::new(CliAgentConfig { tool: "claude".into(), ..cfg("claude", &claude0) }).complete("hi").await.unwrap_err();
+        let e = CliAgent::new(CliAgentConfig { tool: "claude".into(), ..cfg("claude", &claude0) })
+            .complete("hi")
+            .await
+            .unwrap_err();
         assert_eq!(e.agent_error().unwrap().kind.key(), "invalid_model");
 
         // Nothing printed at all: an exit code in words, never Rust's Debug.
         let mute = write_fake_cli(tmp.path(), "mute", "exit 1");
-        let e = CliAgent::new(CliAgentConfig { tool: "agy".into(), ..cfg("agy", &mute) }).complete("hi").await.unwrap_err();
+        let e =
+            CliAgent::new(CliAgentConfig { tool: "agy".into(), ..cfg("agy", &mute) }).complete("hi").await.unwrap_err();
         assert_eq!(e.to_string(), "agy: exit code 1 — agy exited with code 1 and printed nothing");
     }
 

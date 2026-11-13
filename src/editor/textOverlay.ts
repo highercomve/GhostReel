@@ -15,7 +15,7 @@ export function fontStack(font: string): string {
   return `"${font.replace(/"/g, "")}", ${FALLBACKS[font.toLowerCase()] ?? "sans-serif"}`;
 }
 
-/** Selection key for a title (`t-<beat>`) or a caption (`cap-<video>_<source start ms>`). The
+/** Selection key for a title (`t-<beat>`), a section card (`card-<beat>`) or a caption (`cap-<video>_<source start ms>`). The
  * caption key comes from the cue's source anchor, so it survives moving clips around. */
 export function cueKey(cue: Cue, index = 0): string {
   return cue.video_id != null && cue.src_start_s != null
@@ -24,6 +24,8 @@ export function cueKey(cue: Cue, index = 0): string {
 }
 
 export function overlayKey(o: Overlay, index = 0): string {
+  // A card's key is its timeline block's, so selecting either selects the other.
+  if (o.kind === "card") return `card-${o.beat_index ?? index}`;
   return o.kind === "title" ? `t-${o.beat_index ?? index}` : cueKey(o.cue ?? { start_s: 0, end_s: 0, text: "" }, index);
 }
 

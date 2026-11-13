@@ -141,7 +141,10 @@ pub fn project_readiness(db: &Db, project_id: i64, video_ids: &[i64], needs: Nee
                 Level::Error,
                 Scope::Project,
                 "transcribe",
-                format!("transcription is still running for {} — wait for indexing to finish or pick transcribed videos", of(k)),
+                format!(
+                    "transcription is still running for {} — wait for indexing to finish or pick transcribed videos",
+                    of(k)
+                ),
             ));
         }
     }

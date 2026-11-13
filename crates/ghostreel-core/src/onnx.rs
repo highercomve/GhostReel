@@ -16,7 +16,8 @@ pub fn environment() -> Result<Arc<Environment>, Error> {
     if let Some(env) = slot.as_ref() {
         return Ok(env.clone());
     }
-    let env = Arc::new(ort::init().build().map_err(|e| Error::Invalid(format!("Failed to init ort environment: {e}")))?);
+    let env =
+        Arc::new(ort::init().build().map_err(|e| Error::Invalid(format!("Failed to init ort environment: {e}")))?);
     *slot = Some(env.clone());
     Ok(env)
 }

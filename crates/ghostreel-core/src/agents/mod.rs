@@ -20,22 +20,21 @@ mod selection;
 mod slots;
 mod spec;
 
-pub use pool::{
-    AgentJob, AgentLoad, AgentPool, AgentTarget, Attempt, JobOutcome, JobRunner, ModelRunner, PoolAction, PoolAgent,
-    PoolEvent, PoolProgress,
-    Skipped, running_line, share_line,
-};
-pub use selection::{
-    AgentSelection, ResolvedSelection, SelectionError, SelectionSource, WorkTarget, resolve_selection, validate_selection,
-    with_role,
-};
-pub use slots::{EndpointKey, EndpointSlots, EndpointUse, Slot, SlotRegistry, acquire_for};
 pub use cooldown::{Cooldown, Cooldowns, call_once};
 pub use error::{
-    AgentError, AgentErrorKind, Handling, classify_cli, classify_http, classify_text, from_request as error_from_request,
-    from_response as error_from_response, human_duration, resets_in,
+    AgentError, AgentErrorKind, Handling, classify_cli, classify_http, classify_text,
+    from_request as error_from_request, from_response as error_from_response, human_duration, resets_in,
+};
+pub use pool::{
+    AgentJob, AgentLoad, AgentPool, AgentTarget, Attempt, JobOutcome, JobRunner, ModelRunner, PoolAction, PoolAgent,
+    PoolEvent, PoolProgress, Skipped, running_line, share_line,
 };
 pub use preflight::{agent_checks, check_agent};
+pub use selection::{
+    AgentSelection, ResolvedSelection, SelectionError, SelectionSource, WorkTarget, resolve_selection,
+    validate_selection, with_role,
+};
+pub use slots::{EndpointKey, EndpointSlots, EndpointUse, Slot, SlotRegistry, acquire_for};
 pub use spec::{
     AgentRole, AgentSource, AgentSpec, Effort, LINKED_FIELDS, MAX_CONCURRENT, implicit_agents, materialize,
 };
@@ -99,7 +98,8 @@ pub async fn check_availability(paths: &Paths, config: &Config, spec: &AgentSpec
         }
         VisionSetup::Cli(cfg) => {
             let probe = cfg.clone();
-            let models = tokio::task::spawn_blocking(move || crate::cliagent::list_models(&probe)).await.unwrap_or_default();
+            let models =
+                tokio::task::spawn_blocking(move || crate::cliagent::list_models(&probe)).await.unwrap_or_default();
             let path = crate::cliagent::find_binary(cfg).map(|p| p.display().to_string()).unwrap_or_default();
             let model_listed = (!cfg.model.is_empty() && !models.is_empty()).then(|| models.contains(&cfg.model));
             let (level, detail) = match model_listed {
@@ -121,12 +121,17 @@ pub async fn check_availability(paths: &Paths, config: &Config, spec: &AgentSpec
                     ),
                     _ => (
                         Level::Ok,
-                        format!("server answers with {} model{}", models.len(), if models.len() == 1 { "" } else { "s" }),
+                        format!(
+                            "server answers with {} model{}",
+                            models.len(),
+                            if models.len() == 1 { "" } else { "s" }
+                        ),
                     ),
                 };
                 let mut av = Availability::new(id.clone(), level, resolved, detail.clone(), model_listed);
                 if level == Level::Error {
-                    av.error = Some(AgentError::new(id, AgentErrorKind::InvalidModel { model: s.model.clone() }, detail));
+                    av.error =
+                        Some(AgentError::new(id, AgentErrorKind::InvalidModel { model: s.model.clone() }, detail));
                 }
                 av
             }
@@ -138,7 +143,10 @@ pub async fn check_availability(paths: &Paths, config: &Config, spec: &AgentSpec
             }
         },
         VisionSetup::Local { model, found, .. } => {
-            let present = found.iter().any(|p| p.file_name().is_some_and(|n| n == model.file_name.as_str()) || p == std::path::Path::new(&model.file_name));
+            let present = found.iter().any(|p| {
+                p.file_name().is_some_and(|n| n == model.file_name.as_str())
+                    || p == std::path::Path::new(&model.file_name)
+            });
             let detail = if present {
                 "model file present; one at a time on this computer".to_string()
             } else {
@@ -161,9 +169,14 @@ pub enum AgentState {
     /// Can take a call now.
     Ready,
     /// Every call slot of its endpoint is taken.
-    Busy { in_use: usize, capacity: usize },
+    Busy {
+        in_use: usize,
+        capacity: usize,
+    },
     /// Its quota is used up; it rests until `until` (unix seconds).
-    OutOfQuota { until: i64 },
+    OutOfQuota {
+        until: i64,
+    },
     NotInstalled,
     Unreachable,
     /// Something else stops it (wrong model, not signed in…): see the detail.
@@ -201,7 +214,12 @@ pub async fn agent_status(paths: &Paths, config: &Config, spec: &AgentSpec) -> A
     let role = spec.roles.iter().next().copied().unwrap_or(AgentRole::Chat);
     let setup = crate::runtime::resolve_agent(paths, config, spec, role).await;
     let key = EndpointKey::for_setup(&setup);
-    let status = |state: AgentState, detail: String| AgentStatus { id: spec.id.clone(), label: state.label().into(), state, detail };
+    let status = |state: AgentState, detail: String| AgentStatus {
+        id: spec.id.clone(),
+        label: state.label().into(),
+        state,
+        detail,
+    };
     if let Some(c) = key.as_ref().and_then(|k| Cooldowns::global().get(k)) {
         return status(AgentState::OutOfQuota { until: c.until }, c.reason());
     }
@@ -225,7 +243,10 @@ pub async fn agent_status(paths: &Paths, config: &Config, spec: &AgentSpec) -> A
         && let Some(u) = SlotRegistry::global().snapshot().into_iter().find(|u| &u.key == k)
         && u.in_use >= u.capacity
     {
-        return status(AgentState::Busy { in_use: u.in_use, capacity: u.capacity }, format!("{} of {} calls in flight", u.in_use, u.capacity));
+        return status(
+            AgentState::Busy { in_use: u.in_use, capacity: u.capacity },
+            format!("{} of {} calls in flight", u.in_use, u.capacity),
+        );
     }
     status(AgentState::Ready, av.detail)
 }
@@ -348,15 +369,18 @@ impl Config {
                         matches!(value.trim().to_lowercase().as_str(), "true" | "on" | "yes" | "1").then_some(true)
                 }
                 "workers" => {
-                    self.agent_selection.workers = (!none).then(|| {
-                        value.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
-                    })
+                    self.agent_selection.workers = (!none)
+                        .then(|| value.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
                 }
                 "max_parallel" => {
                     self.agent_selection.max_parallel = if none {
                         None
                     } else {
-                        Some(value.parse().map_err(|_| format!("agent_selection.max_parallel must be a number, got '{value}'"))?)
+                        Some(
+                            value
+                                .parse()
+                                .map_err(|_| format!("agent_selection.max_parallel must be a number, got '{value}'"))?,
+                        )
                     }
                 }
                 other => return Err(format!("unknown config key 'agent_selection.{other}'")),
@@ -385,7 +409,8 @@ impl Config {
             spec.api_key = spec.llm_config(self, role).api_key;
             spec.source = None;
         }
-        let num = |v: &str| v.trim().parse::<u64>().map_err(|_| format!("agents.{id}.{field} must be a number, got '{v}'"));
+        let num =
+            |v: &str| v.trim().parse::<u64>().map_err(|_| format!("agents.{id}.{field} must be a number, got '{v}'"));
         match *field {
             "name" => spec.name = value.to_string(),
             "backend" => {

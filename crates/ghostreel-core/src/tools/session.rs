@@ -11,7 +11,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 
 use serde_json::{Value, json};
 
-use super::{Effect, ToolCtx, ToolError, ToolOutput, ToolImage, canonical_name, lookup};
+use super::{Effect, ToolCtx, ToolError, ToolImage, ToolOutput, canonical_name, lookup};
 
 /// An optional cap on how much a run may do. `None` is the default and means no cap: with a
 /// registry of forty tools a small number makes no sense, and a run still ends when the model
@@ -140,9 +140,13 @@ pub struct CallGuard {
 pub enum Verdict {
     Allow,
     /// Do not run it: answer with the refusal.
-    Refuse { times: u32 },
+    Refuse {
+        times: u32,
+    },
     /// Refused and still asking: end the run's research.
-    Stop { times: u32 },
+    Stop {
+        times: u32,
+    },
 }
 
 impl CallGuard {
@@ -219,11 +223,21 @@ pub struct ToolSession {
     /// Calls made, including repeats and refusals.
     pub calls: u32,
     withheld: u32,
+    /// The last script version a call saved (save_script, apply_fix): what the session delivered,
+    /// the way an MCP client's work ends in the version it saved last.
+    pub saved_script: Option<i64>,
 }
 
 impl ToolSession {
     pub fn new(max_chars: usize) -> Self {
-        Self { memo: ToolMemo::default(), guard: CallGuard::default(), max_chars, calls: 0, withheld: 0 }
+        Self {
+            memo: ToolMemo::default(),
+            guard: CallGuard::default(),
+            max_chars,
+            calls: 0,
+            withheld: 0,
+            saved_script: None,
+        }
     }
 
     pub async fn call(&mut self, ctx: &mut ToolCtx<'_>, name: &str, args: &Value) -> Called {
@@ -265,16 +279,20 @@ impl ToolSession {
                     self.memo.remember(&tool, args, &called.model_text, &called.summary);
                 }
                 self.guard.note(&key, fingerprint(&called.model_text));
+                if effect == Some(Effect::Write)
+                    && matches!(tool.as_str(), "save_script" | "apply_fix")
+                    && !args["dry_run"].as_bool().unwrap_or(false)
+                    && let Some(id) = out.value["script_id"].as_i64()
+                {
+                    self.saved_script = Some(id);
+                }
                 called.value = Some(out.value);
             }
             Err(e) => {
                 called.is_error = true;
                 called.cancelled = e.is_cancelled();
                 let message = match &e {
-                    ToolError::Unknown(_) => format!(
-                        "{e}; the tools are: {}",
-                        super::names().join(", ")
-                    ),
+                    ToolError::Unknown(_) => format!("{e}; the tools are: {}", super::names().join(", ")),
                     other => other.to_string(),
                 };
                 called.summary = format!("error: {}", one_line(&e.to_string(), 100));
@@ -298,7 +316,11 @@ fn refused(mut called: Called, times: u32, stop: bool) -> Called {
 
 fn one_line(s: &str, max: usize) -> String {
     let line = s.lines().next().unwrap_or_default().trim();
-    if line.chars().count() <= max { line.to_string() } else { format!("{}…", line.chars().take(max).collect::<String>()) }
+    if line.chars().count() <= max {
+        line.to_string()
+    } else {
+        format!("{}…", line.chars().take(max).collect::<String>())
+    }
 }
 
 /// Cut a result to `max` characters: the text by whole lines, the JSON by dropping the tail of

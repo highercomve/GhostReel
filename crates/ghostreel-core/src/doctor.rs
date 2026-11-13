@@ -178,7 +178,8 @@ pub async fn run(paths: &Paths) -> Report {
                 model_files.push(("vision projector (local)".into(), projector));
             }
         } else {
-            model_files.push(("vision (local)".into(), config.vision.local_model.trim_start_matches("external:").into()));
+            model_files
+                .push(("vision (local)".into(), config.vision.local_model.trim_start_matches("external:").into()));
         }
     }
 
@@ -269,7 +270,15 @@ pub async fn run(paths: &Paths) -> Report {
             resolution.reason = if files.iter().all(|m| m.found.is_some()) {
                 format!("Using {}", files.iter().map(|m| m.pattern.as_str()).collect::<Vec<_>>().join(" + "))
             } else {
-                format!("Missing {}", files.iter().filter(|m| m.found.is_none()).map(|m| m.pattern.as_str()).collect::<Vec<_>>().join(" + "))
+                format!(
+                    "Missing {}",
+                    files
+                        .iter()
+                        .filter(|m| m.found.is_none())
+                        .map(|m| m.pattern.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" + ")
+                )
             };
         }
     }
@@ -332,8 +341,12 @@ pub(crate) fn selected_whisper_model(configured: &str, gpus: &[Gpu], roots: &[Pa
     }
     let preferred = crate::runtime::auto_whisper_model(gpus);
     std::iter::once(preferred.to_string())
-        .chain(crate::models::catalog().into_iter().filter(|m| m.kind == crate::models::ModelKind::Whisper).map(|m| m.id))
-        .find(|id| crate::models::whisper(id).ok().is_some_and(|spec| crate::models::find(roots, &spec.file_name).is_some()))
+        .chain(
+            crate::models::catalog().into_iter().filter(|m| m.kind == crate::models::ModelKind::Whisper).map(|m| m.id),
+        )
+        .find(|id| {
+            crate::models::whisper(id).ok().is_some_and(|spec| crate::models::find(roots, &spec.file_name).is_some())
+        })
         .unwrap_or_else(|| preferred.to_string())
 }
 
@@ -535,9 +548,16 @@ mod tests {
         cfg.save(&paths.config_file).unwrap();
         let mut report = run(&paths).await;
         for model in &mut report.models {
-            if !model.role.starts_with("vision") { model.found = Some(dir.path().join(&model.pattern)); }
+            if !model.role.starts_with("vision") {
+                model.found = Some(dir.path().join(&model.pattern));
+            }
         }
-        assert!(report.blockers().iter().all(|b| !b.starts_with("vision:") && !b.starts_with("stt:") && !b.starts_with("embeddings:")));
+        assert!(
+            report
+                .blockers()
+                .iter()
+                .all(|b| !b.starts_with("vision:") && !b.starts_with("stt:") && !b.starts_with("embeddings:"))
+        );
         report.models.iter_mut().find(|m| m.role.starts_with("whisper")).unwrap().found = None;
         assert!(report.blockers().iter().any(|b| b.contains("ggml-large-v3-turbo-q8_0.bin")));
         report.stt.target = Target::Server;

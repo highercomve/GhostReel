@@ -26,7 +26,9 @@ static GET_FACES: ToolSpec = ToolSpec {
               boxes}: framing is the median box centre, height fraction and % of time cut off by the frame \
               edge; boxes are downsampled to at most 2 per second ({t_s, x, y, w, h, sharpness, cut_off}, 0..1 \
               of the frame).",
-    misuse: &["No tracks and a message means the faces stage has not run: call index first, do not assume nobody is there."],
+    misuse: &[
+        "No tracks and a message means the faces stage has not run: call index first, do not assume nobody is there.",
+    ],
     chains_with: &["get_people names the person_id; preview_crop shows how the framing looks."],
     params: &[
         ToolParam::new("video_id", T::Integer, true, ""),
@@ -124,7 +126,9 @@ static GET_SCENES: ToolSpec = ToolSpec {
     when: "To choose a layout for a vertical cut, or to avoid a screen share. It is the same segmentation \
            framing uses (each stretch gets its own layout), clip candidates rank by, and checks warn about.",
     returns: "{video_id, from_s, to_s, mix, scenes}: mix is the share of each kind over the range; scenes are \
-              the stretches. Without face analysis: scenes [] and a message.",
+              the stretches, one per change of picture of 1.5 s or more, however long the range: a screen share \
+              (camera tiles over a shared screen, even when the screen shows faces) is never merged into the \
+              two-shot around it. Without face analysis: scenes [] and a message.",
     misuse: &[],
     chains_with: &["preview_crop on a stretch to see the crop; get_faces for the boxes."],
     params: &[
@@ -341,7 +345,8 @@ async fn preview_crop(ctx: &mut ToolCtx<'_>, a: Args<'_>) -> ToolResult {
     let layout: crate::framing::Layout = a.str("layout")?.parse()?;
     let width = a.opt_u64("width").unwrap_or(1080).clamp(16, 8192) as u32;
     let height = a.opt_u64("height").unwrap_or(1920).clamp(16, 8192) as u32;
-    let framing = crate::framing::Framing { layout, person_id: a.opt_i64("person_id"), box_: None, overrides: Vec::new() };
+    let framing =
+        crate::framing::Framing { layout, person_id: a.opt_i64("person_id"), box_: None, overrides: Vec::new() };
     let ffmpeg = crate::doctor::locate("ffmpeg").ok_or_else(|| ToolError::invalid("ffmpeg not found"))?;
     let dir = ctx.paths.data_dir.join("frames").join("crops");
     let (plan, stills) =
@@ -360,6 +365,7 @@ async fn preview_crop(ctx: &mut ToolCtx<'_>, a: Args<'_>) -> ToolResult {
             images.push(ToolImage {
                 caption: format!("video {video_id} at {:.2}s ({} crop)", from_s + t, plan.layout.as_str()),
                 jpeg,
+                name: format!("v{video_id}_crop_t{}ms.jpg", ((from_s + t) * 1000.0).round() as i64),
             });
         }
     }

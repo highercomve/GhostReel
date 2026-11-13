@@ -121,7 +121,13 @@ pub struct SpeakerClusterParams {
 
 impl Default for SpeakerClusterParams {
     fn default() -> Self {
-        Self { threshold: 0.4, min_speaker_s: 15.0, min_speaker_share: 0.02, merge_centroid_cos: 0.6, max_windows: 3000 }
+        Self {
+            threshold: 0.4,
+            min_speaker_s: 15.0,
+            min_speaker_share: 0.02,
+            merge_centroid_cos: 0.6,
+            max_windows: 3000,
+        }
     }
 }
 
@@ -204,7 +210,9 @@ pub fn label_speakers(
     let labels: Vec<usize> = labels.into_iter().map(|l| remap[l]).collect();
     cents = (0..order.len())
         .map(|k| {
-            centroid(&labels.iter().enumerate().filter(|(_, l)| **l == k).map(|(i, _)| embeddings[i]).collect::<Vec<_>>())
+            centroid(
+                &labels.iter().enumerate().filter(|(_, l)| **l == k).map(|(i, _)| embeddings[i]).collect::<Vec<_>>(),
+            )
         })
         .collect();
     (labels, cents)

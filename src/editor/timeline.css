@@ -216,6 +216,12 @@
   background: var(--panel);
   color: var(--text);
 }
+/* Section cards: the card's own colour (inline), its title as the label; solid, no filmstrip. */
+.tl-block.tl-card { border-color: color-mix(in srgb, currentColor 35%, transparent); cursor: pointer; }
+.tl-block.tl-card .tl-caption { color: inherit; }
+.tl-block.tl-card .tl-label, .tl-block.tl-card .tl-detail { color: inherit; font-weight: 600; }
+.tl-block.tl-card .tl-detail { font-weight: 400; opacity: 0.8; }
+.tl-block.tl-card:not(.selected):not(:hover) .tl-detail { display: none; }
 .tl-block.tl-bed {
   background: color-mix(in srgb, var(--accent-2) 22%, var(--panel));
   border-color: color-mix(in srgb, var(--accent-2) 45%, transparent);

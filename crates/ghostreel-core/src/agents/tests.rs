@@ -91,7 +91,10 @@ fn explicit_agents_roundtrip_and_materialize_from_old_sections() {
     // The worker section became a standalone agent and the section is gone.
     assert!(cfg.chat_worker.is_none());
     let worker = cfg.agents.iter().find(|a| a.id == "worker").unwrap();
-    assert_eq!((worker.backend, worker.url.as_str(), worker.model.as_str()), (Backend::Server, "http://127.0.0.1:8771", "qwen3.5-9b"));
+    assert_eq!(
+        (worker.backend, worker.url.as_str(), worker.model.as_str()),
+        (Backend::Server, "http://127.0.0.1:8771", "qwen3.5-9b")
+    );
     let (now, was) = (worker.llm_config(&cfg, AgentRole::Worker), old.chat_worker());
     assert_eq!((now.backend, now.url, now.model, now.think), (was.backend, was.url, was.model, was.think));
     assert_eq!(worker.max_concurrent, old.worker_concurrency());
@@ -176,16 +179,29 @@ fn selection_resolves_run_over_cut_over_app_field_by_field() {
 #[test]
 fn selection_errors_name_the_problem() {
     use AgentRole::*;
-    let agents = vec![agent("claude", &[Orchestrator, Worker], 2), AgentSpec { enabled: false, ..agent("off", &[Worker], 1) }, agent("eyes", &[Vision], 1)];
+    let agents = vec![
+        agent("claude", &[Orchestrator, Worker], 2),
+        AgentSpec { enabled: false, ..agent("off", &[Worker], 1) },
+        agent("eyes", &[Vision], 1),
+    ];
     let app = AgentSelection::default();
     let err = |sel: AgentSelection| resolve_selection(&agents, Some(&sel), None, &app).unwrap_err();
-    assert!(matches!(err(AgentSelection { orchestrator: Some("gpt".into()), ..Default::default() }), SelectionError::UnknownAgent { id, .. } if id == "gpt"));
-    assert_eq!(err(AgentSelection { workers: Some(vec!["off".into()]), ..Default::default() }), SelectionError::Disabled { id: "off".into() });
+    assert!(
+        matches!(err(AgentSelection { orchestrator: Some("gpt".into()), ..Default::default() }), SelectionError::UnknownAgent { id, .. } if id == "gpt")
+    );
+    assert_eq!(
+        err(AgentSelection { workers: Some(vec!["off".into()]), ..Default::default() }),
+        SelectionError::Disabled { id: "off".into() }
+    );
     let missing = err(AgentSelection { orchestrator: Some("eyes".into()), ..Default::default() });
     assert_eq!(missing, SelectionError::MissingRole { id: "eyes".into(), role: Orchestrator });
     assert!(missing.to_string().contains("an orchestrator"), "{missing}");
     assert_eq!(err(AgentSelection { max_parallel: Some(0), ..Default::default() }), SelectionError::ZeroParallel);
-    assert!(err(AgentSelection { orchestrator: Some("gpt".into()), ..Default::default() }).to_string().contains("claude, off, eyes"));
+    assert!(
+        err(AgentSelection { orchestrator: Some("gpt".into()), ..Default::default() })
+            .to_string()
+            .contains("claude, off, eyes")
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -285,7 +301,15 @@ fn cli(tool: &str) -> EndpointKey {
 }
 
 fn jobs(n: usize) -> Vec<AgentJob> {
-    (0..n).map(|i| AgentJob { label: format!("j{i}"), prompt: String::new(), schema: json!({}), max_tokens: 16, tools: None }).collect()
+    (0..n)
+        .map(|i| AgentJob {
+            label: format!("j{i}"),
+            prompt: String::new(),
+            schema: json!({}),
+            max_tokens: 16,
+            tools: None,
+        })
+        .collect()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -436,7 +460,9 @@ fn bad_model(_: usize) -> Option<AgentError> {
 }
 /// Busy for its first two calls, then fine.
 fn busy_twice(n: usize) -> Option<AgentError> {
-    (n <= 2).then(|| classify_http("http://ghostpen", "", 503, Some(0), "busy: too many chat requests waiting, retry later"))
+    (n <= 2).then(|| {
+        classify_http("http://ghostpen", "", 503, Some(0), "busy: too many chat requests waiting, retry later")
+    })
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -465,7 +491,9 @@ async fn a_used_up_quota_rests_the_agent_and_its_jobs_go_elsewhere() {
     assert_eq!(events.len(), 1, "one rest, not one line per job: {events:?}");
     assert!(matches!(events[0].action, PoolAction::CoolingDown { .. }));
     assert_eq!(events[0].remaining, ["codex"]);
-    assert!(events[0].message().starts_with("agy: quota used up, resets in 2 h 3 min — resting it; its jobs go to codex"));
+    assert!(
+        events[0].message().starts_with("agy: quota used up, resets in 2 h 3 min — resting it; its jobs go to codex")
+    );
     // Process-wide: the next run (any feature) sees agy resting.
     let rest = cooldowns.get(&cli("agy")).expect("agy rests");
     assert!(rest.remaining() > Duration::from_secs(7000));
@@ -528,7 +556,8 @@ async fn resolving_skips_an_agent_that_is_resting() {
     let dir = tempfile::tempdir().unwrap();
     let paths = crate::paths::Paths { config_file: dir.path().join("config.toml"), data_dir: dir.path().join("data") };
     let cfg = Config::default();
-    let resting = AgentSpec { model: "resting-test-model".into(), tool: "agy".into(), ..agent("agy", &[AgentRole::Worker], 1) };
+    let resting =
+        AgentSpec { model: "resting-test-model".into(), tool: "agy".into(), ..agent("agy", &[AgentRole::Worker], 1) };
     let av = check_availability(&paths, &cfg, &resting).await;
     // Installed or not, a resting endpoint is reported as resting first.
     assert_eq!(av.level, crate::preflight::Level::Error);
@@ -542,7 +571,10 @@ async fn resolving_skips_an_agent_that_is_resting() {
 
 #[test]
 fn legacy_effort_suffixes_become_a_model_and_an_effort() {
-    assert_eq!(Effort::split_model("claude", "claude-opus-5-5-medium"), Some(("claude-opus-5-5".into(), Effort::Medium)));
+    assert_eq!(
+        Effort::split_model("claude", "claude-opus-5-5-medium"),
+        Some(("claude-opus-5-5".into(), Effort::Medium))
+    );
     assert_eq!(Effort::split_model("claude", "opus-max"), Some(("opus".into(), Effort::Max)));
     assert_eq!(Effort::split_model("claude", "claude-opus-5-5"), None);
     // Other tools have real models that end like that.
@@ -568,7 +600,11 @@ fn legacy_effort_suffixes_become_a_model_and_an_effort() {
     let mut cfg = cfg;
     cfg.set_key("agents.opus.model", "claude-sonnet-5-5-low").unwrap();
     let opus = cfg.agents().into_iter().find(|a| a.id == "opus").unwrap();
-    assert_eq!((opus.model.as_str(), opus.effort), ("claude-sonnet-5-5", Some(Effort::High)), "an effort already set stays");
+    assert_eq!(
+        (opus.model.as_str(), opus.effort),
+        ("claude-sonnet-5-5", Some(Effort::High)),
+        "an effort already set stays"
+    );
     cfg.set_key("agents.opus.effort", "low").unwrap();
     assert_eq!(cfg.agents().into_iter().find(|a| a.id == "opus").unwrap().effort, Some(Effort::Low));
     assert!(cfg.set_key("agents.opus.effort", "extreme").is_err());
@@ -596,7 +632,10 @@ fn a_linked_agent_has_one_source_for_its_model() {
     let text = cfg.to_toml().unwrap();
     let agents_part = &text[text.find("[[agents]]").unwrap()..];
     for k in LINKED_FIELDS {
-        assert!(!agents_part.lines().any(|l| l.starts_with(&format!("{k} ="))), "{k} written for a linked agent:\n{agents_part}");
+        assert!(
+            !agents_part.lines().any(|l| l.starts_with(&format!("{k} ="))),
+            "{k} written for a linked agent:\n{agents_part}"
+        );
     }
     assert!(agents_part.contains("source = \"chat_model\""));
     // The section comes first, as before (the file keeps its order).
@@ -640,7 +679,8 @@ async fn preflight_downgrades_an_agent_others_can_cover() {
     assert_eq!(checks[0].level, crate::preflight::Level::Error);
     assert_eq!(checks[0].error.as_ref().unwrap().kind.key(), "unreachable");
     // As an optional orchestrator it only warns.
-    let checks = agent_checks(&paths, &cfg, &[(AgentRole::Orchestrator, vec![b.clone()])], &[AgentRole::Orchestrator]).await;
+    let checks =
+        agent_checks(&paths, &cfg, &[(AgentRole::Orchestrator, vec![b.clone()])], &[AgentRole::Orchestrator]).await;
     assert_eq!(checks[0].level, crate::preflight::Level::Warn);
     assert!(checks[0].message.ends_with("the orchestrator step is skipped"), "{}", checks[0].message);
 }
@@ -650,7 +690,12 @@ fn a_selection_can_pick_by_score_and_set_calls_at_once() {
     use AgentRole::*;
     let agents = vec![
         AgentSpec { name: "Claude".into(), ..agent("claude", &[Orchestrator, Worker], 2) },
-        AgentSpec { name: "GhostPen".into(), backend: Backend::Local, local_model: "q".into(), ..agent("pen", &[Worker], 1) },
+        AgentSpec {
+            name: "GhostPen".into(),
+            backend: Backend::Local,
+            local_model: "q".into(),
+            ..agent("pen", &[Worker], 1)
+        },
     ];
     let app = AgentSelection { orchestrator: Some("claude".into()), ..Default::default() };
     // A run that picks by score wins over the app's orchestrator.
@@ -660,7 +705,8 @@ fn a_selection_can_pick_by_score_and_set_calls_at_once() {
     assert_eq!(r.orchestrator_from, SelectionSource::Run);
     assert_eq!(r.effective().pick_by_score, Some(true));
     // Calls at once per worker; a local model stays at one.
-    let run = AgentSelection { concurrency: Some([("claude".into(), 4), ("pen".into(), 3)].into()), ..Default::default() };
+    let run =
+        AgentSelection { concurrency: Some([("claude".into(), 4), ("pen".into(), 3)].into()), ..Default::default() };
     let r = resolve_selection(&agents, Some(&run), None, &app).unwrap();
     assert_eq!(r.concurrency(), [("claude".to_string(), 4), ("pen".to_string(), 1)].into());
     assert_eq!((r.capacity, r.max_parallel), (5, 5));
@@ -671,8 +717,8 @@ fn a_selection_can_pick_by_score_and_set_calls_at_once() {
 
 #[test]
 fn a_resolved_selection_reads_as_one_sentence() {
-    use AgentRole::*;
     use crate::clips::ClipFormat;
+    use AgentRole::*;
     let agents = vec![
         AgentSpec { name: "Claude".into(), ..agent("claude", &[Orchestrator, Worker], 1) },
         AgentSpec { name: "GhostPen".into(), ..agent("pen", &[Worker], 2) },
@@ -680,9 +726,20 @@ fn a_resolved_selection_reads_as_one_sentence() {
     let run = AgentSelection { workers: Some(vec!["pen".into(), "claude".into()]), ..Default::default() };
     let r = resolve_selection(&agents, Some(&run), None, &AgentSelection::default()).unwrap();
     let target = WorkTarget { count: Some(2), format: Some(ClipFormat::Vertical) };
-    assert_eq!(r.summary(&target), "GhostPen (2 at a time) and Claude (1) score the episode; Claude picks the 2 clips (9:16).");
-    assert_eq!(r.summary(&WorkTarget::default()), "GhostPen (2 at a time) and Claude (1) score the episode; Claude picks the clips.");
-    let run = AgentSelection { workers: Some(vec!["pen".into()]), pick_by_score: Some(true), max_parallel: Some(1), ..Default::default() };
+    assert_eq!(
+        r.summary(&target),
+        "GhostPen (2 at a time) and Claude (1) score the episode; Claude picks the 2 clips (9:16)."
+    );
+    assert_eq!(
+        r.summary(&WorkTarget::default()),
+        "GhostPen (2 at a time) and Claude (1) score the episode; Claude picks the clips."
+    );
+    let run = AgentSelection {
+        workers: Some(vec!["pen".into()]),
+        pick_by_score: Some(true),
+        max_parallel: Some(1),
+        ..Default::default()
+    };
     let r = resolve_selection(&agents, Some(&run), None, &AgentSelection::default()).unwrap();
     assert_eq!(
         r.summary(&WorkTarget { count: Some(3), format: Some(ClipFormat::Original) }),

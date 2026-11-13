@@ -183,7 +183,11 @@ pub async fn run(paths: &Paths, action: ClipsAction) -> anyhow::Result<ExitCode>
             println!("clip set {} — {} clips ({})", res.set.id, res.set.items.len(), opts.format.label());
             for (k, c) in res.clips.iter().enumerate() {
                 let Some(id) = c.script_id else {
-                    println!("  [skipped] {} — errors: {:?}", c.pick.title, c.issues.iter().map(|i| &i.message).collect::<Vec<_>>());
+                    println!(
+                        "  [skipped] {} — errors: {:?}",
+                        c.pick.title,
+                        c.issues.iter().map(|i| &i.message).collect::<Vec<_>>()
+                    );
                     continue;
                 };
                 println!(
@@ -256,7 +260,12 @@ pub async fn run(paths: &Paths, action: ClipsAction) -> anyhow::Result<ExitCode>
             }
             for s in sets {
                 let brief = if s.brief.is_empty() { "(no brief)".to_string() } else { s.brief.clone() };
-                println!("{} · {} clips · {} · {brief}", s.id, s.items.len(), s.options["format"].as_str().unwrap_or("original"));
+                println!(
+                    "{} · {} clips · {} · {brief}",
+                    s.id,
+                    s.items.len(),
+                    s.options["format"].as_str().unwrap_or("original")
+                );
                 for i in &s.items {
                     println!(
                         "   #{} [{}] {:.1} v{} {}–{} {}",
@@ -283,11 +292,21 @@ pub async fn run(paths: &Paths, action: ClipsAction) -> anyhow::Result<ExitCode>
             } else {
                 clips::ExportWhich::NotRejected
             };
-            let files = clips::export_set(&db, &paths.data_dir, &ffmpeg, &set_id, &out, which, &config.script, None, |k, n, name| {
-                if k < n {
-                    eprintln!("rendering {}/{n}: {name}", k + 1);
-                }
-            })?;
+            let files = clips::export_set(
+                &db,
+                &paths.data_dir,
+                &ffmpeg,
+                &set_id,
+                &out,
+                which,
+                &config.script,
+                None,
+                |k, n, name| {
+                    if k < n {
+                        eprintln!("rendering {}/{n}: {name}", k + 1);
+                    }
+                },
+            )?;
             for f in files {
                 println!("{}", f.display());
             }

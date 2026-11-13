@@ -35,15 +35,20 @@ import {
 } from "lucide-react";
 import { audible, autoTrack, loadAudioTracks, trackProxyUrl, type TrackMonitor } from "./audioTracks";
 import { fpsValue, frameClock } from "./timecode";
+import { beatTimes, cardBackground, cardSeconds } from "./cards";
 import TextOverlays from "./TextOverlays";
 import { overlayKey } from "./textOverlay";
 import "./player.css";
 import { cropBox, fitRect } from "./FramedImage";
 
-/** One picture clip placed on the cut's clock. */
+/** One picture clip (or one section card) placed on the cut's clock. */
 export interface LiveSegment {
   beatIndex: number;
+  /** -1 for a section card. */
   clipIndex: number;
+  /** A section card: a plain colour frame with no footage behind it (`videoId` is 0). It is
+   * timed by the clock, not by a media element. */
+  card?: { background: string };
   videoId: number;
   inS: number;
   outS: number;
@@ -58,6 +63,9 @@ export interface LiveSegment {
 
 export interface LiveBeatSpan {
   beat: Beat;
+  /** Where the beat's card begins (equals `start` when it has none). */
+  cardStart: number;
+  /** Where its clips begin: the beat's bed and title time run from here. */
   start: number;
   end: number;
 }
@@ -68,12 +76,29 @@ export interface LiveLayout {
   total: number;
 }
 
-/** Lays the clips end to end the way the timeline draws them: beat order, then clip order. */
+/** Lays the cards and clips end to end the way the timeline draws them: beat order, a beat's card
+ * first, then its clips in order. */
 export function layoutScript(script: Script): LiveLayout {
   const segments: LiveSegment[] = [];
   const beats: LiveBeatSpan[] = [];
+  const times = beatTimes(script);
   let t = 0;
   script.beats.forEach((beat, beatIndex) => {
+    const cardLen = cardSeconds(script, beat);
+    if (cardLen > 0) {
+      segments.push({
+        beatIndex,
+        clipIndex: -1,
+        card: { background: cardBackground(script, beat) },
+        videoId: 0,
+        inS: 0,
+        outS: cardLen,
+        start: times[beatIndex].cardStart,
+        end: times[beatIndex].clipsStart,
+        muted: true,
+      });
+    }
+    t = times[beatIndex].clipsStart;
     const start = t;
     const hasBed = !!beat.bed && beat.bed.out_s > beat.bed.in_s;
     beat.clips.forEach((c, clipIndex) => {
@@ -92,7 +117,7 @@ export function layoutScript(script: Script): LiveLayout {
       });
       t += dur;
     });
-    beats.push({ beat, start, end: t });
+    beats.push({ beat, cardStart: times[beatIndex].cardStart, start, end: t });
   });
   return { segments, beats, total: t };
 }
@@ -240,6 +265,8 @@ export default function LivePlayer({
   const rateRef = useRef(1);
   const loopRef = useRef(false);
   const lastFrame = useRef(-1);
+  // A section card has no media element to follow: its time runs off the wall clock, from here.
+  const cardAnchor = useRef({ perf: 0, t: 0 });
   const lastReport = useRef(0);
   const onTimeRef = useRef(onTime);
   onTimeRef.current = onTime;
@@ -382,11 +409,8 @@ export default function LivePlayer({
     const seg = layoutRef.current.segments[idx];
     if (!v || !seg) return false;
     slotSeg.current[slot] = idx;
-    v.muted = pictureMuted(seg);
-    const url = urlsRef.current[seg.videoId];
-    if (!url) {
-      ensureUrl(seg.videoId);
-      // Drop the previous source: its picture and clock belong to another clip.
+    // Drop the previous source: its picture and clock belong to another clip.
+    const dropSource = () => {
       if (slotUrl.current[slot] != null) {
         slotUrl.current[slot] = null;
         pending.current[slot] = null;
@@ -394,6 +418,17 @@ export default function LivePlayer({
         v.removeAttribute("src");
         v.load();
       }
+    };
+    if (seg.card) {
+      // Nothing to load: the card is drawn over the frame.
+      dropSource();
+      return true;
+    }
+    v.muted = pictureMuted(seg);
+    const url = urlsRef.current[seg.videoId];
+    if (!url) {
+      ensureUrl(seg.videoId);
+      dropSource();
       return false;
     }
     const target = seg.inS + offset;
@@ -524,6 +559,14 @@ export default function LivePlayer({
     for (const te of trackEls.current.values()) te.el.pause();
   };
 
+  /** While paused, nothing of the viewer's may sound. WebKitGTK can start an element whose
+   *  `play()` was still pending (a bed or track proxy loading on demand) after `pause()` ran, so a
+   *  paused viewer went on playing audio. The clock calls this every frame while paused. */
+  const haltStrays = () => {
+    for (const el of [vidA.current, vidB.current, bedRef.current]) if (el && !el.paused) el.pause();
+    for (const te of trackEls.current.values()) if (!te.el.paused) te.el.pause();
+  };
+
   const segAt = (t: number) => {
     const segs = layoutRef.current.segments;
     if (!segs.length) return -1;
@@ -557,9 +600,10 @@ export default function LivePlayer({
     if (idx + 1 < segments.length) prime(other, idx + 1, 0);
     const v = vid(active);
     if (v) {
-      if (playingRef.current && ready) v.play().catch(() => {});
-      else if (!playingRef.current) v.pause();
+      if (playingRef.current && ready && !seg.card) v.play().catch(() => {});
+      else if (!playingRef.current || seg.card) v.pause();
     }
+    cardAnchor.current = { perf: performance.now(), t: time };
     showSlot(active);
     syncAudio(time, true);
     report(time, true);
@@ -605,7 +649,12 @@ export default function LivePlayer({
     const other = (1 - active) as Slot;
     const v = vid(active);
     const o = vid(other);
-    if (v && !v.ended && ns.videoId === seg.videoId && Math.abs(ns.inS - v.currentTime) < 0.15) {
+    // A card has no element to hand over to: start it fresh on the clock.
+    if (ns.card) {
+      place(ns.start);
+      return;
+    }
+    if (v && !seg.card && !v.ended && ns.videoId === seg.videoId && Math.abs(ns.inS - v.currentTime) < 0.15) {
       idxRef.current = next;
       setCurIdx(next);
       v.muted = pictureMuted(ns);
@@ -639,12 +688,27 @@ export default function LivePlayer({
     let raf = 0;
     const tick = () => {
       raf = requestAnimationFrame(tick);
-      if (!playingRef.current) return;
+      if (!playingRef.current) {
+        haltStrays();
+        return;
+      }
       const { segments } = layoutRef.current;
       const idx = idxRef.current;
       const seg = segments[idx];
       const active = activeRef.current;
       const v = vid(active);
+      if (seg?.card) {
+        // A card runs on the wall clock (scaled by the playback rate), then moves on like a clip.
+        const a = cardAnchor.current;
+        const t = a.t + ((performance.now() - a.perf) / 1000) * rateRef.current;
+        if (t >= seg.end - 0.25 / fpsRef.current) {
+          advance();
+          return;
+        }
+        timeRef.current = t;
+        report(t);
+        return;
+      }
       if (!seg || !v) return;
       if (
         slotSeg.current[active] !== idx ||
@@ -781,7 +845,7 @@ export default function LivePlayer({
     const segs = layout.segments;
     for (const i of [curIdx, curIdx + 1, curIdx + 2]) {
       const seg = segs[i];
-      if (!seg) continue;
+      if (!seg || seg.card) continue;
       ensureUrl(seg.videoId);
       ensureInfo(seg.videoId);
       for (const tr of seg.tracks ?? []) ensureTrack(seg.videoId, tr);
@@ -837,7 +901,8 @@ export default function LivePlayer({
   }, []);
 
   const current = layout.segments[curIdx];
-  const currentVideoId = current?.videoId;
+  const currentCard = current?.card;
+  const currentVideoId = currentCard ? undefined : current?.videoId;
   const waitingFor = currentVideoId != null && !urls[currentVideoId] ? currentVideoId : null;
 
   // Poll the proxy build while the clip on screen waits for one.
@@ -886,6 +951,8 @@ export default function LivePlayer({
 
   const setRate = (r: number) => {
     rateRef.current = r;
+    // A card on screen keeps its place: the clock restarts from here at the new speed.
+    cardAnchor.current = { perf: performance.now(), t: timeRef.current };
     setRateState(r);
     applyRate(vidA.current);
     applyRate(vidB.current);
@@ -1025,10 +1092,18 @@ export default function LivePlayer({
   const narration = span?.beat.narration?.trim();
   const at = (o: { start_s: number; end_s: number }) => displayTime >= o.start_s && displayTime < o.end_s;
   const visibleTitles = showTitles ? (overlays?.titles ?? []).filter(at) : [];
+  // Cards are part of the cut, not a burn-in option: shown whenever the playhead is on one.
+  const visibleCards = currentCard ? (overlays?.cards ?? []).filter(at) : [];
   const visibleCaptions = showCaptions ? (overlays?.captions ?? []).filter((o) => !o.cue?.hidden && at(o)) : [];
   const hasActiveCaption = visibleCaptions.length > 0;
   const currentVideo = currentVideoId != null ? videos[currentVideoId] : undefined;
-  const currentName = currentVideo ? fileName(currentVideo.path) : currentVideoId != null ? `video ${currentVideoId}` : "";
+  const currentName = currentCard
+    ? "Section card"
+    : currentVideo
+      ? fileName(currentVideo.path)
+      : currentVideoId != null
+        ? `video ${currentVideoId}`
+        : "";
 
   return (
     <div className="lp" ref={rootRef} tabIndex={0} onKeyDown={onKeyDown} aria-label="Live viewer">
@@ -1060,14 +1135,15 @@ export default function LivePlayer({
               onLoadedMetadata={() => onMeta(1)} onEnded={() => activeRef.current === 1 && playingRef.current && advance()} />
           </div>
           <canvas ref={stackRef} className="lp-stack-bottom" aria-hidden="true" />
-          {!empty && subtitles && narration && (
+          {currentCard && <div className="lp-card" style={{ background: currentCard.background }} aria-hidden="true" />}
+          {!empty && subtitles && narration && !currentCard && (
             <div className={`lp-subtitle ${hasActiveCaption ? "lp-subtitle-above" : ""}`}>
               {narration}
             </div>
           )}
           {!empty && (
             <TextOverlays
-              items={[...visibleCaptions, ...visibleTitles]}
+              items={[...visibleCaptions, ...visibleTitles, ...visibleCards]}
               frameH={frameH}
               frameRef={frameRef}
               editable={!!onOverlayMove}

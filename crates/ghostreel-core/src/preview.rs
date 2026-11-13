@@ -34,6 +34,21 @@ pub struct PlannedSegment {
     /// How the picture is cut to the cut's shape (the clip's framing, else the script's).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub framing: Option<crate::framing::Framing>,
+    /// The quiet picture a cut closes on (`chat::CLOSING_PICTURE`), outside any bed: it plays the
+    /// room's own sound when no one is speaking in it, not digital silence.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hold: bool,
+    /// A section card, not footage: a plain frame of this colour (`#rrggbb`) for the segment's
+    /// length, in silence; its title is drawn with the other overlays. `video_id` is 0 and `path`
+    /// empty, `in_s` is 0 and `out_s` the card's length.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub card: Option<String>,
+}
+
+impl PlannedSegment {
+    pub fn duration_s(&self) -> f64 {
+        (self.out_s - self.in_s).max(0.0)
+    }
 }
 
 /// The sound running under a beat: where it sits on the preview timeline and where it comes from.
@@ -111,12 +126,32 @@ pub struct PreviewOptions {
     /// Seconds of fade at each join; `script.audio_fade_s`.
     pub audio_fade_s: f64,
     /// How far a cut runs past the last word so its decay survives; `script.speech_overrun_s`.
-    /// The fade out spends this, rather than starting on the word's final sample.
+    /// The cuts are placed with it (`cuts.rs`); the fade out no longer reads it, it is the end of
+    /// the clip (see [`audio_fades`]).
     pub speech_overrun_s: f64,
     pub out: Option<PathBuf>,
     pub cancel: Option<Arc<AtomicBool>>,
     /// How big the frames are: a light 540p preview, or the cut's own size for a finished export.
     pub size: RenderSize,
+}
+
+impl PreviewOptions {
+    /// What a finished MP4 is rendered with: the cut's own size, titles and speech captions burnt
+    /// in where the script has them, every clip at the same loudness. The one definition behind a
+    /// clip set's export and `export_script` with `format: mp4`.
+    pub fn deliverable(cfg: &crate::config::ScriptConfig, out: PathBuf, cancel: Option<Arc<AtomicBool>>) -> Self {
+        Self {
+            burn_titles: true,
+            burn_narration: false,
+            burn_captions: true,
+            normalize_audio: true,
+            audio_fade_s: cfg.audio_fade_s,
+            speech_overrun_s: cfg.speech_overrun_s,
+            out: Some(out),
+            cancel,
+            size: RenderSize::Full,
+        }
+    }
 }
 
 /// Output frame size of a render.
@@ -211,6 +246,52 @@ pub fn proxy_file_name_with_audio(
     format!("{hash}_{in_ms}_{out_ms}_{}_{}_{w}x{h}_{audio}.mp4", fps.num, fps.den)
 }
 
+/// The shortest fade out that still avoids a click when a voice runs to the very end (s).
+const MIN_FADE_OUT_S: f64 = 0.03;
+
+/// How far past a hold's end the next voice may be before the hold stops being room tone (s).
+const HOLD_GUARD_S: f64 = 0.12;
+
+/// Where the fade out of `dur` seconds of audio starts and how long it lasts.
+///
+/// It is the last `fade` seconds of the audio, and never starts before the last voiced sound in it
+/// (`last_voiced_end`, seconds from the start; `None` when nothing is known or nothing is voiced).
+/// An `afade` out leaves everything after it at zero, so a fade that began where the transcript
+/// says the speech ends erased real speech whenever Whisper's end was early (1.5 s and once 2.1 s
+/// of a benchmark render), and turned the room's sound after the last word into digital silence.
+/// A voice that runs right to the end still gets a [`MIN_FADE_OUT_S`] fade: a cut mid-breath is a
+/// click otherwise.
+pub fn fade_out_window(dur: f64, fade: f64, last_voiced_end: Option<f64>) -> (f64, f64) {
+    let natural = (dur - fade).max(0.0);
+    let start = last_voiced_end.map_or(natural, |end| end.max(natural));
+    let start = start.min((dur - MIN_FADE_OUT_S).max(0.0));
+    (start, dur - start)
+}
+
+/// The `afade` filters for `dur` seconds of `video_id` from `in_s` (with a trailing comma; empty
+/// when fades are off), and where the fade out starts. A clip's fade out follows the measured
+/// speech when the speech stage has run for the video ([`fade_out_window`]); without it the fade
+/// is only the last `fade_s` of the audio. The transcript's end times are not consulted: they are
+/// approximate, and a fade can only be too early by erasing what is said.
+pub fn audio_fades(db: &Db, video_id: i64, in_s: f64, dur: f64, fade_s: f64) -> (String, f64) {
+    let fade = fade_s.max(0.0).min(dur / 3.0);
+    if fade <= 0.005 {
+        return (String::new(), dur);
+    }
+    let last_voiced = crate::speech::speech_regions(db, video_id, in_s, in_s + dur)
+        .ok()
+        .and_then(|regions| regions.iter().map(|r| r.end_s.min(in_s + dur) - in_s).reduce(f64::max));
+    let (start, len) = fade_out_window(dur, fade, last_voiced);
+    (format!("afade=t=in:st=0:d={fade:.3},afade=t=out:st={start:.3}:d={len:.3},"), start)
+}
+
+/// Whether nobody is speaking in `in_s..out_s` of a video the speech stage has measured, nor in the
+/// moment after: a stretch of room sound that is safe to play.
+fn is_room_tone(db: &Db, video_id: i64, in_s: f64, out_s: f64) -> bool {
+    crate::speech::analysed(db, video_id)
+        && crate::speech::speech_regions(db, video_id, in_s, out_s + HOLD_GUARD_S).is_ok_and(|r| r.is_empty())
+}
+
 /// The source tracks a clip or bed plays: its own choice, without repeats or tracks the file does
 /// not have (when the count is known), else the automatic track. Empty = silent.
 pub fn effective_tracks(tracks: Option<&[u32]>, auto_track: u32, stream_count: Option<u32>) -> Vec<u32> {
@@ -261,6 +342,26 @@ pub fn plan_segments(script: &Script, media: &HashMap<i64, ResolvedMedia>) -> Re
     let mut timeline_start_s = 0.0;
 
     for beat in &script.beats {
+        let card_s = script.card_s(beat);
+        if card_s > 0.0 {
+            let dur = (card_s * seq_rate).round().max(1.0) / seq_rate;
+            segments.push(PlannedSegment {
+                video_id: 0,
+                path: PathBuf::new(),
+                in_s: 0.0,
+                out_s: dur,
+                timeline_start_s,
+                beat_id: beat.id.clone(),
+                mute: true,
+                has_audio: false,
+                audio_track: 0,
+                tracks: None,
+                framing: None,
+                hold: false,
+                card: Some(script.card_background(beat)),
+            });
+            timeline_start_s += dur;
+        }
         for clip in &beat.clips {
             let res = media
                 .get(&clip.video_id)
@@ -286,6 +387,10 @@ pub fn plan_segments(script: &Script, media: &HashMap<i64, ResolvedMedia>) -> Re
                 audio_track: res.audio_track,
                 tracks: clip.tracks.clone(),
                 framing: crate::framing::effective(script, clip).cloned(),
+                hold: clip.audio == Audio::Mute
+                    && beat.bed.is_none()
+                    && clip.why.as_deref() == Some(crate::chat::CLOSING_PICTURE),
+                card: None,
             });
 
             timeline_start_s += dur;
@@ -299,7 +404,9 @@ pub fn plan_segments(script: &Script, media: &HashMap<i64, ResolvedMedia>) -> Re
 pub fn plan_beat_spans(script: &Script, segments: &[PlannedSegment]) -> Vec<BeatSpan> {
     let mut spans = Vec::new();
     for beat in &script.beats {
-        let beat_segs: Vec<&PlannedSegment> = segments.iter().filter(|s| s.beat_id == beat.id).collect();
+        // A beat's titles and narration go over its footage, not over its section card.
+        let beat_segs: Vec<&PlannedSegment> =
+            segments.iter().filter(|s| s.beat_id == beat.id && s.card.is_none()).collect();
         let (start_s, end_s) = if let Some(first) = beat_segs.first() {
             let last = beat_segs.last().unwrap();
             (first.timeline_start_s, last.timeline_start_s + (last.out_s - last.in_s).max(0.0))
@@ -328,7 +435,7 @@ pub fn plan_bed_spans(
     for beat in &script.beats {
         let Some(bed) = &beat.bed else { continue };
         let Some(res) = media.get(&bed.video_id) else { continue };
-        let Some(first) = segments.iter().find(|s| s.beat_id == beat.id) else { continue };
+        let Some(first) = segments.iter().find(|s| s.beat_id == beat.id && s.card.is_none()) else { continue };
         if bed.duration_s() <= 0.0 {
             continue;
         }
@@ -699,8 +806,7 @@ pub fn render_preview(
     let previews_dir = data_dir.join("previews");
     std::fs::create_dir_all(&previews_dir).map_err(|e| Error::Io(previews_dir.clone(), e))?;
 
-    let out_path =
-        opts.out.clone().unwrap_or_else(|| default_preview_path(data_dir, stored.id, stored.version));
+    let out_path = opts.out.clone().unwrap_or_else(|| default_preview_path(data_dir, stored.id, stored.version));
     if let Some(parent) = out_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| Error::Io(parent.to_path_buf(), e))?;
     }
@@ -720,6 +826,53 @@ pub fn render_preview(
     for (i, seg) in segments.iter().enumerate() {
         if opts.cancel.as_ref().is_some_and(|c| c.load(Ordering::SeqCst)) {
             return Err(Error::Preview("cancelled".into()));
+        }
+
+        // A section card is a plain frame in silence, encoded like the clips so they join without
+        // re-encoding; its title is burnt with the other overlays.
+        if let Some(bg) = &seg.card {
+            let hex = bg.trim_start_matches('#');
+            let dur = seg.duration_s().max(0.01);
+            let p_path = proxies_dir.join(format!(
+                "card_{hex}_{proxy_w}x{proxy_h}_{}-{}_{}ms.mp4",
+                project_fps.num,
+                project_fps.den,
+                (dur * 1000.0).round() as i64
+            ));
+            if p_path.is_file() && std::fs::metadata(&p_path).map(|m| m.len() > 0).unwrap_or(false) {
+                proxies_cached += 1;
+            } else {
+                proxies_built += 1;
+                let dur_str = format!("{dur:.3}");
+                let tmp_path = p_path.with_extension(format!("tmp.{}.mp4", std::process::id()));
+                let mut cmd = crate::proc::std_command(ffmpeg);
+                cmd.args(["-y", "-f", "lavfi", "-i"])
+                    .arg(format!(
+                        "color=c=0x{hex}:s={proxy_w}x{proxy_h}:r={}/{}:d={dur_str}",
+                        project_fps.num, project_fps.den
+                    ))
+                    .args(["-f", "lavfi", "-t", &dur_str, "-i", "anullsrc=r=48000:cl=stereo"])
+                    .args(["-map", "0:v:0", "-map", "1:a:0", "-vf", &format!("setsar=1,{fps_tail}")])
+                    .args(["-g", &g_val.to_string()])
+                    .args(&encoder.args)
+                    .args(["-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2", "-t", &dur_str])
+                    .args(["-shortest", "-movflags", "+faststart"])
+                    .arg(&tmp_path);
+                let out = crate::cancel::output(&mut cmd, opts.cancel.as_ref())
+                    .map_err(ffmpeg_err("failed to run ffmpeg for a section card"))?;
+                if !out.status.success() {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    let tail = stderr.lines().rev().take(10).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>();
+                    let _ = std::fs::remove_file(&tmp_path);
+                    return Err(Error::Preview(format!("section card encode failed: {}", tail.join("\n"))));
+                }
+                std::fs::rename(&tmp_path, &p_path).map_err(|e| Error::Io(p_path.clone(), e))?;
+            }
+            proxy_paths.push(p_path);
+            completed_dur += dur;
+            let frac = if total_dur > 0.0 { (completed_dur / total_dur) * 0.85 } else { 0.85 };
+            on_progress(frac, &format!("Building proxies {}/{} ({})", i + 1, segments.len(), encoder.name));
+            continue;
         }
 
         let res = media
@@ -746,6 +899,10 @@ pub fn render_preview(
             Some(p) => format!("{},{fps_tail}", p.ffmpeg_filter(proxy_w, proxy_h)),
             None => letterbox_vf.clone(),
         };
+        // A closing hold is room sound when nobody speaks in it, silence otherwise (it must never
+        // carry the next voice).
+        let room_tone = seg.hold && seg.has_audio && is_room_tone(db, seg.video_id, seg.in_s, seg.out_s);
+        let silent = seg.mute && !room_tone;
         let mut p_name = proxy_file_name_with_audio(
             &res.content_hash,
             seg.in_s,
@@ -757,8 +914,15 @@ pub fn render_preview(
             opts.audio_fade_s,
             // A silent segment is cached as "no tracks": sharing a name with the same range's
             // sounding version replayed whichever one was built first after a mute toggle.
-            if seg.mute { Some(&[]) } else { seg.tracks.as_deref() },
+            if silent { Some(&[]) } else { seg.tracks.as_deref() },
         );
+        // Where the fade out starts is part of what was encoded: proxies built when the fade began
+        // at the transcript's end must not be replayed.
+        let seg_dur = (seg.out_s - seg.in_s).max(0.01);
+        let (fades, fade_out_at) = audio_fades(db, seg.video_id, seg.in_s, seg_dur, opts.audio_fade_s);
+        if !silent {
+            p_name = p_name.replace(".mp4", &format!("_o{}.mp4", (fade_out_at * 1000.0).round() as i64));
+        }
         if let Some(p) = &plan {
             p_name = p_name.replace(".mp4", &format!("_f{}.mp4", p.digest()));
         }
@@ -770,7 +934,6 @@ pub fn render_preview(
             proxies_cached += 1;
         } else {
             proxies_built += 1;
-            let seg_dur = (seg.out_s - seg.in_s).max(0.01);
             let in_str = format!("{:.3}", seg.in_s);
             let dur_str = format!("{:.3}", seg_dur);
             let tmp_path = p_path.with_extension(format!("tmp.{}.mp4", std::process::id()));
@@ -781,47 +944,14 @@ pub fn render_preview(
             // Levelling happens per clip, before they are joined: loudnorm needs a whole clip
             // to measure, and the point is that clips match each other.
             // Fade each clip in and out: segments are joined end to end, and a cut taken in the
-            // middle of a breath stops dead without one.
-            //
-            // The fade out starts where the speaking stops, not where the clip does. A clip runs
-            // a little past the last word so its decay survives, and in continuous speech that
-            // overrun reaches into the next sentence — audible as a stray "And" after the point
-            // has been made. Fading from the sentence end keeps the decay and loses the word.
-            let fade = opts.audio_fade_s.max(0.0).min(seg_dur / 3.0);
-            let cfg_overrun = opts.speech_overrun_s.max(0.0);
-            let speech_end_rel: Option<f64> = db
-                .conn
-                .query_row(
-                    "SELECT MAX(end_s) FROM transcript_segments WHERE video_id = ?1 AND end_s > ?2 AND end_s <= ?3",
-                    rusqlite::params![seg.video_id, seg.in_s, seg.out_s + 0.01],
-                    |r| r.get::<_, Option<f64>>(0),
-                )
-                .ok()
-                .flatten()
-                .map(|e| (e - seg.in_s).max(0.0));
-            // The fade runs *across* the decay of the last word rather than starting on it.
-            // Whisper's segment times are approximate and often quantised to whole seconds, so
-            // "the sentence ends here" is only nearly true; fading from that instant clipped
-            // "…running around too" and "Genuine, real neighborhood." The clip carries an overrun
-            // for exactly this, and the fade now spends it.
-            let (fade_out_at, fade_len) = match speech_end_rel {
-                Some(end) if end < seg_dur => {
-                    let room = (seg_dur - end).max(0.0);
-                    (end.min((seg_dur - fade).max(0.0)), fade.max(room.min(cfg_overrun)))
-                }
-                _ => ((seg_dur - fade).max(0.0), fade),
-            };
-            let fades = if fade > 0.005 {
-                format!("afade=t=in:st=0:d={fade:.3},afade=t=out:st={fade_out_at:.3}:d={fade_len:.3},")
-            } else {
-                String::new()
-            };
+            // middle of a breath stops dead without one. The fade out is the end of the clip, and
+            // never starts before the last voiced sound in it (see `audio_fades`).
             let af = if opts.normalize_audio {
                 format!("{fades}loudnorm=I=-16:TP=-1.5:LRA=11,apad")
             } else {
                 format!("{fades}apad")
             };
-            let chosen = if seg.mute || !seg.has_audio {
+            let chosen = if silent || !seg.has_audio {
                 Vec::new()
             } else {
                 let count = if seg.tracks.is_some() { stream_count(seg.video_id, &seg.path) } else { None };
@@ -899,7 +1029,9 @@ pub fn render_preview(
     let has_captions = burn_captions && !cues.is_empty();
     let has_titles = opts.burn_titles && beat_spans.iter().any(|b| b.on_screen_text.is_some());
     let has_narration = opts.burn_narration && beat_spans.iter().any(|b| b.narration.is_some());
-    let burn_pass_needed = has_titles || has_narration || has_captions;
+    // A section card's title is the card: it is always drawn.
+    let has_cards = segments.iter().any(|s| s.card.is_some());
+    let burn_pass_needed = has_titles || has_narration || has_captions || has_cards;
 
     let bed_pass_needed = !bed_spans.is_empty();
     let concat_output = if burn_pass_needed || bed_pass_needed {
@@ -938,30 +1070,10 @@ pub fn render_preview(
         for (i, (bed, chosen)) in bed_spans.iter().enumerate() {
             let dur = (bed.out_s - bed.in_s).max(0.01);
             let wav = previews_dir.join(format!("bed_{}_{i}_{}.wav", stored.id, std::process::id()));
-            let fade = opts.audio_fade_s.max(0.0).min(dur / 3.0);
-            let cfg_overrun = opts.speech_overrun_s.max(0.0);
-            // As for a clip, the fade out starts where the speaking stops, not where the bed does.
-            let speech_end_rel: Option<f64> = db
-                .conn
-                .query_row(
-                    "SELECT MAX(end_s) FROM transcript_segments WHERE video_id = ?1 AND end_s > ?2 AND end_s <= ?3",
-                    params![bed.video_id, bed.in_s, bed.out_s + 0.01],
-                    |r| r.get::<_, Option<f64>>(0),
-                )
-                .ok()
-                .flatten()
-                .map(|e| (e - bed.in_s).max(0.0));
-            let (fade_out_at, fade_len) = match speech_end_rel {
-                Some(end) if end < dur => {
-                    let room = (dur - end).max(0.0);
-                    (end.min((dur - fade).max(0.0)), fade.max(room.min(cfg_overrun)))
-                }
-                _ => ((dur - fade).max(0.0), fade),
-            };
-            let mut af = String::new();
-            if fade > 0.005 {
-                af.push_str(&format!("afade=t=in:st=0:d={fade:.3},afade=t=out:st={fade_out_at:.3}:d={fade_len:.3},"));
-            }
+            // As for a clip, the fade out is the end of the bed and never starts before the last
+            // voiced sound in it.
+            let (fades, _) = audio_fades(db, bed.video_id, bed.in_s, dur, opts.audio_fade_s);
+            let mut af = fades;
             if opts.normalize_audio {
                 af.push_str("loudnorm=I=-16:TP=-1.5:LRA=11,");
             }
@@ -1046,15 +1158,16 @@ pub fn render_preview(
         };
         // Titles and captions share one ASS file, each line at an explicit position, laid out
         // exactly as the editor's live viewer draws them.
-        let overlays_escaped = if has_titles || has_captions {
+        let overlays_escaped = if has_titles || has_captions || has_cards {
             let mut ov = crate::overlays::layout(&stored.script, if has_captions { &cues } else { &[] });
             if !has_titles {
                 ov.titles.clear();
             }
-            let ass_path = out_path
-                .parent()
-                .unwrap_or(Path::new("."))
-                .join(format!("overlays_{}_{}.ass", stored.id, std::process::id()));
+            let ass_path = out_path.parent().unwrap_or(Path::new(".")).join(format!(
+                "overlays_{}_{}.ass",
+                stored.id,
+                std::process::id()
+            ));
             std::fs::write(&ass_path, crate::overlays::to_ass(&ov, proxy_w, proxy_h))
                 .map_err(|e| Error::Io(ass_path.clone(), e))?;
             temp_files_to_remove.push(ass_path.clone());
@@ -1411,7 +1524,8 @@ mod tests {
                     on_screen_text: Some("Title 1".into()),
                     title_layout: None,
                     clips: vec![
-                        script::ScriptClip {
+                        script::ScriptClip { exact: false,
+                            sentences: None,
                             framing: None,
                             video_id: 1,
                             in_s: 0.0,
@@ -1420,7 +1534,8 @@ mod tests {
                             why: None,
                             tracks: None,
                         },
-                        script::ScriptClip {
+                        script::ScriptClip { exact: false,
+                            sentences: None,
                             framing: None,
                             video_id: 2,
                             in_s: 2.0,
@@ -1432,6 +1547,7 @@ mod tests {
                     ],
                     notes: None,
                     bed: None,
+                    card: None,
                 },
                 script::Beat {
                     id: "b2".into(),
@@ -1439,7 +1555,8 @@ mod tests {
                     narration: Some("Voice 2".into()),
                     on_screen_text: None,
                     title_layout: None,
-                    clips: vec![script::ScriptClip {
+                    clips: vec![script::ScriptClip { exact: false,
+                        sentences: None,
                         framing: None,
                         video_id: 1,
                         in_s: 5.0,
@@ -1450,8 +1567,10 @@ mod tests {
                     }],
                     notes: None,
                     bed: None,
+                    card: None,
                 },
             ],
+            card_style: None,
         };
 
         let mut media = HashMap::new();
@@ -1797,7 +1916,8 @@ mod tests {
                     narration: Some("Narration for Beat 1".into()),
                     on_screen_text: Some("Preview Title".into()),
                     title_layout: None,
-                    clips: vec![script::ScriptClip {
+                    clips: vec![script::ScriptClip { exact: false,
+                        sentences: None,
                         framing: None,
                         video_id: 1,
                         in_s: 0.5,
@@ -1808,6 +1928,7 @@ mod tests {
                     }],
                     notes: None,
                     bed: None,
+                    card: None,
                 },
                 script::Beat {
                     id: "b2".into(),
@@ -1815,7 +1936,8 @@ mod tests {
                     narration: None,
                     on_screen_text: None,
                     title_layout: None,
-                    clips: vec![script::ScriptClip {
+                    clips: vec![script::ScriptClip { exact: false,
+                        sentences: None,
                         framing: None,
                         video_id: 2,
                         in_s: 0.0,
@@ -1826,8 +1948,10 @@ mod tests {
                     }],
                     notes: None,
                     bed: None,
+                    card: None,
                 },
             ],
+            card_style: None,
         };
 
         let script_id = script::save_version(&db, project.id, &script, None).unwrap();
@@ -1994,8 +2118,18 @@ mod tests {
     #[test]
     fn test_burn_captions_filtergraph_and_timing() {
         let cues = vec![
-            crate::captions::Cue { start_s: 1.25, end_s: 3.5, text: "First line\nSecond line".into(), ..Default::default() },
-            crate::captions::Cue { start_s: 4.0, end_s: 6.75, text: "Single line caption".into(), ..Default::default() },
+            crate::captions::Cue {
+                start_s: 1.25,
+                end_s: 3.5,
+                text: "First line\nSecond line".into(),
+                ..Default::default()
+            },
+            crate::captions::Cue {
+                start_s: 4.0,
+                end_s: 6.75,
+                text: "Single line caption".into(),
+                ..Default::default()
+            },
         ];
 
         // 1. ASS text has the right times and formatting
@@ -2117,5 +2251,158 @@ mod tests {
         let built_proxy = playback_proxy(&ffmpeg, &data_dir, &video_path, hash).await.unwrap();
         assert!(built_proxy.exists());
         assert!(validate_proxy_file(&ffmpeg, &built_proxy).await);
+    }
+
+    // ---- the fade out -----------------------------------------------------------------------
+
+    /// `st` and `d` of the `afade=t=out` in a filter string.
+    fn fade_out_of(filter: &str) -> (f64, f64) {
+        let out = filter.split(',').find(|f| f.starts_with("afade=t=out")).expect("a fade out");
+        let field = |key: &str| -> f64 {
+            out.split(':').find_map(|p| p.strip_prefix(key)).expect("field").parse().expect("number")
+        };
+        (field("st="), field("d="))
+    }
+
+    fn db_with_speech(transcript_end: f64, regions: &[(f64, f64)]) -> Db {
+        let db = Db::open_in_memory().unwrap();
+        db.conn
+            .execute("INSERT INTO videos(id, content_hash, size, duration_s) VALUES (1, 'h', 1, 100.0)", [])
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO transcript_segments(video_id, start_s, end_s, text) VALUES (1, 10.0, ?1, 'una frase')",
+                [transcript_end],
+            )
+            .unwrap();
+        if !regions.is_empty() {
+            let regions: Vec<_> = regions.iter().map(|&(a, b)| crate::speech::SpeechRegion::new(a, b)).collect();
+            db.set_speech_regions(1, &regions).unwrap();
+        }
+        db
+    }
+
+    /// A clip 10..20 s whose transcript ends at 19.0 (1.0 s before the out point), the fade 0.12.
+    #[test]
+    fn the_fade_out_never_starts_before_the_last_voiced_sound() {
+        // The speaking actually runs to 19.8, 0.2 s before the out point.
+        let db = db_with_speech(19.0, &[(10.5, 19.8)]);
+        let (filter, start) = audio_fades(&db, 1, 10.0, 10.0, 0.12);
+        let (st, d) = fade_out_of(&filter);
+        assert!(st >= 9.8 - 1e-9, "the fade starts at {st} s into the clip, over speech that runs to 9.8");
+        assert!((st - 9.88).abs() < 1e-9 && (d - 0.12).abs() < 1e-9, "{filter}");
+        assert_eq!(start, st);
+        assert!((st + d - 10.0).abs() < 1e-9, "and it ends with the clip");
+        assert!(filter.starts_with("afade=t=in:st=0:d=0.120,"));
+
+        // The speech ends 1.0 s before the out point: the room tone after it plays, and only the
+        // last 0.12 s fades. Starting from 9.0 would have erased 1.0 s of it.
+        let db = db_with_speech(19.0, &[(10.5, 19.0)]);
+        let (st, d) = fade_out_of(&audio_fades(&db, 1, 10.0, 10.0, 0.12).0);
+        assert!((st - 9.88).abs() < 1e-9 && (d - 0.12).abs() < 1e-9);
+
+        // Voice to the very end of the clip: a short fade, so the cut does not click, but not one
+        // that begins before the voice ends.
+        let db = db_with_speech(19.0, &[(10.5, 25.0)]);
+        let (st, d) = fade_out_of(&audio_fades(&db, 1, 10.0, 10.0, 0.12).0);
+        assert!(st >= 9.9 && d >= MIN_FADE_OUT_S - 1e-9 && (st + d - 10.0).abs() < 1e-9, "{st} {d}");
+    }
+
+    #[test]
+    fn without_speech_regions_only_the_last_fade_seconds_fade() {
+        // The transcript says the speech ended at 19.0, 1.0 s before the out point, and says no
+        // more: the fade must not begin there.
+        let db = db_with_speech(19.0, &[]);
+        let (filter, start) = audio_fades(&db, 1, 10.0, 10.0, 0.12);
+        let (st, d) = fade_out_of(&filter);
+        assert!((st - 9.88).abs() < 1e-9 && (d - 0.12).abs() < 1e-9, "{filter}");
+        assert_eq!(start, st);
+        // Measured, but nothing voiced in the clip: the same.
+        let db = db_with_speech(19.0, &[(40.0, 50.0)]);
+        let (st, _) = fade_out_of(&audio_fades(&db, 1, 10.0, 10.0, 0.12).0);
+        assert!((st - 9.88).abs() < 1e-9);
+        // Fades off: no filter at all.
+        assert_eq!(audio_fades(&db, 1, 10.0, 10.0, 0.0).0, "");
+    }
+
+    #[test]
+    fn a_closing_hold_is_room_tone_unless_somebody_speaks_in_it() {
+        let db = db_with_speech(12.0, &[(10.5, 12.0), (15.0, 18.0)]);
+        // 12.4..14.4: quiet, and the next voice is 0.6 s off.
+        assert!(is_room_tone(&db, 1, 12.4, 14.4));
+        // 13.0..15.5 would carry the next speaker.
+        assert!(!is_room_tone(&db, 1, 13.0, 15.5));
+        // Ending right on the next voice is not safe either.
+        assert!(!is_room_tone(&db, 1, 13.0, 14.95));
+        // Not measured: silent, as before.
+        let unmeasured = db_with_speech(12.0, &[]);
+        assert!(!is_room_tone(&unmeasured, 1, 12.4, 14.4));
+    }
+
+    #[test]
+    fn only_a_hold_outside_a_bed_is_planned_as_one() {
+        let seg = |why: Option<&str>, audio: Audio, bed: bool| {
+            let mut s = script::Script {
+                title: "t".into(),
+                target_duration_s: None,
+                fps: None,
+                width: None,
+                height: None,
+                framing: None,
+                beats: vec![script::Beat {
+                    id: "b1".into(),
+                    purpose: "p".into(),
+                    narration: None,
+                    on_screen_text: None,
+                    title_layout: None,
+                    clips: vec![script::ScriptClip { exact: false,
+                        sentences: None,
+                        video_id: 1,
+                        in_s: 0.0,
+                        out_s: 2.0,
+                        audio,
+                        why: why.map(String::from),
+                        tracks: None,
+                        framing: None,
+                    }],
+                    bed: None,
+                    notes: None,
+                    card: None,
+                }],
+                captions: None,
+                title_style: None,
+                caption_edits: Vec::new(),
+                agents: None,
+                card_style: None,
+            };
+            if bed {
+                s.beats[0].bed = Some(script::AudioBed {
+                    sentences: None,
+                    video_id: 1,
+                    in_s: 0.0,
+                    out_s: 2.0,
+                    why: None,
+                    inferred: false,
+                    tracks: None,
+                });
+            }
+            let media = HashMap::from([(
+                1,
+                ResolvedMedia {
+                    video_id: 1,
+                    path: PathBuf::from("/a.mp4"),
+                    duration_s: 10.0,
+                    has_audio: true,
+                    fps: Fps::new(25, 1),
+                    content_hash: "h".into(),
+                    audio_track: 0,
+                },
+            )]);
+            plan_segments(&s, &media).unwrap().remove(0)
+        };
+        assert!(seg(Some(crate::chat::CLOSING_PICTURE), Audio::Mute, false).hold);
+        assert!(!seg(Some(crate::chat::CLOSING_PICTURE), Audio::Mute, true).hold, "a bed carries the sound");
+        assert!(!seg(Some(crate::chat::CLOSING_PICTURE), Audio::Source, false).hold);
+        assert!(!seg(None, Audio::Mute, false).hold);
     }
 }

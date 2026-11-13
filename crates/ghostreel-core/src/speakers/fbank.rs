@@ -61,7 +61,8 @@ impl Fbank {
             for k in 0..n_bins {
                 let mel = mel_scale(fft_bin_width * k as f32);
                 if mel > left && mel < right {
-                    let w = if mel <= center { (mel - left) / (center - left) } else { (right - mel) / (right - center) };
+                    let w =
+                        if mel <= center { (mel - left) / (center - left) } else { (right - mel) / (right - center) };
                     if first.is_none() {
                         first = Some(k);
                     }

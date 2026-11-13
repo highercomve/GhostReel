@@ -28,3 +28,4 @@ site-public/
 # Local review and automation artifacts
 .playwright-mcp/
 .agents/design-council/
+.agents/bench/

@@ -25,7 +25,13 @@ pub fn finish_script(
     }
     let mut issues = Vec::new();
     let note = |issues: &mut Vec<Issue>, message: String| {
-        issues.push(Issue { fixes: Vec::new(), severity: IssueSeverity::Info, beat_id: None, clip_index: None, message });
+        issues.push(Issue {
+            fixes: Vec::new(),
+            severity: IssueSeverity::Info,
+            beat_id: None,
+            clip_index: None,
+            message,
+        });
     };
 
     // Anything a previous repair added comes off first: the fit below counts clips, and a
@@ -76,31 +82,44 @@ pub fn finish_script(
     // should have found nothing to do.
     let turns = super::end_on_turns(db, s, cfg);
     if turns > 0 {
-        note(&mut issues, format!(
-            "ended {} where the speaker stopped, before the reply over the top",
-            if turns == 1 { "one quote".to_string() } else { format!("{turns} quotes") },
-        ));
+        note(
+            &mut issues,
+            format!(
+                "ended {} where the speaker stopped, before the reply over the top",
+                if turns == 1 { "one quote".to_string() } else { format!("{turns} quotes") },
+            ),
+        );
     }
     let mended = super::end_on_sentences(db, s, cfg);
     if mended > 0 {
-        note(&mut issues, if mended == 1 {
-            "restored one trimmed quote to its full sentence".to_string()
-        } else {
-            format!("restored {mended} trimmed quotes to their full sentences")
-        });
+        note(
+            &mut issues,
+            if mended == 1 {
+                "restored one trimmed quote to its full sentence".to_string()
+            } else {
+                format!("restored {mended} trimmed quotes to their full sentences")
+            },
+        );
     }
     let shortened = super::trim_pictures_to_bed(s, cfg);
     if shortened > 0 {
-        note(&mut issues, format!(
-            "cut the pictures back to the voice in {}",
-            if shortened == 1 { "one beat".to_string() } else { format!("{shortened} beats") },
-        ));
+        note(
+            &mut issues,
+            format!(
+                "cut the pictures back to the voice in {}",
+                if shortened == 1 { "one beat".to_string() } else { format!("{shortened} beats") },
+            ),
+        );
     }
     let held = super::hold_the_last_picture(db, project_id, s, cfg);
     if held > 0.0 {
         note(&mut issues, format!("held the closing picture for {held:.1} s of quiet"));
     }
     super::clamp_beds_to_beats(db, s, cfg);
+    // The last pass, on the sound itself: everything above cut by the transcript's times.
+    for m in crate::cuts::place_cuts(db, s, cfg) {
+        note(&mut issues, m.message());
+    }
 
     issues.extend(super::content_issues(db, s, cfg));
     issues.extend(validate(db, project_id, s)?);

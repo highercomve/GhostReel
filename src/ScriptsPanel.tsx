@@ -1360,11 +1360,24 @@ export default function ScriptsPanel({
         (t.kind.type === "export_clips" && clipSets.some((c) => c.id === (t.kind as { set_id: string }).set_id))),
   );
 
-  // This project's runs (clip generation, indexing, faces, renders… from the app or the CLI) in the
-  // Sonar thread, in time order among the messages. Chat turns are left out: they already show as
-  // messages.
+  // The runs that worked on this cut (a render, an export, a delete or restore of one of its
+  // versions, from the app or the CLI), in time order among the chat's messages. A chat is one
+  // cut's history: project-wide runs (clip generation, indexing) belong to Activity and the clip
+  // set, not to every cut's thread, and a new cut starts empty. Chat turns are left out: they
+  // already show as messages.
+  const threadScriptIds = new Set(
+    scripts
+      .filter(
+        (s) =>
+          s.kind !== "clip" &&
+          ((selectedSessionId != null && s.session_id === selectedSessionId) ||
+            (activeScript != null && s.title === activeScript.title)),
+      )
+      .map((s) => s.id),
+  );
   const sonarRuns = projectRuns
     .filter((r) => r.kind !== "chat")
+    .filter((r) => r.links.some((l) => l.kind === "script" && threadScriptIds.has(l.id)))
     .slice(0, SONAR_RUNS)
     .reverse();
   type ThreadItem = { at: number; msg: (typeof messages)[number]; run?: undefined } | { at: number; run: RunView; msg?: undefined };

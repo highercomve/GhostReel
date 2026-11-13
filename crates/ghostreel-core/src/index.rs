@@ -27,7 +27,7 @@ pub const STAGES: &[&str] = &["probe", "transcribe", "frames", "describe", "embe
 
 /// All indexing stages including post-index analysis.
 pub const ALL_STAGES: &[&str] =
-    &["probe", "transcribe", "frames", "describe", "embed", "steadiness", "faces", "speakers"];
+    &["probe", "transcribe", "frames", "describe", "embed", "steadiness", "faces", "speakers", "speech", "chapters"];
 
 /// The stage whose completion a stage waits for.
 fn prerequisite(stage: &str) -> Option<&'static str> {
@@ -143,7 +143,9 @@ impl Event {
                 ),
             },
             // Per-file passes say which file they are on; the main stages are too quick for that.
-            Event::JobStarted { stage, path, .. } if matches!(stage.as_str(), "steadiness" | "faces" | "speakers") => {
+            Event::JobStarted { stage, path, .. }
+                if matches!(stage.as_str(), "steadiness" | "faces" | "speakers" | "speech" | "chapters") =>
+            {
                 EventReport::Note(format!("{}: {}", label(stage), file(path)))
             }
             _ => return None,
@@ -353,7 +355,7 @@ pub async fn run(db: &mut Db, rt: &Runtime, opts: &Options, on_event: impl FnMut
 }
 
 /// The whole indexing pipeline for a scope: the scan and per-video stages ([`run`]), then the
-/// analysis passes (camera shake, faces, speakers) that [`stage_enabled`] lets through. The one
+/// analysis passes (camera shake, faces, speakers, speech) that [`stage_enabled`] lets through. The one
 /// sequence the app's queue, `ghostreel index` and the MCP tool run, so they agree on what an
 /// index run is and how it ended.
 ///
@@ -401,6 +403,20 @@ pub async fn run_pipeline(
             let mut tracker = Tracker::new(&[("speakers", 1.0)]);
             if let Err(e) = run_speaker_jobs(db, paths, config, rt, opts, false, &mut tracker, &mut sink).await {
                 failed("speakers", e, &mut sink);
+            }
+        }
+        if enabled("speech") {
+            let mut tracker = Tracker::new(&[("speech", 1.0)]);
+            if let Err(e) = run_speech_jobs(db, rt, opts, false, &mut tracker, &mut sink).await {
+                failed("speech", e, &mut sink);
+            }
+        }
+        // After the embeddings it reads and the speakers its titles may name.
+        if enabled("chapters") {
+            let mut tracker = Tracker::new(&[("chapters", 1.0)]);
+            let chapters = ChaptersRun { paths, config, force: false, refresh_titles: false };
+            if let Err(e) = run_chapter_jobs(db, opts, &chapters, &mut tracker, &mut sink).await {
+                failed("chapters", e, &mut sink);
             }
         }
     }
@@ -1167,11 +1183,22 @@ fn store_transcript(db: &mut Db, video_id: i64, t: &stt::Transcript) -> Result<(
     }
     tx.execute("UPDATE videos SET language = ?1 WHERE id = ?2", params![t.language, video_id])?;
     tx.execute("UPDATE jobs SET state = 'pending', attempts = 0 WHERE video_id = ?1 AND stage = 'embed'", [video_id])?;
+    // The sentences (and the chapters they bound) were built on the old segments: split again.
+    crate::sentence_split::invalidate(&tx, video_id)?;
     tx.execute(
         "UPDATE jobs SET state = 'done', last_error = NULL, updated_at = ?1 WHERE video_id = ?2 AND stage = 'transcribe'",
         params![now(), video_id],
     )?;
     tx.commit()?;
+    // Words belong to the sentences just stored (the old ones went with the old sentences).
+    if !t.words.is_empty() {
+        let stored: Vec<(i64, f64, f64)> = db
+            .conn
+            .prepare("SELECT id, start_s, end_s FROM transcript_segments WHERE video_id = ?1 ORDER BY start_s, id")?
+            .query_map([video_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<Result<_, _>>()?;
+        crate::sentences::store_words(db, &stored, &t.words)?;
+    }
     Ok(())
 }
 
@@ -1346,22 +1373,75 @@ async fn run_transcribe_jobs(
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TranscriptSegment {
+    /// The sentence's row id (`transcript_sentences`). Quoted as a sentence id (`s412`, see
+    /// [`crate::sentences`]).
+    #[serde(serialize_with = "crate::sentences::serialize_id")]
+    pub id: i64,
     pub start: f64,
     pub end: f64,
     pub text: String,
     /// Spoken away from the subject's mic (usually the interviewer's questions).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub off_mic: bool,
+    /// Who says it, when known: the person's name, else their handle, else the voice ("speaker 2").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speaker: Option<String>,
+    /// What the picture shows while it is said, when that is not a face: "screen" (a screen share)
+    /// or "no face". Filled in by `get_transcript` where the faces stage has run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub picture: Option<&'static str>,
 }
 
+/// A video's transcript as sentences ([`crate::sentence_split`]), each with who says it and
+/// whether it is off-mic, read from the Whisper segments it overlaps (the one covering most of it).
 pub fn transcript(db: &Db, video_id: i64) -> Result<Vec<TranscriptSegment>, Error> {
+    crate::sentence_split::ensure(db, video_id)?;
+    let segs: Vec<(f64, f64, bool, Option<String>)> = {
+        let mut st = db.conn.prepare(
+            "SELECT ts.start_s, ts.end_s, COALESCE(ts.off_mic, 0),
+                    NULLIF(TRIM(p.name), ''), NULLIF(TRIM(p.handle), ''), ts.speaker
+               FROM transcript_segments ts LEFT JOIN people p ON p.id = ts.person_id
+              WHERE ts.video_id = ?1 ORDER BY ts.start_s, ts.id",
+        )?;
+        let rows = st.query_map([video_id], |r| {
+            let (name, handle, voice): (Option<String>, Option<String>, Option<i64>) =
+                (r.get(3)?, r.get(4)?, r.get(5)?);
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, name.or(handle).or(voice.map(|v| format!("speaker {v}")))))
+        })?;
+        rows.collect::<Result<_, _>>()?
+    };
     let mut st = db.conn.prepare(
-        "SELECT start_s, end_s, text, COALESCE(off_mic, 0) FROM transcript_segments WHERE video_id = ?1 ORDER BY start_s",
+        "SELECT id, start_s, end_s, text FROM transcript_sentences WHERE video_id = ?1 ORDER BY start_s, id",
     )?;
-    let rows = st.query_map([video_id], |r| {
-        Ok(TranscriptSegment { start: r.get(0)?, end: r.get(1)?, text: r.get(2)?, off_mic: r.get(3)? })
-    })?;
-    Ok(rows.collect::<Result<_, _>>()?)
+    let sentences: Vec<(i64, f64, f64, String)> =
+        st.query_map([video_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<Result<_, _>>()?;
+    let mut first = 0usize;
+    let mut out = Vec::with_capacity(sentences.len());
+    for (id, start, end, text) in sentences {
+        while first < segs.len() && segs[first].1 <= start {
+            first += 1;
+        }
+        let mut off = 0.0;
+        let mut on = 0.0;
+        let mut voices: Vec<(&str, f64)> = Vec::new();
+        for (a, b, off_mic, who) in segs[first..].iter().take_while(|s| s.0 < end) {
+            let overlap = (b.min(end) - a.max(start)).max(0.0);
+            if *off_mic {
+                off += overlap;
+            } else {
+                on += overlap;
+            }
+            if let Some(w) = who {
+                match voices.iter_mut().find(|(n, _)| *n == w.as_str()) {
+                    Some(v) => v.1 += overlap,
+                    None => voices.push((w.as_str(), overlap)),
+                }
+            }
+        }
+        let speaker = voices.iter().max_by(|x, y| x.1.total_cmp(&y.1)).map(|(n, _)| n.to_string());
+        out.push(TranscriptSegment { id, start, end, text, off_mic: off > on, speaker, picture: None });
+    }
+    Ok(out)
 }
 
 // ---- frames -------------------------------------------------------------------------------
@@ -1628,6 +1708,287 @@ pub async fn run_steadiness_jobs(
         on_event(Event::Progress(tracker.snapshot(Some(path))));
     }
     Ok(SteadinessSummary { measured: done, failed, total: total_in_scope })
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct SpeechSummary {
+    pub measured: usize,
+    pub failed: usize,
+    pub total: usize,
+}
+
+/// Find where speech is, from the audio itself, for videos that haven't been measured yet (or all
+/// videos if `force` is true): the chosen audio track is streamed through ffmpeg, measured in
+/// 10 ms frames and stored as regions (`speech.rs`). Needs nothing but ffmpeg.
+///
+/// A video with no audio, or none that is speech, is still *done*: its job row says so, so it is
+/// not decoded again on every run.
+pub async fn run_speech_jobs(
+    db: &mut Db,
+    rt: &Runtime,
+    opts: &Options,
+    force: bool,
+    tracker: &mut Tracker,
+    on_event: &mut impl FnMut(Event),
+) -> Result<SpeechSummary, Error> {
+    const STAGE: &str = "speech";
+    let scope = "v.duration_s > 0 AND (?1 IS NULL OR vf.folder_id IN
+                   (SELECT folder_id FROM project_folders WHERE project_id = ?1))";
+    let total_in_scope: usize = db
+        .conn
+        .query_row(
+            &format!(
+                "SELECT COUNT(DISTINCT v.id) FROM videos v JOIN video_files vf ON vf.video_id = v.id WHERE {scope}"
+            ),
+            [opts.project_id],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|n| n as usize)
+        .unwrap_or(0);
+
+    let needs = if force { "1".to_string() } else { needs_analysis_sql(STAGE, "speech_regions", opts.retry_failed) };
+    let todo: Vec<(i64, PathBuf, f64, Option<bool>)> = {
+        let mut st = db.conn.prepare(&format!(
+            "SELECT v.id, MIN(vf.path), COALESCE(v.duration_s, 0), v.has_audio
+               FROM videos v JOIN video_files vf ON vf.video_id = v.id
+              WHERE {scope} AND {needs}
+              GROUP BY v.id ORDER BY v.id"
+        ))?;
+        let rows = st.query_map([opts.project_id], |r| {
+            Ok((r.get(0)?, PathBuf::from(r.get::<_, String>(1)?), r.get(2)?, r.get::<_, Option<bool>>(3)?))
+        })?;
+        rows.collect::<Result<_, _>>()?
+    };
+    if todo.is_empty() {
+        tracker.set_total(STAGE, 0);
+        return Ok(SpeechSummary { measured: 0, failed: 0, total: total_in_scope });
+    }
+
+    let total: f64 = todo.iter().map(|(_, _, d, _)| *d).sum();
+    tracker.set_total(STAGE, total.ceil() as u64);
+    tracker.start(STAGE);
+    on_event(Event::Progress(tracker.snapshot(None)));
+
+    let vad = crate::speech::VadParams::default();
+    let (mut done, mut failed) = (0, 0);
+    for (video_id, path, duration, has_audio) in todo {
+        if opts.cancelled() {
+            break;
+        }
+        on_event(Event::JobStarted { video_id, stage: STAGE.into(), path: path.clone() });
+        let outcome: Result<Vec<crate::speech::SpeechRegion>, Error> = if has_audio == Some(false) {
+            Ok(Vec::new())
+        } else {
+            // One video is one long decode: progress comes from inside it, and a stop drops it (and
+            // kills its ffmpeg) at once. A stopped video stores nothing; it is measured next run.
+            let mut credited = 0u64;
+            let track = db.audio_track(video_id).unwrap_or(0);
+            let measured = crate::cancel::race(
+                opts.cancel.as_ref(),
+                crate::speech::measure(&rt.ffmpeg, &path, track, |secs| {
+                    let secs = secs.min(duration).floor() as u64;
+                    if secs > credited {
+                        tracker.advance(STAGE, secs - credited);
+                        credited = secs;
+                    }
+                    if tracker.should_emit() {
+                        on_event(Event::Progress(tracker.snapshot(Some(path.clone()))));
+                    }
+                }),
+            )
+            .await;
+            tracker.advance(STAGE, (duration.ceil() as u64).saturating_sub(credited));
+            match measured {
+                Err(_) => break,
+                Ok(levels) => levels.map(|l| crate::speech::detect(&l, &vad)),
+            }
+        };
+        match outcome {
+            Ok(regions) => {
+                db.set_speech_regions(video_id, &regions)?;
+                record_analysis(db, video_id, STAGE, None)?;
+                on_event(Event::JobDone { video_id, stage: STAGE.into() });
+                done += 1;
+            }
+            Err(e) => {
+                record_analysis(db, video_id, STAGE, Some(&e.to_string()))?;
+                on_event(Event::JobFailed { video_id, stage: STAGE.into(), error: e.to_string() });
+                failed += 1;
+            }
+        }
+        on_event(Event::Progress(tracker.snapshot(Some(path))));
+    }
+    Ok(SpeechSummary { measured: done, failed, total: total_in_scope })
+}
+
+/// What the chapters pass needs besides the database and the scope.
+pub struct ChaptersRun<'a> {
+    pub paths: &'a crate::paths::Paths,
+    pub config: &'a crate::config::Config,
+    /// Split every video again, even those already split.
+    pub force: bool,
+    /// Keep the boundaries and only give a model's title to chapters stored with a stand-in.
+    pub refresh_titles: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ChaptersSummary {
+    /// Videos whose chapters were (re)made.
+    pub videos: usize,
+    pub chapters: usize,
+    /// Chapters the model titled.
+    pub titled: usize,
+    /// Chapters left with their first sentence as the title, for a later `--refresh-titles`.
+    pub untitled: usize,
+    pub failed: usize,
+    pub total: usize,
+    /// Why the model did not title (no model available, a call that failed), when it did not.
+    pub model_note: Option<String>,
+}
+
+/// Split speech videos into chapters (`chapters.rs`): boundaries in code from the stored
+/// embeddings, then titles, summaries and standout lines from the configured chat model. Without
+/// a model the chapters are stored all the same, with their first sentence as the title, and
+/// marked so they can be titled later. A video without speech is still *done*.
+pub async fn run_chapter_jobs(
+    db: &mut Db,
+    opts: &Options,
+    run: &ChaptersRun<'_>,
+    tracker: &mut Tracker,
+    on_event: &mut impl FnMut(Event),
+) -> Result<ChaptersSummary, Error> {
+    const STAGE: &str = "chapters";
+    let scope = "EXISTS (SELECT 1 FROM transcript_segments t WHERE t.video_id = v.id)
+                 AND (?1 IS NULL OR vf.folder_id IN (SELECT folder_id FROM project_folders WHERE project_id = ?1))";
+    let total_in_scope: usize = db
+        .conn
+        .query_row(
+            &format!(
+                "SELECT COUNT(DISTINCT v.id) FROM videos v JOIN video_files vf ON vf.video_id = v.id WHERE {scope}"
+            ),
+            [opts.project_id],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|n| n as usize)
+        .unwrap_or(0);
+
+    let needs = if run.refresh_titles {
+        "EXISTS (SELECT 1 FROM chapters c WHERE c.video_id = v.id AND c.titled = 0)".to_string()
+    } else if run.force {
+        "1".to_string()
+    } else {
+        needs_analysis_sql(STAGE, "chapters", opts.retry_failed)
+    };
+    let todo: Vec<(i64, PathBuf)> = {
+        let mut st = db.conn.prepare(&format!(
+            "SELECT v.id, MIN(vf.path) FROM videos v JOIN video_files vf ON vf.video_id = v.id
+              WHERE {scope} AND {needs} GROUP BY v.id ORDER BY v.id"
+        ))?;
+        let rows = st.query_map([opts.project_id], |r| Ok((r.get(0)?, PathBuf::from(r.get::<_, String>(1)?))))?;
+        rows.collect::<Result<_, _>>()?
+    };
+    let mut summary = ChaptersSummary { total: total_in_scope, ..Default::default() };
+    if todo.is_empty() {
+        tracker.set_total(STAGE, 0);
+        return Ok(summary);
+    }
+    tracker.set_total(STAGE, todo.len() as u64);
+    tracker.start(STAGE);
+    on_event(Event::Progress(tracker.snapshot(None)));
+
+    // One model for the whole run, asked for the first time a chapter needs a title. Holding the
+    // lease keeps its endpoint's slot, so nothing else asks the model for more than it allows.
+    let mut lease: Option<crate::chat::ChatLease> = None;
+    let mut tried_model = false;
+    let params = crate::chapters::Params::default();
+    for (video_id, path) in todo {
+        if opts.cancelled() {
+            break;
+        }
+        on_event(Event::JobStarted { video_id, stage: STAGE.into(), path: path.clone() });
+        let made: Result<Option<Vec<crate::chapters::Chapter>>, Error> = if run.refresh_titles {
+            crate::chapters::load(db, video_id).map(Some)
+        } else {
+            crate::chapters::split(db, video_id, &params)
+        };
+        let mut chapters = match made {
+            Ok(Some(c)) => c,
+            Ok(None) => {
+                crate::chapters::store(db, video_id, &[])?;
+                record_analysis(db, video_id, STAGE, None)?;
+                on_event(Event::JobDone { video_id, stage: STAGE.into() });
+                tracker.advance(STAGE, 1);
+                continue;
+            }
+            Err(e) => {
+                record_analysis(db, video_id, STAGE, Some(&e.to_string()))?;
+                on_event(Event::JobFailed { video_id, stage: STAGE.into(), error: e.to_string() });
+                summary.failed += 1;
+                tracker.advance(STAGE, 1);
+                continue;
+            }
+        };
+
+        if !tried_model {
+            tried_model = true;
+            match crate::chat::lease_backend(run.paths, run.config, None, None, |_| {}).await {
+                Ok(l) => lease = Some(l),
+                Err(e) => summary.model_note = Some(format!("no chat model to title the chapters: {e}")),
+            }
+        }
+        if let Some(l) = lease.as_mut() {
+            let sentences = crate::index::transcript(db, video_id)?;
+            let timeout_s = run.config.script.server_timeout_s;
+            let mut start = 0;
+            while start < chapters.len() {
+                if opts.cancelled() {
+                    break;
+                }
+                let end = (start + crate::chapters::TITLES_PER_CALL).min(chapters.len());
+                let prompt = crate::chapters::titling_prompt(&chapters[start..end], &sentences);
+                let asked = crate::cancel::race(
+                    opts.cancel.as_ref(),
+                    crate::chat::workers::ask_json(
+                        &mut l.backend,
+                        &prompt,
+                        &crate::chapters::titling_schema(),
+                        2048,
+                        timeout_s,
+                    ),
+                )
+                .await;
+                match asked {
+                    Err(_) => break,
+                    Ok(Ok(answer)) => {
+                        crate::chapters::apply_titles(&mut chapters[start..end], &answer);
+                    }
+                    Ok(Err(e)) => {
+                        summary.model_note = Some(format!("the chat model could not title some chapters: {e}"));
+                    }
+                }
+                start = end;
+            }
+        }
+        if opts.cancelled() {
+            // A stopped video stores nothing; it is split again next run.
+            break;
+        }
+        crate::chapters::store(db, video_id, &chapters)?;
+        record_analysis(db, video_id, STAGE, None)?;
+        summary.videos += 1;
+        summary.chapters += chapters.len();
+        summary.titled += chapters.iter().filter(|c| c.titled).count();
+        summary.untitled += chapters.iter().filter(|c| !c.titled).count();
+        on_event(Event::JobDone { video_id, stage: STAGE.into() });
+        tracker.advance(STAGE, 1);
+        on_event(Event::Progress(tracker.snapshot(Some(path))));
+    }
+    if let Some(mut l) = lease
+        && let crate::chat::ChatBackend::Local { helper, .. } = &mut l.backend
+    {
+        helper.kill().await;
+    }
+    Ok(summary)
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize)]
@@ -2970,6 +3331,8 @@ pub const MENU_STAGES: &[(&str, &str)] = &[
     ("steadiness", "Camera shake"),
     ("faces", "Faces"),
     ("speakers", "Speakers"),
+    ("speech", "Speech activity"),
+    ("chapters", "Chapters"),
 ];
 
 /// Every menu stage's status for a project. A stage the project turned off is `off` — through
@@ -3001,8 +3364,12 @@ pub fn stage_statuses(
             continue;
         }
         match stage {
-            "steadiness" | "faces" => {
-                let output = if stage == "steadiness" { "motion_windows" } else { "face_tracks" };
+            "steadiness" | "faces" | "speech" => {
+                let output = match stage {
+                    "steadiness" => "motion_windows",
+                    "faces" => "face_tracks",
+                    _ => "speech_regions",
+                };
                 st.total = count(scope("COALESCE(v.duration_s, 0) > 0"))?;
                 st.done = count(scope(&format!(
                     "COALESCE(v.duration_s, 0) > 0 AND {}",
@@ -3020,6 +3387,17 @@ pub fn stage_statuses(
                     st.reason = Some("face models not downloaded — Models page".into());
                 } else if st.done < st.total {
                     st.state = if given_up >= st.total - st.done { StageState::Failed } else { StageState::Pending };
+                    st.reason = last_error(db, project_id, stage)?;
+                }
+            }
+            "chapters" => {
+                st.total = count(scope("EXISTS (SELECT 1 FROM transcript_segments t WHERE t.video_id = v.id)"))?;
+                st.done = count(scope(&format!(
+                    "EXISTS (SELECT 1 FROM transcript_segments t WHERE t.video_id = v.id) AND {}",
+                    analysed_sql(stage, "chapters", "v.id")
+                )))?;
+                if st.done < st.total {
+                    st.state = StageState::Pending;
                     st.reason = last_error(db, project_id, stage)?;
                 }
             }
@@ -3426,6 +3804,212 @@ echo '{"streams":[{"codec_type":"video","codec_name":"h264","width":1920,"height
         p.id
     }
 
+    /// The speech stage end to end with the real ffmpeg: pending for an already-indexed video,
+    /// filled in by a run, up to date on the next, redone on `force`; a video with no audio is
+    /// done without being decoded.
+    #[tokio::test]
+    async fn speech_stage_is_pending_for_indexed_videos_and_fills_in() {
+        let Some(ffmpeg) = crate::doctor::locate("ffmpeg") else { return };
+        let tmp = tempfile::tempdir().unwrap();
+        let media = tmp.path().join("media");
+        std::fs::create_dir_all(&media).unwrap();
+        let wav = media.join("talk.wav");
+        let pcm = crate::speech::test_support::track(8.0, -70.0, &[(1.0, 3.0, -12.0), (5.0, 6.0, -24.0)]);
+        crate::speech::test_support::write_wav(&wav, &pcm);
+        let mut db = Db::open_in_memory().unwrap();
+        let p = db.create_project(&NewProject::named("P")).unwrap();
+        let folder = db.add_folder(p.id, &media, true).unwrap();
+        for (id, path, has_audio) in [(1, wav.to_str().unwrap().to_string(), 1), (2, "/nowhere/silent.mp4".into(), 0)] {
+            db.conn
+                .execute(
+                    "INSERT INTO videos(id, content_hash, size, duration_s, has_audio) VALUES (?1, ?2, 1, 8.0, ?3)",
+                    params![id, format!("h{id}"), has_audio],
+                )
+                .unwrap();
+            db.conn
+                .execute(
+                    "INSERT INTO video_files(video_id, folder_id, path, size, mtime, last_seen) VALUES (?1, ?2, ?3, 1, 0, 0)",
+                    params![id, folder.id, path],
+                )
+                .unwrap();
+        }
+        let config = crate::config::Config::default();
+        let status = |db: &Db| {
+            stage_statuses(db, p.id, &config, false).unwrap().into_iter().find(|s| s.stage == "speech").unwrap()
+        };
+        let before = status(&db);
+        assert_eq!((before.state, before.done, before.total), (StageState::Pending, 0, 2));
+        assert_eq!(before.label, "Speech activity");
+
+        let mut runtime = rt(Path::new("ffprobe"));
+        runtime.ffmpeg = ffmpeg;
+        let opts = Options { project_id: Some(p.id), ..Default::default() };
+        let mut tracker = Tracker::new(&[("speech", 1.0)]);
+        let mut events = Vec::new();
+        let s = run_speech_jobs(&mut db, &runtime, &opts, false, &mut tracker, &mut |e| events.push(e)).await.unwrap();
+        assert_eq!((s.measured, s.failed, s.total), (2, 0, 2));
+        let regions = crate::speech::speech_regions(&db, 1, 0.0, 100.0).unwrap();
+        assert_eq!(regions.len(), 2, "{regions:?}");
+        assert!((regions[0].start_s - 1.0).abs() < 0.03 && (regions[1].end_s - 6.0).abs() < 0.03, "{regions:?}");
+        assert!(regions[0].quiet_after_s.is_some_and(|q| q > regions[0].end_s && q < regions[1].start_s));
+        // The silent file was never decoded (its path does not exist) and is still done.
+        assert!(crate::speech::speech_regions(&db, 2, 0.0, 100.0).unwrap().is_empty());
+        assert!(crate::speech::analysed(&db, 2));
+        assert_eq!((status(&db).state, status(&db).done), (StageState::Done, 2));
+        assert!(events.iter().any(|e| matches!(e, Event::JobDone { stage, video_id: 1 } if stage == "speech")));
+
+        // Nothing left to do; `force` measures again.
+        let again = run_speech_jobs(&mut db, &runtime, &opts, false, &mut tracker, &mut |_| {}).await.unwrap();
+        assert_eq!(again.measured, 0);
+        let forced = run_speech_jobs(&mut db, &runtime, &opts, true, &mut tracker, &mut |_| {}).await.unwrap();
+        assert_eq!(forced.measured, 2);
+        assert_eq!(crate::speech::speech_regions(&db, 1, 0.0, 100.0).unwrap().len(), 2);
+
+        // A video whose file cannot be decoded fails, and is retried up to MAX_ATTEMPTS.
+        db.conn.execute("UPDATE video_files SET path = '/nowhere/gone.wav' WHERE video_id = 1", []).unwrap();
+        db.conn.execute("DELETE FROM speech_regions", []).unwrap();
+        db.conn.execute("DELETE FROM jobs WHERE stage = 'speech'", []).unwrap();
+        let failed = run_speech_jobs(&mut db, &runtime, &opts, false, &mut tracker, &mut |_| {}).await.unwrap();
+        assert_eq!((failed.measured, failed.failed), (1, 1));
+        // The project may switch the stage off, and it is then never pending.
+        let off = crate::projects::PipelineConfig { speech: false, ..Default::default() };
+        db.update_project_pipeline(p.id, &off).unwrap();
+        assert_eq!(status(&db).state, StageState::Off);
+    }
+
+    /// Word timings go in with their sentences and are replaced with them; an engine that gives
+    /// none leaves the video without (nothing is made up).
+    #[test]
+    fn words_are_stored_with_their_sentences_and_replaced_with_them() {
+        let mut db = Db::open_in_memory().unwrap();
+        db.conn.execute("INSERT INTO videos(id, content_hash, size, duration_s) VALUES (1, 'h', 1, 10.0)", []).unwrap();
+        let word = |text: &str, start: f64, end: f64| crate::sentences::Word { start, end, text: text.into() };
+        let transcript = stt::Transcript {
+            segments: vec![
+                stt::Segment { start: 0.0, end: 2.0, text: "hola mundo".into() },
+                stt::Segment { start: 3.0, end: 5.0, text: "adios".into() },
+            ],
+            language: Some("es".into()),
+            words: vec![
+                word("hola", 0.1, 0.5),
+                word("mundo", 0.6, 1.1),
+                word("adios", 3.1, 3.6),
+                word("lost", 8.0, 8.4),
+            ],
+        };
+        store_transcript(&mut db, 1, &transcript).unwrap();
+        // The word outside every sentence is not stored.
+        assert_eq!(crate::sentences::word_count(&db, 1), 3);
+        super::transcript(&db, 1).unwrap();
+        let id: i64 = db
+            .conn
+            .query_row("SELECT id FROM transcript_sentences WHERE text = 'hola mundo'", [], |r| r.get(0))
+            .unwrap();
+        let sid = crate::sentences::format_id(id);
+        assert_eq!(
+            crate::sentences::resolve_range(&db, 1, &format!("{sid}@2"), &format!("{sid}@2")).unwrap(),
+            (0.6, 1.1)
+        );
+        // Transcribed again by an engine with no word timings.
+        store_transcript(&mut db, 1, &stt::Transcript { words: Vec::new(), ..transcript }).unwrap();
+        assert_eq!(crate::sentences::word_count(&db, 1), 0);
+        super::transcript(&db, 1).unwrap();
+        let id: i64 = db
+            .conn
+            .query_row("SELECT id FROM transcript_sentences WHERE text = 'hola mundo'", [], |r| r.get(0))
+            .unwrap();
+        let err = crate::sentences::resolve_range(&db, 1, &format!("s{id}@1"), &format!("s{id}")).unwrap_err();
+        assert!(matches!(err, crate::sentences::SentenceError::NoWordTimings { .. }), "{err:?}");
+    }
+
+    /// The chapters stage end to end with no chat model reachable: pending for an indexed video
+    /// with a transcript, filled in with first-sentence titles marked as stand-ins, up to date on
+    /// the next run, and redone on `force`. A video with no speech is not in its scope.
+    #[tokio::test]
+    async fn chapters_stage_is_pending_for_indexed_videos_and_stores_stand_ins_without_a_model() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = Db::open_in_memory().unwrap();
+        let p = db.create_project(&NewProject::named("P")).unwrap();
+        let folder = db.add_folder(p.id, tmp.path(), true).unwrap();
+        for id in [1, 2] {
+            db.conn
+                .execute(
+                    "INSERT INTO videos(id, content_hash, size, duration_s) VALUES (?1, ?2, 1, 1200.0)",
+                    params![id, format!("h{id}")],
+                )
+                .unwrap();
+            db.conn
+                .execute(
+                    "INSERT INTO video_files(video_id, folder_id, path, size, mtime, last_seen) VALUES (?1, ?2, ?3, 1, 0, 0)",
+                    params![id, folder.id, format!("/nowhere/v{id}.mp4")],
+                )
+                .unwrap();
+        }
+        // Video 1 speaks for twenty minutes, a sentence every 20 s; video 2 never does.
+        for i in 0..60 {
+            db.conn
+                .execute(
+                    "INSERT INTO transcript_segments(video_id, start_s, end_s, text) VALUES (1, ?1, ?2, ?3)",
+                    params![i as f64 * 20.0, i as f64 * 20.0 + 18.0, format!("sentence number {i} of the talk")],
+                )
+                .unwrap();
+        }
+        let mut config = crate::config::Config::default();
+        config.ai.use_ghost_service = false;
+        config.chat_model = Some(crate::config::VisionConfig {
+            backend: crate::config::Backend::Server,
+            url: "http://127.0.0.1:9".into(),
+            ..config.vision.clone()
+        });
+        let paths = crate::paths::Paths::in_dir(tmp.path());
+        let status = |db: &Db| {
+            stage_statuses(db, p.id, &config, false).unwrap().into_iter().find(|s| s.stage == "chapters").unwrap()
+        };
+        let before = status(&db);
+        assert_eq!((before.state, before.done, before.total), (StageState::Pending, 0, 1));
+        assert_eq!(before.label, "Chapters");
+
+        let opts = Options { project_id: Some(p.id), ..Default::default() };
+        let mut tracker = Tracker::new(&[("chapters", 1.0)]);
+        let mut events = Vec::new();
+        let run = ChaptersRun { paths: &paths, config: &config, force: false, refresh_titles: false };
+        let s = run_chapter_jobs(&mut db, &opts, &run, &mut tracker, &mut |e| events.push(e)).await.unwrap();
+        assert_eq!((s.videos, s.total), (1, 1));
+        assert!(s.chapters >= 3 && s.untitled == s.chapters && s.titled == 0, "{s:?}");
+        assert!(s.model_note.as_deref().is_some_and(|n| n.contains("no chat model")), "{s:?}");
+        let stored = crate::chapters::load(&db, 1).unwrap();
+        assert_eq!(stored.len(), s.chapters);
+        assert!(stored.iter().all(|c| !c.titled && c.title.starts_with("sentence number")), "{stored:?}");
+        assert_eq!(stored[0].start_s, 0.0);
+        assert!(stored.windows(2).all(|w| w[0].last_sentence_id < w[1].first_sentence_id));
+        assert!(events.iter().any(|e| matches!(e, Event::JobDone { stage, video_id: 1 } if stage == "chapters")));
+        assert_eq!((status(&db).state, status(&db).done), (StageState::Done, 1));
+        assert!(crate::chapters::has_untitled(&db, 1), "stand-ins can be titled later");
+
+        // Up to date: nothing to do. Forced: split again.
+        let again = run_chapter_jobs(&mut db, &opts, &run, &mut tracker, &mut |_| {}).await.unwrap();
+        assert_eq!(again.videos, 0);
+        let forced = ChaptersRun { force: true, ..run };
+        assert_eq!(run_chapter_jobs(&mut db, &opts, &forced, &mut tracker, &mut |_| {}).await.unwrap().videos, 1);
+
+        // Transcribed again: the sentences and the chapters built on them go, and it is pending.
+        store_transcript(
+            &mut db,
+            1,
+            &stt::Transcript {
+                segments: vec![stt::Segment { start: 0.0, end: 5.0, text: "new".into() }],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(crate::chapters::load(&db, 1).unwrap().is_empty());
+        assert_eq!(status(&db).state, StageState::Pending);
+        // The project may switch the stage off.
+        let off = crate::projects::PipelineConfig { chapters: false, ..Default::default() };
+        db.update_project_pipeline(p.id, &off).unwrap();
+        assert_eq!(status(&db).state, StageState::Off);
+    }
+
     /// Stop reaches inside one long video: the camera-shake decode is dropped within the poll,
     /// its ffmpeg is killed, and nothing is stored for the video (it is measured next run).
     #[cfg(unix)]
@@ -3502,7 +4086,7 @@ echo '{"streams":[{"codec_type":"video","codec_name":"h264","width":1920,"height
     async fn a_disabled_stage_never_runs_and_shows_off() {
         let tmp = tempfile::tempdir().unwrap();
         let mut db = Db::open_in_memory().unwrap();
-        let pipeline = crate::projects::PipelineConfig { steadiness: false, ..Default::default() };
+        let pipeline = crate::projects::PipelineConfig { steadiness: false, speech: false, ..Default::default() };
         let pid = one_probed_video(&mut db, tmp.path(), Some(pipeline)).await;
         let pidfile = tmp.path().join("ffmpeg.pid");
         let mut runtime = rt(&fake_ffprobe(tmp.path()));
@@ -3545,8 +4129,13 @@ echo '{"streams":[{"codec_type":"video","codec_name":"h264","width":1920,"height
     async fn a_postponed_stage_makes_the_run_partial() {
         let tmp = tempfile::tempdir().unwrap();
         let mut db = Db::open_in_memory().unwrap();
-        let pipeline =
-            crate::projects::PipelineConfig { steadiness: false, faces: false, speakers: false, ..Default::default() };
+        let pipeline = crate::projects::PipelineConfig {
+            steadiness: false,
+            faces: false,
+            speakers: false,
+            speech: false,
+            ..Default::default()
+        };
         let pid = one_probed_video(&mut db, tmp.path(), Some(pipeline)).await;
         // Its keyframes exist and wait to be described.
         let vid: i64 = db.conn.query_row("SELECT id FROM videos", [], |r| r.get(0)).unwrap();
@@ -4071,6 +4660,8 @@ done
             steadiness: true,
             faces: true,
             speakers: true,
+            speech: true,
+            chapters: true,
         };
         let p = db.create_project(&NewProject::named("NoSpeech").with_pipeline(custom_pipeline)).unwrap();
 

@@ -10,7 +10,7 @@ use super::spec::{Detail, Effect, ToolSpec};
 pub const TOOL_CONTRACT: &str = "Every clip you write must lie inside a range one of these tools \
     returned for that video. A range nothing returned is checked against the index and dropped if \
     nothing was ever described or spoken there — so look before you cut. Opening a video with \
-    get_video or get_transcript makes the whole of that video legal to cut; a search hit makes \
+    get_video makes the whole of that video legal to cut, get_manifest or get_transcript the range it read; a search hit makes \
     only the window it returned legal; list_videos makes nothing legal.";
 
 /// How a rendering is adjusted for who reads it.

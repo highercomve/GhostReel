@@ -267,11 +267,6 @@ pub struct ScriptConfig {
     /// stopping when we cut away. The editor can name a bed itself; this decides whether the
     /// pipeline lays one where it sees a beat that would otherwise fall silent.
     pub infer_audio_beds: bool,
-    /// Put every word spoken in the project in the prompt, before any tool is called. A model
-    /// that has to ask for each transcript reads a couple of tapes and builds the story out of
-    /// whoever it found there; an editor reads the interviews first. Off for a brain with a small
-    /// context that needs the room for tool results.
-    pub speech_in_prompt: bool,
     /// How much of each tool's description to send: `auto`, `full` or `short`. Rich descriptions
     /// — what a result means, what the repair passes will do to a draft that misuses it — are
     /// worth far more than their tokens, but a small local model's window is already half
@@ -327,6 +322,20 @@ pub struct ScriptConfig {
     /// default, so every second of a video is covered: the shaky stretches are reported as
     /// timestamps, and a gap between windows would hide one.
     pub shake_stride_s: f64,
+    /// Place the cuts of speaking clips and audio beds on the sound itself rather than on the
+    /// transcript's segment times, when the speech stage has measured the video (see `cuts.rs`).
+    /// Whisper is often late at a start and early or quantised at an end, which put a clip's end on
+    /// the attack of the next speaker's first word. Off keeps the transcript's times.
+    pub cut_to_speech: bool,
+    /// A cut ends at least this long before the next voice comes in, so the attack of its first
+    /// word is not heard, whatever the frame rounding does (s). The tail after the last word is
+    /// `speech_overrun_s`.
+    pub cut_guard_s: f64,
+    /// A cut opens this long before a voice comes in (s).
+    pub cut_lead_s: f64,
+    /// The furthest a cut may move to land on the sound (s). Past it the clip is left as it was:
+    /// what is being cut is then a different sentence, not a different breath.
+    pub cut_max_move_s: f64,
 }
 
 /// Jev, TypeSafe's System One model, used as an editorial judge.
@@ -433,7 +442,6 @@ impl Default for ScriptConfig {
             audio_fade_s: 0.12,
             speech_lead_s: 0.5,
             infer_audio_beds: true,
-            speech_in_prompt: true,
             tool_docs: "auto".into(),
             closing_hold_s: 2.0,
             max_answer_tokens: 16384,
@@ -449,6 +457,10 @@ impl Default for ScriptConfig {
             max_sway: 1.0,
             shake_window_s: 4.0,
             shake_stride_s: 4.0,
+            cut_to_speech: true,
+            cut_guard_s: 0.12,
+            cut_lead_s: 0.15,
+            cut_max_move_s: 0.8,
             style: Default::default(),
         }
     }
@@ -500,6 +512,15 @@ impl ScriptConfig {
         if self.local_tool_rounds == 0 || self.roomy_tool_rounds == 0 {
             return Err("script tool rounds must be at least 1".into());
         }
+        for (name, v) in [
+            ("cut_guard_s", self.cut_guard_s),
+            ("cut_lead_s", self.cut_lead_s),
+            ("cut_max_move_s", self.cut_max_move_s),
+        ] {
+            if v < 0.0 || v.is_nan() {
+                return Err(format!("script.{name} cannot be negative, got {v}"));
+            }
+        }
         Ok(())
     }
 }
@@ -548,8 +569,8 @@ pub struct ModelsConfig {
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ChatConfig {
-    /// Editing instructions for the script chat; empty = the built-in default
-    /// (`chat::DEFAULT_EDITOR_PROMPT`). `{project}`, `{fps}`, `{width}`, `{height}` are filled in.
+    /// House rules for the script chat, added after the harness instructions every model gets
+    /// (`tools::INSTRUCTIONS`); empty = none. `{project}`, `{fps}`, `{width}`, `{height}` are filled in.
     pub system_prompt: String,
 }
 
@@ -929,7 +950,6 @@ impl Config {
                 "audio_fade_s" => f.audio_fade_s = num(key, value)?,
                 "speech_lead_s" => f.speech_lead_s = num(key, value)?,
                 "infer_audio_beds" => f.infer_audio_beds = flag(value),
-                "speech_in_prompt" => f.speech_in_prompt = flag(value),
                 "tool_docs" => f.tool_docs = value.to_string(),
                 "closing_hold_s" => f.closing_hold_s = num(key, value)?,
                 "max_answer_tokens" => f.max_answer_tokens = num(key, value)?,
@@ -945,6 +965,10 @@ impl Config {
                 "max_sway" => f.max_sway = num(key, value)?,
                 "shake_window_s" => f.shake_window_s = num(key, value)?,
                 "shake_stride_s" => f.shake_stride_s = num(key, value)?,
+                "cut_to_speech" => f.cut_to_speech = flag(value),
+                "cut_guard_s" => f.cut_guard_s = num(key, value)?,
+                "cut_lead_s" => f.cut_lead_s = num(key, value)?,
+                "cut_max_move_s" => f.cut_max_move_s = num(key, value)?,
                 other => return Err(format!("unknown config key 'script.{other}'")),
             }
             return self.script.validate();

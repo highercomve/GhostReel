@@ -152,7 +152,8 @@ impl ToolSpec {
             }
         }
         // The costliest warning is worth its tokens even in the short rendering.
-        let warnings: &[&str] = if detail == Detail::Full { self.misuse } else { &self.misuse[..self.misuse.len().min(1)] };
+        let warnings: &[&str] =
+            if detail == Detail::Full { self.misuse } else { &self.misuse[..self.misuse.len().min(1)] };
         for line in warnings {
             out.push(' ');
             out.push_str(line);

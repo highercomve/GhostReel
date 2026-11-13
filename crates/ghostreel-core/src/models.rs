@@ -698,7 +698,13 @@ fn status_for(models_dir: &Path, roots: &[PathBuf], mlx: bool) -> Vec<ModelStatu
             if entry.bundle.is_some() {
                 if entry.bundle_installed(models_dir) {
                     let path = entry.bundle_dir(models_dir);
-                    return ModelStatus { entry, installed_path: Some(path), in_own_dir: true, partial_bytes: None, external: None };
+                    return ModelStatus {
+                        entry,
+                        installed_path: Some(path),
+                        in_own_dir: true,
+                        partial_bytes: None,
+                        external: None,
+                    };
                 }
                 let partial: u64 = entry
                     .downloads()
@@ -728,7 +734,13 @@ fn status_for(models_dir: &Path, roots: &[PathBuf], mlx: bool) -> Vec<ModelStatu
 
                 if let (Some(m_p), Some(_p_p)) = (model_path, proj_path) {
                     let in_own = m_p.starts_with(models_dir);
-                    return ModelStatus { entry, installed_path: Some(m_p), in_own_dir: in_own, partial_bytes: None, external: None };
+                    return ModelStatus {
+                        entry,
+                        installed_path: Some(m_p),
+                        in_own_dir: in_own,
+                        partial_bytes: None,
+                        external: None,
+                    };
                 }
 
                 // If not fully installed, check for partial files or already downloaded individual files
@@ -753,11 +765,23 @@ fn status_for(models_dir: &Path, roots: &[PathBuf], mlx: bool) -> Vec<ModelStatu
 
             let own = models_dir.join(&entry.file_name);
             if own.is_file() && own.metadata().map(|m| m.len() > 0).unwrap_or(false) {
-                return ModelStatus { entry, installed_path: Some(own), in_own_dir: true, partial_bytes: None, external: None };
+                return ModelStatus {
+                    entry,
+                    installed_path: Some(own),
+                    in_own_dir: true,
+                    partial_bytes: None,
+                    external: None,
+                };
             }
             if let Some(found) = find(roots, &entry.file_name) {
                 let in_own = found.starts_with(models_dir);
-                return ModelStatus { entry, installed_path: Some(found), in_own_dir: in_own, partial_bytes: None, external: None };
+                return ModelStatus {
+                    entry,
+                    installed_path: Some(found),
+                    in_own_dir: in_own,
+                    partial_bytes: None,
+                    external: None,
+                };
             }
             let part = models_dir.join(format!("{}.part", entry.file_name));
             let partial_bytes = part.metadata().ok().map(|m| m.len()).filter(|&l| l > 0);
@@ -774,7 +798,9 @@ pub fn scan_external(models_dir: &Path, roots: &[PathBuf]) -> Vec<ModelStatus> {
     let mut directories = std::collections::HashSet::new();
     while let Some(dir) = pending.pop() {
         let Ok(canonical) = std::fs::canonicalize(&dir) else { continue };
-        if !directories.insert(canonical) { continue; }
+        if !directories.insert(canonical) {
+            continue;
+        }
         let Ok(entries) = std::fs::read_dir(&dir) else { continue };
         for entry in entries.flatten() {
             let path = entry.path();
@@ -790,72 +816,107 @@ pub fn scan_external(models_dir: &Path, roots: &[PathBuf]) -> Vec<ModelStatus> {
     let catalog = catalog();
     files.sort();
     let mut seen = std::collections::HashSet::new();
-    files.into_iter().filter_map(|path| {
-        let canonical = std::fs::canonicalize(&path).ok()?;
-        if !seen.insert(canonical) { return None; }
-        let name = path.file_name()?.to_str()?;
-        // Catalog matches retain their existing metadata and selection IDs.
-        if catalog.iter().any(|e| e.file_name.eq_ignore_ascii_case(name)) {
-            return None;
-        }
-        external_status(models_dir, &path)
-    }).collect()
+    files
+        .into_iter()
+        .filter_map(|path| {
+            let canonical = std::fs::canonicalize(&path).ok()?;
+            if !seen.insert(canonical) {
+                return None;
+            }
+            let name = path.file_name()?.to_str()?;
+            // Catalog matches retain their existing metadata and selection IDs.
+            if catalog.iter().any(|e| e.file_name.eq_ignore_ascii_case(name)) {
+                return None;
+            }
+            external_status(models_dir, &path)
+        })
+        .collect()
 }
 
 fn main_gguf(path: &Path) -> bool {
     let name = path.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
-    name.ends_with(".gguf") && !name.contains("mmproj") && !name.starts_with("mtp-")
+    name.ends_with(".gguf")
+        && !name.contains("mmproj")
+        && !name.starts_with("mtp-")
         && (!name.contains("-of-") || name.contains("-00001-of-"))
-        && path.is_file() && path.metadata().is_ok_and(|m| m.len() > 0)
+        && path.is_file()
+        && path.metadata().is_ok_and(|m| m.len() > 0)
 }
 
 /// Resolve the persisted ID directly, including models in configured search paths.
 /// A missing file is an error to the caller, never a download request.
 pub fn external_model(id: &str) -> Option<ModelStatus> {
     let path = Path::new(id.strip_prefix("external:")?);
-    if !path.is_absolute() { return None; }
+    if !path.is_absolute() {
+        return None;
+    }
     external_status(Path::new(""), path)
 }
 
 fn external_status(models_dir: &Path, path: &Path) -> Option<ModelStatus> {
-    if !main_gguf(path) { return None; }
+    if !main_gguf(path) {
+        return None;
+    }
     let path = std::path::absolute(path).ok()?;
     let stem = path.file_stem()?.to_str()?;
     let lower = stem.to_lowercase();
     let kind = if lower.contains("embed") { ModelKind::Embedding } else { ModelKind::Vision };
-    let mut projectors: Vec<_> = std::fs::read_dir(path.parent()?).ok()?.flatten()
-        .map(|e| e.path()).filter(|p| {
+    let mut projectors: Vec<_> = std::fs::read_dir(path.parent()?)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
             let n = p.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
-            n.contains("mmproj") && n.ends_with(".gguf") && p.is_file()
-                && p.metadata().is_ok_and(|m| m.len() > 0)
-        }).collect();
+            n.contains("mmproj") && n.ends_with(".gguf") && p.is_file() && p.metadata().is_ok_and(|m| m.len() > 0)
+        })
+        .collect();
     projectors.sort();
     let mmproj_path = (kind == ModelKind::Vision).then(|| projectors.into_iter().next()).flatten();
     let parts: Vec<_> = stem.split(['-', '.']).collect();
-    let quant = parts.iter().find(|p| {
-        let p = p.to_lowercase();
-        p.starts_with('q') && p.as_bytes().get(1).is_some_and(u8::is_ascii_digit)
-            || p.starts_with("iq") || p.starts_with("pq") || matches!(p.as_str(), "f16" | "bf16" | "f32")
-    }).map(|p| p.to_lowercase());
+    let quant = parts
+        .iter()
+        .find(|p| {
+            let p = p.to_lowercase();
+            p.starts_with('q') && p.as_bytes().get(1).is_some_and(u8::is_ascii_digit)
+                || p.starts_with("iq")
+                || p.starts_with("pq")
+                || matches!(p.as_str(), "f16" | "bf16" | "f32")
+        })
+        .map(|p| p.to_lowercase());
     let display_stem = quant.as_ref().and_then(|q| lower.find(q)).map_or(stem, |i| &stem[..i]);
     let mut name = display_stem.trim_end_matches(['-', '.', '_']).replace(['-', '_'], " ");
-    if let Some(first) = name.get_mut(..1) { first.make_ascii_uppercase(); }
-    let source = if path.to_string_lossy().to_lowercase().contains("lmstudio") { "LM Studio" }
-        else if path.to_string_lossy().to_lowercase().contains("ghostpen") { "GhostPen" }
-        else { "local folder" }.to_string();
+    if let Some(first) = name.get_mut(..1) {
+        first.make_ascii_uppercase();
+    }
+    let source = if path.to_string_lossy().to_lowercase().contains("lmstudio") {
+        "LM Studio"
+    } else if path.to_string_lossy().to_lowercase().contains("ghostpen") {
+        "GhostPen"
+    } else {
+        "local folder"
+    }
+    .to_string();
     Some(ModelStatus {
         entry: CatalogEntry {
-            id: format!("external:{}", path.display()), kind,
-            file_name: path.to_str()?.to_string(), url: String::new(),
-            size_bytes: path.metadata().ok()?.len(), speed: 0, accuracy: 0,
-            note: String::new(), languages: String::new(),
+            id: format!("external:{}", path.display()),
+            kind,
+            file_name: path.to_str()?.to_string(),
+            url: String::new(),
+            size_bytes: path.metadata().ok()?.len(),
+            speed: 0,
+            accuracy: 0,
+            note: String::new(),
+            languages: String::new(),
             mmproj_file_name: mmproj_path.as_ref().map(|p| p.to_string_lossy().into_owned()),
             mmproj_url: None,
             mmproj_size_bytes: mmproj_path.as_ref().and_then(|p| p.metadata().ok()).map(|m| m.len()),
-            vram_mb: None, bundle: None, sha256: None,
+            vram_mb: None,
+            bundle: None,
+            sha256: None,
         },
         in_own_dir: !models_dir.as_os_str().is_empty() && path.starts_with(models_dir),
-        installed_path: Some(path), partial_bytes: None,
+        installed_path: Some(path),
+        partial_bytes: None,
         external: Some(ExternalModel { name, quant, source, mmproj_path }),
     })
 }
@@ -980,9 +1041,11 @@ pub fn well_known_dirs() -> Vec<PathBuf> {
 pub fn find_with_projector(roots: &[PathBuf], model: &str, projector: &str) -> (Option<PathBuf>, Option<PathBuf>) {
     let Some(model_path) = find(roots, model) else { return (None, None) };
     let model_path = Some(model_path);
-    let beside = model_path.as_ref().and_then(|m| m.parent()).map(|dir| dir.join(projector)).filter(|p| {
-        p.is_file() && p.metadata().is_ok_and(|m| m.len() > 0)
-    });
+    let beside = model_path
+        .as_ref()
+        .and_then(|m| m.parent())
+        .map(|dir| dir.join(projector))
+        .filter(|p| p.is_file() && p.metadata().is_ok_and(|m| m.len() > 0));
     let projector_path = beside.or_else(|| find(roots, projector));
     (model_path, projector_path)
 }
@@ -1123,13 +1186,24 @@ mod tests {
         let root = dir.path().join(".lmstudio/models");
         let folder = root.join("highllama/highllama-qwen3.5-9b");
         std::fs::create_dir_all(&folder).unwrap();
-        for file in ["highllama-qwen3.5-9b-q4_k_m.gguf", "mmproj-F16.gguf", "mtp-draft.gguf",
-            "embedding-test-Q8_0.gguf", "Bonsai-27B-Q1_0.gguf", "empty.gguf",
-            "split-00001-of-00002.gguf", "split-00002-of-00002.gguf"] {
+        for file in [
+            "highllama-qwen3.5-9b-q4_k_m.gguf",
+            "mmproj-F16.gguf",
+            "mtp-draft.gguf",
+            "embedding-test-Q8_0.gguf",
+            "Bonsai-27B-Q1_0.gguf",
+            "empty.gguf",
+            "split-00001-of-00002.gguf",
+            "split-00002-of-00002.gguf",
+        ] {
             std::fs::write(folder.join(file), if file == "empty.gguf" { &b""[..] } else { &b"model"[..] }).unwrap();
         }
         let models = scan_external(&own, &[root.clone(), root.clone()]);
-        assert_eq!(models.len(), 3 + usize::from(uses_mlx()), "main, embedding, first split shard; native catalog files on MLX hosts");
+        assert_eq!(
+            models.len(),
+            3 + usize::from(uses_mlx()),
+            "main, embedding, first split shard; native catalog files on MLX hosts"
+        );
         let model = models.iter().find(|m| m.entry.file_name.contains("highllama-qwen3.5-9b-q4")).unwrap();
         let ext = model.external.as_ref().unwrap();
         assert_eq!(ext.name, "Highllama qwen3.5 9b");
@@ -1166,7 +1240,8 @@ mod tests {
         let config_path = dir.path().join("config.toml");
         config.save(&config_path).unwrap();
         let loaded = Config::load(&config_path).unwrap();
-        for (id, expected) in [(&loaded.vision.local_model, &models[0]), (&loaded.chat_model().local_model, &models[1])] {
+        for (id, expected) in [(&loaded.vision.local_model, &models[0]), (&loaded.chat_model().local_model, &models[1])]
+        {
             assert_eq!(*id, expected.entry.id);
             let resolved = external_model(id).unwrap();
             assert_eq!(resolved.installed_path, expected.installed_path);

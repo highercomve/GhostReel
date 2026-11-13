@@ -5,9 +5,12 @@
 //! ```text
 //! {"type":"loaded","model":"…","gpu":true}
 //! {"type":"progress","percent":42}
-//! {"type":"segment","start":0.0,"end":6.2,"text":"…","no_speech":0.01}
+//! {"type":"segment","start":0.0,"end":6.2,"text":"…","no_speech":0.01,"words":[{"w":"Esto","s":0.1,"e":0.4}]}
 //! {"type":"done","language":"en","audio_s":123.4}
 //! ```
+//!
+//! `words` are the segment's words with whisper's own token timestamps (seconds in the audio): a
+//! rough clock, good to a word and not to a phoneme, which GhostReel snaps to the measured speech.
 //!
 //! Errors go to stderr with a non-zero exit code. Runs as its own process because whisper-rs and
 //! llama-cpp-2 each vendor ggml (duplicate symbols in one binary), and so the GPU memory is
@@ -133,6 +136,8 @@ fn transcribe(ctx: &WhisperContext, args: &Args, raw: &[u8], prompt: Option<&str
     params.set_print_realtime(false);
     params.set_print_timestamps(false);
     params.set_suppress_nst(true);
+    // Per-token times, for cutting at a word inside a sentence.
+    params.set_token_timestamps(true);
     let mut last = -1;
     params.set_progress_callback_safe(move |p: i32| {
         if p != last {
@@ -149,17 +154,83 @@ fn transcribe(ctx: &WhisperContext, args: &Args, raw: &[u8], prompt: Option<&str
         if text.is_empty() {
             continue;
         }
+        let eot = ctx.token_eot();
+        let tokens: Vec<Token> = (0..seg.n_tokens())
+            .filter_map(|k| {
+                let token = seg.get_token(k)?;
+                let data = token.token_data();
+                // The end-of-text and timestamp tokens ([_BEG_], [_TT_n]) are not words.
+                if data.id >= eot {
+                    return None;
+                }
+                Some(Token { text: token.to_str_lossy().ok()?.into_owned(), t0: data.t0, t1: data.t1 })
+            })
+            .collect();
+        let words: Vec<serde_json::Value> = group_words(&tokens, seg.start_timestamp(), seg.end_timestamp())
+            .into_iter()
+            .map(|w| json!({ "w": w.text, "s": w.start, "e": w.end }))
+            .collect();
         emit(json!({
             "type": "segment",
             "start": seg.start_timestamp() as f64 / 100.0,
             "end": seg.end_timestamp() as f64 / 100.0,
             "text": text,
             "no_speech": seg.no_speech_probability(),
+            "words": words,
         }));
     }
     let language = whisper_rs::get_lang_str(state.full_lang_id_from_state());
     emit(json!({ "type": "done", "language": language, "audio_s": audio_s }));
     Ok(())
+}
+
+/// One token of a segment, with whisper's times for it in centiseconds (-1 when it has none).
+struct Token {
+    text: String,
+    t0: i64,
+    t1: i64,
+}
+
+#[derive(Debug, PartialEq)]
+struct Word {
+    text: String,
+    start: f64,
+    end: f64,
+}
+
+/// Group a segment's tokens into words. A token that starts with a space starts a word; one that
+/// does not (a suffix, a punctuation mark) belongs to the word before it. A word runs from its
+/// first token's start to its last token's end, clamped to the segment and kept in order: whisper
+/// leaves some tokens without a time, and those take their neighbours'.
+fn group_words(tokens: &[Token], seg_start: i64, seg_end: i64) -> Vec<Word> {
+    let mut words: Vec<(String, i64, i64)> = Vec::new();
+    for t in tokens {
+        if t.text.trim().is_empty() {
+            continue;
+        }
+        let (a, b) = (t.t0.max(seg_start), t.t1.max(t.t0).min(seg_end.max(seg_start)));
+        let new_word = t.text.starts_with(' ') || words.is_empty();
+        match words.last_mut() {
+            Some(w) if !new_word => {
+                w.0.push_str(&t.text);
+                if t.t1 >= 0 {
+                    w.2 = w.2.max(b);
+                }
+            }
+            _ => words.push((t.text.trim_start().to_string(), a, b)),
+        }
+    }
+    // A word without its own time starts where the one before ended, and never ends before it starts.
+    let mut cursor = seg_start;
+    words
+        .into_iter()
+        .map(|(text, a, b)| {
+            let start = a.max(cursor);
+            let end = b.max(start);
+            cursor = end;
+            Word { text, start: start as f64 / 100.0, end: end as f64 / 100.0 }
+        })
+        .collect()
 }
 
 fn main() -> ExitCode {
@@ -169,5 +240,41 @@ fn main() -> ExitCode {
             eprintln!("ghostreel-asr: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tok(text: &str, t0: i64, t1: i64) -> Token {
+        Token { text: text.into(), t0, t1 }
+    }
+
+    #[test]
+    fn tokens_make_words_with_their_pieces_and_punctuation_kept_together() {
+        let tokens = [
+            tok(" Esto", 100, 125),
+            tok(" es", 125, 140),
+            tok(" O", 150, 170),
+            tok(" Cor", 170, 185),
+            tok("res", 185, 205),
+            tok(".", 205, 206),
+        ];
+        let words = group_words(&tokens, 100, 210);
+        let text: Vec<&str> = words.iter().map(|w| w.text.as_str()).collect();
+        assert_eq!(text, ["Esto", "es", "O", "Corres."]);
+        assert_eq!((words[0].start, words[0].end), (1.0, 1.25));
+        assert_eq!((words[3].start, words[3].end), (1.7, 2.06));
+    }
+
+    #[test]
+    fn a_token_without_a_time_takes_its_neighbours_and_nothing_runs_backwards() {
+        let tokens = [tok(" uno", 100, 120), tok(" dos", -1, -1), tok(" tres", 90, 150)];
+        let words = group_words(&tokens, 100, 200);
+        assert_eq!(words.len(), 3);
+        assert!(words.windows(2).all(|w| w[0].end <= w[1].start + 1e-9), "{words:?}");
+        assert!(words.iter().all(|w| w.start >= 1.0 && w.end >= w.start && w.end <= 2.0), "{words:?}");
+        assert!(group_words(&[], 0, 100).is_empty());
     }
 }

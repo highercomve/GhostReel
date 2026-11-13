@@ -132,8 +132,9 @@ impl Db {
     }
 
     pub fn people(&self, project_id: i64) -> Result<Vec<Person>, Error> {
-        let mut st =
-            self.conn.prepare("SELECT id, project_id, name, handle, role FROM people WHERE project_id = ?1 ORDER BY id")?;
+        let mut st = self
+            .conn
+            .prepare("SELECT id, project_id, name, handle, role FROM people WHERE project_id = ?1 ORDER BY id")?;
         let rows = st.query_map([project_id], |r| {
             Ok(Person { id: r.get(0)?, project_id: r.get(1)?, name: r.get(2)?, handle: r.get(3)?, role: r.get(4)? })
         })?;
@@ -145,7 +146,15 @@ impl Db {
             .query_row(
                 "SELECT id, project_id, name, handle, role FROM people WHERE project_id = ?1 AND id = ?2",
                 params![project_id, person_id],
-                |r| Ok(Person { id: r.get(0)?, project_id: r.get(1)?, name: r.get(2)?, handle: r.get(3)?, role: r.get(4)? }),
+                |r| {
+                    Ok(Person {
+                        id: r.get(0)?,
+                        project_id: r.get(1)?,
+                        name: r.get(2)?,
+                        handle: r.get(3)?,
+                        role: r.get(4)?,
+                    })
+                },
             )
             .optional()?
             .ok_or_else(|| Error::NotFound(format!("person {person_id} in project {project_id}")))
@@ -196,7 +205,9 @@ impl Db {
             let c = centroid(&g.iter().map(|&i| tracks[i].mean_embedding.as_slice()).collect::<Vec<_>>());
             let best = known
                 .iter()
-                .map(|(id, embs)| (*id, embs.iter().map(|e| cosine_similarity(e, &c)).fold(f32::NEG_INFINITY, f32::max)))
+                .map(|(id, embs)| {
+                    (*id, embs.iter().map(|e| cosine_similarity(e, &c)).fold(f32::NEG_INFINITY, f32::max))
+                })
                 .max_by(|a, b| a.1.total_cmp(&b.1));
             let id = match best {
                 Some((id, s)) if s >= MATCH_THRESHOLD => id,

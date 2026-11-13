@@ -16,6 +16,10 @@ fn round2(x: f64) -> f64 {
     (x * 100.0).round() / 100.0
 }
 
+/// Silence before a clip's first word (or past the tail after its last) longer than this plays as
+/// dead air (s).
+const DEAD_AIR_S: f64 = 0.5;
+
 /// Options to customize script checking.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct CheckOptions {
@@ -104,8 +108,9 @@ impl Steadiness {
 /// The repair passes a script written outside the chat gets before it is checked and saved
 /// (`ghostreel script import`, clip runs): snap to speech segments, lay audio beds, end on the
 /// speaker's turn and on whole sentences, cut pictures back to the voice, hold the last picture,
-/// keep vertical framing off screen shares, clamp beds. Returns one line per pass that changed
-/// something.
+/// keep vertical framing off screen shares, clamp beds, and last of all place every cut on the
+/// sound itself (`cuts.rs`, for videos the speech stage has measured). Returns one line per pass
+/// that changed something, and none when the script comes out as it went in.
 ///
 /// `min_clip_s`: the shortest a clip may be trimmed to (a clip run's length range); `None` keeps
 /// most of each clip.
@@ -117,6 +122,7 @@ pub fn repair_for_import(
     min_clip_s: Option<f64>,
 ) -> Result<Vec<String>, Error> {
     let mut notes = Vec::new();
+    let before = script.clone();
     let snapped = crate::script::snap_to_segments(db, script)?;
     if snapped > 0 {
         notes.push(format!("snapped {snapped} clip boundary(ies) to speech segments"));
@@ -156,6 +162,13 @@ pub fn repair_for_import(
     notes.extend(crate::script_fix::repair_framing(db, script, cfg.speech_overrun_s, min_clip_s));
     // A bed may not outlast the pictures it plays under, and everything above moves them.
     crate::chat::clamp_beds_to_beats(db, script, cfg);
+    // Last: every pass above moves clips by the transcript's times, which are approximate.
+    notes.extend(crate::cuts::place_cuts(db, script, cfg).iter().map(crate::cuts::CutMove::message));
+    // The passes take turns (the transcript's times pull a cut one way, the sound puts it back):
+    // a script they leave exactly as it came in was not changed, whatever each pass did on the way.
+    if *script == before {
+        notes.clear();
+    }
     Ok(notes)
 }
 
@@ -469,8 +482,14 @@ pub fn check(
                 continue;
             }
 
+            // An edge written as a word ("s412@3") is inside a sentence on purpose: the editor asked
+            // for it. Seconds that land inside one are what this is for.
+            let on_word = |r: Option<&str>| r.is_some_and(|t| t.contains('@'));
+            let in_on_word = on_word(clip.sentences.as_ref().map(|r| r.from.as_str()));
+            let out_on_word = on_word(clip.sentences.as_ref().map(|r| r.to.as_str()));
+
             // Check in_s
-            for &(start, end) in edges.iter() {
+            for &(start, end) in edges.iter().filter(|_| !in_on_word) {
                 if clip.in_s > start && clip.in_s < end {
                     let d_start = clip.in_s - start;
                     let d_end = end - clip.in_s;
@@ -492,7 +511,7 @@ pub fn check(
             }
 
             // Check out_s
-            for &(start, end) in edges.iter() {
+            for &(start, end) in edges.iter().filter(|_| !out_on_word) {
                 if clip.out_s > start && clip.out_s < end {
                     let d_start = clip.out_s - start;
                     let d_end = end - clip.out_s;
@@ -518,11 +537,283 @@ pub fn check(
         }
     }
 
-    // d. breath info: for Source clips whose out_s is within 0.2 s after the end of the last spoken segment
-    // it contains (cut lands right on the last word), an Info issue "cut lands on the last word; hold ~1 s".
+    // c1. a silent talking head: a muted clip over someone speaking, with no bed or voice-over in its
+    // beat to carry a voice, shows a mouth moving and plays nothing. Muting is right for b-roll and
+    // under a bed; over the speech the piece is cut from, it is a slip whatever model made it.
+    // The closing hold the save path lays after the last words is muted on purpose.
+    let hold = crate::script_fix::closing_hold(script);
+    for (beat_idx, beat) in script.beats.iter().enumerate() {
+        let voiced = beat.bed.is_some() || beat.narration.as_deref().is_some_and(|n| !n.trim().is_empty());
+        if voiced {
+            continue;
+        }
+        for (clip_idx, clip) in beat.clips.iter().enumerate() {
+            let len = clip.out_s - clip.in_s;
+            if clip.audio != Audio::Mute || len <= 0.0 || hold == Some((beat_idx, clip_idx)) {
+                continue;
+            }
+            let spoken: f64 = db
+                .conn
+                .query_row(
+                    "SELECT COALESCE(SUM(MIN(end_s, ?3) - MAX(start_s, ?2)), 0) FROM transcript_segments \
+                     WHERE video_id = ?1 AND end_s > ?2 AND start_s < ?3",
+                    rusqlite::params![clip.video_id, clip.in_s, clip.out_s],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0.0);
+            if spoken < 0.5 * len {
+                continue;
+            }
+            issues.push(Issue {
+                fixes: vec![crate::script::Fix::new(
+                    "Play its sound",
+                    crate::script::FixAction::SetAudio { beat_id: beat.id.clone(), clip_index: clip_idx, audio: Audio::Source },
+                )],
+                severity: IssueSeverity::Warning,
+                beat_id: Some(beat.id.clone()),
+                clip_index: Some(clip_idx),
+                message: format!(
+                    "video #{}: {:.1}–{:.1} s is muted, but someone speaks through {:.0}% of it and the beat has no \
+                     bed or narration: the viewer sees a mouth move and hears nothing. Set its audio to \"source\".",
+                    clip.video_id,
+                    clip.in_s,
+                    clip.out_s,
+                    100.0 * spoken / len
+                ),
+            });
+        }
+    }
+
+    // c3. edges on a change of picture: a clip that opens inside a dissolve or just before a change
+    // shows a flash of the shot it was not cut for (and the same at its end). Measured from the
+    // pixels around each edge (`transitions`); an edge that runs straight on into the next clip of
+    // the same footage is no cut at all.
+    let clips: Vec<(&crate::script::Beat, usize, &ScriptClip)> =
+        script.beats.iter().flat_map(|b| b.clips.iter().enumerate().map(move |(i, c)| (b, i, c))).collect();
+    for (k, &(beat, clip_idx, clip)) in clips.iter().enumerate() {
+        let runs_on = |other: Option<&(&crate::script::Beat, usize, &ScriptClip)>, a: f64, b: f64| {
+            other.is_some_and(|o| o.2.video_id == clip.video_id && (a - b).abs() < 0.05)
+        };
+        let prev = k.checked_sub(1).and_then(|p| clips.get(p));
+        let next = clips.get(k + 1);
+        let edges = [
+            (true, clip.in_s, prev.is_some_and(|p| runs_on(Some(p), p.2.out_s, clip.in_s))),
+            (false, clip.out_s, next.is_some_and(|n| runs_on(Some(n), clip.out_s, n.2.in_s))),
+        ];
+        for (opening, edge, continuous) in edges {
+            if continuous {
+                continue;
+            }
+            let near = crate::transitions::around(db, clip.video_id, edge);
+            let Some(t) = crate::transitions::edge_hazard(&near, edge, opening) else { continue };
+            let what = if t.is_cut() {
+                format!("a cut in the source at {:.2} s", t.start)
+            } else {
+                format!("a change of picture over {:.2}–{:.2} s", t.start, t.end)
+            };
+            let (moved, side) = if opening {
+                ((t.end + 0.05, clip.out_s), "opens on")
+            } else {
+                ((clip.in_s, t.start - 0.05), "closes on")
+            };
+            let fixes = if moved.1 - moved.0 >= 1.0 {
+                vec![crate::script::Fix::new(
+                    format!("Trim to {:.2}–{:.2}", moved.0, moved.1),
+                    crate::script::FixAction::Trim {
+                        beat_id: beat.id.clone(),
+                        clip_index: clip_idx,
+                        in_s: moved.0,
+                        out_s: moved.1,
+                    },
+                )]
+            } else {
+                Vec::new()
+            };
+            issues.push(Issue {
+                fixes,
+                severity: IssueSeverity::Warning,
+                beat_id: Some(beat.id.clone()),
+                clip_index: Some(clip_idx),
+                message: format!(
+                    "video #{}: the clip {side} {what}: its {} frames show the other picture",
+                    clip.video_id,
+                    if opening { "first" } else { "last" }
+                ),
+            });
+        }
+    }
+
+    // c4. a voice over a screen share, in a cut the shape of its footage: the speaker is only a
+    // camera tile in a corner. When the screen is not the point, their own tile can be framed for
+    // that stretch (the lips stay in sync, unlike a face from another moment under a bed).
+    let out = (script.width.unwrap_or(0) as f64, script.height.unwrap_or(0) as f64);
     for beat in &script.beats {
         for (clip_idx, clip) in beat.clips.iter().enumerate() {
-            if clip.audio != Audio::Source {
+            if clip.audio != Audio::Source || beat.bed.is_some() {
+                continue;
+            }
+            let Ok(Some((src_w, src_h))) = crate::framing::video_size(db, clip.video_id) else { continue };
+            if crate::framing::needs_crop(src_w, src_h, out.0, out.1) {
+                continue; // a vertical cut frames its screen shares already (framing_issues)
+            }
+            let framed = |a: f64, b: f64| {
+                clip.framing.as_ref().is_some_and(|f| f.overrides.iter().any(|o| o.from_s <= a + 0.05 && o.to_s >= b - 0.05))
+            };
+            let Ok(Some(spans)) = crate::scenes::for_range(db, clip.video_id, clip.in_s, clip.out_s) else { continue };
+            for s in spans.iter().filter(|s| s.scene == crate::scenes::Scene::ScreenShare && s.len() >= 1.5) {
+                if framed(s.start, s.end) {
+                    continue;
+                }
+                issues.push(Issue {
+                    fixes: vec![crate::script::Fix::new(
+                        format!("Frame the speaker's tile over {:.1}–{:.1}", s.start, s.end),
+                        crate::script::FixAction::SetLayout {
+                            beat_id: beat.id.clone(),
+                            clip_index: clip_idx,
+                            from_s: s.start,
+                            to_s: s.end,
+                            layout: crate::framing::Layout::FollowSpeaker,
+                        },
+                    )],
+                    severity: IssueSeverity::Warning,
+                    beat_id: Some(beat.id.clone()),
+                    clip_index: Some(clip_idx),
+                    message: format!(
+                        "video #{}: {:.1} s of this line ({:.1}–{:.1} s) plays over a screen share, the speaker only a \
+                         camera tile; if the screen is not the point, frame their own tile there (lips in sync, \
+                         zoomed from a small tile)",
+                        clip.video_id,
+                        s.len(),
+                        s.start,
+                        s.end
+                    ),
+                });
+            }
+        }
+    }
+
+    // c2. whole thoughts: a clip that opens on a reply or a connective leaning on a line the viewer
+    // never hears, or ends on a question whose answer is cut (`readcut::story`). Not when the line
+    // before plays right before it in the cut (the previous clip runs up to it).
+    let mut prev: Option<&crate::script::ScriptClip> = None;
+    for beat in &script.beats {
+        for (clip_idx, clip) in beat.clips.iter().enumerate() {
+            let heard =
+                beat.bed.is_none() && clip.audio == Audio::Source && !clip.tracks.as_ref().is_some_and(Vec::is_empty);
+            if heard {
+                let continues = prev.is_some_and(|p| {
+                    p.video_id == clip.video_id && p.audio == Audio::Source && (clip.in_s - p.out_s).abs() < 3.0
+                });
+                for note in crate::readcut::story(db, clip.video_id, clip.in_s, clip.out_s) {
+                    let opener = note.starts_with("opens on");
+                    if !(opener || note.starts_with("ends on a question")) || (opener && continues) {
+                        continue;
+                    }
+                    issues.push(Issue {
+                        fixes: Vec::new(),
+                        severity: IssueSeverity::Warning,
+                        beat_id: Some(beat.id.clone()),
+                        clip_index: Some(clip_idx),
+                        message: format!("story: {note}"),
+                    });
+                }
+            }
+            prev = Some(clip);
+        }
+    }
+
+    // d. cut edges. Where the speech stage has measured the video, the sound decides: a cut in
+    // silence, a little after the last word and a guard before the next voice, is clean and says
+    // nothing; a clipped word, a leak of the next speaker or a start inside a word is flagged, in
+    // the words `read_cut` uses (`cuts::judge_range`). Without measurements the transcript's
+    // times are all there is: a cut right on a segment's end gets the old hint.
+    let fps = script.fps.map(|f| f.as_f64()).filter(|f| *f > 0.0).unwrap_or(25.0);
+    for beat in &script.beats {
+        for (clip_idx, clip) in beat.clips.iter().enumerate() {
+            if clip.audio != Audio::Source || clip.tracks.as_ref().is_some_and(Vec::is_empty) {
+                continue;
+            }
+            if let Some((start, end)) = crate::cuts::judge_range(
+                db,
+                clip.video_id,
+                clip.in_s,
+                clip.out_s,
+                crate::sentences::WordEdges::of(db, clip.sentences.as_ref()),
+                cfg,
+                fps,
+            ) {
+                let fixes = || -> Vec<crate::script::Fix> {
+                    crate::cuts::placed_range(db, clip.video_id, clip.in_s, clip.out_s, cfg, fps)
+                        .map(|(in_s, out_s)| {
+                            vec![crate::script::Fix::new(
+                                format!("place the cut on the speech ({in_s:.2}–{out_s:.2} s)"),
+                                crate::script::FixAction::Trim {
+                                    beat_id: beat.id.clone(),
+                                    clip_index: clip_idx,
+                                    in_s,
+                                    out_s,
+                                },
+                            )]
+                        })
+                        .unwrap_or_default()
+                };
+                if !end.flag.is_clean() {
+                    issues.push(Issue {
+                        fixes: fixes(),
+                        severity: IssueSeverity::Warning,
+                        beat_id: Some(beat.id.clone()),
+                        clip_index: Some(clip_idx),
+                        message: format!("end {:.2} s of video #{}: {}", clip.out_s, clip.video_id, end.detail()),
+                    });
+                }
+                if !start.flag.is_clean() {
+                    issues.push(Issue {
+                        fixes: fixes(),
+                        severity: IssueSeverity::Warning,
+                        beat_id: Some(beat.id.clone()),
+                        clip_index: Some(clip_idx),
+                        message: format!("start {:.2} s of video #{}: {}", clip.in_s, clip.video_id, start.detail()),
+                    });
+                }
+                // Dead air: a clean cut can still leave a long silence before the first word or after
+                // the last one, which plays as a stall. Trimmed to the lead and tail the save path
+                // would give.
+                let trim = |in_s: f64, out_s: f64| {
+                    vec![crate::script::Fix::new(
+                        format!("Trim to {in_s:.2}–{out_s:.2}"),
+                        crate::script::FixAction::Trim { beat_id: beat.id.clone(), clip_index: clip_idx, in_s, out_s },
+                    )]
+                };
+                if start.flag.is_clean()
+                    && let Some(b) = start.before_voice_s.filter(|b| *b > DEAD_AIR_S)
+                {
+                    let to = clip.in_s + b - cfg.cut_lead_s;
+                    issues.push(Issue {
+                        fixes: if clip.out_s - to >= 1.0 { trim(to, clip.out_s) } else { Vec::new() },
+                        severity: IssueSeverity::Warning,
+                        beat_id: Some(beat.id.clone()),
+                        clip_index: Some(clip_idx),
+                        message: format!(
+                            "start {:.2} s of video #{}: {b:.2} s of silence before the first word plays as dead air",
+                            clip.in_s, clip.video_id
+                        ),
+                    });
+                }
+                if end.flag.is_clean()
+                    && let Some(a) = end.after_voice_s.filter(|a| *a > DEAD_AIR_S + cfg.speech_overrun_s)
+                {
+                    let to = clip.out_s - a + cfg.speech_overrun_s;
+                    issues.push(Issue {
+                        fixes: if to - clip.in_s >= 1.0 { trim(clip.in_s, to) } else { Vec::new() },
+                        severity: IssueSeverity::Warning,
+                        beat_id: Some(beat.id.clone()),
+                        clip_index: Some(clip_idx),
+                        message: format!(
+                            "end {:.2} s of video #{}: {a:.2} s of silence after the last word plays as dead air",
+                            clip.out_s, clip.video_id
+                        ),
+                    });
+                }
                 continue;
             }
             let edges =
@@ -538,16 +829,17 @@ pub fn check(
                 .map(|(_s_start, s_end)| *s_end)
                 .last();
 
-            if let Some(seg_end) = last_seg_end {
-                if clip.out_s >= seg_end - 0.05 && clip.out_s <= seg_end + 0.2 {
-                    issues.push(Issue {
-                        fixes: Vec::new(),
-                        severity: IssueSeverity::Info,
-                        beat_id: Some(beat.id.clone()),
-                        clip_index: Some(clip_idx),
-                        message: "cut lands on the last word; hold ~1 s".to_string(),
-                    });
-                }
+            if let Some(seg_end) = last_seg_end
+                && clip.out_s >= seg_end - 0.05
+                && clip.out_s <= seg_end + 0.2
+            {
+                issues.push(Issue {
+                    fixes: Vec::new(),
+                    severity: IssueSeverity::Info,
+                    beat_id: Some(beat.id.clone()),
+                    clip_index: Some(clip_idx),
+                    message: "cut lands on the last word; hold ~1 s".to_string(),
+                });
             }
         }
     }
@@ -707,11 +999,21 @@ mod tests {
     }
 
     fn speech(in_s: f64, out_s: f64) -> ScriptClip {
-        ScriptClip { video_id: 1, in_s, out_s, audio: Audio::Source, why: None, tracks: None, framing: None }
+        ScriptClip { exact: false,
+            sentences: None,
+            video_id: 1,
+            in_s,
+            out_s,
+            audio: Audio::Source,
+            why: None,
+            tracks: None,
+            framing: None,
+        }
     }
 
     fn hold(in_s: f64) -> ScriptClip {
-        ScriptClip {
+        ScriptClip { exact: false,
+            sentences: None,
             video_id: 1,
             in_s,
             out_s: in_s + 2.0,
@@ -855,6 +1157,43 @@ mod tests {
         assert_eq!(framed, before);
     }
 
+    /// A muted clip over someone talking, with nothing else to carry a voice, is flagged with a fix
+    /// that plays its sound; under a bed it is how a cutaway works and nothing is said.
+    #[test]
+    fn a_muted_talking_head_is_flagged_unless_a_bed_carries_the_voice() {
+        let (mut db, pid, _dir) = setup_test_db();
+        podcast(&db);
+        let mut muted = speech(2.0, 20.0);
+        muted.audio = Audio::Mute;
+        let s = make_script(vec![muted.clone()]);
+        let silent = |s: &Script, db: &Db| -> Vec<Issue> {
+            check(db, pid, s, &ScriptConfig::default(), &CheckOptions::default())
+                .unwrap()
+                .into_iter()
+                .filter(|i| i.message.contains("is muted, but someone speaks"))
+                .collect()
+        };
+        let issues = silent(&s, &db);
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        let fix = &issues[0].fixes[0].action;
+        let mut fixed = s.clone();
+        crate::script_fix::apply_fix(&mut db, pid, &mut fixed, fix).unwrap();
+        assert_eq!(fixed.beats[0].clips[0].audio, Audio::Source);
+        assert!(silent(&fixed, &db).is_empty());
+
+        let mut bedded = s.clone();
+        bedded.beats[0].bed = Some(crate::script::AudioBed {
+            sentences: None,
+            video_id: 1,
+            in_s: 2.0,
+            out_s: 20.0,
+            why: None,
+            inferred: false,
+            tracks: None,
+        });
+        assert!(silent(&bedded, &db).is_empty(), "a bed carries the voice");
+    }
+
     #[test]
     fn clip_set_warnings_are_checked_live_not_stored() {
         let (db, pid, _dir) = setup_test_db();
@@ -918,7 +1257,9 @@ mod tests {
                 clips,
                 notes: None,
                 bed: None,
+                card: None,
             }],
+            card_style: None,
         }
     }
 
@@ -937,7 +1278,8 @@ mod tests {
         let opts = CheckOptions::default();
 
         // 1. Clip starts mid-sentence (15.0 s), ends outside (25.0 s) -> Warning
-        let script_mid = make_script(vec![ScriptClip {
+        let script_mid = make_script(vec![ScriptClip { exact: false,
+            sentences: None,
             framing: None,
             video_id: 1,
             in_s: 15.0,
@@ -957,7 +1299,8 @@ mod tests {
         assert!(sentence_warns[0].message.contains("10.0"));
 
         // 2. Clip starts within 0.1 s of sentence start (10.1 s) and ends on edge (20.0 s) -> OK
-        let script_edge = make_script(vec![ScriptClip {
+        let script_edge = make_script(vec![ScriptClip { exact: false,
+            sentences: None,
             framing: None,
             video_id: 1,
             in_s: 10.1,
@@ -981,7 +1324,8 @@ mod tests {
 
         let script = make_script(vec![
             // Too short: 1.0 s < 2.0 s
-            ScriptClip {
+            ScriptClip { exact: false,
+                sentences: None,
                 framing: None,
                 video_id: 1,
                 in_s: 0.0,
@@ -991,7 +1335,8 @@ mod tests {
                 tracks: None,
             },
             // Just right: 3.0 s
-            ScriptClip {
+            ScriptClip { exact: false,
+                sentences: None,
                 framing: None,
                 video_id: 1,
                 in_s: 2.0,
@@ -1001,7 +1346,8 @@ mod tests {
                 tracks: None,
             },
             // Too long: 6.0 s > 5.0 s
-            ScriptClip {
+            ScriptClip { exact: false,
+                sentences: None,
                 framing: None,
                 video_id: 1,
                 in_s: 10.0,
@@ -1033,7 +1379,8 @@ mod tests {
         let cfg = ScriptConfig::default();
 
         let script_overlap = make_script(vec![
-            ScriptClip {
+            ScriptClip { exact: false,
+                sentences: None,
                 framing: None,
                 video_id: 1,
                 in_s: 0.0,
@@ -1042,7 +1389,8 @@ mod tests {
                 why: None,
                 tracks: None,
             },
-            ScriptClip {
+            ScriptClip { exact: false,
+                sentences: None,
                 framing: None,
                 video_id: 1,
                 in_s: 4.0,
@@ -1068,7 +1416,8 @@ mod tests {
 
         // Touching / tiny overlap <= 0.1 s: no error
         let script_touch = make_script(vec![
-            ScriptClip {
+            ScriptClip { exact: false,
+                sentences: None,
                 framing: None,
                 video_id: 1,
                 in_s: 0.0,
@@ -1077,7 +1426,8 @@ mod tests {
                 why: None,
                 tracks: None,
             },
-            ScriptClip {
+            ScriptClip { exact: false,
+                sentences: None,
                 framing: None,
                 video_id: 1,
                 in_s: 4.95,
@@ -1089,6 +1439,98 @@ mod tests {
         ]);
         let issues_touch = check(&db, project_id, &script_touch, &cfg, &opts_forbid).unwrap();
         assert!(!issues_touch.iter().any(|i| i.severity == IssueSeverity::Error && i.message.contains("overlap")));
+    }
+
+    /// Measured speech decides the cut edges: the transcript's "cut lands on the last word" hint
+    /// stands aside when the cut is in the silence after the word, and only a clipped word or a
+    /// leak of the next speaker is flagged, in the words `read_cut` uses.
+    #[test]
+    fn measured_speech_decides_the_cut_edge_issues() {
+        use crate::speech::SpeechRegion;
+        let (db, project_id, _dir) = setup_test_db();
+        db.conn
+            .execute(
+                "INSERT INTO transcript_segments(video_id, start_s, end_s, text) VALUES (1, 10.0, 20.0, 'sentence 1')",
+                [],
+            )
+            .unwrap();
+        let cfg = ScriptConfig::default();
+        let opts = CheckOptions::default();
+        let clip = |out_s| {
+            make_script(vec![ScriptClip { exact: false,
+                sentences: None,
+                framing: None,
+                video_id: 1,
+                in_s: 9.85,
+                out_s,
+                audio: Audio::Source,
+                why: None,
+                tracks: None,
+            }])
+        };
+        let edge_issues = |issues: Vec<Issue>| -> Vec<String> {
+            issues
+                .into_iter()
+                .filter(|i| {
+                    i.message.contains("last word") || i.message.contains("leaks") || i.message.contains("mid-word")
+                })
+                .map(|i| i.message)
+                .collect()
+        };
+
+        // Not measured: the transcript's hint, as it always was.
+        let hint = edge_issues(check(&db, project_id, &clip(20.1), &cfg, &opts).unwrap());
+        assert_eq!(hint, vec!["cut lands on the last word; hold ~1 s".to_string()]);
+
+        // Measured: the voice ends at 19.80 and nobody speaks until 25. The same cut, 0.3 s after
+        // the last word, is clean: no hint, no issue.
+        db.set_speech_regions(
+            1,
+            &[SpeechRegion { start_s: 10.0, end_s: 19.80, quiet_after_s: Some(22.0) }, SpeechRegion::new(25.0, 30.0)],
+        )
+        .unwrap();
+        assert!(edge_issues(check(&db, project_id, &clip(20.1), &cfg, &opts).unwrap()).is_empty());
+        // A cut on the segment's end that is still in the silence is clean too (the old hint fired).
+        assert!(edge_issues(check(&db, project_id, &clip(20.0), &cfg, &opts).unwrap()).is_empty());
+
+        // Inside the last word: flagged, with the fix.
+        let issues = check(&db, project_id, &clip(19.6), &cfg, &opts).unwrap();
+        let clipped: Vec<&Issue> = issues.iter().filter(|i| i.message.contains("clips the last word")).collect();
+        assert_eq!(clipped.len(), 1, "{issues:?}");
+        assert_eq!(clipped[0].severity, IssueSeverity::Warning);
+        assert!(clipped[0].message.contains("0.20 s past the cut"), "{}", clipped[0].message);
+        assert!(
+            clipped[0]
+                .fixes
+                .iter()
+                .any(|f| matches!(&f.action, crate::script::FixAction::Trim { out_s, .. } if *out_s > 19.8)),
+            "the fix places the cut after the word: {:?}",
+            clipped[0].fixes
+        );
+
+        // The next voice comes in at 20.05: a cut at 20.1 has it leaking in.
+        db.set_speech_regions(
+            1,
+            &[SpeechRegion { start_s: 10.0, end_s: 19.80, quiet_after_s: Some(19.9) }, SpeechRegion::new(20.05, 30.0)],
+        )
+        .unwrap();
+        let leaks = edge_issues(check(&db, project_id, &clip(20.1), &cfg, &opts).unwrap());
+        assert_eq!(leaks.len(), 1, "{leaks:?}");
+        assert!(leaks[0].contains("next speaker leaks in"), "{}", leaks[0]);
+        // One that stays in the 0.25 s pause is fine, however short.
+        assert!(edge_issues(check(&db, project_id, &clip(19.93), &cfg, &opts).unwrap()).is_empty());
+
+        // A start inside the first word is flagged as such; one a little before it is not.
+        let mut start_script = clip(19.9);
+        start_script.beats[0].clips[0].in_s = 10.1;
+        let mid = edge_issues(check(&db, project_id, &start_script, &cfg, &opts).unwrap());
+        assert!(mid.iter().any(|m| m.contains("starts mid-word")), "{mid:?}");
+        start_script.beats[0].clips[0].in_s = 9.85;
+        assert!(
+            !edge_issues(check(&db, project_id, &start_script, &cfg, &opts).unwrap())
+                .iter()
+                .any(|m| m.contains("mid-word"))
+        );
     }
 
     #[test]
@@ -1104,7 +1546,8 @@ mod tests {
         let cfg = ScriptConfig::default();
         let opts = CheckOptions::default();
 
-        let script = make_script(vec![ScriptClip {
+        let script = make_script(vec![ScriptClip { exact: false,
+            sentences: None,
             framing: None,
             video_id: 1,
             in_s: 15.0,
@@ -1135,7 +1578,8 @@ mod tests {
         let opts = CheckOptions::default();
 
         // 1. Cut lands 0.1 s after sentence end (20.1 s) -> Info issue
-        let script_breath = make_script(vec![ScriptClip {
+        let script_breath = make_script(vec![ScriptClip { exact: false,
+            sentences: None,
             framing: None,
             video_id: 1,
             in_s: 10.0,
@@ -1153,7 +1597,8 @@ mod tests {
         );
 
         // 2. Cut held 1.0 s after sentence end (21.0 s) -> No Info issue
-        let script_held = make_script(vec![ScriptClip {
+        let script_held = make_script(vec![ScriptClip { exact: false,
+            sentences: None,
             framing: None,
             video_id: 1,
             in_s: 10.0,

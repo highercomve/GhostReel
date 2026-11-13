@@ -174,7 +174,8 @@ mod tests {
                 narration: Some("Hello".into()),
                 on_screen_text: Some("Title".into()),
                 title_layout: None,
-                clips: vec![script::ScriptClip {
+                clips: vec![script::ScriptClip { exact: false,
+                    sentences: None,
                     framing: None,
                     video_id: 1,
                     in_s: 0.0,
@@ -185,7 +186,9 @@ mod tests {
                 }],
                 notes: None,
                 bed: None,
+                card: None,
             }],
+            card_style: None,
         };
 
         let script_id = script::save_version(&db, project.id, &script, None).unwrap();

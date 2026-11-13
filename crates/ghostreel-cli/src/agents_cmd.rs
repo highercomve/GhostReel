@@ -7,9 +7,9 @@ use std::process::ExitCode;
 
 use clap::Subcommand;
 use ghostreel_core::agents::{self, AgentError, AgentErrorKind, AgentJob, AgentPool, AgentRole, AgentSpec, Effort};
-use ghostreel_core::preflight::Level;
 use ghostreel_core::config::Config;
 use ghostreel_core::paths::Paths;
+use ghostreel_core::preflight::Level;
 use serde_json::json;
 
 #[derive(Subcommand)]
@@ -90,7 +90,9 @@ pub async fn run(paths: &Paths, action: AgentsAction) -> anyhow::Result<ExitCode
                 return Ok(ExitCode::SUCCESS);
             }
             if config.agents.is_empty() {
-                println!("(implicit agents from [chat_model], [chat_worker] and [vision]; any `config set agents.…` makes them explicit)");
+                println!(
+                    "(implicit agents from [chat_model], [chat_worker] and [vision]; any `config set agents.…` makes them explicit)"
+                );
             }
             for a in &list {
                 let e = a.effective(&config);
@@ -160,7 +162,9 @@ pub async fn run(paths: &Paths, action: AgentsAction) -> anyhow::Result<ExitCode
                     };
                     answer = Some(match res {
                         Ok(v) => json!({ "ok": true, "seconds": started.elapsed().as_secs_f64(), "answer": v }),
-                        Err(e) => json!({ "ok": false, "seconds": started.elapsed().as_secs_f64(), "error": e.to_string(), "error_detail": e }),
+                        Err(e) => {
+                            json!({ "ok": false, "seconds": started.elapsed().as_secs_f64(), "error": e.to_string(), "error_detail": e })
+                        }
                     });
                 }
                 all_ok &= av.ok && answer.as_ref().is_none_or(|a| a["ok"] == true);
@@ -173,7 +177,11 @@ pub async fn run(paths: &Paths, action: AgentsAction) -> anyhow::Result<ExitCode
                     println!("{:<10} {status} {} — {}", a.id, av.resolved, av.detail);
                     if let Some(ans) = &answer {
                         match ans["ok"].as_bool() {
-                            Some(true) => println!("           answered in {:.1} s: {}", ans["seconds"].as_f64().unwrap_or(0.0), ans["answer"]),
+                            Some(true) => println!(
+                                "           answered in {:.1} s: {}",
+                                ans["seconds"].as_f64().unwrap_or(0.0),
+                                ans["answer"]
+                            ),
                             _ => println!("           call failed: {}", ans["error"].as_str().unwrap_or_default()),
                         }
                     }
@@ -185,7 +193,19 @@ pub async fn run(paths: &Paths, action: AgentsAction) -> anyhow::Result<ExitCode
             }
             return Ok(if all_ok { ExitCode::SUCCESS } else { ExitCode::FAILURE });
         }
-        AgentsAction::Add { id, backend, tool, model, effort, url, local_model, roles, max_concurrent, priority, name } => {
+        AgentsAction::Add {
+            id,
+            backend,
+            tool,
+            model,
+            effort,
+            url,
+            local_model,
+            roles,
+            max_concurrent,
+            priority,
+            name,
+        } => {
             let backend = match backend.as_str() {
                 "cli" => ghostreel_core::config::Backend::Cli,
                 "server" => ghostreel_core::config::Backend::Server,
@@ -201,7 +221,11 @@ pub async fn run(paths: &Paths, action: AgentsAction) -> anyhow::Result<ExitCode
                 effort: Effort::parse_opt(&effort).map_err(|e| anyhow::anyhow!(e))?,
                 url,
                 local_model,
-                roles: roles.iter().map(|r| AgentRole::parse(r)).collect::<Result<_, _>>().map_err(|e| anyhow::anyhow!(e))?,
+                roles: roles
+                    .iter()
+                    .map(|r| AgentRole::parse(r))
+                    .collect::<Result<_, _>>()
+                    .map_err(|e| anyhow::anyhow!(e))?,
                 max_concurrent,
                 priority,
                 ..AgentSpec::default()

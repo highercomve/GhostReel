@@ -4,7 +4,7 @@ use serde_json::{Value, json};
 
 use super::spec::{Effect, PROJECT, ParamType as T, ToolParam, ToolSpec};
 use super::{Args, Tool, ToolCtx, ToolError, ToolOutput, ToolResult, tool};
-use crate::config::{CLI_TOOLS, Config, CliAgentConfig, VisionConfig};
+use crate::config::{CLI_TOOLS, CliAgentConfig, Config, VisionConfig};
 
 pub static TOOLS: [Tool; 5] = [
     tool!(GET_SETTINGS, get_settings),
@@ -109,7 +109,8 @@ async fn set_settings(ctx: &mut ToolCtx<'_>, a: Args<'_>) -> ToolResult {
     }
     cfg.save(&ctx.paths.config_file)?;
     let n = applied.len();
-    Ok(ToolOutput::json(json!({ "applied": applied, "settings": settings_view(&cfg) })).summary(format!("{n} settings changed")))
+    Ok(ToolOutput::json(json!({ "applied": applied, "settings": settings_view(&cfg) }))
+        .summary(format!("{n} settings changed")))
 }
 
 static LIST_AGENTS: ToolSpec = ToolSpec {

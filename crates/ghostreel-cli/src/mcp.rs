@@ -54,7 +54,7 @@ pub async fn serve(paths: Paths) -> anyhow::Result<()> {
                             "protocolVersion": PROTOCOL_VERSION,
                             "capabilities": { "tools": {} },
                             "serverInfo": { "name": "ghostreel", "version": env!("CARGO_PKG_VERSION") },
-                            "instructions": INSTRUCTIONS,
+                            "instructions": tools::INSTRUCTIONS,
                         }
                     })),
                     "ping" => send(&json!({ "jsonrpc": "2.0", "id": id, "result": {} })),
@@ -83,38 +83,7 @@ pub async fn serve(paths: Paths) -> anyhow::Result<()> {
         .await
 }
 
-const INSTRUCTIONS: &str = "GhostReel indexes folders of video (speech transcripts, keyframe \
-descriptions, embeddings) and turns clips into an edit. Typical flow: create_project → add_folder \
-→ get_glossary / set_glossary (terms Whisper should spell correctly) → index (repeat until it \
-reports no pending work) → learn the footage → write the script → preview_script / export_script.
 
-You can edit without GhostReel's own model: list_videos gives the library at a glance (interviews \
-vs b-roll, speech, camera), get_transcript reads what people said (several videos at once, \
-interviewer lines marked or dropped), search finds moments by what is said or visible, get_video \
-lists a clip's keyframe descriptions and get_frames shows you the actual pictures; \
-get_steadiness tells you whether the stretch you picked is shaky and where the nearest steady one \
-is; get_faces finds face tracks across time (bounding boxes, framing, whether cut off, person); \
-get_people lists who appears in a project (name, handle, role, screen and speaking time) and \
-set_person / merge_people name them or join duplicates; get_speakers says who talks when; \
-get_glossary and set_glossary manage transcription vocabulary (terms Whisper should spell \
-correctly; heard_as are known mis-hearings); get_scenes says which stretches are a two-shot, a \
-single face, a screen share or empty. Then write the script yourself with save_script \
-(dry_run first to check it; it warns about clips on shaky stretches); a beat's `bed` lays an \
-interview's audio under muted b-roll (a J-cut). draft_script instead hands the whole edit to \
-GhostReel's local chat model, which needs that model to fit on this machine. Clip in_s/out_s must \
-lie inside real footage. save_script does the deterministic framing work itself (a vertical clip \
-is trimmed off a screen share at sentence edges, its closing hold kept on a face) and says what \
-it changed in `notes`; everything else comes back as issues, many with typed `fixes` you can \
-apply with apply_fix. Issues are computed from the index as it is now (get_script returns them \
-too), so they never go stale.
-
-Short social clips: generate_clips runs the whole pipeline with GhostReel's own models; or \
-orchestrate it yourself — find_clip_candidates (sentence-bounded windows with a visual label), \
-read the transcript around the ones you like, check_clips, then save_clips to store them as a \
-clip set; list_clip_sets shows the sets.
-
-Tools that change things say so in their annotations (readOnlyHint false); delete_project and \
-merge_people are marked destructive and cannot be undone.";
 
 fn send(msg: &Value) {
     let mut out = std::io::stdout().lock();
@@ -149,7 +118,8 @@ fn content(out: ToolOutput) -> Vec<Value> {
         content.push(json!({ "type": "text", "text": text }));
     }
     for image in out.images {
-        content.push(json!({ "type": "text", "text": image.caption }));
+        // The name is in the caption so a client that saves pictures can keep them apart.
+        content.push(json!({ "type": "text", "text": format!("{} (file {})", image.caption, image.name) }));
         content.push(json!({
             "type": "image",
             "data": base64::engine::general_purpose::STANDARD.encode(&image.jpeg),
@@ -194,27 +164,13 @@ mod tests {
 
     #[test]
     fn tools_list_is_the_registry_and_nothing_else() {
-        let listed: Vec<String> = tools_list()["tools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|t| t["name"].as_str().unwrap().to_string())
-            .collect();
+        let listed: Vec<String> =
+            tools_list()["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().to_string()).collect();
         let registry: Vec<String> = tools::names().iter().map(|n| n.to_string()).collect();
         assert_eq!(listed, registry);
-        assert_eq!(listed.len(), 41);
+        assert_eq!(listed.len(), 45);
         for t in tools_list()["tools"].as_array().unwrap() {
             assert!(t["annotations"]["readOnlyHint"].is_boolean() && t["annotations"]["destructiveHint"].is_boolean());
-        }
-    }
-
-    #[test]
-    fn the_instructions_name_only_tools_that_exist() {
-        let names = tools::names();
-        // Every `snake_case` word in the instructions that looks like a tool name is one.
-        for word in INSTRUCTIONS.split(|c: char| !(c.is_ascii_lowercase() || c == '_')).filter(|w| w.contains('_')) {
-            let known = names.contains(&word) || ["dry_run", "heard_as", "in_s", "out_s"].contains(&word);
-            assert!(known, "the instructions mention {word}, which is not a tool");
         }
     }
 
@@ -223,10 +179,11 @@ mod tests {
         let out = ToolOutput::json(json!({ "frames": [] })).images(vec![tools::ToolImage {
             caption: "video 1 at 2.00s".into(),
             jpeg: vec![0xff, 0xd8, 0xff],
+            name: "v1_t2000ms.jpg".into(),
         }]);
         let blocks = content(out);
         assert_eq!(blocks[0]["type"], "text");
-        assert_eq!(blocks[1]["text"], "video 1 at 2.00s");
+        assert_eq!(blocks[1]["text"], "video 1 at 2.00s (file v1_t2000ms.jpg)");
         assert_eq!(blocks[2]["type"], "image");
         assert_eq!(blocks[2]["mimeType"], "image/jpeg");
         let text = content(ToolOutput::json(json!({ "ignored": true })).text("0.00-1.00 hello\n"));
@@ -246,9 +203,13 @@ mod tests {
         let err = call_tool_content(&paths, "no_such_tool", &json!({})).await.unwrap_err();
         assert!(err.to_string().contains("unknown tool"), "{err}");
         // The old name resolves, so a client that still sends it keeps working.
-        let hits = call_tool_content(&paths, "search_moments", &json!({ "project": "Spain", "query": "x", "keywords_only": true }))
-            .await
-            .unwrap();
+        let hits = call_tool_content(
+            &paths,
+            "search_moments",
+            &json!({ "project": "Spain", "query": "x", "keywords_only": true }),
+        )
+        .await
+        .unwrap();
         assert!(hits[0]["text"].as_str().unwrap().contains("\"hits\""));
     }
 }

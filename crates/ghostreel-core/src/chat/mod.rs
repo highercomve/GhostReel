@@ -21,9 +21,9 @@ mod research;
 pub use enforce_grounding_and_pacing as repair_draft;
 pub mod tools;
 pub mod workers;
+pub use crate::tools::{Grounding, ToolMemo};
 pub use judge::Judgement;
 pub use metrics::{ScriptMetrics, ScriptScore, measure, score};
-pub use crate::tools::{Grounding, ToolMemo};
 pub use tools::{Detail, tools_definition};
 
 use crate::Error;
@@ -260,7 +260,8 @@ pub async fn lease_backend(
         None => None,
     };
     let describe = setup.describe();
-    let backend = ChatBackend::from_vision_setup(&setup, config.script.server_timeout_s).await?.with_window(llm.ctx_tokens);
+    let backend =
+        ChatBackend::from_vision_setup(&setup, config.script.server_timeout_s).await?.with_window(llm.ctx_tokens);
     Ok(ChatLease { backend, agent: selection.chat, slot, max_tool_rounds: llm.max_tool_rounds, describe })
 }
 
@@ -270,7 +271,11 @@ pub fn cut_agents(db: &Db, script_id: Option<i64>, session_id: Option<i64>) -> O
     let id = script_id.or_else(|| {
         let sid = session_id?;
         db.conn
-            .query_row("SELECT id FROM scripts WHERE session_id = ?1 AND trash_id IS NULL ORDER BY id DESC LIMIT 1", [sid], |r| r.get(0))
+            .query_row(
+                "SELECT id FROM scripts WHERE session_id = ?1 AND trash_id IS NULL ORDER BY id DESC LIMIT 1",
+                [sid],
+                |r| r.get(0),
+            )
             .ok()
     })?;
     crate::script::load(db, id).ok()?.script.agents
@@ -283,7 +288,7 @@ pub struct ChatContext {
     pub paths: crate::paths::Paths,
     pub backend: ChatBackend,
     pub embedder: Option<Embedder>,
-    /// Custom editing instructions (Settings); `None`/empty = [`DEFAULT_EDITOR_PROMPT`].
+    /// House rules from Settings, added to the harness instructions; `None`/empty = none.
     pub system_prompt: Option<String>,
     /// `chat_model.max_tool_rounds`: an optional cap on model rounds; 0 (the default) = no cap.
     pub max_tool_rounds: u32,
@@ -745,10 +750,12 @@ pub fn script_json_schema() -> Value {
                                     "video_id": { "type": "integer" },
                                     "in_s": { "type": "number" },
                                     "out_s": { "type": "number" },
+                                    "from": { "type": "string" },
+                                    "to": { "type": "string" },
                                     "audio": { "type": "string", "enum": ["source", "mute"] },
                                     "why": { "type": "string" }
                                 },
-                                "required": ["video_id", "in_s", "out_s", "audio"],
+                                "required": ["video_id", "audio"],
                                 "additionalProperties": false
                             }
                         },
@@ -758,9 +765,11 @@ pub fn script_json_schema() -> Value {
                                 "video_id": { "type": "integer" },
                                 "in_s": { "type": "number" },
                                 "out_s": { "type": "number" },
+                                "from": { "type": "string" },
+                                "to": { "type": "string" },
                                 "why": { "type": "string" }
                             },
-                            "required": ["video_id", "in_s", "out_s"],
+                            "required": ["video_id"],
                             "additionalProperties": false
                         },
                         "notes": { "type": "string" }
@@ -967,203 +976,6 @@ pub(crate) async fn fit_local_prompt(
         }
         dropped = true;
     }
-}
-
-/// Everything anyone says in the project, with timestamps, laid out for the editor to read
-/// before it cuts anything.
-///
-/// A model that has to *ask* for each transcript only reads the tapes it already suspects: one run
-/// looked at two videos, found a good speaker and built the whole teaser out of him, while three
-/// other people said better things on tapes it never opened. An editor does not work that way —
-/// they read the interviews first, decide what the story is, and then go looking for pictures.
-///
-/// It is affordable: every word of a 96-video project is about 34 000 characters. When that will
-/// not fit, the videos with the most speech go in first and the rest are named with a pointer to
-/// `get_transcript`, so nothing is hidden, only deferred.
-pub fn speech_digest(db: &Db, project_id: i64, max_chars: usize) -> String {
-    let Ok(mut st) = db.conn.prepare(
-        "SELECT ts.video_id, MIN(vf.path), SUM(LENGTH(ts.text))
-           FROM transcript_segments ts
-           JOIN video_files vf ON vf.video_id = ts.video_id
-           JOIN folders f ON f.id = vf.folder_id
-           JOIN project_folders pf ON pf.folder_id = f.id
-          WHERE pf.project_id = ?1
-            AND NOT EXISTS (SELECT 1 FROM project_exclusions x
-                             WHERE x.project_id = pf.project_id AND x.video_id = ts.video_id)
-          GROUP BY ts.video_id
-          ORDER BY SUM(LENGTH(ts.text)) DESC",
-    ) else {
-        return String::new();
-    };
-    let videos: Vec<(i64, String, i64)> = st
-        .query_map([project_id], |r| Ok((r.get(0)?, r.get::<_, String>(1)?, r.get(2)?)))
-        .map(|rows| rows.filter_map(|r| r.ok()).collect())
-        .unwrap_or_default();
-    if videos.is_empty() {
-        return String::new();
-    }
-
-    let mut out = String::from(
-        "\nWHAT PEOPLE SAY\nEvery word spoken in this project, with the timestamps to cut on. Read it first and \
-         decide whose words carry the story; then use search and get_video to find pictures for what they \
-         describe. A line marked [off-mic] is the interviewer or someone away from the microphone: never open a clip \
-         or build a beat on one.\n",
-    );
-    let mut left_out = Vec::new();
-
-    for (video_id, path, _) in &videos {
-        let name = Path::new(path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-        let mut block = format!("\n#{video_id} {name}\n");
-        if let Ok(mut q) = db.conn.prepare(
-            "SELECT start_s, end_s, text, COALESCE(off_mic, 0) FROM transcript_segments
-              WHERE video_id = ?1 ORDER BY start_s",
-        ) {
-            let rows = q.query_map([video_id], |r| {
-                Ok((r.get::<_, f64>(0)?, r.get::<_, f64>(1)?, r.get::<_, String>(2)?, r.get::<_, i64>(3)? != 0))
-            });
-            for (start, end, text, off) in rows.into_iter().flatten().flatten() {
-                let text = text.trim();
-                if text.is_empty() {
-                    continue;
-                }
-                block.push_str(&format!("  {start:.2}-{end:.2}{} {text}\n", if off { " [off-mic]" } else { "" }));
-            }
-        }
-        if out.len() + block.len() <= max_chars {
-            out.push_str(&block);
-            continue;
-        }
-        // Out of room. Keep as much of this tape as fits rather than dropping it: the list is in
-        // order of how much is said, so the one being cut is the one most worth reading.
-        let room = max_chars.saturating_sub(out.len());
-        match block[..block.len().min(room)].rfind('\n') {
-            Some(cut) if cut > 120 => {
-                out.push_str(&block[..=cut]);
-                out.push_str("  … the rest of this one with get_transcript\n");
-            }
-            _ => left_out.push(format!("#{video_id}")),
-        }
-    }
-
-    if !left_out.is_empty() {
-        out.push_str(&format!(
-            "\nAlso speech in {} more: {} — read them with get_transcript.\n",
-            left_out.len(),
-            left_out.join(", ")
-        ));
-    }
-    out
-}
-
-/// What the footage *looks* like, the way [`speech_digest`] is what it sounds like.
-///
-/// The prompt gave the model every word anybody said and not one word about what is on screen —
-/// pictures were reachable only by calling a tool. A model that does not call one therefore
-/// concludes, correctly from what it was given, that there is no b-roll: both local models
-/// refused this project with "the only clips containing people speaking contain no visual
-/// descriptions of the neighborhood's scenery", while the index held 639 described frames of
-/// exactly that. It is not a hallucination, it is an honest reading of an incomplete prompt.
-///
-/// Deliberately a *digest*, not the descriptions: one line per video, the first description and a
-/// count, so the model learns which tapes hold pictures and goes looking. The full text is still
-/// `search` and `get_video`.
-///
-/// With `mark_talk` — a b-roll chat — each line also says how much of the tape is somebody
-/// talking on the microphone, and the quiet tapes come first. A montage cut from an interview
-/// tape is a muted talking head; the model cannot see that from a description of the first frame.
-pub fn picture_digest(db: &Db, project_id: i64, max_chars: usize, mark_talk: bool) -> String {
-    let Ok(mut st) = db.conn.prepare(
-        "SELECT fr.video_id, MIN(vf.path), COUNT(*), MIN(fr.t_s), MAX(fr.t_s)
-           FROM frames fr
-           JOIN video_files vf ON vf.video_id = fr.video_id
-           JOIN folders f ON f.id = vf.folder_id
-           JOIN project_folders pf ON pf.folder_id = f.id
-          WHERE pf.project_id = ?1 AND fr.description_json IS NOT NULL
-            AND fr.description_json NOT LIKE '{\"error\"%'
-            AND NOT EXISTS (SELECT 1 FROM project_exclusions x
-                             WHERE x.project_id = pf.project_id AND x.video_id = fr.video_id)
-          GROUP BY fr.video_id
-          ORDER BY COUNT(*) DESC",
-    ) else {
-        return String::new();
-    };
-    let mut videos: Vec<(i64, String, i64, f64, f64)> = st
-        .query_map([project_id], |r| Ok((r.get(0)?, r.get::<_, String>(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
-        .map(|rows| rows.filter_map(|r| r.ok()).collect())
-        .unwrap_or_default();
-    if videos.is_empty() {
-        return String::new();
-    }
-    let talk_share = |video_id: i64| -> f64 {
-        db.conn
-            .query_row(
-                "SELECT COALESCE(SUM(t.end_s - t.start_s), 0) / MAX(v.duration_s, 1)
-                   FROM videos v LEFT JOIN transcript_segments t
-                     ON t.video_id = v.id AND COALESCE(t.off_mic, 0) = 0
-                  WHERE v.id = ?1",
-                [video_id],
-                |r| r.get::<_, f64>(0),
-            )
-            .unwrap_or(0.0)
-            .clamp(0.0, 1.0)
-    };
-    let shares: std::collections::HashMap<i64, f64> =
-        if mark_talk { videos.iter().map(|v| (v.0, talk_share(v.0))).collect() } else { Default::default() };
-    if mark_talk {
-        // Stable, so tapes with the same share keep the most-described first.
-        videos.sort_by(|a, b| shares[&a.0].total_cmp(&shares[&b.0]));
-    }
-
-    let mut out = String::from(
-        "\nWHAT THE FOOTAGE SHOWS\nOne line per video that has pictures: how many moments were described and what \
-         the first one shows. This is a table of contents, not the pictures themselves — when a line sounds like \
-         what somebody is talking about, open it with get_video or search for the exact moments and their \
-         timestamps. A video listed here HAS usable b-roll.\n",
-    );
-    let mut left_out = Vec::new();
-
-    for (video_id, path, count, first_t, last_t) in &videos {
-        let name = Path::new(path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-        let first: Option<String> = db
-            .conn
-            .query_row(
-                "SELECT description_json FROM frames
-                  WHERE video_id = ?1 AND description_json IS NOT NULL ORDER BY t_s LIMIT 1",
-                [video_id],
-                |r| r.get(0),
-            )
-            .ok();
-        let shows = first
-            .and_then(|raw| {
-                serde_json::from_str::<Value>(&raw).ok().and_then(|v| v["description"].as_str().map(str::to_string))
-            })
-            .unwrap_or_default();
-        let shows: String = shows.trim().chars().take(180).collect();
-        let talk = match shares.get(video_id) {
-            Some(&share) if share >= 0.4 => {
-                format!(" [interview: someone talks on the mic for {:.0}% of it - avoid]", share * 100.0)
-            }
-            Some(&share) if share >= 0.05 => {
-                format!(" [someone talks for {:.0}% of it - use the quiet stretches]", share * 100.0)
-            }
-            _ => String::new(),
-        };
-        let block = format!("  #{video_id} {name} — {count} moments, {first_t:.0}-{last_t:.0}s{talk}: {shows}\n");
-        if out.len() + block.len() <= max_chars {
-            out.push_str(&block);
-        } else {
-            left_out.push(format!("#{video_id}"));
-        }
-    }
-
-    if !left_out.is_empty() {
-        out.push_str(&format!(
-            "\nAlso pictures in {} more: {} — open them with get_video.\n",
-            left_out.len(),
-            left_out.join(", ")
-        ));
-    }
-    out
 }
 
 /// The project's reference edits (finished videos made by a person) as a study guide for the model:
@@ -1438,7 +1250,8 @@ pub fn hold_the_last_picture(db: &Db, project_id: i64, script: &mut Script, cfg:
         let heard = closing_words(db, script);
         if let Some(shot) = closing_shot(db, project_id, script, &heard, cfg.closing_hold_s) {
             let beat = script.beats.last_mut().expect("checked above");
-            beat.clips.push(ScriptClip {
+            beat.clips.push(ScriptClip { exact: false,
+                sentences: None,
                 framing: None,
                 video_id: shot.video_id,
                 in_s: shot.t_s,
@@ -1464,7 +1277,8 @@ pub fn hold_the_last_picture(db: &Db, project_id: i64, script: &mut Script, cfg:
         // on or off for a whole clip, so the quiet is its own clip continuing the same shot.
         // Muting the extended clip instead silenced everything said in it: a one-clip cut (a
         // social clip) of someone talking came out with no sound at all.
-        let hold = ScriptClip {
+        let hold = ScriptClip { exact: false,
+            sentences: None,
             framing: None,
             video_id: last.video_id,
             in_s: last.out_s,
@@ -1955,58 +1769,29 @@ fn merge_contiguous_clips(script: &mut Script, cfg: &crate::config::ScriptConfig
     merged
 }
 
-/// Default editing instructions. Users can replace them in Settings (`[chat] system_prompt`);
-/// `{project}`, `{fps}`, `{width}` and `{height}` are filled in. The tool list and the clip-range
-/// rule are always appended, since scripts can't be built without them.
-pub const DEFAULT_EDITOR_PROMPT: &str = "You are a senior documentary and promo video editor working on project \"{project}\" \
-({fps} fps, {width}x{height}). You cut real footage into a watchable, well-paced story and write the voice-over for it.
+/// What the script chat adds to the harness instructions ([`crate::tools::INSTRUCTIONS`], the same
+/// ones an MCP client reads): only how a chat turn ends. Every model the chat drives, local or not,
+/// gets these same words and the same tools; `{project}`, `{fps}`, `{width}` and `{height}` are filled in.
+pub const CHAT_TURN_PROMPT: &str = "You are the editor on GhostReel project \"{project}\" ({fps} fps, {width}x{height}). \
+The project is set, so `project` is optional in every tool. The instructions below are the ones every editor \
+working with GhostReel follows, with the same tools.
 
-HOW THIS WORKS
-The whole project is in front of you before you call anything: WHAT PEOPLE SAY has every word spoken, with the timestamps to cut on. Work in this order.
- a. Read it. Decide whose sentences carry the story and copy their timestamps exactly.
- b. For each of those, find a picture of what is being described: search for the subject, then get_video to see the keyframes and the shaky stretches. A range you have not seen returned is a guess, and guesses are dropped.
- c. Lay the beat out: the speaker's face first, then cut to the picture and give the beat a \"bed\" so their voice keeps running under it.
- d. Add up the clip lengths and fix the total yourself before you answer.
- e. Answer with one JSON object and nothing else.
-Before you answer, check: every range came from WHAT PEOPLE SAY or from a tool; every clip with \"source\" audio starts and ends where a sentence does and carries a whole thought, never just \"Okay\" or \"Thank you\"; no clip is under 4 s; the total is within 10% of the target; every beat has a purpose that moves the story on.
+IN THIS CHAT
+- Save the edit with save_script, as below: the last version you save is what this turn delivers. (Answering \
+with the script as one JSON object, the `script` save_script takes, saves it too.)
+- Rendering (preview_script, export_script) and review_render come after the turn: do not render from here, and do \
+not start another draft or a clip run.
+- Answer {\"action\":\"reply\",\"text\":...} instead of a script when the request is ambiguous and one question \
+would settle it, or when the footage cannot support it (say what is missing). Do not reply to avoid work.
+- When revising, change what the user asked for and keep what they did not mention. A line marked [applied after \
+drafting] in an earlier reply is a change already made to the saved script: build on it.
+- Reply in the user's language, and look at any image they attach.
 
-HOW TO EDIT
-1. Understand the material first: list the videos, look at the keyframes of the promising ones, and read the transcripts of the videos where people talk.
-2. Build one story out of what the footage actually has, not a list of nice moments: a hook, 3-6 beats that each make one point, and an ending that lands. Each beat follows from the one before - someone names the place, someone says what it is like to live there, someone shows what that looks like. If two clips could swap places without anyone noticing, the piece has no story yet. Every beat has a purpose, and the purpose says how it moves the story on.
-3. Choose only strong shots: a clear subject (people, a landmark, a building, a sign, activity, a striking view). Skip footage whose keyframes describe black or blank frames, blur, transitions, the ground or sky only, empty hillsides with nothing to see, or the same view as the previous clip.
-4. Pacing - slower is better than frantic:
-   - hold every shot at least 4 s so viewers can see it and read any text; views and b-roll 5-10 s;
-   - when someone speaks, keep the clip from just before their first word to the end of their sentences (use the transcript timestamps; up to ~25 s) with audio \"source\", and never cut the moment they stop: hold 1-2 s of the person on screen after the last word;
-   - prefer fewer, longer clips over many quick cuts; never jump between unrelated shots every 2 s.
-5. Audio: use \"source\" when a person is speaking in the clip; use \"mute\" for scenery and b-roll so wind and handling noise don't play under the voice-over.
-6. Every search hit and video says what the camera is doing: static, tripod, stabilised or handheld, and a hit marked shaky sits on a stretch the camera shakes through - do not cut from it. list_videos and get_video report the camera work too. When two clips cover the same moment, prefer the mounted or stabilised one. get_video also lists a clip's shaky stretches as shaky_at timestamps (\"12.0-16.0\") - the parts worse than that clip's own ordinary level. A shaky shot looks wrong in a finished cut whatever it shows: cut around those stretches rather than dropping the video, since the rest of it is usually fine. Use a shaky range only when nothing else covers the moment, and keep it short when you do.
-7. When the footage has people talking on camera (interviews), build the story out of what they say. Everything anyone says is already in front of you under WHAT PEOPLE SAY - read it before you decide anything, and choose whose words carry the piece from all of the tapes, not from the first speaker you come across. Use get_transcript only for a tape listed as left out there. Cut the clip to whole sentences and set that clip's audio to \"source\". A talking head is not b-roll - never mute someone mid-sentence to speak over them, and never write narration for a beat whose clips use \"source\" audio. Voice-over is for the scenery between what people say, not a replacement for it.
-8. Do not sit on a talking head for a whole beat, and do not bury them either. Show the person first - long enough for a viewer to take in their face, a few seconds - then cut to a picture of what they are describing while they keep talking, and come back to them if the point lands on them. The viewer should recognise that face when it returns later in the piece. To keep a voice running while the picture changes, give the beat a \"bed\": {video_id, in_s, out_s} naming the stretch of speech that carries the whole beat. The beat's clips are then pictures only - their own audio is not played - and you can cut between as many as you like without interrupting the speaker. Use a bed whenever an answer continues under a cutaway; the range must be one speaker talking, on the microphone, ending on a whole sentence. Without a bed the sound stops dead the moment you cut away.
-9. get_transcript marks segments spoken away from the microphone: in an interview those are the questions and the slate, not the answers. Never start a clip on one and never build a beat around one - cut to where the person answers. They sound as far away as they were.
-10. Use what people say deliberately: a statement, an explanation, a line with a point to it. Chatter, half-sentences, thinking aloud, banter between takes and answers that go nowhere do not belong in a teaser, however clearly they are recorded - unless the user asks for that kind of material.
-11. How much of the piece is people talking is your decision, and it follows what the user asked for: a teaser built on what people say can be almost all interview, a scenic one almost none. Cutting to a picture of what is being described is usually better than staying on a face for a long time - but do it because it helps the story, not to hit a quota.
-12. Narration (voice-over) must cover the beat: about 2.5 spoken words per second of the beat's clips (a 20 s beat needs ~50 words). Set narration to \"\" for beats where people speak on camera (never copy their words into the narration). Every beat has its own narration; never repeat text from another beat, and never reuse the same footage twice. Write natural, specific sentences about what is on screen and why it matters; no filler. on_screen_text is short (a title or a name).
-13. Length: the clips add up to the length the user asked for; set target_duration_s to it. Give it a little more than asked - about 10% - and pick one more moment than you think you need: a cut that comes in long is trimmed to fit, but a cut that comes in short can only be fixed by holding shots after the voice-over has stopped, which looks like a mistake. If the user gave no length, choose what the material supports (usually 60-180 s).
-14. You can answer in words instead of drafting: reply with {\"action\":\"reply\",\"text\":...} when the request is ambiguous and one question would settle it, when a message is not about the video (notes, something pasted by mistake), or when the footage cannot support what was asked - say what is missing. A reply leaves the previous version alone, which is better than rebuilding it around a guess. Do not reply to avoid work: when the request is clear, draft.
-15a. A line marked [applied after drafting] in an earlier reply is a change already made to the saved script - a bed laid, a clip moved off a shaky stretch, a range dropped. It is done: build on it rather than undoing it, and do not make the same mistake again in this session.
-15. The user's feedback overrides these defaults. When revising, change what they asked for (slower, longer, different shots, more narration) and keep what they didn't mention; never return the previous draft unchanged.
-16. Always reply in the user's language.
-17. The user may attach images (such as screenshots of the timeline, preview video player, or specific frames) to their messages. Carefully inspect any attached images to understand visual feedback, timeline misalignments, mute/unmute issues, or footage references they are pointing out, and address them directly in your revised script.
 ";
 
-/// Construct the system prompt for the editor agent: the editing instructions (`custom` or the
-/// default), the fixed tool contract, and the current draft.
-/// The editing instructions for a b-roll montage: a theme told in pictures, nobody speaking, no
-/// voice-over. `{audio_rule}` is filled with the chat's choice of natural sound or silence.
-///
-/// Its own prompt rather than a paragraph appended to the default, whose every step starts from
-/// what people say: a model told "read the interviews first, open on the speaker's face" and then
-/// "but no interviews" follows the first half.
-pub const BROLL_EDITOR_PROMPT: &str = "You are a senior editor cutting a b-roll montage for project \"{project}\" \
-({fps} fps, {width}x{height}): a piece told in pictures only, on one theme, with no interviews and no voice-over.
-
-HOW THIS WORKS
-WHAT THE FOOTAGE SHOWS lists every video that has described pictures. Work in this order.
+/// What a b-roll montage chat adds to the harness instructions: a theme told in pictures, nobody
+/// speaking, no voice-over. `{audio_rule}` is filled with the chat's choice of natural sound or silence.
+pub const BROLL_EDITOR_PROMPT: &str = "THIS CHAT IS A B-ROLL MONTAGE\nA piece told in pictures only, on one theme, with no interviews and no voice-over. Work in this order.
  a. Read the brief and decide the theme and the feeling: what the piece is about, and what a viewer should come away with.
  b. Find the pictures: search for the subjects of the theme, then get_video to see the keyframes, the shot sizes and the shaky stretches. A range you have not seen returned is a guess, and guesses are dropped.
  c. Lay out beats - each a short visual sequence on one idea of the theme - and order them so the piece goes somewhere.
@@ -2025,13 +1810,13 @@ HOW TO EDIT
 8. Audio: {audio_rule}
 9. Narration: none. Set narration to \"\" on every beat and do not give any beat a \"bed\". on_screen_text may carry a short title or a place name when it helps the piece.
 10. Length: the clips add up to the length the user asked for; set target_duration_s to it, and give it about 10% more - a cut that comes in long is trimmed to fit, one that comes in short cannot be fixed. If the user gave no length, choose what the material supports (usually 30-90 s).
-11. You can answer in words instead of drafting: reply with {\"action\":\"reply\",\"text\":...} when the request is ambiguous and one question would settle it, or when the footage cannot support the theme - say what is missing. Do not reply to avoid work: when the request is clear, draft.
-12. A line marked [applied after drafting] in an earlier reply is a change already made to the saved script. It is done: build on it rather than undoing it.
-13. The user's feedback overrides these defaults. When revising, change what they asked for and keep what they didn't mention; never return the previous draft unchanged.
-14. Always reply in the user's language.
-15. The user may attach images (screenshots of the timeline or the player, or frames). Inspect them and address what they point at in your revised script.
 ";
 
+/// The system prompt of a chat turn, the same for every model the chat drives: the project and how a
+/// chat turn ends ([`CHAT_TURN_PROMPT`]), the harness instructions every editor gets
+/// ([`crate::tools::INSTRUCTIONS`]), a b-roll montage's brief when the chat is one, the house rules
+/// from Settings (`custom`), the tools, and the current draft. Only the rendering of the tools
+/// (`detail`) follows the model's window.
 pub fn build_system_prompt(
     project: &Project,
     latest_script_json: Option<&str>,
@@ -2039,21 +1824,6 @@ pub fn build_system_prompt(
     detail: tools::Detail,
     style: ChatStyle,
 ) -> String {
-    let broll_template;
-    let template = if style.broll {
-        // The house prompt in Settings is written for interview-led cuts; a montage needs its own.
-        broll_template = BROLL_EDITOR_PROMPT.replace(
-            "{audio_rule}",
-            if style.natural_sound {
-                "set every clip's audio to \"source\": its own ambient sound (street, wind, water, a crowd) carries the piece. That is one more reason to avoid anyone speaking."
-            } else {
-                "set every clip's audio to \"mute\": the piece is pictures only, and music is laid over it later."
-            },
-        );
-        broll_template.as_str()
-    } else {
-        custom.map(str::trim).filter(|c| !c.is_empty()).unwrap_or(DEFAULT_EDITOR_PROMPT)
-    };
     let fps = if project.fps_den == 1 {
         project.fps_num.to_string()
     } else {
@@ -2062,25 +1832,32 @@ pub fn build_system_prompt(
             .trim_end_matches('.')
             .to_string()
     };
-    let mut prompt = template
-        .replace("{project}", &project.name)
-        .replace("{fps}", &fps)
-        .replace("{width}", &project.width.to_string())
-        .replace("{height}", &project.height.to_string());
+    let fill = |s: &str| {
+        s.replace("{project}", &project.name)
+            .replace("{fps}", &fps)
+            .replace("{width}", &project.width.to_string())
+            .replace("{height}", &project.height.to_string())
+    };
+    let mut prompt = fill(CHAT_TURN_PROMPT);
+    prompt.push_str(crate::tools::INSTRUCTIONS);
+    prompt.push('\n');
+    if style.broll {
+        prompt.push('\n');
+        prompt.push_str(&BROLL_EDITOR_PROMPT.replace(
+            "{audio_rule}",
+            if style.natural_sound {
+                "set every clip's audio to \"source\": its own ambient sound (street, wind, water, a crowd) carries the piece. That is one more reason to avoid anyone speaking."
+            } else {
+                "set every clip's audio to \"mute\": the piece is pictures only, and music is laid over it later."
+            },
+        ));
+    }
+    if let Some(house) = custom.map(str::trim).filter(|c| !c.is_empty()) {
+        prompt.push_str("\nHOUSE RULES (from Settings; they win over the defaults above)\n");
+        prompt.push_str(&fill(house));
+        prompt.push('\n');
+    }
     prompt.push_str(&tools::tools_prose(RenderOpts::new(detail, true)));
-    prompt.push_str(
-        "\nResearch before selecting: compare relevant interview candidates and search for supporting \
-        B-roll and alternatives. Open the specific ranges you plan to use with get_video, and verify spoken \
-        quotes with get_transcript. Search results and the project digest are a starting point, not a \
-        completed footage review. Inspect the selected evidence before finalizing; do not stop after the first hit.\n\
-        \n\
-        The tools above are the whole set GhostReel offers, the same ones an outside editor is given: besides \
-        looking (list_videos, search, get_video, get_transcript, get_frames) you can check how steady a range is \
-        (get_steadiness), who is on screen and who talks (get_people, get_faces, get_scenes, get_speakers) and how \
-        a vertical crop would look (preview_crop). Tools marked [changes things] or [destructive] act on the real \
-        project: use one only when the user asked for that, never to explore. The draft you return is your work; \
-        you cannot start another draft or a clip run from here.\n",
-    );
 
     if let Some(draft) = latest_script_json {
         prompt.push_str(&format!(
@@ -2632,13 +2409,7 @@ const CUT_INTO_SENTENCE_S: f64 = 0.6;
 
 /// Every sentence boundary in a video, as (start, end) pairs in order.
 pub(crate) fn sentence_edges(db: &Db, video_id: i64) -> Vec<(f64, f64)> {
-    db.conn
-        .prepare_cached("SELECT start_s, end_s FROM transcript_segments WHERE video_id = ?1 ORDER BY start_s")
-        .and_then(|mut st| {
-            st.query_map([video_id], |r| Ok((r.get::<_, f64>(0)?, r.get::<_, f64>(1)?)))
-                .map(|rows| rows.flatten().collect())
-        })
-        .unwrap_or_default()
+    crate::sentence_split::edges(db, video_id)
 }
 
 /// Pull one range onto whole sentences.
@@ -2722,16 +2493,7 @@ fn pad_speech(db: &Db, script: &mut Script, cfg: &crate::config::ScriptConfig) -
         if c.audio != crate::script::Audio::Source {
             continue;
         }
-        let Ok(mut st) = db
-            .conn
-            .prepare_cached("SELECT start_s, end_s FROM transcript_segments WHERE video_id = ?1 ORDER BY start_s")
-        else {
-            continue;
-        };
-        let segs: Vec<(f64, f64)> = st
-            .query_map([c.video_id], |r| Ok((r.get::<_, f64>(0)?, r.get::<_, f64>(1)?)))
-            .map(|rows| rows.flatten().collect())
-            .unwrap_or_default();
+        let segs = crate::sentence_split::edges(db, c.video_id);
         let overlapping: Vec<usize> =
             (0..segs.len()).filter(|&i| segs[i].1 > c.in_s + 0.05 && segs[i].0 < c.out_s - 0.05).collect();
         let (Some(&first), Some(&last)) = (overlapping.first(), overlapping.last()) else { continue };
@@ -3014,9 +2776,11 @@ pub async fn run_turn(
     let logged_baseline = baseline_script_id.or_else(|| {
         ctx.db
             .conn
-            .query_row("SELECT id FROM scripts WHERE session_id = ?1 AND trash_id IS NULL ORDER BY id DESC LIMIT 1", [session_id], |r| {
-                r.get::<_, i64>(0)
-            })
+            .query_row(
+                "SELECT id FROM scripts WHERE session_id = ?1 AND trash_id IS NULL ORDER BY id DESC LIMIT 1",
+                [session_id],
+                |r| r.get::<_, i64>(0),
+            )
             .ok()
     });
     crate::llmlog::push(
@@ -3093,7 +2857,6 @@ async fn run_turn_inner(
     let images_json = if !image_strings.is_empty() { serde_json::to_string(&image_strings).ok() } else { None };
 
     let mut grounding = Grounding::default();
-    let mut research_evidence = research::Evidence::default();
     // Every tool call goes through the registry by way of this session: what the turn has already
     // fetched is not fetched twice, a model repeating itself is told to answer, results are cut to
     // the room the context has, and errors come back as something the model can read.
@@ -3198,52 +2961,11 @@ async fn run_turn_inner(
         ChatBackend::Cli(_) => 6000,
     };
     sys_prompt.push_str(&reference_edits_text(&ctx.db, project_id, reference_chars));
-    // The tapes themselves, before any tool is called. A whole project's speech is a few thousand
-    // tokens; a model that has to ask for each transcript reads two and builds the teaser out of
-    // whoever it happened to find there.
-    let speech_chars = match &ctx.backend {
-        ChatBackend::Server { .. } | ChatBackend::Cli(_) => 60_000,
-        // Budget the footage digest after reserving the draft and the existing rules.
-        ChatBackend::Local { ctx_tokens, .. } => {
-            let prompt_tokens =
-                (*ctx_tokens as usize).saturating_sub(local_output_budget(*ctx_tokens, ctx.script.max_answer_tokens));
-            // Leave room for the rules, references, current request and later length directives.
-            // Picture summaries consume another quarter of this allowance below.
-            (prompt_tokens.saturating_mul(3).saturating_sub(sys_prompt.len() + 8192).saturating_mul(4) / 5).min(60_000)
-        }
-    };
-    if style.broll {
-        // A montage is chosen from pictures: the speech would only pull it back to the interviews,
-        // and the room it takes goes to the table of contents instead.
-        sys_prompt.push_str(&picture_digest(&ctx.db, project_id, speech_chars / 2, true));
-    } else if ctx.script.speech_in_prompt {
-        sys_prompt.push_str(&speech_digest(&ctx.db, project_id, speech_chars));
-        // And a table of contents for the pictures. Without it the prompt describes every word
-        // anybody said and nothing at all about what is on screen, so a model that does not
-        // happen to call a tool concludes there is no b-roll — which is what both local models
-        // did on a project holding 639 described frames. A line per video is a fraction of the
-        // speech digest and removes the whole failure.
-        sys_prompt.push_str(&picture_digest(&ctx.db, project_id, speech_chars / 4, false));
-    }
+    // Nothing else goes into the prompt: no transcript digest, no picture digest. Every model starts
+    // where an editor over MCP starts, with get_outline, and reads only what its story needs.
     // A length the user states ("60 second promo", "2 minutos") wins over whatever the model sets.
     let requested_s = requested_duration_s(message);
 
-    // The arithmetic of the length, spelled out. "40 seconds" plus "a clip may run to 30 s" is a
-    // contradiction a model resolves by ignoring the first: one drafted seven quotes of twenty
-    // seconds, all legal, and came out 349% over with nothing left to trim. Saying how many
-    // beats and how long each shot costs a line and is the only lever that works before the
-    // draft exists — afterwards speech cannot be scaled and dropping beats has a floor.
-    if let Some(target) = requested_s.filter(|t| *t > 0.0) {
-        let beats = ((target / 9.0).round() as usize).clamp(3, 8);
-        sys_prompt.push_str(&format!(
-            "\nTHE LENGTH YOU WERE ASKED FOR\n{target:.0} seconds. That is about {beats} beats of \
-             {:.0} s each, and no single shot may run longer than {:.0} s — a third of the piece. \
-             Choosing more or longer than that does not make a longer piece, it makes one that has \
-             to be cut back before anyone sees it.\n",
-            target / beats as f64,
-            target / 3.0,
-        ));
-    }
     // Only a first draft (or an explicit length) is squeezed to its target; revisions follow feedback.
     let enforce_target = latest_script_json.is_none() || requested_s.is_some();
 
@@ -3413,10 +3135,11 @@ async fn run_turn_inner(
                     on_event(ChatEvent::ToolStarted { tool: tool_name.clone(), args: tool_args.clone() });
 
                     let called = {
-                        let mut tctx = ToolCtx::new(&ctx.paths, &tool_cfg, &mut ctx.db, &mut ctx.embedder, Origin::ScriptChat)
-                            .with_project(project.clone())
-                            .with_cancel(ctx.cancel.clone())
-                            .with_grounding(&mut grounding);
+                        let mut tctx =
+                            ToolCtx::new(&ctx.paths, &tool_cfg, &mut ctx.db, &mut ctx.embedder, Origin::ScriptChat)
+                                .with_project(project.clone())
+                                .with_cancel(ctx.cancel.clone())
+                                .with_grounding(&mut grounding);
                         session.call(&mut tctx, &tool_name, &tool_args).await
                     };
                     if called.cancelled {
@@ -3449,6 +3172,9 @@ async fn run_turn_inner(
                 }
             }
 
+            // A model that saved its edit with save_script has delivered it, the way an MCP session
+            // does: only one that never saved is asked for the script here.
+            if session.saved_script.is_none() {
             // Drafting final script call
             on_event(ChatEvent::Drafting);
 
@@ -3508,7 +3234,7 @@ async fn run_turn_inner(
 
             // Set when a redraft came back worse and was thrown away, so the turn can say so.
             let mut kept_first_draft: Option<(f64, f64)> = None;
-            let mut script_res = Script::parse_for_project(content, &project);
+            let mut script_res = crate::sentences::parse_for_project(&ctx.db, content, &project);
             if let (Ok(s), Some(t)) = (&mut script_res, requested_s) {
                 s.target_duration_s = Some(t);
             }
@@ -3569,7 +3295,7 @@ async fn run_turn_inner(
                         retry_started.elapsed().as_secs_f64(),
                     ));
                     let retry_content = rv["choices"][0]["message"]["content"].as_str().unwrap_or_default();
-                    if let Ok(mut rescript) = Script::parse_for_project(retry_content, &project) {
+                    if let Ok(mut rescript) = crate::sentences::parse_for_project(&ctx.db, retry_content, &project) {
                         if let Some(t) = requested_s {
                             rescript.target_duration_s = Some(t);
                         }
@@ -3612,6 +3338,7 @@ async fn run_turn_inner(
                     });
                 }
                 parsed_script = Some(s);
+            }
             }
 
             raw_reply = last_assistant_text;
@@ -3720,17 +3447,11 @@ async fn run_turn_inner(
                             // interviewee" — the model knows what to do and describes doing it
                             // instead of doing it. Saying "use a tool" is not enough; showing the
                             // JSON is.
-                            transcript.push_str(if pushed_back == 1 && style.broll {
+                            transcript.push_str(if pushed_back == 1 {
                                 "<|im_start|>user\nYou have not opened any footage yet, so that answer is a guess. \
-                                 WHAT THE FOOTAGE SHOWS lists every video that has pictures. Use a tool — \
-                                 search for a subject, get_video to open a tape — and then draft. Only say the \
-                                 footage cannot support the request after you have looked.<|im_end|>\n"
-                            } else if pushed_back == 1 {
-                                "<|im_start|>user\nYou have not opened any footage yet, so that answer is a guess. \
-                                 WHAT THE FOOTAGE SHOWS lists every video that has pictures, and WHAT PEOPLE SAY has \
-                                 every word with its timestamps. Use a tool — search for a subject, \
-                                 get_video to open a tape — and then draft. Only say the footage cannot support the \
-                                 request after you have looked.<|im_end|>\n"
+                                 Start where the instructions say: get_outline, then read what your story needs, and \
+                                 then draft. Only say the footage cannot support the request after you have \
+                                 looked.<|im_end|>\n"
                             } else {
                                 "<|im_start|>user\nDo not describe what you need to check: check it. Answer with \
                                  the tool action itself, for example \
@@ -3766,12 +3487,10 @@ async fn run_turn_inner(
                             helper.kill().await;
                             return Err(Error::Invalid(CANCELLED.into()));
                         }
-                        if let Some(value) = &called.value {
-                            research_evidence.record(&tool, &args, value);
-                        }
                         on_event(ChatEvent::ToolFinished { tool: tool.clone(), summary: called.summary.clone() });
                         let res = called.model_text.clone();
-                        let record = ToolCallRecord { tool: tool.clone(), args: args.clone(), summary: called.summary.clone() };
+                        let record =
+                            ToolCallRecord { tool: tool.clone(), args: args.clone(), summary: called.summary.clone() };
                         log_tool_record(&record);
                         tool_records.push(record);
 
@@ -3798,6 +3517,7 @@ async fn run_turn_inner(
                     Ok(LocalAction::Final { script }) => {
                         let mut s = script;
                         s.fill_from_project(&project);
+                        crate::sentences::resolve_script(&ctx.db, &mut s).map_err(|e| Error::Invalid(e.to_string()))?;
                         parsed_script = Some(s);
                         break;
                     }
@@ -3807,7 +3527,7 @@ async fn run_turn_inner(
                 }
             }
 
-            if parsed_script.is_none() {
+            if parsed_script.is_none() && session.saved_script.is_none() {
                 if cancelled() {
                     return Err(Error::Invalid(CANCELLED.into()));
                 }
@@ -3841,6 +3561,8 @@ async fn run_turn_inner(
                 match serde_json::from_str::<LocalAction>(&final_str) {
                     Ok(LocalAction::Final { mut script }) => {
                         script.fill_from_project(&project);
+                        crate::sentences::resolve_script(&ctx.db, &mut script)
+                            .map_err(|e| Error::Invalid(e.to_string()))?;
                         parsed_script = Some(script);
                     }
                     Ok(LocalAction::Reply { text }) => {
@@ -3911,91 +3633,10 @@ async fn run_turn_inner(
                         && let Ok(LocalAction::Final { mut script }) = serde_json::from_str::<LocalAction>(&retry_str)
                     {
                         script.fill_from_project(&project);
+                        crate::sentences::resolve_script(&ctx.db, &mut script)
+                            .map_err(|e| Error::Invalid(e.to_string()))?;
                         parsed_script = Some(script);
                     }
-                }
-            }
-
-            // Inspect the proposal before accepting it: a digest/search hit is only a candidate.
-            // Reserve a bounded review after real tool calls, without charging planning replies
-            // against the footage budget. New choices in a revision are checked on the next pass.
-            for pass in 0..3 {
-                let Some(proposal) = parsed_script.as_ref() else { break };
-                let needed: Vec<_> = research_evidence
-                    .missing(proposal, !style.broll)
-                    .into_iter()
-                    .filter(|inspection| !research_evidence.attempted(inspection))
-                    .collect();
-                if needed.is_empty() || budget.remaining() == 0 || !budget.can_review() {
-                    break;
-                }
-                let proposal_json = serde_json::to_string(&LocalAction::Final { script: proposal.clone() })
-                    .map_err(|e| Error::Invalid(e.to_string()))?;
-                let mut results = String::new();
-                for inspection in needed.into_iter().take(budget.remaining() as usize) {
-                    if cancelled() {
-                        helper.kill().await;
-                        return Err(Error::Invalid(CANCELLED.into()));
-                    }
-                    let args = inspection.args();
-                    on_event(ChatEvent::ToolStarted { tool: inspection.tool.into(), args: args.clone() });
-                    let called = {
-                        let mut tctx =
-                            ToolCtx::new(&ctx.paths, &tool_cfg, &mut ctx.db, &mut ctx.embedder, Origin::ScriptChat)
-                                .with_project(project.clone())
-                                .with_cancel(ctx.cancel.clone())
-                                .with_grounding(&mut grounding);
-                        session.call(&mut tctx, inspection.tool, &args).await
-                    };
-                    if called.cancelled {
-                        helper.kill().await;
-                        return Err(Error::Invalid(CANCELLED.into()));
-                    }
-                    budget.tools += 1;
-                    if let Some(value) = &called.value {
-                        research_evidence.record(inspection.tool, &args, value);
-                    }
-                    on_event(ChatEvent::ToolFinished { tool: inspection.tool.into(), summary: called.summary.clone() });
-                    let record =
-                        ToolCallRecord { tool: inspection.tool.into(), args: args.clone(), summary: called.summary.clone() };
-                    log_tool_record(&record);
-                    tool_records.push(record);
-                    results.push_str(&format!("\n{} {args}:\n{}\n", inspection.tool, called.model_text));
-                }
-                transcript.push_str(&format!(
-                    "<|im_start|>assistant\n{proposal_json}<|im_end|>\n<|im_start|>user\n\
-                     Review your proposed edit against these newly inspected shot details and transcript ranges. \
-                     Keep choices the evidence supports. Replace unsupported shots and quotes, use numeric IDs, \
-                     and preserve the requested duration and story. Do not treat a search hit or a filename as \
-                     proof of what a shot shows. Return the complete final script action.\n{results}<|im_end|>\n"
-                ));
-                fit_local_prompt(
-                    helper,
-                    &mut transcript,
-                    &user_turn_text,
-                    *ctx_tokens,
-                    script_token_budget,
-                    *think,
-                    None,
-                )
-                .await?;
-                if cancelled() {
-                    helper.kill().await;
-                    return Err(Error::Invalid(CANCELLED.into()));
-                }
-                on_event(ChatEvent::Drafting);
-                budget.calls += 1;
-                *rounds_used += 1;
-                let reviewed = helper
-                    .complete_full(&transcript, Some(local_final_action_schema(false)), script_token_budget, *think)
-                    .await?;
-                debug_dump(&format!("evidence-review-{}", pass + 1), &transcript, &reviewed);
-                match serde_json::from_str::<LocalAction>(&reviewed) {
-                    Ok(LocalAction::Final { mut script }) => {
-                        script.fill_from_project(&project);
-                        parsed_script = Some(script);
-                    }
-                    _ => return Err(Error::Invalid("evidence review did not return a complete script".into())),
                 }
             }
 
@@ -4108,7 +3749,8 @@ async fn run_turn_inner(
                         }
                         on_event(ChatEvent::ToolFinished { tool: tool.clone(), summary: called.summary.clone() });
                         let res = called.model_text.clone();
-                        let record = ToolCallRecord { tool: tool.clone(), args: args.clone(), summary: called.summary.clone() };
+                        let record =
+                            ToolCallRecord { tool: tool.clone(), args: args.clone(), summary: called.summary.clone() };
                         log_tool_record(&record);
                         tool_records.push(record);
 
@@ -4136,6 +3778,7 @@ async fn run_turn_inner(
                     Ok(LocalAction::Final { script }) => {
                         let mut s = script;
                         s.fill_from_project(&project);
+                        crate::sentences::resolve_script(&ctx.db, &mut s).map_err(|e| Error::Invalid(e.to_string()))?;
                         parsed_script = Some(s);
                         break;
                     }
@@ -4146,6 +3789,8 @@ async fn run_turn_inner(
                                 serde_json::from_str::<LocalAction>(&out_str[start..])
                         {
                             script.fill_from_project(&project);
+                            crate::sentences::resolve_script(&ctx.db, &mut script)
+                                .map_err(|e| Error::Invalid(e.to_string()))?;
                             parsed_script = Some(script);
                             break;
                         }
@@ -4155,7 +3800,7 @@ async fn run_turn_inner(
                 }
             }
 
-            if parsed_script.is_none() {
+            if parsed_script.is_none() && session.saved_script.is_none() {
                 if cancelled() {
                     return Err(Error::Invalid(CANCELLED.into()));
                 }
@@ -4177,6 +3822,8 @@ async fn run_turn_inner(
                     raw_reply = text;
                 } else if let Ok(LocalAction::Final { mut script }) = serde_json::from_str::<LocalAction>(&final_str) {
                     script.fill_from_project(&project);
+                    crate::sentences::resolve_script(&ctx.db, &mut script)
+                        .map_err(|e| Error::Invalid(e.to_string()))?;
                     parsed_script = Some(script);
                 }
             }
@@ -4199,13 +3846,6 @@ async fn run_turn_inner(
         match repair::finish_script(&ctx.db, project_id, &mut s, enforce_target, &ctx.script)? {
             Some(more) => {
                 issues.extend(more);
-                if matches!(&ctx.backend, ChatBackend::Local { .. }) {
-                    let missing = research_evidence.missing(&s, !style.broll);
-                    if !missing.is_empty() {
-                        issues.push(Issue { fixes: Vec::new(), severity: IssueSeverity::Warning, beat_id: None, clip_index: None,
-                            message: format!("research incomplete: {} shot/transcript range(s) in the saved edit were not fully inspected; review them before export", missing.len()) });
-                    }
-                }
                 // Pin cut title to baseline script title on revision to prevent AI from accidentally splitting cuts
                 if let Some(ref base) = baseline_script {
                     s.title = base.title.clone();
@@ -4220,6 +3860,24 @@ async fn run_turn_inner(
             }
             None => parsed_script = None,
         }
+    }
+
+    // The edit the model saved itself (save_script, apply_fix), when it did not answer with one: it
+    // already went through the save path, so it is this turn's version as it stands.
+    if script_id.is_none()
+        && let Some(id) = session.saved_script
+        && let Ok(stored) = crate::script::load(&ctx.db, id)
+    {
+        ctx.db.conn.execute("UPDATE scripts SET session_id = ?1 WHERE id = ?2", params![session_id, id])?;
+        issues.extend(crate::script_check::check(
+            &ctx.db,
+            project_id,
+            &stored.script,
+            &ctx.script,
+            &Default::default(),
+        )?);
+        script_id = Some(id);
+        parsed_script = Some(stored.script);
     }
 
     // What the pipeline changed after the draft was written — beds laid, clips moved off shaky
@@ -4538,6 +4196,7 @@ pub fn lay_audio_beds(db: &Db, s: &mut Script, cfg: &crate::config::ScriptConfig
         }
 
         beat.bed = Some(crate::script::AudioBed {
+            sentences: None,
             video_id: clip.video_id,
             in_s: start,
             out_s: end,
@@ -4610,7 +4269,8 @@ mod tests {
             narration: None,
             on_screen_text: None,
             title_layout: None,
-            clips: vec![ScriptClip {
+            clips: vec![ScriptClip { exact: false,
+                sentences: None,
                 framing: None,
                 video_id: 1,
                 in_s,
@@ -4621,6 +4281,7 @@ mod tests {
             }],
             bed: None,
             notes: None,
+            card: None,
         };
         let script = Script {
             framing: None,
@@ -4634,6 +4295,7 @@ mod tests {
             width: None,
             height: None,
             beats: vec![beat("thanks", 1.0, 6.0), beat("real", 10.0, 18.0)],
+            card_style: None,
         };
 
         let issues = empty_speech_issues(&db, &script);
@@ -4672,7 +4334,8 @@ mod tests {
                 on_screen_text: None,
                 title_layout: None,
                 // Muted pictures under somebody else's voice: what they say is irrelevant.
-                clips: vec![ScriptClip {
+                clips: vec![ScriptClip { exact: false,
+                    sentences: None,
                     framing: None,
                     video_id: 1,
                     in_s: 1.0,
@@ -4681,9 +4344,19 @@ mod tests {
                     why: None,
                     tracks: None,
                 }],
-                bed: Some(AudioBed { video_id: 1, in_s: 10.0, out_s: 18.0, why: None, inferred: true, tracks: None }),
+                bed: Some(AudioBed {
+                    sentences: None,
+                    video_id: 1,
+                    in_s: 10.0,
+                    out_s: 18.0,
+                    why: None,
+                    inferred: true,
+                    tracks: None,
+                }),
                 notes: None,
+                card: None,
             }],
+            card_style: None,
         };
         assert!(empty_speech_issues(&db, &script).is_empty());
     }
@@ -4724,7 +4397,8 @@ mod tests {
             narration: None,
             on_screen_text: None,
             title_layout: None,
-            clips: vec![ScriptClip {
+            clips: vec![ScriptClip { exact: false,
+                sentences: None,
                 framing: None,
                 video_id: 1,
                 in_s: 0.0,
@@ -4735,6 +4409,7 @@ mod tests {
             }],
             bed: None,
             notes: None,
+            card: None,
         };
         let mut script = Script {
             framing: None,
@@ -4748,6 +4423,7 @@ mod tests {
             width: None,
             height: None,
             beats: vec![beat("open", 25.0), beat("mid-1", 25.0), beat("mid-2", 25.0), beat("close", 25.0)],
+            card_style: None,
         };
 
         assert!(drop_beats_to_target(&db, &mut script, &cfg), "100 s against 40 s must lose something");
@@ -4771,7 +4447,8 @@ mod tests {
             narration: None,
             on_screen_text: None,
             title_layout: None,
-            clips: vec![ScriptClip {
+            clips: vec![ScriptClip { exact: false,
+                sentences: None,
                 framing: None,
                 video_id: 1,
                 in_s: 0.0,
@@ -4782,6 +4459,7 @@ mod tests {
             }],
             bed: None,
             notes: None,
+            card: None,
         };
         // Two beats of 90 s against a 10 s target: hopeless, and dropping to one would not be
         // the script any more. The score reports the overrun instead.
@@ -4797,6 +4475,7 @@ mod tests {
             width: None,
             height: None,
             beats: vec![beat("open"), beat("close")],
+            card_style: None,
         };
         assert!(!drop_beats_to_target(&db, &mut script, &cfg));
         assert_eq!(script.beats.len(), 2);
@@ -4836,7 +4515,8 @@ mod tests {
                 )
                 .unwrap();
         }
-        let clip = |in_s: f64, out_s: f64| ScriptClip {
+        let clip = |in_s: f64, out_s: f64| ScriptClip { exact: false,
+            sentences: None,
             framing: None,
             video_id: 1,
             in_s,
@@ -4866,7 +4546,9 @@ mod tests {
                 notes: None,
                 clips: vec![clip(0.0, 25.0), clip(25.0, 50.0), clip(50.0, 75.0)],
                 bed: None,
+                card: None,
             }],
+            card_style: None,
         };
         let before = script.total_duration_s();
         // Nothing here is a picture, so there is nothing that may be trimmed: the fit leaves it.
@@ -4936,7 +4618,8 @@ mod tests {
                 on_screen_text: None,
                 title_layout: None,
                 notes: None,
-                clips: vec![ScriptClip {
+                clips: vec![ScriptClip { exact: false,
+                    sentences: None,
                     framing: None,
                     video_id: 1,
                     in_s: 10.0,
@@ -4945,8 +4628,18 @@ mod tests {
                     why: None,
                     tracks: None,
                 }],
-                bed: Some(AudioBed { video_id: 1, in_s: 10.0, out_s: 20.0, why: None, inferred: true, tracks: None }),
+                bed: Some(AudioBed {
+                    sentences: None,
+                    video_id: 1,
+                    in_s: 10.0,
+                    out_s: 20.0,
+                    why: None,
+                    inferred: true,
+                    tracks: None,
+                }),
+                card: None,
             }],
+            card_style: None,
         };
         let held = hold_the_last_picture(&db, project.id, &mut script, &sc());
         assert!(held > 0.0, "there is a hold to add");
@@ -5030,8 +4723,18 @@ mod tests {
                 title_layout: None,
                 notes: None,
                 clips: vec![],
-                bed: Some(AudioBed { video_id: 100, in_s: 72.0, out_s: 82.0, why: None, inferred: true, tracks: None }),
+                bed: Some(AudioBed {
+                    sentences: None,
+                    video_id: 100,
+                    in_s: 72.0,
+                    out_s: 82.0,
+                    why: None,
+                    inferred: true,
+                    tracks: None,
+                }),
+                card: None,
             }],
+            card_style: None,
         };
         assert_eq!(end_on_turns(&db, &mut script, &sc()), 1, "the handover is there to be found");
         let bed = script.beats[0].bed.clone().unwrap();
@@ -5078,7 +4781,8 @@ mod tests {
                 on_screen_text: None,
                 title_layout: None,
                 notes: None,
-                clips: vec![ScriptClip {
+                clips: vec![ScriptClip { exact: false,
+                    sentences: None,
                     framing: None,
                     video_id: 7,
                     in_s: 0.0,
@@ -5088,7 +4792,9 @@ mod tests {
                     tracks: None,
                 }],
                 bed: None,
+                card: None,
             }],
+            card_style: None,
         };
         assert_eq!(end_on_turns(&db, &mut script, &sc()), 0, "kept: {:?}", script.beats[0].clips[0]);
     }
@@ -5117,7 +4823,8 @@ mod tests {
             on_screen_text: None,
             title_layout: None,
             notes: None,
-            clips: vec![ScriptClip {
+            clips: vec![ScriptClip { exact: false,
+                sentences: None,
                 framing: None,
                 video_id: 1,
                 in_s,
@@ -5127,6 +4834,7 @@ mod tests {
                 tracks: None,
             }],
             bed: None,
+            card: None,
         };
         let script_of = |b: Beat| Script {
             framing: None,
@@ -5140,6 +4848,7 @@ mod tests {
             width: None,
             height: None,
             beats: vec![b],
+            card_style: None,
         };
 
         // Cut 2.6 s early: within reach, so it runs on to the end of the sentence.
@@ -5196,70 +4905,6 @@ mod tests {
         // Nothing left to forget: the caller is told to stop looking and draft.
         let mut only_prompt = vec![msg("system", &"rules ".repeat(500)), msg("user", "hello")];
         assert!(!make_room(&mut only_prompt, 10));
-    }
-
-    /// The editor reads the tapes before it cuts. Everything spoken goes in the prompt, marked
-    /// where it is off the microphone, and when it will not all fit the tapes with the most
-    /// speech go first and the rest are named rather than hidden.
-    #[test]
-    fn every_word_spoken_goes_in_the_prompt() {
-        let mut db = Db::open_in_memory().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        let p = db.create_project(&NewProject::named("P")).unwrap();
-        let folder = db.add_folder(p.id, tmp.path(), true).unwrap();
-        for (id, name) in [(1, "talky.mp4"), (2, "quiet.mp4")] {
-            db.conn
-                .execute(
-                    "INSERT INTO videos(id, content_hash, size, duration_s) VALUES (?1, ?2, 1, 60.0)",
-                    params![id, format!("h{id}")],
-                )
-                .unwrap();
-            db.conn
-                .execute(
-                    "INSERT INTO video_files(video_id, folder_id, path, size, mtime, last_seen)
-                     VALUES (?1, ?2, ?3, 1, 0, 0)",
-                    params![id, folder.id, tmp.path().join(name).to_str().unwrap()],
-                )
-                .unwrap();
-        }
-        // The talkative tape, and one question asked from across the room.
-        for i in 0..8 {
-            db.conn
-                .execute(
-                    "INSERT INTO transcript_segments(video_id, start_s, end_s, text, off_mic)
-                     VALUES (1, ?1, ?2, 'I grew up in Northwest Hills and stayed', 0)",
-                    params![i as f64 * 3.0, i as f64 * 3.0 + 3.0],
-                )
-                .unwrap();
-        }
-        db.conn
-            .execute(
-                "INSERT INTO transcript_segments(video_id, start_s, end_s, text, off_mic)
-                 VALUES (1, 30.0, 32.0, 'So where did you grow up?', 1)",
-                [],
-            )
-            .unwrap();
-        db.conn
-            .execute(
-                "INSERT INTO transcript_segments(video_id, start_s, end_s, text, off_mic)
-                 VALUES (2, 0.0, 2.0, 'a word from the quiet tape', 0)",
-                [],
-            )
-            .unwrap();
-
-        let all = speech_digest(&db, p.id, 60_000);
-        assert!(all.contains("#1 talky.mp4"), "{all}");
-        assert!(all.contains("#2 quiet.mp4"));
-        assert!(all.contains("I grew up in Northwest Hills"));
-        assert!(all.contains("[off-mic] So where did you grow up?"), "the questions are marked: {all}");
-        assert!(all.contains("0.00-3.00"), "timestamps to cut on");
-
-        // Squeezed: the tape with the most speech is kept and cut short, not dropped for a
-        // shorter one that happens to fit.
-        let tight = speech_digest(&db, p.id, 700);
-        assert!(tight.contains("#1 talky.mp4"), "{tight}");
-        assert!(tight.contains("the rest of this one with get_transcript"), "{tight}");
-        assert!(tight.len() <= 800, "stays near its budget: {}", tight.len());
     }
 
     /// The model never hears about a repair in the turn that caused it, so the note rides on the
@@ -5352,7 +4997,8 @@ mod tests {
                 on_screen_text: None,
                 title_layout: None,
                 notes: None,
-                clips: vec![ScriptClip {
+                clips: vec![ScriptClip { exact: false,
+                    sentences: None,
                     framing: None,
                     video_id: 1,
                     in_s: 0.0,
@@ -5361,8 +5007,18 @@ mod tests {
                     why: None,
                     tracks: None,
                 }],
-                bed: Some(AudioBed { video_id: 1, in_s: 10.0, out_s: 30.0, why: None, inferred: true, tracks: None }),
+                bed: Some(AudioBed {
+                    sentences: None,
+                    video_id: 1,
+                    in_s: 10.0,
+                    out_s: 30.0,
+                    why: None,
+                    inferred: true,
+                    tracks: None,
+                }),
+                card: None,
             }],
+            card_style: None,
         };
         clamp_beds_to_beats(&db, &mut script, &sc());
         let bed = script.beats[0].bed.clone().unwrap();
@@ -5382,6 +5038,7 @@ mod tests {
             notes: None,
             clips: vec![],
             bed: None,
+            card: None,
         };
         let mut script = Script {
             framing: None,
@@ -5402,6 +5059,7 @@ mod tests {
                 beat("", "Establish the deep roots"),
                 beat("keep-me", "Something else"),
             ],
+            card_style: None,
         };
         let issues = tidy_beat_ids(&mut script);
         assert_eq!(script.beats[0].id, "establish-the-deep-roots");
@@ -5448,7 +5106,8 @@ mod tests {
                 notes: None,
                 // Her face for 4 s, then two pictures of what she is describing.
                 clips: vec![
-                    ScriptClip {
+                    ScriptClip { exact: false,
+                        sentences: None,
                         framing: None,
                         video_id: 1,
                         in_s: 10.0,
@@ -5457,7 +5116,8 @@ mod tests {
                         why: None,
                         tracks: None,
                     },
-                    ScriptClip {
+                    ScriptClip { exact: false,
+                        sentences: None,
                         framing: None,
                         video_id: 2,
                         in_s: 0.0,
@@ -5466,7 +5126,8 @@ mod tests {
                         why: None,
                         tracks: None,
                     },
-                    ScriptClip {
+                    ScriptClip { exact: false,
+                        sentences: None,
                         framing: None,
                         video_id: 2,
                         in_s: 20.0,
@@ -5477,7 +5138,9 @@ mod tests {
                     },
                 ],
                 bed: None,
+                card: None,
             }],
+            card_style: None,
         };
         let issues = lay_audio_beds(&db, &mut script, &sc());
         let bed = script.beats[0].bed.clone().expect("a bed was laid");
@@ -5526,7 +5189,8 @@ mod tests {
                 title_layout: None,
                 notes: None,
                 clips: vec![
-                    ScriptClip {
+                    ScriptClip { exact: false,
+                        sentences: None,
                         framing: None,
                         video_id: 2,
                         in_s: 0.0,
@@ -5535,7 +5199,8 @@ mod tests {
                         why: None,
                         tracks: None,
                     },
-                    ScriptClip {
+                    ScriptClip { exact: false,
+                        sentences: None,
                         framing: None,
                         video_id: 1,
                         in_s: 14.0,
@@ -5546,7 +5211,9 @@ mod tests {
                     },
                 ],
                 bed: None,
+                card: None,
             }],
+            card_style: None,
         };
         lay_audio_beds(&db, &mut script, &sc());
         let bed = script.beats[0].bed.clone().expect("a bed was laid");
@@ -5579,7 +5246,8 @@ mod tests {
                 on_screen_text: None,
                 title_layout: None,
                 notes: None,
-                clips: vec![ScriptClip {
+                clips: vec![ScriptClip { exact: false,
+                    sentences: None,
                     framing: None,
                     video_id: 1,
                     in_s: 0.0,
@@ -5588,8 +5256,18 @@ mod tests {
                     why: None,
                     tracks: None,
                 }],
-                bed: Some(AudioBed { video_id: 1, in_s: 40.0, out_s: 50.0, why: None, inferred: false, tracks: None }),
+                bed: Some(AudioBed {
+                    sentences: None,
+                    video_id: 1,
+                    in_s: 40.0,
+                    out_s: 50.0,
+                    why: None,
+                    inferred: false,
+                    tracks: None,
+                }),
+                card: None,
             }],
+            card_style: None,
         };
         let issues = lay_audio_beds(&db, &mut script, &sc());
         assert!(script.beats[0].bed.is_none(), "a bed with no speech in it is dropped");
@@ -5650,7 +5328,8 @@ mod tests {
                 on_screen_text: None,
                 title_layout: None,
                 notes: None,
-                clips: vec![ScriptClip {
+                clips: vec![ScriptClip { exact: false,
+                    sentences: None,
                     framing: None,
                     video_id: 1,
                     in_s: 0.5,
@@ -5660,7 +5339,9 @@ mod tests {
                     tracks: None,
                 }],
                 bed: None,
+                card: None,
             }],
+            card_style: None,
         };
         let issues = enforce_grounding_and_pacing(&db, p.id, &mut script, &grounding, false, &sc());
         let c = &script.beats[0].clips[0];
@@ -5675,7 +5356,7 @@ mod tests {
     /// the editor ask a question instead of drafting around a guess.
     #[cfg(unix)]
     #[tokio::test]
-    async fn local_planning_preserves_research_budget_and_selected_clips_are_reviewed() {
+    async fn local_planning_replies_do_not_spend_the_research_budget() {
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
         let mut db = Db::open_in_memory().unwrap();
@@ -5770,11 +5451,11 @@ for line in sys.stdin:
         let result =
             run_turn(&mut ctx, p.id, None, "Create a 5 second community video", &[], None, &mut |_| {}).await.unwrap();
         assert!(result.script_id.is_some());
-        assert_eq!(result.tool_calls.len(), 3, "two planning replies must leave room for actual inspections");
-        assert!(result.tool_calls.iter().any(|t| t.tool == "get_video" && t.args["video_id"] == 2));
-        assert!(result.tool_calls.iter().any(|t| t.tool == "get_transcript" && t.args["video_id"] == 2));
-        assert!(marker_path.exists(), "the model must receive inspection results before finalizing");
-        assert!(!result.issues.iter().any(|i| i.message.starts_with("research incomplete:")));
+        // The calls are the model's own: the harness runs no inspections of its own on a local
+        // model's draft that it would not run on any other model's.
+        assert_eq!(result.tool_calls.len(), 1, "{:?}", result.tool_calls);
+        assert_eq!(result.tool_calls[0].tool, "get_video");
+        assert!(!marker_path.exists(), "no extra review round");
     }
 
     #[test]
@@ -5788,7 +5469,10 @@ for line in sys.stdin:
             fn without_docs(v: &Value) -> Value {
                 match v {
                     Value::Object(m) => Value::Object(
-                        m.iter().filter(|(k, v)| !(*k == "description" && v.is_string())).map(|(k, x)| (k.clone(), without_docs(x))).collect(),
+                        m.iter()
+                            .filter(|(k, v)| !(*k == "description" && v.is_string()))
+                            .map(|(k, x)| (k.clone(), without_docs(x)))
+                            .collect(),
                     ),
                     Value::Array(a) => Value::Array(a.iter().map(without_docs).collect()),
                     other => other.clone(),
@@ -5844,7 +5528,8 @@ for line in sys.stdin:
 
         // The model opened nothing, so nothing is grounded by tool results.
         let grounding = Grounding::default();
-        let clip = |in_s: f64, out_s: f64| ScriptClip {
+        let clip = |in_s: f64, out_s: f64| ScriptClip { exact: false,
+            sentences: None,
             framing: None,
             video_id: 1,
             in_s,
@@ -5874,7 +5559,9 @@ for line in sys.stdin:
                 // Real footage it never opened, then a range past the end of the video.
                 clips: vec![clip(0.0, 5.0), clip(9000.0, 9005.0)],
                 bed: None,
+                card: None,
             }],
+            card_style: None,
         };
         let issues = enforce_grounding_and_pacing(&db, p.id, &mut script, &grounding, false, &sc());
         let kept: Vec<(f64, f64)> = script.beats.iter().flat_map(|b| &b.clips).map(|c| (c.in_s, c.out_s)).collect();
@@ -5944,7 +5631,8 @@ for line in sys.stdin:
     #[test]
     fn pacing_redraft_and_trim() {
         use crate::script::{Audio, Beat, ScriptClip};
-        let clip = |in_s: f64, out_s: f64| ScriptClip {
+        let clip = |in_s: f64, out_s: f64| ScriptClip { exact: false,
+            sentences: None,
             framing: None,
             video_id: 1,
             in_s,
@@ -5973,7 +5661,9 @@ for line in sys.stdin:
                 clips: vec![clip(0.0, 45.0), clip(90.0, 144.0), clip(200.0, 206.0)],
                 notes: None,
                 bed: None,
+                card: None,
             }],
+            card_style: None,
         };
         let issues = pacing_issues(&s, true, &sc());
         // two over-long clips + total far from target
@@ -6095,7 +5785,8 @@ for line in sys.stdin:
         for t in [20.0, 105.0] {
             db.conn.execute("INSERT INTO frames(video_id, t_s, description_json) VALUES (1, ?1, '{}')", [t]).unwrap();
         }
-        let clip = |in_s: f64, out_s: f64, audio| ScriptClip {
+        let clip = |in_s: f64, out_s: f64, audio| ScriptClip { exact: false,
+            sentences: None,
             video_id: 1,
             in_s,
             out_s,
@@ -6124,6 +5815,7 @@ for line in sys.stdin:
                 clips: vec![clip(22.0, 30.0, Audio::Mute), clip(100.0, 108.0, Audio::Source)],
                 notes: None,
                 bed: Some(AudioBed {
+                    sentences: None,
                     video_id: 1,
                     in_s: 100.0,
                     out_s: 110.0,
@@ -6131,7 +5823,9 @@ for line in sys.stdin:
                     inferred: false,
                     tracks: None,
                 }),
+                card: None,
             }],
+            card_style: None,
         };
 
         let natural = ChatStyle { broll: true, natural_sound: true };
@@ -6160,33 +5854,12 @@ for line in sys.stdin:
         repair::finish_script(&db, p.id, &mut s, false, &cfg).unwrap();
         assert_eq!((s.beats[0].clips[1].in_s, s.beats[0].clips[1].out_s), (100.0, 108.0));
 
-        // The table of contents says which tapes are interviews, and lists the quiet ones first.
-        db.conn
-            .execute("INSERT INTO videos(id, content_hash, size, duration_s) VALUES (2, 'h2', 1, 60.0)", [])
-            .unwrap();
-        db.conn
-            .execute(
-                "INSERT INTO video_files(video_id, folder_id, path, size, mtime, last_seen) VALUES (2, ?1, 'b.mp4', 1, 0, 0)",
-                [folder.id],
-            )
-            .unwrap();
-        db.conn.execute("INSERT INTO frames(video_id, t_s, description_json) VALUES (2, 5.0, '{}')", []).unwrap();
-        db.conn
-            .execute(
-                "INSERT INTO transcript_segments(video_id, start_s, end_s, text) VALUES (2, 0.0, 50.0, 'talk')",
-                [],
-            )
-            .unwrap();
-        let digest = picture_digest(&db, p.id, 10_000, true);
-        let (quiet, interview) = (digest.find("#1 a.mp4").unwrap(), digest.find("#2 b.mp4").unwrap());
-        assert!(quiet < interview, "{digest}");
-        assert!(digest.contains("[interview: someone talks on the mic for 83% of it - avoid]"), "{digest}");
-        assert!(!picture_digest(&db, p.id, 10_000, false).contains("interview:"));
-
-        // And the prompt is the montage's own, with the sound rule filled in.
-        let prompt = build_system_prompt(&p, None, Some("custom interview prompt"), tools::Detail::Short, natural);
-        assert!(prompt.contains("b-roll montage"));
-        assert!(!prompt.contains("custom interview prompt"));
+        // And the prompt carries the montage's brief after the harness instructions, with the sound
+        // rule filled in and the house rules after it.
+        let prompt = build_system_prompt(&p, None, Some("custom house rule"), tools::Detail::Short, natural);
+        assert!(prompt.contains("B-ROLL MONTAGE"));
+        assert!(prompt.contains(crate::tools::INSTRUCTIONS));
+        assert!(prompt.find("B-ROLL MONTAGE").unwrap() < prompt.find("custom house rule").unwrap());
         assert!(!prompt.contains("{audio_rule}"));
         assert!(prompt.contains("ambient sound"));
     }
@@ -6215,7 +5888,8 @@ for line in sys.stdin:
             )
             .unwrap();
         db.conn.execute("INSERT INTO frames(video_id, t_s, description_json) VALUES (1, 20.0, '{}')", []).unwrap();
-        let clip = |in_s: f64, out_s: f64| ScriptClip {
+        let clip = |in_s: f64, out_s: f64| ScriptClip { exact: false,
+            sentences: None,
             framing: None,
             video_id: 1,
             in_s,
@@ -6233,6 +5907,7 @@ for line in sys.stdin:
             clips,
             notes: None,
             bed: None,
+            card: None,
         };
         let mut s = Script {
             framing: None,
@@ -6257,6 +5932,7 @@ for line in sys.stdin:
                     vec![clip(300.0, 306.0)],
                 ),
             ],
+            card_style: None,
         };
         let issues = content_issues(&db, &s, &sc());
         let msgs: Vec<_> = issues.iter().map(|i| (i.beat_id.clone().unwrap(), i.clip_index)).collect();
@@ -6269,6 +5945,8 @@ for line in sys.stdin:
                 [],
             )
             .unwrap();
+        // The transcript changed under the stored sentences: as after a new transcription.
+        crate::sentence_split::invalidate(&db.conn, 1).unwrap();
         let mut talk = s.clone();
         talk.beats[1].clips[0] = clip(100.0, 110.0);
         pad_speech(&db, &mut talk, &sc());
@@ -6276,6 +5954,7 @@ for line in sys.stdin:
         assert!((c.in_s - 99.5).abs() < 1e-9, "{c:?}");
         assert!((c.out_s - 110.7).abs() < 1e-9, "stops before the next sentence: {c:?}");
         db.conn.execute("DELETE FROM transcript_segments WHERE text = 'next'", []).unwrap();
+        crate::sentence_split::invalidate(&db.conn, 1).unwrap();
         let mut talk = s.clone();
         talk.beats[1].clips[0] = clip(100.0, 105.0);
         pad_speech(&db, &mut talk, &sc());
@@ -6311,8 +5990,8 @@ for line in sys.stdin:
 
         c.execute(
             "INSERT INTO transcript_segments(video_id, start_s, end_s, text)
-             VALUES (10, 0.0, 5.0, 'welcome to cm5 unboxing'),
-                    (10, 5.0, 12.0, 'here is the compute module board')",
+             VALUES (10, 0.0, 5.0, 'welcome to cm5 unboxing.'),
+                    (10, 5.0, 12.0, 'here is the compute module board.')",
             [],
         )
         .unwrap();
@@ -6363,7 +6042,7 @@ for line in sys.stdin:
         let called = call!("get_transcript", json!({"video_id": 10, "start_s": 0.0, "end_s": 6.0}));
         assert!(called.model_text.len() <= 1500);
         assert!(called.model_text.contains("welcome to cm5 unboxing"));
-        assert_eq!(called.summary, "2 segments");
+        assert_eq!(called.summary, "2 sentences");
 
         // 4. search (keyword only), asked for by its old name
         let called = call!("search_moments", json!({"query": "unboxing"}));
@@ -6407,7 +6086,8 @@ for line in sys.stdin:
                 on_screen_text: None,
                 title_layout: None,
                 notes: None,
-                clips: vec![ScriptClip {
+                clips: vec![ScriptClip { exact: false,
+                    sentences: None,
                     framing: None,
                     video_id: 1,
                     in_s: 10.0,
@@ -6416,8 +6096,18 @@ for line in sys.stdin:
                     why: None,
                     tracks: None,
                 }],
-                bed: Some(AudioBed { video_id: 1, in_s: 10.0, out_s: 20.0, why: None, inferred: true, tracks: None }),
+                bed: Some(AudioBed {
+                    sentences: None,
+                    video_id: 1,
+                    in_s: 10.0,
+                    out_s: 20.0,
+                    why: None,
+                    inferred: true,
+                    tracks: None,
+                }),
+                card: None,
             }],
+            card_style: None,
         };
 
         let held = hold_the_last_picture(&db, 1, &mut script, &sc());
@@ -6443,7 +6133,8 @@ for line in sys.stdin:
             notes: None,
             // A beat that ends on someone speaking: the case a hold is for. A last picture that
             // is already silent has ended the piece by itself and is left alone.
-            clips: vec![ScriptClip {
+            clips: vec![ScriptClip { exact: false,
+                sentences: None,
                 framing: None,
                 video_id: 1,
                 in_s: 10.0,
@@ -6453,6 +6144,7 @@ for line in sys.stdin:
                 tracks: None,
             }],
             bed: None,
+            card: None,
         };
         let script_of = |b: Beat| Script {
             framing: None,
@@ -6466,6 +6158,7 @@ for line in sys.stdin:
             width: None,
             height: None,
             beats: vec![b],
+            card_style: None,
         };
 
         // Only 0.6 s of the file is left: hold that and no more.
@@ -6510,7 +6203,8 @@ for line in sys.stdin:
                 on_screen_text: None,
                 title_layout: None,
                 notes: None,
-                clips: vec![ScriptClip {
+                clips: vec![ScriptClip { exact: false,
+                    sentences: None,
                     framing: None,
                     video_id: 1,
                     in_s: 100.0,
@@ -6520,7 +6214,9 @@ for line in sys.stdin:
                     tracks: None,
                 }],
                 bed: None,
+                card: None,
             }],
+            card_style: None,
         };
         let held = hold_the_last_picture(&db, 1, &mut s, &sc());
         assert!((held - 2.0).abs() < 0.01, "held {held}");
@@ -6562,7 +6258,8 @@ for line in sys.stdin:
                 notes: None,
                 // Her face, then a cutaway: 14.5 s of picture over 11.9 s of voice.
                 clips: vec![
-                    ScriptClip {
+                    ScriptClip { exact: false,
+                        sentences: None,
                         framing: None,
                         video_id: 1,
                         in_s: 0.0,
@@ -6571,7 +6268,8 @@ for line in sys.stdin:
                         why: None,
                         tracks: None,
                     },
-                    ScriptClip {
+                    ScriptClip { exact: false,
+                        sentences: None,
                         framing: None,
                         video_id: 2,
                         in_s: 0.0,
@@ -6581,8 +6279,18 @@ for line in sys.stdin:
                         tracks: None,
                     },
                 ],
-                bed: Some(AudioBed { video_id: 1, in_s: 0.0, out_s: 11.9, why: None, inferred: true, tracks: None }),
+                bed: Some(AudioBed {
+                    sentences: None,
+                    video_id: 1,
+                    in_s: 0.0,
+                    out_s: 11.9,
+                    why: None,
+                    inferred: true,
+                    tracks: None,
+                }),
+                card: None,
             }],
+            card_style: None,
         };
 
         assert_eq!(trim_pictures_to_bed(&mut script, &sc()), 1);
@@ -6619,7 +6327,8 @@ for line in sys.stdin:
                 notes: None,
                 // 40 s of pictures over 8 s of voice.
                 clips: vec![
-                    ScriptClip {
+                    ScriptClip { exact: false,
+                        sentences: None,
                         framing: None,
                         video_id: 1,
                         in_s: 0.0,
@@ -6628,7 +6337,8 @@ for line in sys.stdin:
                         why: None,
                         tracks: None,
                     },
-                    ScriptClip {
+                    ScriptClip { exact: false,
+                        sentences: None,
                         framing: None,
                         video_id: 2,
                         in_s: 0.0,
@@ -6637,7 +6347,8 @@ for line in sys.stdin:
                         why: None,
                         tracks: None,
                     },
-                    ScriptClip {
+                    ScriptClip { exact: false,
+                        sentences: None,
                         framing: None,
                         video_id: 3,
                         in_s: 0.0,
@@ -6647,8 +6358,18 @@ for line in sys.stdin:
                         tracks: None,
                     },
                 ],
-                bed: Some(AudioBed { video_id: 1, in_s: 0.0, out_s: 8.0, why: None, inferred: true, tracks: None }),
+                bed: Some(AudioBed {
+                    sentences: None,
+                    video_id: 1,
+                    in_s: 0.0,
+                    out_s: 8.0,
+                    why: None,
+                    inferred: true,
+                    tracks: None,
+                }),
+                card: None,
             }],
+            card_style: None,
         };
         assert_eq!(trim_pictures_to_bed(&mut script, &sc()), 0, "the cut is not thrown away");
         assert_eq!(script.beats[0].clips.len(), 3);
@@ -6680,7 +6401,8 @@ for line in sys.stdin:
                 // 12 s of picture over 7 s of voice: a tail worth taking, but not enough give in
                 // the two shots to reach it without one of them going.
                 clips: vec![
-                    ScriptClip {
+                    ScriptClip { exact: false,
+                        sentences: None,
                         framing: None,
                         video_id: 1,
                         in_s: 0.0,
@@ -6689,7 +6411,8 @@ for line in sys.stdin:
                         why: None,
                         tracks: None,
                     },
-                    ScriptClip {
+                    ScriptClip { exact: false,
+                        sentences: None,
                         framing: None,
                         video_id: 2,
                         in_s: 0.0,
@@ -6699,8 +6422,18 @@ for line in sys.stdin:
                         tracks: None,
                     },
                 ],
-                bed: Some(AudioBed { video_id: 1, in_s: 0.0, out_s: 7.0, why: None, inferred: true, tracks: None }),
+                bed: Some(AudioBed {
+                    sentences: None,
+                    video_id: 1,
+                    in_s: 0.0,
+                    out_s: 7.0,
+                    why: None,
+                    inferred: true,
+                    tracks: None,
+                }),
+                card: None,
             }],
+            card_style: None,
         };
 
         trim_pictures_to_bed(&mut script, &sc());
@@ -6735,7 +6468,8 @@ for line in sys.stdin:
                 on_screen_text: None,
                 title_layout: None,
                 notes: None,
-                clips: vec![ScriptClip {
+                clips: vec![ScriptClip { exact: false,
+                    sentences: None,
                     framing: None,
                     video_id: 2,
                     in_s: 0.0,
@@ -6744,8 +6478,18 @@ for line in sys.stdin:
                     why: None,
                     tracks: None,
                 }],
-                bed: Some(AudioBed { video_id: 1, in_s: 0.0, out_s: 4.0, why: None, inferred: true, tracks: None }),
+                bed: Some(AudioBed {
+                    sentences: None,
+                    video_id: 1,
+                    in_s: 0.0,
+                    out_s: 4.0,
+                    why: None,
+                    inferred: true,
+                    tracks: None,
+                }),
+                card: None,
             }],
+            card_style: None,
         };
         assert_eq!(trim_pictures_to_bed(&mut script, &sc()), 0);
         assert!((script.beats[0].clips[0].out_s - 12.0).abs() < 0.01);
@@ -6788,7 +6532,8 @@ for line in sys.stdin:
                 title_layout: None,
                 notes: None,
                 clips: vec![
-                    ScriptClip {
+                    ScriptClip { exact: false,
+                        sentences: None,
                         framing: None,
                         video_id: 1,
                         in_s: 10.0,
@@ -6797,7 +6542,8 @@ for line in sys.stdin:
                         why: None,
                         tracks: None,
                     },
-                    ScriptClip {
+                    ScriptClip { exact: false,
+                        sentences: None,
                         framing: None,
                         video_id: 2,
                         in_s: 0.0,
@@ -6807,8 +6553,18 @@ for line in sys.stdin:
                         tracks: None,
                     },
                 ],
-                bed: Some(AudioBed { video_id: 1, in_s: 10.0, out_s: 28.4, why: None, inferred: true, tracks: None }),
+                bed: Some(AudioBed {
+                    sentences: None,
+                    video_id: 1,
+                    in_s: 10.0,
+                    out_s: 28.4,
+                    why: None,
+                    inferred: true,
+                    tracks: None,
+                }),
+                card: None,
             }],
+            card_style: None,
         };
 
         assert_eq!(end_on_sentences(&db, &mut script, &sc()), 1);
@@ -6853,7 +6609,8 @@ for line in sys.stdin:
                 title_layout: None,
                 notes: None,
                 // Only 12 s of pictures.
-                clips: vec![ScriptClip {
+                clips: vec![ScriptClip { exact: false,
+                    sentences: None,
                     framing: None,
                     video_id: 1,
                     in_s: 10.0,
@@ -6862,8 +6619,18 @@ for line in sys.stdin:
                     why: None,
                     tracks: None,
                 }],
-                bed: Some(AudioBed { video_id: 1, in_s: 10.0, out_s: 22.0, why: None, inferred: true, tracks: None }),
+                bed: Some(AudioBed {
+                    sentences: None,
+                    video_id: 1,
+                    in_s: 10.0,
+                    out_s: 22.0,
+                    why: None,
+                    inferred: true,
+                    tracks: None,
+                }),
+                card: None,
             }],
+            card_style: None,
         };
 
         end_on_sentences(&db, &mut script, &sc());

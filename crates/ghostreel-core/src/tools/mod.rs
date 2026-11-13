@@ -21,6 +21,7 @@
 mod agent_loop;
 mod clips;
 mod ctx;
+mod instructions;
 mod library;
 mod people;
 mod project;
@@ -35,9 +36,10 @@ use futures_util::future::BoxFuture;
 use serde_json::Value;
 
 pub use agent_loop::{ToolAccess, ToolTrail, run_agent_json};
+pub use instructions::INSTRUCTIONS;
 pub use ctx::{Args, Grounding, Origin, ToolCtx, ToolError, ToolImage, ToolOutput, ToolResult};
 pub use render::{RenderOpts, TOOL_CONTRACT, action_branches, render_mcp, render_openai, tools_prose};
-pub use session::{Called, CallGuard, ToolBudget, ToolMemo, ToolSession};
+pub use session::{CallGuard, Called, ToolBudget, ToolMemo, ToolSession};
 pub use spec::{Detail, Effect, ParamType, ToolParam, ToolSpec, params_schema};
 
 /// A handler: runs one tool. Async, because search, indexing and the model runs are.
@@ -93,6 +95,21 @@ pub fn names() -> Vec<&'static str> {
 /// Run one tool.
 pub async fn call(ctx: &mut ToolCtx<'_>, name: &str, args: &Value) -> ToolResult {
     let tool = lookup(name).ok_or_else(|| ToolError::Unknown(name.to_string()))?;
+    // An argument the tool does not take is an error, not something to drop: a model that passes
+    // `from`/`to` to a tool without them otherwise gets the whole video back and never learns why.
+    if let Some(obj) = args.as_object() {
+        let unknown: Vec<&str> =
+            obj.keys().map(String::as_str).filter(|k| !tool.spec.params.iter().any(|p| p.name == *k)).collect();
+        if !unknown.is_empty() {
+            let takes: Vec<&str> = tool.spec.params.iter().map(|p| p.name).collect();
+            return Err(ToolError::Invalid(format!(
+                "{} does not take {}; it takes: {}",
+                tool.spec.name,
+                unknown.iter().map(|k| format!("'{k}'")).collect::<Vec<_>>().join(", "),
+                takes.join(", ")
+            )));
+        }
+    }
     let args = Args(args);
     for p in tool.spec.params.iter().filter(|p| p.required) {
         // The current project stands in for a missing `project`.

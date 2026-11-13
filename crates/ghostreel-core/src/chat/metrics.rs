@@ -220,6 +220,7 @@ mod tests {
             width: None,
             height: None,
             beats,
+            card_style: None,
         }
     }
 
@@ -233,11 +234,12 @@ mod tests {
             notes: None,
             clips,
             bed,
+            card: None,
         }
     }
 
     fn clip(video_id: i64, in_s: f64, out_s: f64, audio: Audio) -> ScriptClip {
-        ScriptClip { video_id, in_s, out_s, audio, why: None, tracks: None, framing: None }
+        ScriptClip { exact: false, sentences: None, video_id, in_s, out_s, audio, why: None, tracks: None, framing: None }
     }
 
     #[test]
@@ -319,7 +321,15 @@ mod tests {
             vec![beat(
                 "b1",
                 vec![clip(1, 0.0, 10.0, Audio::Mute), clip(2, 0.0, 20.0, Audio::Mute)],
-                Some(AudioBed { video_id: 1, in_s: 0.0, out_s: 30.0, why: None, inferred: true, tracks: None }),
+                Some(AudioBed {
+                    sentences: None,
+                    video_id: 1,
+                    in_s: 0.0,
+                    out_s: 30.0,
+                    why: None,
+                    inferred: true,
+                    tracks: None,
+                }),
             )],
             Some(30.0),
         );

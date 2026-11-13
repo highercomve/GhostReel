@@ -384,18 +384,17 @@ impl Vision<'_> {
                         continue;
                     }
                 };
-                let chunks = match mtmd
-                    .tokenize(MtmdInputText { text, add_special: true, parse_special: true }, &[&bitmap])
-                {
-                    Ok(c) => c,
-                    Err(e) => {
-                        chunk_results[slot_idx] = Some(json!({
-                            "ok": false,
-                            "error": format!("tokenize: {e:?}"),
-                        }));
-                        continue;
-                    }
-                };
+                let chunks =
+                    match mtmd.tokenize(MtmdInputText { text, add_special: true, parse_special: true }, &[&bitmap]) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            chunk_results[slot_idx] = Some(json!({
+                                "ok": false,
+                                "error": format!("tokenize: {e:?}"),
+                            }));
+                            continue;
+                        }
+                    };
                 let prompt_tokens = chunks.total_tokens();
                 let seq_id = slot_idx as i32;
                 let n_past = match chunks.eval_chunks(mtmd, &self.ctx, 0, seq_id, self.n_batch as i32, true) {
@@ -658,8 +657,7 @@ impl Vision<'_> {
 
         let bitmap = if let Some(img_path) = image {
             let mtmd = self.mtmd.as_ref().ok_or("this model has no image projector")?;
-            let bm = MtmdBitmap::from_file(mtmd, img_path, false)
-                .map_err(|e| format!("image {img_path}: {e:?}"))?;
+            let bm = MtmdBitmap::from_file(mtmd, img_path, false).map_err(|e| format!("image {img_path}: {e:?}"))?;
             insert_image_marker(&mut text);
             Some(bm)
         } else {
@@ -912,18 +910,23 @@ fn run() -> Result<(), String> {
     let mut effective_kv = args.kv_type.clone();
     let mut vision = match &vision_model {
         Some(model) => {
-            let mtmd = args.mmproj.as_ref().map(|mmproj| {
-                MtmdContext::init_from_file(
-                    mmproj,
-                    model,
-                    &MtmdContextParams {
-                        use_gpu: effective_ngl > 0,
-                        n_threads: args.threads,
-                        print_timings: false,
-                        ..Default::default()
-                    },
-                ).map_err(|e| format!("loading {mmproj}: {e:?}"))
-            }).transpose()?;
+            let mtmd = args
+                .mmproj
+                .as_ref()
+                .map(|mmproj| {
+                    MtmdContext::init_from_file(
+                        mmproj,
+                        model,
+                        &MtmdContextParams {
+                            use_gpu: effective_ngl > 0,
+                            n_threads: args.threads,
+                            print_timings: false,
+                            ..Default::default()
+                        },
+                    )
+                    .map_err(|e| format!("loading {mmproj}: {e:?}"))
+                })
+                .transpose()?;
             let n_batch = 512;
             let kv = match args.kv_type.as_str() {
                 "f16" => KvCacheType::F16,
@@ -1067,10 +1070,12 @@ fn run() -> Result<(), String> {
                             bitmap.and_then(|bitmap| {
                                 let mut text = text;
                                 insert_image_marker(&mut text);
-                                mtmd
-                                    .tokenize(MtmdInputText { text, add_special: true, parse_special: true }, &[&bitmap])
-                                    .map(|chunks| json!({"tokens":chunks.total_tokens()}))
-                                    .map_err(|e| format!("tokenize: {e:?}"))
+                                mtmd.tokenize(
+                                    MtmdInputText { text, add_special: true, parse_special: true },
+                                    &[&bitmap],
+                                )
+                                .map(|chunks| json!({"tokens":chunks.total_tokens()}))
+                                .map_err(|e| format!("tokenize: {e:?}"))
                             })
                         })
                     } else {

@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use rusqlite::params;
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::Error;
 use crate::db::Db;
@@ -64,6 +64,44 @@ pub fn file_url(path: &str) -> String {
 }
 
 /// Pure timeline builder: script + resolved media map -> OpenTimelineIO JSON (serde_json::Value).
+/// A section card's length in frames of the sequence (0 when the beat has none).
+fn card_frames(script: &Script, beat: &crate::script::Beat, seq_rate: f64) -> f64 {
+    let s = script.card_s(beat);
+    if s > 0.0 { (s * seq_rate).round().max(1.0) } else { 0.0 }
+}
+
+/// An OTIO gap `frames` long, with a name, metadata and, when given, a marker over all of it.
+fn gap(seq_rate: f64, frames: f64, name: &str, metadata: Value, marker: Option<&str>) -> Value {
+    let range = json!({
+        "OTIO_SCHEMA": "TimeRange.1",
+        "start_time": {"OTIO_SCHEMA": "RationalTime.1", "rate": seq_rate, "value": 0.0},
+        "duration": {"OTIO_SCHEMA": "RationalTime.1", "rate": seq_rate, "value": frames}
+    });
+    let markers: Vec<Value> = marker
+        .map(|text| {
+            json!({
+                "OTIO_SCHEMA": "Marker.2",
+                "metadata": {},
+                "name": text,
+                "color": "BLUE",
+                "marked_range": range,
+                "comment": text
+            })
+        })
+        .into_iter()
+        .collect();
+    json!({
+        "OTIO_SCHEMA": "Gap.1",
+        "metadata": metadata,
+        "name": name,
+        "source_range": range,
+        "effects": [],
+        "markers": markers,
+        "enabled": true,
+        "color": null
+    })
+}
+
 pub fn build_timeline_pure(
     script: &Script,
     project_fps: Fps,
@@ -81,6 +119,16 @@ pub fn build_timeline_pure(
 
     for beat in &script.beats {
         let beat_dur_s: f64 = beat.clips.iter().map(|c| (c.out_s - c.in_s).max(0.0)).sum();
+
+        // A section card plays before the beat: a gap on every track, named after its title and
+        // marked on the picture track, so an editor sees where to drop a title card.
+        let card_frames = card_frames(script, beat, seq_rate);
+        if card_frames > 0.0 {
+            let card = beat.card.as_ref().expect("a card takes time only when there is one");
+            let meta = json!({"ghostreel": {"card": {"text": card.text, "background": script.card_background(beat)}}});
+            v1_children.push(gap(seq_rate, card_frames, &card.text, meta, Some(&card.text)));
+            a1_children.push(gap(seq_rate, card_frames, "", json!({}), None));
+        }
 
         // A bed is one voice across the whole beat: A1 carries it once, and the pictures above
         // contribute no sound of their own. In an NLE that is a J-cut, audio and video cut apart.
@@ -338,6 +386,10 @@ pub fn build_timeline_pure(
         for beat in &script.beats {
             let beat_dur_s: f64 = beat.clips.iter().map(|c| (c.out_s - c.in_s).max(0.0)).sum();
             let beat_frames = (beat_dur_s * seq_rate).round().max(1.0);
+            let card_frames = card_frames(script, beat, seq_rate);
+            if card_frames > 0.0 {
+                v2_children.push(gap(seq_rate, card_frames, "", json!({}), None));
+            }
 
             if let Some(text) = beat.on_screen_text.as_deref().filter(|t| !t.trim().is_empty()) {
                 v2_children.push(json!({

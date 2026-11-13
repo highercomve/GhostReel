@@ -63,8 +63,8 @@ mod tests {
         }
     }
 
-    /// The schema is re-sent every round, so its size is a running cost, not a one-off. Forty-one
-    /// tools at full detail are about 10k tokens (a server model is also given their short prose, about
+    /// The schema is re-sent every round, so its size is a running cost, not a one-off. Forty-four
+    /// tools at full detail are about 12k tokens (a server model is also given their short prose, about
     /// 3k); against the ~11500 the project's transcripts already take, and a measured three-fold
     /// difference in task success between thin and rich tool descriptions, that is the deal. This
     /// is a ceiling, not a target: a wordier spec should have to argue for itself here. The short
@@ -73,8 +73,11 @@ mod tests {
     fn the_descriptions_stay_within_their_budget() {
         let full = serde_json::to_string(&render_openai(CHAT(Detail::Full))).unwrap().len();
         let short = serde_json::to_string(&render_openai(CHAT(Detail::Short))).unwrap().len();
-        assert!(full < 46_000, "full tool schema is {full} chars (~{} tokens)", full / 4);
-        assert!(short < 20_000, "short tool schema is {short} chars (~{} tokens)", short / 4);
+        // 54k since get_manifest: one read that stands in for get_transcript + get_scenes +
+        // get_faces + get_video saves more rounds (each re-sending this schema) than it costs.
+        assert!(full < 54_000, "full tool schema is {full} chars (~{} tokens)", full / 4);
+        // 23.5k since review_render: still under 6k tokens, well inside a 16k window.
+        assert!(short < 23_500, "short tool schema is {short} chars (~{} tokens)", short / 4);
         assert!(short * 2 < full, "short rendering saves little: {short} vs {full}");
         let prose_short = tools_prose(CHAT(Detail::Short)).len();
         assert!(prose_short < 13_000, "short prose is {prose_short} chars (~{} tokens)", prose_short / 4);

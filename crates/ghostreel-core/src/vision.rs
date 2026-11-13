@@ -269,7 +269,9 @@ impl From<&crate::config::VisionConfig> for HelperRuntime {
 }
 
 impl LocalLlm {
-    pub fn model_name(&self) -> &str { &self.model_name }
+    pub fn model_name(&self) -> &str {
+        &self.model_name
+    }
 
     pub async fn start(m: &LocalModels) -> Result<Self, Error> {
         // A chat/vision model on the GPU needs the VRAM a running GhostPen may be holding.
@@ -279,7 +281,9 @@ impl LocalLlm {
         let mut cmd = crate::proc::command(&m.helper);
         if let Some((model, mmproj)) = &m.vision {
             cmd.arg("--model").arg(model);
-            if let Some(mmproj) = mmproj { cmd.arg("--mmproj").arg(mmproj); }
+            if let Some(mmproj) = mmproj {
+                cmd.arg("--mmproj").arg(mmproj);
+            }
         }
         if let Some(e) = &m.embed {
             cmd.arg("--embed-model").arg(e);
@@ -799,19 +803,30 @@ echo '{"id":1,"ok":true,"tokens":17}'
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let helper = dir.path().join("helper");
-        std::fs::write(&helper, r#"#!/bin/sh
+        std::fs::write(
+            &helper,
+            r#"#!/bin/sh
 printf '%s\n' "$@" > "$0.args"
 echo '{"ready":true}'
 cat >/dev/null
-"#).unwrap();
+"#,
+        )
+        .unwrap();
         std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
         let model = dir.path().join("Other app/Custom-Q4_K_M.gguf");
         let projector = dir.path().join("Other app/mmproj.gguf");
         for mmproj in [None, Some(projector.clone())] {
             let llm = LocalLlm::start(&LocalModels {
-                helper: helper.clone(), vision: Some((model.clone(), mmproj.clone())),
-                embed: None, cpu: true, runtime: Default::default(), concurrency: 1, free_ghostpen: Vec::new(),
-            }).await.unwrap();
+                helper: helper.clone(),
+                vision: Some((model.clone(), mmproj.clone())),
+                embed: None,
+                cpu: true,
+                runtime: Default::default(),
+                concurrency: 1,
+                free_ghostpen: Vec::new(),
+            })
+            .await
+            .unwrap();
             let args = std::fs::read_to_string(dir.path().join("helper.args")).unwrap();
             let args: Vec<_> = args.lines().collect();
             assert_eq!(&args[..2], &["--model", model.to_str().unwrap()]);

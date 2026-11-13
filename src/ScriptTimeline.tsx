@@ -3,6 +3,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import type { AudioTrackInfo, Cue, FrameRow, Script, VideoRow } from "./api";
 import { AudioLines, ChevronDown, EyeOff, Film, MessageSquareText, Type, Volume2 } from "lucide-react";
 import { cueKey } from "./editor/textOverlay";
+import { beatTimes, cardBackground, cardSeconds } from "./editor/cards";
 import MediaImage from "./MediaImage";
 import { PICK_MIME, type Pick } from "./editor/MediaBin";
 import {
@@ -24,7 +25,7 @@ import "./editor/timeline.css";
 /** One block on a lane, already positioned in seconds on the cut's timeline. */
 type Block = {
   key: string;
-  kind: "title" | "picture" | "bed" | "cue";
+  kind: "title" | "picture" | "bed" | "cue" | "card";
   beat: number;
   clip: number | null;
   /** Position in the finished cut. */
@@ -46,6 +47,8 @@ type Block = {
   hi?: number;
   /** Caption blocks: the cue. */
   cue?: Cue;
+  /** Section cards: the colour of the card, drawn as the block's own. */
+  background?: string;
 };
 
 type ClipRef = { beat: number; clip: number };
@@ -91,6 +94,13 @@ function name(videos: Record<number, VideoRow>, id: number): string {
 
 const clamp = (v: number, lo: number, hi: number) => Math.min(Math.max(v, lo), hi);
 
+/** Black or white, whichever reads on a `#rrggbb` background. */
+function onColour(hex: string): string {
+  const n = parseInt(hex.slice(1), 16);
+  const lum = (0.299 * ((n >> 16) & 255) + 0.587 * ((n >> 8) & 255) + 0.114 * (n & 255)) / 255;
+  return lum > 0.6 ? "#111111" : "#ffffff";
+}
+
 /** The keyframe closest to a source time; frames must be sorted by `t_s`. */
 function nearestFrame(frames: FrameRow[], t: number): FrameRow | null {
   if (frames.length === 0) return null;
@@ -105,6 +115,9 @@ function nearestFrame(frames: FrameRow[], t: number): FrameRow | null {
   return frames[lo];
 }
 
+/** Where a beat sits on the cut: its card (if any) from `start`, its clips from `clipsStart`. */
+type BeatSpan = { beat: number; id: string; start: number; clipsStart: number; end: number };
+
 /** Lay the script out in seconds: where every picture, title and bed sits in the finished cut. */
 function layout(
   script: Script,
@@ -113,17 +126,37 @@ function layout(
 ): {
   blocks: Block[];
   total: number;
-  beatStarts: { beat: number; id: string; start: number; end: number }[];
+  beatStarts: BeatSpan[];
   laneCount: number;
 } {
   const blocks: Block[] = [];
   const fmt = formatDuration;
   let laneCount = 1;
-  const beatStarts: { beat: number; id: string; start: number; end: number }[] = [];
+  const beatStarts: BeatSpan[] = [];
+  const times = beatTimes(script);
   let at = 0;
 
   script.beats.forEach((beat, b) => {
-    const beatStart = at;
+    const { cardStart, clipsStart: beatStart } = times[b];
+    const cardLen = cardSeconds(script, beat);
+    if (cardLen > 0 && beat.card) {
+      blocks.push({
+        key: `card-${b}`,
+        kind: "card",
+        beat: b,
+        clip: null,
+        start: cardStart,
+        end: beatStart,
+        sourceIn: 0,
+        videoId: null,
+        label: beat.card.text.trim(),
+        detail: `section card · ${fmt(cardLen)}`,
+        muted: false,
+        inferred: false,
+        background: cardBackground(script, beat),
+      });
+    }
+    at = beatStart;
     beat.clips.forEach((c, i) => {
       const dur = Math.max(0, c.out_s - c.in_s);
       // Lead with what the shot is for; the file name and source range are the detail.
@@ -146,7 +179,7 @@ function layout(
       at += dur;
     });
     const beatEnd = at;
-    beatStarts.push({ beat: b, id: beat.id, start: beatStart, end: beatEnd });
+    beatStarts.push({ beat: b, id: beat.id, start: cardStart, clipsStart: beatStart, end: beatEnd });
 
     if (beat.on_screen_text?.trim() && beatEnd > beatStart) {
       const dur = beatEnd - beatStart;
@@ -245,7 +278,7 @@ function ownerOf(key: string | null): string | null {
   return null;
 }
 const blockOwner = (b: Block) =>
-  b.kind === "title" || b.kind === "cue" ? null : b.clip != null ? `c${b.beat}-${b.clip}` : `bed${b.beat}`;
+  b.kind === "title" || b.kind === "cue" || b.kind === "card" ? null : b.clip != null ? `c${b.beat}-${b.clip}` : `bed${b.beat}`;
 
 /** Caption cues as blocks on their own lane. */
 function cueBlocks(cues: Cue[] | undefined): Block[] {
@@ -291,6 +324,8 @@ type Props = {
   onSplit?: (beat: number, clip: number, atSourceSeconds: number) => void;
   /** Remove a clip, or the beat's bed when `clip` is null. */
   onDelete?: (beat: number, clip: number | null) => void;
+  /** Remove a beat's section card. */
+  onDeleteCard?: (beat: number) => void;
   /** Turn one source audio track on or off for a clip (or the beat's bed when `clip` is null). */
   onToggleTrack?: (beat: number, clip: number | null, track: number) => void;
   /** Lane mute/solo for the live viewer. Uncontrolled (kept here) when absent. */
@@ -333,6 +368,7 @@ export default function ScriptTimeline({
   onInsertPick,
   onSplit,
   onDelete,
+  onDeleteCard,
   onToggleTrack,
   monitor: monitorProp,
   onMonitor,
@@ -583,7 +619,8 @@ export default function ScriptTimeline({
   const dropTarget = useCallback((t: number): { to: ClipRef; x: number } | null => {
     const list = live.current.pictures.filter((p) => p.end > p.start);
     if (list.length === 0) return null;
-    const over = list.find((p) => t >= p.start && t < p.end) ?? (t <= list[0].start ? list[0] : list[list.length - 1]);
+    // On a section card (or past the end) the nearest picture after it, else the last one.
+    const over = list.find((p) => t < p.end) ?? list[list.length - 1];
     const before = t < (over.start + over.end) / 2;
     return {
       to: { beat: over.beat, clip: (over.clip ?? 0) + (before ? 0 : 1) },
@@ -691,6 +728,9 @@ export default function ScriptTimeline({
         const dir = e.key === "ArrowRight" ? 1 : -1;
         if (!sel) {
           onSeek(Math.min(Math.max(playhead + dir * step, 0), total));
+        } else if (sel.kind === "card") {
+          // A card has no source to trim; its length is set in the inspector.
+          return;
         } else if (sel.kind === "title" || sel.kind === "cue") {
           // Titles and captions: arrows move them (Shift: only the start, as for a clip's in).
           const lo = sel.lo ?? 0;
@@ -721,7 +761,7 @@ export default function ScriptTimeline({
       case "i":
       case "o": {
         // Put this edge where the playhead is, read back into the source file's own clock.
-        if (mod || !sel || playhead < sel.start || playhead > sel.end) return;
+        if (mod || !sel || sel.kind === "card" || playhead < sel.start || playhead > sel.end) return;
         if (sel.kind === "title" || sel.kind === "cue") {
           const lo = sel.lo ?? 0;
           const start = e.key === "i" ? clamp(playhead, lo, sel.end - MIN_ITEM) : sel.start;
@@ -735,7 +775,7 @@ export default function ScriptTimeline({
       }
       case "s":
         if (mod) return;
-        if (sel) onSnap(sel.beat, sel.clip);
+        if (sel && sel.kind !== "card") onSnap(sel.beat, sel.clip);
         break;
       case "m":
         if (mod || !sel || sel.track == null || !onToggleTrack) return;
@@ -760,6 +800,13 @@ export default function ScriptTimeline({
         if (sel?.kind === "cue" && sel.cue) {
           // A caption is not deleted, only hidden: the transcript still has it.
           onCueHide?.(sel.cue, true);
+          break;
+        }
+        if (sel?.kind === "card") {
+          if (!onDeleteCard) return;
+          const { beat } = sel;
+          onSelect(null, -1, null);
+          onDeleteCard(beat);
           break;
         }
         if (!sel || !onDelete) return;
@@ -818,6 +865,8 @@ export default function ScriptTimeline({
     const clip = pictures.find((p) => p.start <= t && t < p.end);
     if (clip) return { to: { beat: clip.beat, clip: clip.clip! }, x: clip.start };
     const beat = beatStarts.find((b) => b.start <= t && t < b.end) ?? beatStarts[beatStarts.length - 1];
+    // Dropped on a beat's card: before that beat's first clip.
+    if (beat && t < beat.clipsStart) return { to: { beat: beat.beat, clip: 0 }, x: beat.clipsStart };
     return beat ? { to: { beat: beat.beat, clip: script.beats[beat.beat].clips.length }, x: beat.end }
       : { to: { beat: 0, clip: 0 }, x: 0 };
   };
@@ -1140,7 +1189,7 @@ export default function ScriptTimeline({
                 {blocks
                   .filter(
                     (b) =>
-                      !lane.summary && b.kind === lane.kind &&
+                      !lane.summary && (b.kind === lane.kind || (b.kind === "card" && lane.kind === "picture")) &&
                       (lane.track == null || (b.track === lane.track && !laneStates[lane.track].silent)) &&
                       b.end >= visFrom &&
                       b.start <= visTo,
@@ -1191,7 +1240,11 @@ export default function ScriptTimeline({
                       ]
                         .filter(Boolean)
                         .join(" ")}
-                      style={{ left: xOf(bStart), width }}
+                      style={{
+                        left: xOf(bStart),
+                        width,
+                        ...(b.background ? { background: b.background, color: onColour(b.background) } : null),
+                      }}
                       onClick={selectable(b)}
                       onDoubleClick={b.kind === "cue" && onCueText ? (e) => {
                         e.stopPropagation();
@@ -1210,7 +1263,7 @@ export default function ScriptTimeline({
                           active: false,
                         };
                       }}
-                      title={`${b.kind === "title" ? "On-screen title · " : b.kind === "cue" ? "Caption · " : ""}${b.track != null ? `${trackName(b.track)} · ` : ""}${b.label}${b.detail ? ` · ${b.detail}` : ""}${
+                      title={`${b.kind === "title" ? "On-screen title · " : b.kind === "cue" ? "Caption · " : b.kind === "card" ? "Section card · " : ""}${b.track != null ? `${trackName(b.track)} · ` : ""}${b.label}${b.detail ? ` · ${b.detail}` : ""}${
                         info ? ` · ${trackDescription(info)}` : ""
                       }${db != null ? ` · ${dbLabel(db)}` : ""}${
                         b.inferred ? " · voice carried under the pictures" : ""
@@ -1219,7 +1272,7 @@ export default function ScriptTimeline({
                       }`}
                     >
                       {b.kind === "picture" && filmstrip(b)}
-                      {isItem ? (
+                      {b.kind === "card" ? null : isItem ? (
                         <span className="tl-handle in" onPointerDown={itemGesture("in")} />
                       ) : (
                         <span
@@ -1260,7 +1313,7 @@ export default function ScriptTimeline({
                           <span className="tl-level-bar" style={{ width: `${levelFraction(db) * 100}%` }} />
                         </>
                       )}
-                      {isItem ? (
+                      {b.kind === "card" ? null : isItem ? (
                         <span className="tl-handle out" onPointerDown={itemGesture("out")} />
                       ) : (
                         <span
@@ -1363,7 +1416,7 @@ export default function ScriptTimeline({
           <span><kbd>s</kbd> snap to sentence</span>
           {onToggleTrack && <span><kbd>m</kbd> audio track on/off</span>}
           <span><kbd>c</kbd> / <kbd>ctrl</kbd><kbd>k</kbd> blade</span>
-          <span><kbd>del</kbd> delete clip or bed (caption: hide)</span>
+          <span><kbd>del</kbd> delete clip, bed or section card (caption: hide)</span>
           {captions && captions.length > 0 && <span><kbd>h</kbd> hide caption · <kbd>enter</kbd> edit it</span>}
           <span><kbd>=</kbd><kbd>-</kbd> zoom</span>
           <span><kbd>ctrl</kbd>+wheel zoom</span>

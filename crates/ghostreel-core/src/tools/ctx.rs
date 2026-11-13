@@ -81,6 +81,12 @@ impl From<rusqlite::Error> for ToolError {
     }
 }
 
+impl From<crate::sentences::SentenceError> for ToolError {
+    fn from(e: crate::sentences::SentenceError) -> Self {
+        ToolError::Invalid(e.to_string())
+    }
+}
+
 impl From<serde_json::Error> for ToolError {
     fn from(e: serde_json::Error) -> Self {
         ToolError::Invalid(e.to_string())
@@ -92,6 +98,9 @@ impl From<serde_json::Error> for ToolError {
 pub struct ToolImage {
     pub caption: String,
     pub jpeg: Vec<u8>,
+    /// A file name no other picture of the call shares (`v104_t2799400ms.jpg`), so a caller that
+    /// saves what it is shown does not overwrite one picture with the next.
+    pub name: String,
 }
 
 /// What a tool returns.
@@ -164,7 +173,7 @@ impl Grounding {
     /// Record grounding ranges from an earlier call's arguments (a session's stored tool calls).
     pub fn record_tool_call(&mut self, tool: &str, args: &Value, db: &Db) {
         match crate::tools::canonical_name(tool) {
-            "get_transcript" => {
+            "get_transcript" | "get_manifest" => {
                 if let (Some(vid), Some(s), Some(e)) = (
                     args.get("video_id").and_then(|v| v.as_i64()),
                     args.get("start_s").and_then(|v| v.as_f64()),
@@ -385,7 +394,9 @@ impl<'a> Args<'a> {
     pub fn f64_list(&self, key: &str) -> Vec<f64> {
         self.get(key)
             .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))).collect())
+            .map(|a| {
+                a.iter().filter_map(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))).collect()
+            })
             .unwrap_or_default()
     }
 

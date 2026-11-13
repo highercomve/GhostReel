@@ -303,16 +303,22 @@ async fn media(Query(q): Query<MediaQuery>, req: Request) -> Response {
 }
 
 #[derive(Deserialize)]
-struct ChatLogQuery { session_id: i64 }
+struct ChatLogQuery {
+    session_id: i64,
+}
 
 async fn download_chat_log(Query(q): Query<ChatLogQuery>, req: Request) -> Response {
-    let Ok(paths) = Paths::resolve() else { return StatusCode::INTERNAL_SERVER_ERROR.into_response(); };
+    let Ok(paths) = Paths::resolve() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
     let path = paths.data_dir.join("logs/chat").join(format!("{}.jsonl", q.session_id));
     match tower_http::services::ServeFile::new(path).oneshot(req).await {
         Ok(r) => {
             let mut response = r.into_response();
-            response.headers_mut().insert(header::CONTENT_DISPOSITION,
-                format!("attachment; filename=\"{}.jsonl\"", q.session_id).parse().unwrap());
+            response.headers_mut().insert(
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{}.jsonl\"", q.session_id).parse().unwrap(),
+            );
             response.headers_mut().insert(header::CONTENT_TYPE, "application/x-ndjson".parse().unwrap());
             response
         }
@@ -492,6 +498,14 @@ async fn dispatch(app: &AppHandle, cmd: &str, args: Value) -> Result<Value, Stri
         "enqueue_speakers" => {
             let (project_id, force) = args!(args; project_id: i64, force: Option<bool>);
             ok(crate::enqueue_speakers(app.clone(), queue(), project_id, force).await?)
+        }
+        "enqueue_speech" => {
+            let (project_id, force) = args!(args; project_id: i64, force: Option<bool>);
+            ok(crate::enqueue_speech(app.clone(), queue(), project_id, force).await?)
+        }
+        "enqueue_chapters" => {
+            let (project_id, force) = args!(args; project_id: i64, force: Option<bool>);
+            ok(crate::enqueue_chapters(app.clone(), queue(), project_id, force).await?)
         }
         "project_people" => {
             let (project_id,) = args!(args; project_id: i64);
@@ -747,6 +761,10 @@ async fn dispatch(app: &AppHandle, cmd: &str, args: Value) -> Result<Value, Stri
         "script_overlays" => {
             let (script,) = args!(args; script: Script);
             ok(crate::script_overlays(script)?)
+        }
+        "script_section_cards" => {
+            let (script, on) = args!(args; script: Script, on: bool);
+            ok(crate::script_section_cards(script, on)?)
         }
         "script_framing" => {
             let (script,) = args!(args; script: Script);

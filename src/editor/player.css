@@ -231,6 +231,8 @@
 /* Fit: the whole picture over a blurred copy of itself filling the frame (as the render does). */
 .lp-fit-blur { position: absolute; inset: 0; width: 100%; height: 100%; display: none; filter: blur(12px); transform: scale(1.08); }
 .lp-frame:not(.is-framed) .lp-fit-blur { display: none !important; }
+/* A section card: a plain colour over the whole frame, with the card's text drawn on it. */
+.lp-card { position: absolute; inset: 0; z-index: 1; pointer-events: none; }
 /* Burnt-in titles and captions, placed and sized by the backend's layout (same as the render).
    Sizes and positions come inline; this only makes them selectable and draggable. */
 .lp-ovl {
@@ -241,6 +243,7 @@
   user-select: none;
 }
 .lp-ovl.editable { pointer-events: auto; cursor: move; touch-action: none; }
+.lp-ovl.editable.fixed { cursor: pointer; }
 .lp-ovl.editable:hover { outline: 1px dashed rgba(255, 255, 255, 0.6); outline-offset: 3px; }
 .lp-ovl.selected { outline: 2px solid var(--accent); outline-offset: 4px; }
 .lp-ovl-line > span { display: inline; }

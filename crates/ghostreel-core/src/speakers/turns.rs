@@ -113,10 +113,7 @@ mod tests {
 
     #[test]
     fn segment_takes_the_majority_speaker() {
-        let turns = vec![
-            Turn { start_s: 0.0, end_s: 3.0, speaker: 0 },
-            Turn { start_s: 3.0, end_s: 10.0, speaker: 1 },
-        ];
+        let turns = vec![Turn { start_s: 0.0, end_s: 3.0, speaker: 0 }, Turn { start_s: 3.0, end_s: 10.0, speaker: 1 }];
         assert_eq!(majority_speaker(2.0, 6.0, &turns), Some(1));
         assert_eq!(majority_speaker(0.0, 3.5, &turns), Some(0));
         assert_eq!(majority_speaker(11.0, 12.0, &turns), None);

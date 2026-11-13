@@ -257,8 +257,13 @@ fn inventory(data_dir: &Path) -> Vec<Item> {
     }
 
     for e in entries(&data_dir.join("logs/chat")) {
-        let owner = e.path().file_stem().and_then(|s| s.to_str()).and_then(|s| s.parse().ok())
-            .map(Owner::Session).unwrap_or(Owner::None);
+        let owner = e
+            .path()
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(|s| s.parse().ok())
+            .map(Owner::Session)
+            .unwrap_or(Owner::None);
         items.push(Item { kind: Kind::ChatLogs, bytes: size_of(&e.path()), path: e.path(), owner });
     }
     for e in entries(&data_dir.join("tmp")) {

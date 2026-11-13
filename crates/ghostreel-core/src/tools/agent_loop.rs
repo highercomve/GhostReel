@@ -18,7 +18,9 @@ use std::sync::atomic::AtomicBool;
 
 use serde_json::{Value, json};
 
-use super::{Detail, Origin, RenderOpts, ToolBudget, ToolCtx, ToolSession, action_branches, render_openai, tools_prose};
+use super::{
+    Detail, Origin, RenderOpts, ToolBudget, ToolCtx, ToolSession, action_branches, render_openai, tools_prose,
+};
 use crate::Error;
 use crate::agents::{AgentError, AgentErrorKind};
 use crate::chat::{ChatBackend, workers};
@@ -102,14 +104,20 @@ fn read_step(reply: Value, schema: &Value) -> Result<Step, Error> {
     match reply.get("action").and_then(Value::as_str) {
         Some("tool") => {
             let name = reply.get("tool").and_then(Value::as_str).unwrap_or_default().to_string();
-            Ok(Step::Tool { name, args: reply.get("args").cloned().filter(Value::is_object).unwrap_or_else(|| json!({})) })
+            Ok(Step::Tool {
+                name,
+                args: reply.get("args").cloned().filter(Value::is_object).unwrap_or_else(|| json!({})),
+            })
         }
         Some("final") => match reply.get("answer") {
             Some(a) if satisfies(schema, a) => Ok(Step::Answer(a.clone())),
             _ => Err(unusable("the final answer does not match the schema")),
         },
         _ if satisfies(schema, &reply) => Ok(Step::Answer(reply)),
-        _ => Err(unusable(format!("not a tool action or an answer: {}", super::util::clip_chars(&reply.to_string(), 160)))),
+        _ => Err(unusable(format!(
+            "not a tool action or an answer: {}",
+            super::util::clip_chars(&reply.to_string(), 160)
+        ))),
     }
 }
 
@@ -154,10 +162,9 @@ impl<'a> Run<'a> {
                     _ => Detail::Full,
                 },
             ),
-            _ => (
-                script.roomy_tool_result_chars,
-                if script.tool_docs == "short" { Detail::Short } else { Detail::Full },
-            ),
+            _ => {
+                (script.roomy_tool_result_chars, if script.tool_docs == "short" { Detail::Short } else { Detail::Full })
+            }
         };
         Ok(Self {
             access,
@@ -182,10 +189,11 @@ impl<'a> Run<'a> {
     }
 
     async fn call(&mut self, name: &str, args: &Value) -> super::Called {
-        let mut ctx = ToolCtx::new(&self.access.paths, &self.access.config, &mut self.db, &mut self.embedder, Origin::ClipRun)
-            .with_project(self.project.clone())
-            .with_cancel(self.access.cancel.clone())
-            .on_demand_embedder();
+        let mut ctx =
+            ToolCtx::new(&self.access.paths, &self.access.config, &mut self.db, &mut self.embedder, Origin::ClipRun)
+                .with_project(self.project.clone())
+                .with_cancel(self.access.cancel.clone())
+                .on_demand_embedder();
         let called = self.session.call(&mut ctx, name, args).await;
         if let Some(trail) = &self.access.trail
             && let Ok(mut t) = trail.lock()
@@ -240,7 +248,8 @@ async fn server_loop(
             break;
         }
         run.budget.spend();
-        let msg = workers::server_complete(url, model, api_key, &messages, Some(&tools), None, max_tokens, timeout_s).await?;
+        let msg =
+            workers::server_complete(url, model, api_key, &messages, Some(&tools), None, max_tokens, timeout_s).await?;
         let calls = msg["tool_calls"].as_array().filter(|c| !c.is_empty()).cloned();
         let Some(calls) = calls else {
             // No tool wanted: the content is the answer, if it is one.
@@ -281,7 +290,8 @@ async fn server_loop(
         "role": "user",
         "content": "Now give your final answer: ONLY the JSON object the request describes, using what you have found."
     }));
-    let msg = workers::server_complete(url, model, api_key, &messages, None, Some(schema), max_tokens, timeout_s).await?;
+    let msg =
+        workers::server_complete(url, model, api_key, &messages, None, Some(schema), max_tokens, timeout_s).await?;
     let v = workers::parse_object(msg["content"].as_str().unwrap_or_default()).map_err(|e| unusable(e.to_string()))?;
     match read_step(v, schema)? {
         Step::Answer(a) => Ok(a),
@@ -385,7 +395,9 @@ async fn cli_loop(
     let ask = if continued {
         "Give your final answer now. Reply ONLY with {\"action\":\"final\",\"answer\":<a JSON object matching the schema>}.".to_string()
     } else {
-        format!("{prompt}\n\nReply ONLY with one JSON object matching this JSON schema (no prose, no code fences):\n{schema_text}")
+        format!(
+            "{prompt}\n\nReply ONLY with one JSON object matching this JSON schema (no prose, no code fences):\n{schema_text}"
+        )
     };
     let out = agent.complete_continuing(&ask, continued).await?;
     let reply = workers::parse_object(&out).map_err(|e| unusable(e.to_string()))?;

@@ -189,9 +189,9 @@ pub fn get(db: &Db, trash_id: &str) -> Result<TrashItem, Error> {
 
 /// What is in the trash, newest first: one project's, or everyone's.
 pub fn list(db: &Db, project_id: Option<i64>) -> Result<Vec<TrashItem>, Error> {
-    let mut st = db.conn.prepare(
-        "SELECT * FROM trash WHERE ?1 IS NULL OR project_id = ?1 ORDER BY deleted_at DESC, rowid DESC",
-    )?;
+    let mut st = db
+        .conn
+        .prepare("SELECT * FROM trash WHERE ?1 IS NULL OR project_id = ?1 ORDER BY deleted_at DESC, rowid DESC")?;
     let rows = st.query_map([project_id], row_to_item)?.collect::<Result<Vec<_>, _>>()?;
     rows.into_iter().map(|r| build_item(db, r)).collect()
 }
@@ -403,10 +403,7 @@ pub fn purge_expired(db: &Db, data_dir: &Path, now: i64, source: &str) -> Result
     }
     for (project_id, gone) in by_project {
         let n = gone.len();
-        let label = format!(
-            "Emptied {n} {} deleted over {KEEP_DAYS} days ago",
-            if n == 1 { "item" } else { "items" }
-        );
+        let label = format!("Emptied {n} {} deleted over {KEEP_DAYS} days ago", if n == 1 { "item" } else { "items" });
         let names: Vec<String> =
             gone.iter().map(|i| describe(i.kind, &i.title, i.scripts, i.clips, i.version)).collect();
         let mut rec = RunRecorder::start(PURGE_RUN, label, Some(project_id), source);
@@ -440,16 +437,15 @@ mod tests {
 
     fn clip_set(db: &Db, id: &str, titles: &[&str]) -> Vec<i64> {
         db.conn
-            .execute(
-                "INSERT INTO clip_sets(id, project_id, brief, created_at) VALUES (?1, 1, 'Launch day', 5)",
-                [id],
-            )
+            .execute("INSERT INTO clip_sets(id, project_id, brief, created_at) VALUES (?1, 1, 'Launch day', 5)", [id])
             .unwrap();
         titles
             .iter()
             .map(|t| {
                 let sid = save(db, t);
-                db.conn.execute("UPDATE scripts SET set_id = ?1, kind = 'clip' WHERE id = ?2", params![id, sid]).unwrap();
+                db.conn
+                    .execute("UPDATE scripts SET set_id = ?1, kind = 'clip' WHERE id = ?2", params![id, sid])
+                    .unwrap();
                 sid
             })
             .collect()
@@ -518,9 +514,10 @@ mod tests {
         assert!(crate::clips::list_sets(&db, 1).unwrap().is_empty());
         assert!(crate::clips::load_set(&db, "cs1").is_err());
         assert_eq!(titles(&db), vec![("Promo".into(), 1)]);
-        assert_eq!(crate::runs::links_state(&db, &[item.link.clone()]).unwrap(), vec![LinkState::Trashed {
-            trash_id: item.id.clone()
-        }]);
+        assert_eq!(
+            crate::runs::links_state(&db, &[item.link.clone()]).unwrap(),
+            vec![LinkState::Trashed { trash_id: item.id.clone() }]
+        );
 
         restore_link(&db, &RunLink::ClipSet { id: "cs1".into() }, "app").unwrap();
         assert_eq!(crate::clips::list_sets(&db, 1).unwrap().len(), 1);
@@ -563,7 +560,9 @@ mod tests {
         let c = trash_clip_set(&db, "cs1", "app").unwrap();
         let now = crate::projects::now();
         let long_ago = now - KEEP_S - 60;
-        db.conn.execute("UPDATE trash SET deleted_at = ?1 WHERE id IN (?2, ?3)", params![long_ago, a.id, c.id]).unwrap();
+        db.conn
+            .execute("UPDATE trash SET deleted_at = ?1 WHERE id IN (?2, ?3)", params![long_ago, a.id, c.id])
+            .unwrap();
 
         assert_eq!(purge_expired(&db, dir.path(), now, "app").unwrap(), 2);
         let left: Vec<String> = list(&db, Some(1)).unwrap().into_iter().map(|i| i.id).collect();
@@ -629,9 +628,7 @@ mod tests {
         let item = trash_cut(&db, 1, "Promo", "app").unwrap();
         // The entry was read, then another process purged it before the restore's delete ran:
         // the trigger makes that delete touch no row.
-        db.conn
-            .execute_batch("CREATE TRIGGER gone BEFORE DELETE ON trash BEGIN SELECT RAISE(IGNORE); END")
-            .unwrap();
+        db.conn.execute_batch("CREATE TRIGGER gone BEFORE DELETE ON trash BEGIN SELECT RAISE(IGNORE); END").unwrap();
         assert!(matches!(restore(&db, &item.id, "app"), Err(Error::NotFound(_))));
         assert!(titles(&db).is_empty(), "the restore rolled back");
         let runs = db.runs_for_project(1, 10).unwrap();

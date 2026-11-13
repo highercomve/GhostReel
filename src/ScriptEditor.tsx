@@ -9,6 +9,8 @@ import ScrollPanel from "./editor/ScrollPanel";
 import DurationField from "./editor/DurationField";
 import { fpsValue } from "./editor/timecode";
 import TextInspector from "./editor/TextInspector";
+import { BeatCardFields, CutCardSettings } from "./editor/CardInspector";
+import { beatTimes, clipSeconds, clipsSeconds, editedCard, editedCardStyle, hasCard, scriptLength } from "./editor/cards";
 import AgentPicker from "./agents/AgentPicker";
 import {
   applyTitleStyleToAll,
@@ -59,15 +61,18 @@ import {
   projectView,
   saveScript,
   scriptOverlays,
+  scriptSectionCards,
   videoFrames,
   videoTranscript,
   type Beat,
+  type CardStyle,
   type Fix,
   type FrameRow,
   type Issue,
   type Overlays,
   type Script,
   type ScriptClip,
+  type SectionCard,
   type TranscriptSegment,
   type VideoRow,
 } from "./api";
@@ -145,6 +150,8 @@ const ScriptEditor = forwardRef<ScriptEditorHandle, ScriptEditorProps>(function 
   // What the last save's deterministic repair changed, and a fix being applied.
   const [repairNotes, setRepairNotes] = useState<string[]>([]);
   const [fixing, setFixing] = useState(false);
+  // Turning section cards on or off asks the backend to write or remove them.
+  const [cardsBusy, setCardsBusy] = useState(false);
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -398,6 +405,31 @@ const ScriptEditor = forwardRef<ScriptEditorHandle, ScriptEditorProps>(function 
     updateBeat(bIdx, { clips: newClips });
   };
 
+  // Section cards. A hand edit clears `generated`, so turning cards on again leaves it alone.
+  const editCard = (idx: number, patch: Partial<SectionCard>) => {
+    if (!script) return;
+    updateBeat(idx, { card: editedCard(script.beats[idx].card, patch) });
+  };
+  const removeCard = (idx: number) => updateBeat(idx, { card: undefined });
+  const editCardStyle = (patch: Partial<CardStyle>) => {
+    if (!script) return;
+    setScript({ ...script, card_style: editedCardStyle(script.card_style, patch) });
+  };
+  // On: the backend writes a card before each beat that opens a chapter (keeping the ones edited
+  // by hand); off: it removes them all. The returned script is an ordinary edit: undoable, unsaved.
+  const setSectionCards = async (on: boolean) => {
+    if (!script) return;
+    setCardsBusy(true);
+    setError(null);
+    try {
+      setScript(await scriptSectionCards(script, on));
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setCardsBusy(false);
+    }
+  };
+
   if (loading) {
     return <div className="card muted">Loading script...</div>;
   }
@@ -406,9 +438,10 @@ const ScriptEditor = forwardRef<ScriptEditorHandle, ScriptEditorProps>(function 
     return <div className="card muted">No script loaded.</div>;
   }
 
-  const totalDuration = script.beats
-    .flatMap((b) => b.clips)
-    .reduce((sum, c) => sum + Math.max(0, c.out_s - c.in_s), 0);
+  // How long the cut plays: its clips and its section cards.
+  const totalDuration = scriptLength(script);
+  const times = beatTimes(script);
+  const cardsOn = script.beats.some(hasCard);
 
   const targetDuration = script.target_duration_s ?? 0;
   // Compared in whole frames: lengths are sums of float clip ranges, so a full frame over can
@@ -438,6 +471,7 @@ const ScriptEditor = forwardRef<ScriptEditorHandle, ScriptEditorProps>(function 
   const selTitle = selKind === "t" && beat ? overlays?.titles.find((o) => o.beat_index === selBeat) ?? null : null;
   const selCue = selKind === "cap" ? overlays?.captions.find((o, i) => o.cue && cueKey(o.cue, i) === selectedBlock)?.cue ?? null : null;
   const textAvailable = selKind === "t" ? beat != null : selKind === "cap";
+  const cardSelected = selKind === "card" && beat != null;
   const inspTab: "clip" | "beat" | "cut" | "text" =
     inspPick === "text" && textAvailable ? "text"
     : inspPick === "clip" && clip ? "clip"
@@ -448,7 +482,8 @@ const ScriptEditor = forwardRef<ScriptEditorHandle, ScriptEditorProps>(function 
     : beat ? "beat"
     : "cut";
   const portrait = (overlays?.height ?? script.height ?? 0) > (overlays?.width ?? script.width ?? 0);
-  const beatStartOf = (bIdx: number) => script.beats.slice(0, bIdx).reduce((t, b) => t + beatDuration(b), 0);
+  // Where a beat's clips (and so its titles) begin: after the beat's card.
+  const beatStartOf = (bIdx: number) => times[bIdx]?.clipsStart ?? 0;
   const setTitleTimes = (bIdx: number, startRel: number | null, endRel: number | null) => {
     const dur = beatDuration(script.beats[bIdx]);
     const s0 = startRel == null || startRel <= 0.001 ? undefined : +startRel.toFixed(3);
@@ -466,7 +501,10 @@ const ScriptEditor = forwardRef<ScriptEditorHandle, ScriptEditorProps>(function 
   const fps = fpsValue(script.fps);
 
   const selectBeat = (bIdx: number) => setSelectedBlock(`beat-${bIdx}`);
-  const beatDuration = (b: Beat) => b.clips.reduce((sum, c) => sum + Math.max(0, c.out_s - c.in_s), 0);
+  /** Seconds of a beat's clips: the stretch its titles and bed run over. */
+  const beatDuration = clipsSeconds;
+  /** What the beat takes in the finished cut, its card included. */
+  const beatLength = (bIdx: number) => times[bIdx].end - times[bIdx].cardStart;
   const issueTone = (beatId: string) => {
     const mine = issues.filter((i) => i.beat_id === beatId);
     if (mine.some((i) => i.severity === "error")) return "bad";
@@ -657,7 +695,7 @@ const ScriptEditor = forwardRef<ScriptEditorHandle, ScriptEditorProps>(function 
                         <span className="nle-beat-purpose">{b.purpose || "untitled"}</span>
                         <span className="nle-beat-meta">
                           {tone && <span className={`nle-dot ${tone}`} title={tone === "bad" ? "Has errors" : "Has warnings"} />}
-                          {n} {n === 1 ? "clip" : "clips"} · {clock(beatDuration(b))}
+                          {n} {n === 1 ? "clip" : "clips"}{hasCard(b) ? " + card" : ""} · {clock(beatLength(bIdx))}
                         </span>
                       </button>
                       <span className="nle-beat-tools">
@@ -726,7 +764,7 @@ const ScriptEditor = forwardRef<ScriptEditorHandle, ScriptEditorProps>(function 
           onControls={handleControls}
           trackMonitor={trackMonitor}
           overlays={overlays}
-          selectedOverlay={selKind === "t" || selKind === "cap" ? selectedBlock : null}
+          selectedOverlay={selKind === "t" || selKind === "cap" || selKind === "card" ? selectedBlock : null}
           onSelectOverlay={(k) => setSelectedBlock(k)}
           onOverlayMove={isAiWorking ? undefined : onOverlayMove}
           onOverlayResize={onOverlayResize}
@@ -763,10 +801,9 @@ const ScriptEditor = forwardRef<ScriptEditorHandle, ScriptEditorProps>(function 
         </div>
         <ScrollPanel className="nle-panel-body nle-inspector-body" label="Inspector">
           {inspTab === "clip" && clip && beat && selBeat != null && selClip != null && (() => {
-            const len = Math.max(0, clip.out_s - clip.in_s);
+            const len = clipSeconds(clip);
             const clipStart =
-              script.beats.slice(0, selBeat).reduce((t, b) => t + beatDuration(b), 0) +
-              beat.clips.slice(0, selClip).reduce((t, c) => t + Math.max(0, c.out_s - c.in_s), 0);
+              beatStartOf(selBeat) + beat.clips.slice(0, selClip).reduce((t, c) => t + clipSeconds(c), 0);
             const underPlayhead = playhead >= clipStart - 1e-6 && playhead <= clipStart + len + 1e-6;
             const playheadSource = underPlayhead ? clip.in_s + (playhead - clipStart) : null;
             const maxOut = videosMap[clip.video_id]?.duration_s ?? Number.MAX_SAFE_INTEGER;
@@ -985,7 +1022,7 @@ const ScriptEditor = forwardRef<ScriptEditorHandle, ScriptEditorProps>(function 
                 <span className="insp-crumb-id">{beat.id}</span>
                 <span className="small muted">
                   Beat {selBeat + 1} of {script.beats.length} · {beat.clips.length} {beat.clips.length === 1 ? "clip" : "clips"} ·{" "}
-                  {clock(beatDuration(beat))}
+                  {clock(beatLength(selBeat))}
                 </span>
               </div>
               <label className="nle-insp-field">
@@ -1015,6 +1052,14 @@ const ScriptEditor = forwardRef<ScriptEditorHandle, ScriptEditorProps>(function 
                   placeholder="Title or lower third…"
                 />
               </label>
+              <BeatCardFields
+                script={script}
+                beat={beat}
+                selected={cardSelected}
+                disabled={isAiWorking}
+                onEdit={(patch) => editCard(selBeat, patch)}
+                onRemove={() => removeCard(selBeat)}
+              />
               <div className="nle-insp-row">
                 <button type="button" className="small" onClick={() => setLeftTab("media")} title="Pick footage in the Media bin; it is added to the end of this beat">
                   <Plus size={14} strokeWidth={2} aria-hidden /> Add clip from Media
@@ -1061,6 +1106,14 @@ const ScriptEditor = forwardRef<ScriptEditorHandle, ScriptEditorProps>(function 
                   </span>
                 )}
               </label>
+              <CutCardSettings
+                script={script}
+                on={cardsOn}
+                busy={cardsBusy}
+                disabled={isAiWorking}
+                onToggle={(on) => void setSectionCards(on)}
+                onStyle={editCardStyle}
+              />
               <div className="nle-insp-row">
                 <span className="small muted">
                   Version {version ?? "–"} · {script.beats.length} {script.beats.length === 1 ? "beat" : "beats"} ·{" "}
@@ -1084,7 +1137,7 @@ const ScriptEditor = forwardRef<ScriptEditorHandle, ScriptEditorProps>(function 
                 {script.beats.map((b, i) => (
                   <li key={b.id}>
                     <button type="button" className="ghost small" onClick={() => { selectBeat(i); setInspPick("beat"); }} title={b.purpose}>
-                      <span>{b.purpose || b.id}</span><strong>{clock(beatDuration(b))}</strong>
+                      <span>{b.purpose || b.id}</span><strong>{clock(beatLength(i))}</strong>
                     </button>
                   </li>
                 ))}
@@ -1175,6 +1228,10 @@ const ScriptEditor = forwardRef<ScriptEditorHandle, ScriptEditorProps>(function 
               }}
               onSplit={splitClip}
               onDelete={deleteAt}
+              onDeleteCard={(bIdx) => {
+                removeCard(bIdx);
+                selectBeat(bIdx);
+              }}
               onToggleTrack={toggleTrackAt}
               onUnmute={(bIdx, cIdx) => updateClip(bIdx, cIdx, { audio: "source" })}
               monitor={trackMonitor}
@@ -1341,7 +1398,7 @@ const KEY_GROUPS: KeyGroup[] = [
       { keys: [["S"]], what: "Snap both edges to sentence ends" },
       { keys: [["C"], ["Ctrl", "K"]], what: "Blade: cut the clip at the playhead" },
       { keys: [["M"]], what: "Audio block: track on or off (a muted clip: unmute)" },
-      { keys: [["Delete"]], what: "Remove the selected clip or bed" },
+      { keys: [["Delete"]], what: "Remove the selected clip, bed or section card" },
       { keys: [["Z"]], what: "Zoom to the selected beat, again to fit" },
       { keys: [["="], ["-"], ["\\"]], what: "Zoom in / out / fit" },
       { keys: [["Space"]], what: "Play / pause" },

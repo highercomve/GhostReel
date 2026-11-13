@@ -26,8 +26,10 @@ static FIND_CLIP_CANDIDATES: ToolSpec = ToolSpec {
     returns: "{total, candidates}: each candidate has an id, video_id, in_s/out_s, text, a visual label (faces / \
               screen / mixed, from keyframe descriptions), face numbers from face tracking, speakers when known, \
               and a code prescore. Best prescore first, at most `limit`.",
-    misuse: &["A candidate is where speech is clean, not a judgement that it is good: read its transcript before saving it."],
-    chains_with: &["get_transcript around the ones you like, then check_clips, then save_clips."],
+    misuse: &[
+        "A candidate is where speech is clean, not a judgement that it is good: read its transcript before saving it.",
+    ],
+    chains_with: &["get_manifest around the ones you like, then check_clips, then save_clips."],
     params: &[
         PROJECT,
         ToolParam::new("min_s", T::Number, false, "default 20."),
@@ -67,8 +69,9 @@ fn clip_options(a: Args<'_>) -> Result<crate::clips::ClipOptions, ToolError> {
 
 fn clip_picks(a: Args<'_>) -> Result<Vec<crate::clips::Pick>, ToolError> {
     let raw = a.get("clips").ok_or_else(|| ToolError::invalid("missing 'clips' array"))?;
-    let picks: Vec<crate::clips::Pick> = serde_json::from_value(raw.clone())
-        .map_err(|e| ToolError::Invalid(format!("clips must be [{{video_id, in_s, out_s, title?, hook?, ...}}]: {e}")))?;
+    let picks: Vec<crate::clips::Pick> = serde_json::from_value(raw.clone()).map_err(|e| {
+        ToolError::Invalid(format!("clips must be [{{video_id, in_s, out_s, title?, hook?, ...}}]: {e}"))
+    })?;
     if picks.is_empty() {
         return Err(ToolError::invalid("no clips given"));
     }
@@ -103,7 +106,12 @@ static CHECK_CLIPS: ToolSpec = ToolSpec {
     chains_with: &["save_clips with the same list once errors is 0."],
     params: &[
         PROJECT,
-        ToolParam::new("clips", T::List(&T::Object), true, "[{video_id, in_s, out_s, title?, hook?, quote?, why?, score?}]"),
+        ToolParam::new(
+            "clips",
+            T::List(&T::Object),
+            true,
+            "[{video_id, in_s, out_s, title?, hook?, quote?, why?, score?}]",
+        ),
         ToolParam::new("format", FORMAT, false, ""),
         ToolParam::new("min_s", T::Number, false, ""),
         ToolParam::new("max_s", T::Number, false, ""),
@@ -139,7 +147,12 @@ static SAVE_CLIPS: ToolSpec = ToolSpec {
     chains_with: &["list_clip_sets to see the set with its live checks."],
     params: &[
         PROJECT,
-        ToolParam::new("clips", T::List(&T::Object), true, "[{video_id, in_s, out_s, title, hook, quote?, why?, score?}]"),
+        ToolParam::new(
+            "clips",
+            T::List(&T::Object),
+            true,
+            "[{video_id, in_s, out_s, title, hook, quote?, why?, score?}]",
+        ),
         ToolParam::new("brief", T::String, false, ""),
         ToolParam::new("format", FORMAT, false, ""),
         ToolParam::new("min_s", T::Number, false, ""),
@@ -182,7 +195,9 @@ static GENERATE_CLIPS: ToolSpec = ToolSpec {
     when: "When GhostReel's own models should do the picking. Slow: minutes. Agents default to the app's choice (see \
            list_agents). Not available from inside a clip run or a script chat, which are model runs already.",
     returns: "The set, each clip's script id and issues, and the run log with timings and which agent ran each job.",
-    misuse: &["Called from inside a clip run or a script chat it is refused: pick with find_clip_candidates and save_clips."],
+    misuse: &[
+        "Called from inside a clip run or a script chat it is refused: pick with find_clip_candidates and save_clips.",
+    ],
     chains_with: &["list_clip_sets for the saved set."],
     params: &[
         PROJECT,
@@ -192,14 +207,24 @@ static GENERATE_CLIPS: ToolSpec = ToolSpec {
         ToolParam::new("max_s", T::Number, false, "default 60."),
         ToolParam::new("format", FORMAT, false, "default original."),
         ToolParam::new("video_ids", T::List(&T::Integer), false, "default: the whole library."),
-        ToolParam::new("worker_only", T::Boolean, false, "default false: code picks instead of the orchestrator model."),
+        ToolParam::new(
+            "worker_only",
+            T::Boolean,
+            false,
+            "default false: code picks instead of the orchestrator model.",
+        ),
         ToolParam::new(
             "layout",
             T::Enum(&["follow_speaker", "stacked", "fixed"]),
             false,
             "framing for 9:16 / 1:1 (default follow_speaker: crop on whoever talks).",
         ),
-        ToolParam::new("orchestrator", T::String, false, "agent id that picks the final clips (default: the app's choice)."),
+        ToolParam::new(
+            "orchestrator",
+            T::String,
+            false,
+            "agent id that picks the final clips (default: the app's choice).",
+        ),
         ToolParam::new("agents", T::List(&T::String), false, "worker agent ids (default: the app's choice)."),
         ToolParam::new(
             "max_parallel",

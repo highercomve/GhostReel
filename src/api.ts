@@ -112,6 +112,8 @@ export interface PipelineConfig {
   steadiness: boolean;
   faces: boolean;
   speakers?: boolean;
+  speech?: boolean;
+  chapters?: boolean;
 }
 
 export interface GlossaryTerm {
@@ -481,6 +483,8 @@ export type TaskKind =
   | { type: "steadiness"; project_id: number; force?: boolean }
   | { type: "faces"; project_id: number; force?: boolean }
   | { type: "speakers"; project_id: number; force?: boolean }
+  | { type: "speech"; project_id: number; force?: boolean }
+  | { type: "chapters"; project_id: number; force?: boolean }
   | { type: "clips"; project_id: number; options: ClipOptions }
   | { type: "export_clips"; set_id: string; dir: string; accepted_only: boolean };
 
@@ -514,6 +518,9 @@ export interface PlannedSegment {
   beat_id: string;
   mute: boolean;
   has_audio: boolean;
+  /** Set on a section card: its background colour (`#rrggbb`). A card has video_id 0, no path and
+   * no sound; `out_s` is how long it plays. */
+  card?: string;
 }
 
 export const enqueueIndex = (projectId: number) => call<number>("enqueue_index", { projectId });
@@ -523,6 +530,10 @@ export const enqueueFaces = (projectId: number, force = false) =>
   call<number>("enqueue_faces", { projectId, force });
 export const enqueueSpeakers = (projectId: number, force = false) =>
   call<number>("enqueue_speakers", { projectId, force });
+export const enqueueSpeech = (projectId: number, force = false) =>
+  call<number>("enqueue_speech", { projectId, force });
+export const enqueueChapters = (projectId: number, force = false) =>
+  call<number>("enqueue_chapters", { projectId, force });
 /** `out`: save the rendered MP4 there (demo export) instead of the previews folder. */
 export const enqueuePreview = (
   scriptId: number,
@@ -794,6 +805,10 @@ export interface ScriptClip {
    * automatic track; empty = silent. `audio: "mute"` silences the clip regardless. */
   tracks?: number[];
   why?: string;
+  /** The transcript sentences the clip was written with (`s412`, `s412@3` for a word): code resolved
+   * them to `in_s`/`out_s`, which are what plays. Kept as the clip's own note of what it was meant to say. */
+  from?: string;
+  to?: string;
   /** How the clip is cropped to the cut's shape; absent = the script's framing. */
   framing?: Framing;
 }
@@ -893,6 +908,27 @@ export interface Beat {
   clips: ScriptClip[];
   bed?: AudioBed | null;
   notes?: string;
+  /** A full-screen card played before this beat's clips (the title of the section it opens). */
+  card?: SectionCard | null;
+}
+
+/** A section card: a plain full-screen colour with a title. It takes time on the timeline like a clip. */
+export interface SectionCard {
+  text: string;
+  /** Seconds on screen; absent = the cut's `card_style.duration_s`, else 2 s. */
+  duration_s?: number;
+  /** `#rrggbb`; absent = the cut's, else black. */
+  background?: string;
+  style?: TextStyle;
+  /** True when GhostReel wrote it; any hand edit clears it so generating again leaves it alone. */
+  generated?: boolean;
+}
+
+/** What every section card of a cut starts from (a card's own fields win). */
+export interface CardStyle {
+  duration_s?: number;
+  background?: string;
+  style?: TextStyle;
 }
 
 /** Burnt-in text style; every field optional (falls back to the title or caption defaults). */
@@ -964,6 +1000,8 @@ export interface Script {
   caption_edits?: CueEdit[];
   /** Which agents work on this cut; absent = the app's choice. */
   agents?: AgentSelection | null;
+  /** The look of this cut's section cards. */
+  card_style?: CardStyle | null;
 }
 
 export interface Cue {
@@ -1004,7 +1042,7 @@ export interface ResolvedStyle {
 export type VAnchor = "middle" | "bottom";
 
 export interface Overlay {
-  kind: "title" | "caption";
+  kind: "title" | "caption" | "card";
   beat_index?: number;
   start_s: number;
   end_s: number;
@@ -1014,12 +1052,16 @@ export interface Overlay {
   v_anchor: VAnchor;
   style: ResolvedStyle;
   cue?: Cue;
+  /** Cards: the full-frame colour (`#rrggbb`) behind the text. */
+  background?: string;
 }
 
 export interface Overlays {
   width: number;
   height: number;
   titles: Overlay[];
+  /** Section cards, one per beat that has one, on the cut's clock. */
+  cards: Overlay[];
   captions: Overlay[];
   caption_style: ResolvedStyle;
   caption_x: number;
@@ -1036,11 +1078,13 @@ export interface Issue {
   fixes?: Fix[];
 }
 
-/** A change that fixes an issue: move a clip's bounds, frame a stretch another way, or run an
- * indexing stage (turning it on first when `enable`). Times are source seconds. */
+/** A change that fixes an issue: move a clip's bounds, frame a stretch another way, set what a
+ * clip plays, or run an indexing stage (turning it on first when `enable`). Times are source
+ * seconds. */
 export type FixAction =
   | { kind: "trim"; beat_id: string; clip_index: number; in_s: number; out_s: number }
   | { kind: "set_layout"; beat_id: string; clip_index: number; from_s: number; to_s: number; layout: Layout }
+  | { kind: "set_audio"; beat_id: string; clip_index: number; audio: "source" | "mute" }
   | { kind: "run_stage"; stage: string; enable: boolean };
 
 export type Fix = FixAction & { label: string };
@@ -1246,6 +1290,11 @@ export const scriptCaptions = (script: Script) =>
 /** Titles and captions laid out as a render burns them (hidden cues included, flagged). */
 export const scriptOverlays = (script: Script) =>
   call<Overlays>("script_overlays", { script });
+
+/** Turns section cards on (one before each beat that opens a new chapter, titled after it; cards
+ * edited by hand are kept) or off (every card removed). Returns the changed script, unsaved. */
+export const scriptSectionCards = (script: Script, on: boolean) =>
+  call<Script>("script_section_cards", { script, on });
 
 export const scriptFraming = (script: Script) =>
   call<ClipFraming[]>("script_framing", { script });

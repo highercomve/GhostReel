@@ -141,7 +141,8 @@ export default function TextOverlays({ items, frameH, frameRef, editable, select
     e.stopPropagation();
     e.preventDefault();
     onSelect(key);
-    if (!editable) return;
+    // A section card is edited in the inspector; its text is not dragged around the frame.
+    if (!editable || o.kind === "card") return;
     const frame = frameRef.current?.getBoundingClientRect();
     const el = (e.currentTarget as HTMLElement).closest<HTMLElement>(".lp-ovl");
     const r = el?.getBoundingClientRect();
@@ -175,10 +176,11 @@ export default function TextOverlays({ items, frameH, frameRef, editable, select
         const l = live?.key === key ? live : null;
         const css = overlayCss(o.style, frameH, l?.size);
         const isSel = selected === key;
+        const movable = editable && o.kind !== "card";
         return (
           <div
             key={key}
-            className={`lp-ovl lp-ovl-${o.kind} ${editable ? "editable" : ""} ${isSel ? "selected" : ""}`}
+            className={`lp-ovl lp-ovl-${o.kind} ${editable ? "editable" : ""} ${movable ? "" : "fixed"} ${isSel ? "selected" : ""}`}
             style={{
               ...css.block,
               left: `${(l?.x ?? o.x) * 100}%`,
@@ -188,14 +190,20 @@ export default function TextOverlays({ items, frameH, frameRef, editable, select
             onPointerDown={(e) => start(e, key, o, "move")}
             onClick={(e) => e.stopPropagation()}
             onDoubleClick={(e) => e.stopPropagation()}
-            title={editable ? `${o.kind === "title" ? "Title" : "Caption"}: drag to move, Shift-drag or the corner to resize, arrows nudge` : undefined}
+            title={
+              o.kind === "card"
+                ? "Section card: edit it in the inspector"
+                : editable
+                  ? `${o.kind === "title" ? "Title" : "Caption"}: drag to move, Shift-drag or the corner to resize, arrows nudge`
+                  : undefined
+            }
           >
             {o.lines.map((line, j) => (
               <div key={j} className="lp-ovl-line">
                 <span style={css.line}>{line}</span>
               </div>
             ))}
-            {isSel && editable && (
+            {isSel && movable && (
               <span className="lp-ovl-handle" onPointerDown={(e) => start(e, key, o, "resize")} aria-hidden="true" />
             )}
           </div>

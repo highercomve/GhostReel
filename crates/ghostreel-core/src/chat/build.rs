@@ -485,7 +485,8 @@ pub fn lay_out(project: &Project, lines: &[Quote], shots: &[Option<Shot>], targe
             b - q.in_s >= MIN_SPEAKER_S && (MIN_CUTAWAY_S..=MAX_CUTAWAY_S).contains(&picture)
         });
 
-        let mut clips = vec![ScriptClip {
+        let mut clips = vec![ScriptClip { exact: false,
+            sentences: None,
             framing: None,
             video_id: q.video_id,
             in_s: q.in_s,
@@ -499,7 +500,8 @@ pub fn lay_out(project: &Project, lines: &[Quote], shots: &[Option<Shot>], targe
         if let (Some(cut_at), Some(Some(shot))) = (cut_at, shots.get(i)) {
             let picture_s = q.out_s - cut_at;
             let start = (shot.t_s - picture_s / 2.0).max(0.0);
-            clips.push(ScriptClip {
+            clips.push(ScriptClip { exact: false,
+                sentences: None,
                 framing: None,
                 video_id: shot.video_id,
                 in_s: start,
@@ -517,6 +519,7 @@ pub fn lay_out(project: &Project, lines: &[Quote], shots: &[Option<Shot>], targe
             title_layout: None,
             clips,
             bed: Some(AudioBed {
+                sentences: None,
                 video_id: q.video_id,
                 in_s: q.in_s,
                 out_s: q.out_s,
@@ -525,6 +528,7 @@ pub fn lay_out(project: &Project, lines: &[Quote], shots: &[Option<Shot>], targe
                 tracks: None,
             }),
             notes: None,
+            card: None,
         });
     }
     Script {
@@ -539,6 +543,7 @@ pub fn lay_out(project: &Project, lines: &[Quote], shots: &[Option<Shot>], targe
         width: Some(project.width),
         height: Some(project.height),
         beats,
+        card_style: None,
     }
 }
 

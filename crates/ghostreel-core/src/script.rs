@@ -126,8 +126,24 @@ pub enum Audio {
     Mute,
 }
 
+/// The sentences a clip or a bed was asked for: `from` and `to` are transcript sentence ids
+/// (`s412`, see [`crate::sentences`]), each optionally `@n` for the n-th word of the sentence
+/// (`s412@3`). Code resolves them to seconds; the seconds are what plays and what every tool
+/// reads, the range is kept so a later tool can show what the clip was meant to say.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SentenceRange {
+    pub from: String,
+    pub to: String,
+}
+
 /// A clip used in a script beat.
+///
+/// Written either with seconds (`in_s`, `out_s`) or with sentences (`from`, `to`; see
+/// [`SentenceRange`]). A clip that arrives with sentences only has `in_s` and `out_s` of `0.0`
+/// until [`crate::sentences::resolve_script`] has run; everything that takes a script from outside
+/// runs it first.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "ScriptClipWire")]
 pub struct ScriptClip {
     pub video_id: i64,
     pub in_s: f64,
@@ -144,6 +160,91 @@ pub struct ScriptClip {
     /// from 16:9 footage). None = the cut's `framing`, else letterboxed as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub framing: Option<crate::framing::Framing>,
+    /// The sentences the clip was asked for, when it was written that way.
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub sentences: Option<SentenceRange>,
+    /// Keep this clip's bounds exactly as written: the save path's repairs (cuts placed on the
+    /// sound, framing trims) leave it alone while they still work on the other clips.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub exact: bool,
+}
+
+/// A clip as it is written: seconds, or sentences, or both (then the seconds win).
+#[derive(Deserialize)]
+struct ScriptClipWire {
+    video_id: i64,
+    #[serde(default)]
+    in_s: Option<f64>,
+    #[serde(default)]
+    out_s: Option<f64>,
+    #[serde(default)]
+    from: Option<String>,
+    #[serde(default)]
+    to: Option<String>,
+    #[serde(default)]
+    audio: Audio,
+    #[serde(default)]
+    why: Option<String>,
+    #[serde(default)]
+    tracks: Option<Vec<u32>>,
+    #[serde(default)]
+    framing: Option<crate::framing::Framing>,
+    #[serde(default)]
+    exact: bool,
+}
+
+/// The range a clip or a bed was written with, and the seconds to start from.
+fn wire_range(
+    what: &str,
+    in_s: Option<f64>,
+    out_s: Option<f64>,
+    from: Option<String>,
+    to: Option<String>,
+) -> Result<(f64, f64, Option<SentenceRange>), String> {
+    let sentences = match (from, to) {
+        (Some(from), Some(to)) => Some(SentenceRange { from, to }),
+        (None, None) => None,
+        (Some(_), None) => {
+            return Err(format!("{what} has `from` but no `to`: give the last sentence too (to: \"s418\")"));
+        }
+        (None, Some(_)) => {
+            return Err(format!("{what} has `to` but no `from`: give the first sentence too (from: \"s412\")"));
+        }
+    };
+    match (in_s, out_s, &sentences) {
+        (Some(a), Some(b), _) => Ok((a, b, sentences)),
+        (None, None, Some(_)) => Ok((0.0, 0.0, sentences)),
+        (Some(_), None, _) | (None, Some(_), _) => Err(format!("{what} needs both in_s and out_s")),
+        (None, None, None) => {
+            Err(format!("{what} needs in_s and out_s (seconds), or from and to (sentence ids like \"s412\")"))
+        }
+    }
+}
+
+impl TryFrom<ScriptClipWire> for ScriptClip {
+    type Error = String;
+
+    fn try_from(w: ScriptClipWire) -> Result<Self, String> {
+        let (in_s, out_s, sentences) = wire_range("a clip", w.in_s, w.out_s, w.from, w.to)?;
+        Ok(ScriptClip {
+            exact: w.exact,
+            video_id: w.video_id,
+            in_s,
+            out_s,
+            audio: w.audio,
+            why: w.why,
+            tracks: w.tracks,
+            framing: w.framing,
+            sentences,
+        })
+    }
+}
+
+impl ScriptClip {
+    /// Written with sentences and not yet resolved to seconds.
+    pub fn is_unresolved(&self) -> bool {
+        self.sentences.is_some() && self.in_s == 0.0 && self.out_s == 0.0
+    }
 }
 
 /// The sound that runs under a beat while its pictures play.
@@ -152,6 +253,7 @@ pub struct ScriptClip {
 /// in a cut edit that is the normal way round. A bed names the range whose audio carries the beat,
 /// and the beat's own clips play silent under it — a J-cut, written down.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "AudioBedWire")]
 pub struct AudioBed {
     pub video_id: i64,
     pub in_s: f64,
@@ -166,9 +268,53 @@ pub struct AudioBed {
     /// automatic track (today's behaviour). Empty = silent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tracks: Option<Vec<u32>>,
+    /// The sentences the bed was asked for, when it was written that way (see [`ScriptClip`]).
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub sentences: Option<SentenceRange>,
+}
+
+#[derive(Deserialize)]
+struct AudioBedWire {
+    video_id: i64,
+    #[serde(default)]
+    in_s: Option<f64>,
+    #[serde(default)]
+    out_s: Option<f64>,
+    #[serde(default)]
+    from: Option<String>,
+    #[serde(default)]
+    to: Option<String>,
+    #[serde(default)]
+    why: Option<String>,
+    #[serde(default)]
+    inferred: bool,
+    #[serde(default)]
+    tracks: Option<Vec<u32>>,
+}
+
+impl TryFrom<AudioBedWire> for AudioBed {
+    type Error = String;
+
+    fn try_from(w: AudioBedWire) -> Result<Self, String> {
+        let (in_s, out_s, sentences) = wire_range("a bed", w.in_s, w.out_s, w.from, w.to)?;
+        Ok(AudioBed {
+            video_id: w.video_id,
+            in_s,
+            out_s,
+            why: w.why,
+            inferred: w.inferred,
+            tracks: w.tracks,
+            sentences,
+        })
+    }
 }
 
 impl AudioBed {
+    /// Written with sentences and not yet resolved to seconds.
+    pub fn is_unresolved(&self) -> bool {
+        self.sentences.is_some() && self.in_s == 0.0 && self.out_s == 0.0
+    }
+
     pub fn duration_s(&self) -> f64 {
         (self.out_s - self.in_s).max(0.0)
     }
@@ -194,6 +340,51 @@ pub struct Beat {
     pub bed: Option<AudioBed>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
+    /// A full-screen card shown before the beat's clips: the title of the section it opens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub card: Option<SectionCard>,
+}
+
+/// A section card: a plain full-screen background with a title, played before a beat's clips. It
+/// is part of the cut like a clip is — it takes time on the timeline, and every field can be
+/// edited after it was generated. What it leaves out comes from the cut's [`CardStyle`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SectionCard {
+    pub text: String,
+    /// Seconds on screen. None = the cut's `card_style.duration_s`, else [`DEFAULT_CARD_S`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_s: Option<f64>,
+    /// Background colour, `#rrggbb`. None = the cut's, else black.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub background: Option<String>,
+    /// This card's text style, over the cut's card style.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub style: Option<TextStyle>,
+    /// GhostReel wrote this card from the beat; cleared when someone edits it, so generating
+    /// again replaces only the cards nobody touched.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub generated: bool,
+}
+
+/// How long a section card stays on screen unless it or the cut says otherwise (s).
+pub const DEFAULT_CARD_S: f64 = 2.0;
+/// The range a card's duration is kept in (s).
+pub const CARD_S_RANGE: (f64, f64) = (0.5, 10.0);
+
+/// The look every section card of a cut starts from.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CardStyle {
+    /// Seconds each card stays on screen. None = [`DEFAULT_CARD_S`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_s: Option<f64>,
+    /// Background colour, `#rrggbb`. None = black.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub background: Option<String>,
+    /// Text style of every card, over the card defaults (large bold white, centred).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub style: Option<TextStyle>,
 }
 
 /// How burnt-in text looks: titles and speech captions. Every field is optional; what is left out
@@ -379,6 +570,18 @@ pub struct Script {
     /// Which agents work on this cut (script chat turns, re-drafts). `None` = the app's choice.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agents: Option<crate::agents::AgentSelection>,
+    /// The look of this cut's section cards (a beat's own `card` fields win).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub card_style: Option<CardStyle>,
+}
+
+/// Where a beat sits on the cut's timeline: its card (if any) plays from `card_start_s` to
+/// `clips_start_s`, its clips from there to `end_s`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BeatTime {
+    pub card_start_s: f64,
+    pub clips_start_s: f64,
+    pub end_s: f64,
 }
 
 impl Script {
@@ -402,9 +605,60 @@ impl Script {
         Ok(script)
     }
 
-    /// Total duration of all clips across all beats.
+    /// Total duration of all clips across all beats: the footage, without section cards (what
+    /// fitting to a target length shortens). [`Script::length_s`] is how long the cut plays.
     pub fn total_duration_s(&self) -> f64 {
         self.beats.iter().flat_map(|b| &b.clips).map(|c| (c.out_s - c.in_s).max(0.0)).sum()
+    }
+
+    /// How long the cut plays: its clips and its section cards.
+    pub fn length_s(&self) -> f64 {
+        self.total_duration_s() + self.cards_duration_s()
+    }
+
+    /// Time taken by section cards.
+    pub fn cards_duration_s(&self) -> f64 {
+        self.beats.iter().map(|b| self.card_s(b)).sum()
+    }
+
+    /// How long `beat`'s card stays on screen: 0 when it has none (or one with no text).
+    pub fn card_s(&self, beat: &Beat) -> f64 {
+        let Some(card) = beat.card.as_ref().filter(|c| !c.text.trim().is_empty()) else { return 0.0 };
+        let base = self.card_style.as_ref().and_then(|s| s.duration_s);
+        card.duration_s
+            .or(base)
+            .filter(|d| d.is_finite())
+            .unwrap_or(DEFAULT_CARD_S)
+            .clamp(CARD_S_RANGE.0, CARD_S_RANGE.1)
+    }
+
+    /// The background colour of `beat`'s card, `#rrggbb` (black unless set).
+    pub fn card_background(&self, beat: &Beat) -> String {
+        let pick = beat
+            .card
+            .as_ref()
+            .and_then(|c| c.background.clone())
+            .or_else(|| self.card_style.as_ref().and_then(|s| s.background.clone()));
+        match pick {
+            Some(c) if c.len() == 7 && c.starts_with('#') && c[1..].chars().all(|h| h.is_ascii_hexdigit()) => {
+                c.to_lowercase()
+            }
+            _ => "#000000".into(),
+        }
+    }
+
+    /// Where every beat sits on the timeline, from raw durations (see [`BeatTime`]).
+    pub fn beat_times(&self) -> Vec<BeatTime> {
+        let mut t = 0.0;
+        self.beats
+            .iter()
+            .map(|b| {
+                let card_start_s = t;
+                let clips_start_s = t + self.card_s(b);
+                t = clips_start_s + b.clips.iter().map(|c| (c.out_s - c.in_s).max(0.0)).sum::<f64>();
+                BeatTime { card_start_s, clips_start_s, end_s: t }
+            })
+            .collect()
     }
 
     /// Total number of clips across all beats.
@@ -451,6 +705,8 @@ pub enum FixAction {
     SetLayout { beat_id: String, clip_index: usize, from_s: f64, to_s: f64, layout: crate::framing::Layout },
     /// Run an indexing stage for the project (turning it on first when `enable`).
     RunStage { stage: String, enable: bool },
+    /// Set what a clip plays: its own sound (`source`) or none (`mute`).
+    SetAudio { beat_id: String, clip_index: usize, audio: Audio },
 }
 
 impl Fix {
@@ -610,7 +866,10 @@ pub fn validate(db: &Db, project_id: i64, script: &Script) -> Result<Vec<Issue>,
         }
     }
 
-    let total_duration = script.total_duration_s();
+    // How long the cut plays: section cards take time like clips do.
+    let total_duration = script.length_s();
+    let cards_s = script.cards_duration_s();
+    let with_cards = if cards_s > 0.0 { format!(" with {cards_s:.1}s of section cards") } else { String::new() };
     if let Some(target) = script.target_duration_s.filter(|&t| t > 0.0) {
         let diff = (total_duration - target).abs();
         let pct = (diff / target) * 100.0;
@@ -621,7 +880,7 @@ pub fn validate(db: &Db, project_id: i64, script: &Script) -> Result<Vec<Issue>,
                 beat_id: None,
                 clip_index: None,
                 message: format!(
-                    "total duration {:.1}s differs from target {:.1}s by {:.0}%",
+                    "total duration {:.1}s{with_cards} differs from target {:.1}s by {:.0}%",
                     total_duration, target, pct
                 ),
             });
@@ -632,7 +891,7 @@ pub fn validate(db: &Db, project_id: i64, script: &Script) -> Result<Vec<Issue>,
                 beat_id: None,
                 clip_index: None,
                 message: format!(
-                    "total duration {:.1}s (target {:.1}s, difference {:.0}%)",
+                    "total duration {:.1}s{with_cards} (target {:.1}s, difference {:.0}%)",
                     total_duration, target, pct
                 ),
             });
@@ -642,54 +901,44 @@ pub fn validate(db: &Db, project_id: i64, script: &Script) -> Result<Vec<Issue>,
     Ok(issues)
 }
 
-/// Snap clip in_s and out_s to nearest transcript segment boundaries within 0.75s.
-/// Returns count of clips that were changed.
+/// How far a clip edge may travel to land on a sentence edge (s).
+const SNAP_REACH_S: f64 = 0.75;
+
+/// Snap each clip's `in_s` to the nearest sentence START and its `out_s` to the nearest sentence
+/// END ([`crate::sentence_split`]), within 0.75 s. Returns the count of clips that were changed.
+///
+/// An edge only ever snaps to the kind of boundary it is: a clip opens where somebody starts
+/// speaking and closes where somebody stops. Snapping to the nearest boundary of either kind sent
+/// an out point to the NEXT speaker's first word (12.86 s, a handover from 12.02 s) and an in
+/// point to the end of the PREVIOUS speaker's line, so the cut opened on, or closed with, the
+/// wrong voice. Muted clips are left alone: they carry no voice, and the speech of the video a
+/// cutaway was taken from is not where it should start or end.
 pub fn snap_to_segments(db: &Db, script: &mut Script) -> Result<usize, Error> {
     let mut clips_changed = 0;
 
     for beat in &mut script.beats {
         for clip in &mut beat.clips {
+            // A muted picture (a cutaway, the quiet image a cut closes on) has no speech to land
+            // on; the speech of the video it was taken from is not its edges.
+            if clip.audio == Audio::Mute {
+                continue;
+            }
             let duration_s: Option<f64> = db
                 .conn
                 .query_row("SELECT duration_s FROM videos WHERE id = ?1", [clip.video_id], |r| r.get(0))
                 .optional()?;
             let max_dur = duration_s.unwrap_or(f64::MAX);
 
-            let mut st = db
-                .conn
-                .prepare("SELECT start_s, end_s FROM transcript_segments WHERE video_id = ?1 ORDER BY start_s")?;
-            let rows = st.query_map([clip.video_id], |r| Ok((r.get::<_, f64>(0)?, r.get::<_, f64>(1)?)))?;
+            let (starts, ends): (Vec<f64>, Vec<f64>) =
+                crate::sentence_split::edges(db, clip.video_id).into_iter().unzip();
 
-            let mut boundaries: Vec<f64> = Vec::new();
-            for r in rows {
-                let (s, e) = r?;
-                boundaries.push(s);
-                boundaries.push(e);
-            }
-
-            if boundaries.is_empty() {
+            if starts.is_empty() {
                 continue;
             }
 
-            let mut best_in = clip.in_s;
-            let mut min_diff_in = 0.75;
-            for &b in &boundaries {
-                let diff = (b - clip.in_s).abs();
-                if diff <= min_diff_in {
-                    min_diff_in = diff;
-                    best_in = b.clamp(0.0, max_dur);
-                }
-            }
-
-            let mut best_out = clip.out_s;
-            let mut min_diff_out = 0.75;
-            for &b in &boundaries {
-                let diff = (b - clip.out_s).abs();
-                if diff <= min_diff_out {
-                    min_diff_out = diff;
-                    best_out = b.clamp(0.0, max_dur);
-                }
-            }
+            let best_in = nearest_within(&starts, clip.in_s, SNAP_REACH_S).map_or(clip.in_s, |b| b.clamp(0.0, max_dur));
+            let best_out =
+                nearest_within(&ends, clip.out_s, SNAP_REACH_S).map_or(clip.out_s, |b| b.clamp(0.0, max_dur));
 
             // Never produce in >= out; skip snap if it would
             if best_in >= best_out {
@@ -706,6 +955,20 @@ pub fn snap_to_segments(db: &Db, script: &mut Script) -> Result<usize, Error> {
     }
 
     Ok(clips_changed)
+}
+
+/// The edge closest to `t` within `reach` (the later one on a tie), if any.
+fn nearest_within(edges: &[f64], t: f64, reach: f64) -> Option<f64> {
+    let mut best = None;
+    let mut best_diff = reach;
+    for &b in edges {
+        let diff = (b - t).abs();
+        if diff <= best_diff {
+            best_diff = diff;
+            best = Some(b);
+        }
+    }
+    best
 }
 
 /// Save a new version of the script. Versions are numbered past trashed ones too, so a restore
@@ -789,7 +1052,12 @@ pub fn list(db: &Db, project_id: i64) -> Result<Vec<ScriptSummary>, Error> {
     let rows = st.query_map([project_id], |r| {
         Ok((
             (r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?, r.get::<_, String>(3)?),
-            (r.get::<_, i64>(4)?, r.get::<_, Option<i64>>(5)?, r.get::<_, Option<String>>(6)?, r.get::<_, Option<String>>(7)?),
+            (
+                r.get::<_, i64>(4)?,
+                r.get::<_, Option<i64>>(5)?,
+                r.get::<_, Option<String>>(6)?,
+                r.get::<_, Option<String>>(7)?,
+            ),
         ))
     })?;
 
@@ -797,7 +1065,7 @@ pub fn list(db: &Db, project_id: i64) -> Result<Vec<ScriptSummary>, Error> {
     for row in rows {
         let ((id, title, version, json_str), (created_at, session_id, set_id, kind)) = row?;
         let (beats, clips, duration_s) = if let Ok(s) = serde_json::from_str::<Script>(&json_str) {
-            (s.beats.len(), s.clip_count(), s.total_duration_s())
+            (s.beats.len(), s.clip_count(), s.length_s())
         } else {
             (0, 0, 0.0)
         };
@@ -1005,6 +1273,7 @@ mod tests {
             width: None,
             height: None,
             beats: vec![],
+            card_style: None,
         };
         let issues = validate(&db, project.id, &empty_script).unwrap();
         assert!(issues.iter().any(|i| i.severity == IssueSeverity::Error && i.message.contains("no beats")));
@@ -1029,7 +1298,8 @@ mod tests {
                     on_screen_text: None,
                     title_layout: None,
                     clips: vec![
-                        ScriptClip {
+                        ScriptClip { exact: false,
+                            sentences: None,
                             framing: None,
                             video_id: 1,
                             in_s: 5.0,
@@ -1038,7 +1308,8 @@ mod tests {
                             why: None,
                             tracks: None,
                         },
-                        ScriptClip {
+                        ScriptClip { exact: false,
+                            sentences: None,
                             framing: None,
                             video_id: 999, // not found: Error
                             in_s: 0.0,
@@ -1050,6 +1321,7 @@ mod tests {
                     ],
                     notes: None,
                     bed: None,
+                    card: None,
                 },
                 Beat {
                     id: "b1".into(), // duplicate beat id: Warning
@@ -1057,7 +1329,8 @@ mod tests {
                     narration: None,
                     on_screen_text: None,
                     title_layout: None,
-                    clips: vec![ScriptClip {
+                    clips: vec![ScriptClip { exact: false,
+                        sentences: None,
                         framing: None,
                         video_id: 1,
                         in_s: 0.0,
@@ -1068,8 +1341,10 @@ mod tests {
                     }],
                     notes: None,
                     bed: None,
+                    card: None,
                 },
             ],
+            card_style: None,
         };
 
         let issues = validate(&db, project.id, &bad_script).unwrap();
@@ -1104,6 +1379,7 @@ mod tests {
             fps: None,
             width: None,
             height: None,
+            card_style: None,
         };
         let a1 = save_version(&db, project.id, &cut_a, None).unwrap();
         let s_a1 = load(&db, a1).unwrap();
@@ -1127,6 +1403,7 @@ mod tests {
             fps: None,
             width: None,
             height: None,
+            card_style: None,
         };
         let b1 = save_version(&db, project.id, &cut_b, None).unwrap();
         let s_b1 = load(&db, b1).unwrap();
@@ -1157,7 +1434,9 @@ mod tests {
     }
 
     fn set_of(db: &Db, id: i64) -> (Option<String>, Option<String>) {
-        db.conn.query_row("SELECT set_id, kind FROM scripts WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap()
+        db.conn
+            .query_row("SELECT set_id, kind FROM scripts WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
     }
 
     #[test]
@@ -1165,7 +1444,10 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let project = db.create_project(&NewProject::named("Clips")).unwrap();
         db.conn
-            .execute("INSERT INTO clip_sets(id, project_id, brief, created_at) VALUES ('cs1', ?1, 'Launch', 5)", [project.id])
+            .execute(
+                "INSERT INTO clip_sets(id, project_id, brief, created_at) VALUES ('cs1', ?1, 'Launch', 5)",
+                [project.id],
+            )
             .unwrap();
         let v1 = save_version(&db, project.id, &titled("Clip A"), None).unwrap();
         db.conn.execute("UPDATE scripts SET set_id = 'cs1', kind = 'clip' WHERE id = ?1", [v1]).unwrap();
@@ -1244,6 +1526,76 @@ mod tests {
         assert_eq!(again, s);
         // `box` keeps its JSON name.
         assert!(serde_json::to_string(&s).unwrap().contains(r#""box":false"#));
+    }
+
+    fn snap_clip(in_s: f64, out_s: f64) -> ScriptClip {
+        ScriptClip { exact: false,
+            sentences: None,
+            video_id: 104,
+            in_s,
+            out_s,
+            audio: Audio::Source,
+            why: None,
+            tracks: None,
+            framing: None,
+        }
+    }
+
+    /// The real handover: speaker A ends at 12.02 s and speaker B starts at 12.86 s. An out point
+    /// near the gap closes on A's END, never on B's START, and an in point opens on a START,
+    /// never on A's END.
+    #[test]
+    fn snapping_an_out_point_never_lands_on_the_next_speakers_start() {
+        let db = Db::open_in_memory().unwrap();
+        db.conn
+            .execute("INSERT INTO videos(id, content_hash, size, duration_s) VALUES (104, 'h104', 1, 300.0)", [])
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO transcript_segments(video_id, start_s, end_s, text)
+                 VALUES (104, 0.0, 12.02, 'speaker A'), (104, 12.86, 16.46, 'Esto es O Corres o Te Encaramas')",
+                [],
+            )
+            .unwrap();
+        let mut script = Script {
+            title: "t".into(),
+            target_duration_s: None,
+            fps: None,
+            width: None,
+            height: None,
+            framing: None,
+            beats: vec![Beat {
+                id: "b1".into(),
+                purpose: "p".into(),
+                narration: None,
+                on_screen_text: None,
+                title_layout: None,
+                clips: vec![
+                    // 12.6 is 0.26 s from B's start and 0.58 s from A's end: it used to snap to 12.86.
+                    snap_clip(0.2, 12.6),
+                    // 12.3 is 0.28 s from A's end and 0.56 s from B's start: it used to open on 12.02.
+                    snap_clip(12.3, 16.2),
+                ],
+                bed: None,
+                notes: None,
+                card: None,
+            }],
+            captions: None,
+            title_style: None,
+            caption_edits: Vec::new(),
+            agents: None,
+            card_style: None,
+        };
+        assert_eq!(snap_to_segments(&db, &mut script).unwrap(), 2);
+        let clips = &script.beats[0].clips;
+        assert!((clips[0].in_s - 0.0).abs() < 1e-9 && (clips[0].out_s - 12.02).abs() < 1e-9, "{:?}", clips[0]);
+        assert!((clips[1].in_s - 12.86).abs() < 1e-9 && (clips[1].out_s - 16.46).abs() < 1e-9, "{:?}", clips[1]);
+        // Nothing within reach of an END for the out point (12.86 is 0.84 s from A's end), and the
+        // in point would land on it: the snap would give in >= out, so the clip is left as it was.
+        let mut far = script.clone();
+        far.beats[0].clips = vec![snap_clip(12.3, 12.86)];
+        assert_eq!(snap_to_segments(&db, &mut far).unwrap(), 0);
+        assert_eq!((far.beats[0].clips[0].in_s, far.beats[0].clips[0].out_s), (12.3, 12.86));
     }
 
     #[test]

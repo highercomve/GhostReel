@@ -3,6 +3,114 @@
 All notable changes to GhostReel. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [SemVer](https://semver.org/) while the project is 0.x (minor = features, patch = fixes).
 
+## [Unreleased]
+
+### Added
+
+- **Manifest** (`get_manifest` tool): everything the index measured about a video on one clock —
+  chapters with summaries, each sentence with its speaker and the measured silence before and after
+  it, each change of picture with every face on screen (centre, height, how much it moves or
+  resizes, how long it is on screen, how often it touches the frame's edge), keyframe descriptions
+  and on-screen text, and stretches where the camera shakes past the video's own limit. It reports
+  measurements, never verdicts: what to use is the editing agent's call. `frames` (changes, all,
+  none) and `words` set how much it carries; `get_transcript` stays as the words alone.
+- **Section cards**: a beat's `card` plays a plain full-screen title before its clips (2 s on black
+  unless the card or the cut's `card_style` says otherwise). Cards take time on the timeline in
+  renders, the live viewer, captions, `read_cut` and the length check, and export as named gaps in
+  OTIO. `save_script` takes `section_cards: true` to write them — one before each beat that moves to
+  another chapter, titled after it — and the editor has a **Section cards** switch on the Cut tab;
+  generated cards are refreshed when generated again, edited ones are kept.
+
+- **Speech activity** indexing stage (`speech`): finds where people speak from the audio
+  itself and stores it once per video (`speech_regions`, schema v22). The video's chosen audio
+  track is streamed through ffmpeg at 16 kHz mono, measured in 10 ms frames, and voiced where
+  it rises above an adaptive threshold (a rolling noise floor and speech level, so a speaker
+  12 dB off the microphone is still found), with hysteresis, no blips under 60 ms and pauses of
+  80 ms or more kept. Existing projects get it pending: **Index now** fills it in, or run
+  `ghostreel speech --project NAME` (`--force` to measure again). It has a row and a
+  checkbox in the Project menu.
+- Cuts are placed on the sound: as the last pass of the repair chain (imports, clip runs, the
+  chat and `save_script`), a speaking clip or audio bed ends `speech_overrun_s` after its last
+  word but at least `script.cut_guard_s` (0.12 s) before the next voice, opens
+  `script.cut_lead_s` (0.15 s) before its first, rounds the end down and the start up to the
+  cut's frames, moves at most `script.cut_max_move_s` (0.8 s), and keeps the closing hold muted
+  and attached to the shot. `script.cut_to_speech = false` turns it off.
+- **Edit by sentence.** Every transcript segment has an id the model can quote, `s<segment id>`
+  (`s412`; the row id, so it is unique in the library and a sentence of another video is
+  recognised). `get_transcript` is now one line per sentence, `s412 [12:03.4 Freddy off-mic] words`
+  (JSON keeps `id` and `speaker`). A clip or audio bed may be written `{video_id, from: "s412",
+  to: "s418"}` instead of seconds, in `save_script`, `script import`, the chat's drafts and the
+  app's editor: code resolves it from the first sentence's start to the last one's end, the
+  normal repair chain places the exact cuts on the speech, and the clip keeps both its seconds and
+  its range. A sentence of another video, a `from` after its `to`, an unknown id or half a range is
+  an error that says how to fix it.
+- **`get_outline`**: the project in one call, a few thousand tokens for a 70-minute episode
+  (7.6k characters on the test fixture): videos, people, glossary and each video's chapters with
+  title, summary and standout lines. It reads the new **Chapters** stage (`chapters`, schema
+  v24): each speech video is split where the stored embeddings say the subject changes (chapters
+  of 90 s to 10 min; by length at the longest pauses when there are no embeddings) and titled and
+  summarised by the configured chat model; with no model they are stored with their first
+  sentence as the title and `ghostreel chapters --refresh-titles` titles them later. Existing
+  projects get it pending: **Index now**, the Project menu row, or `ghostreel chapters --project
+  NAME`.
+- **`read_cut`**: reads a cut back as text without rendering it. Per beat and clip it gives the
+  words heard (edge words the cut is on or through marked), who speaks, who is on screen (from
+  the same per-moment scenes as `get_scenes`; how a 9:16 or 1:1 crop frames it), a flag for each
+  cut from the measured speech (clean in silence, clips the last word, next speaker leaks in,
+  starts mid-word), the running time, the total against the target and the check's issues with
+  their fixes. It takes a `script_id` or a draft `script`.
+- The check judges cut edges from the speech stage when a video has it: a cut in the silence
+  after the last word and a guard before the next voice is clean and says nothing (it used to
+  report "cut lands on the last word; hold ~1 s" for a correctly placed cut, and an agent that
+  followed the hint added holds that broke speech and mute). Only a clipped word, a leak or a start
+  inside a word is flagged, with the same words as `read_cut` and a fix that places the cut.
+  Videos without measured speech keep the transcript's hint.
+- `get_frames` with times returns the exact frame at each time (decoded from the playback
+  proxy or the source and kept under `frames/exact/`), not the nearest keyframe; `exact: false`
+  asks for the keyframe. Every picture has a name of its own, `v104_t2799400ms.jpg`, in the
+  result and next to its caption.
+- `export_script` takes `format: "mp4"`: the full-size video through the same render as a clip
+  set's export (titles and captions burnt in, loudness matched), also `ghostreel script export
+  --format mp4`. `preview_script` and `export_script` say which is which.
+- Word timings: the local speech helper writes whisper's token timestamps, grouped into words,
+  and the server path asks for `timestamp_granularities[]=word`; they are stored per sentence
+  (`transcript_words`, schema v23) and `from: "s412@3"` / `to: "s412@5"` cuts at a word, put on the
+  nearest edge of the measured speech. Videos transcribed before this have none (redo
+  `transcribe` to get them), and an engine that gives none leaves the video without: the error says
+  so and the whole sentence is the finest cut.
+- The editor prompt, the clip worker and orchestrator prompts and the MCP instructions steer a
+  workflow (outline first, read the chapters that matter, clips by sentence id, `read_cut`, then
+  preview), say what code guarantees (the exact cut points, breaths, holds and framing) and give
+  the editorial rules (a hook in the first 3 s, one idea per beat, end on a complete thought,
+  faces when someone speaks, J/L cuts through beds, no screen share in 9:16 unless it is the
+  point) and the cost rule (text before pictures).
+
+### Fixed
+
+- A tag question talked straight through ("…10 dólares episodio, ¿ok? En API de Opus…") no longer
+  splits the thought into two sentences, so a clip cannot open on its second half. `read_cut` and the
+  save checks say when a clip opens on the rest of the sentence before it, and no longer call a tag
+  ("¿ok?", "right?") an unanswered question.
+- A sentence boundary is no longer moved onto a pause on the far side of a timed word, and a clip's
+  lead-in no longer reaches back into the previous sentence's last word.
+- `get_scenes` and framing no longer take a screen share for a two-shot: a conferencing layout
+  with tall participant tiles down one side (two tiles of 23% of the frame, taller than a
+  "framed" face) and one with a pair of small tiles in a row under bigger faces on the shared
+  screen both read as two-shots, which merged 2158-3858 s of the test podcast into one stretch
+  and hid its screen shares. Camera tiles now decide, and a screen share of 3 s or more survives
+  a long range as it does a narrow one.
+- A clip's end no longer snaps to the next speaker's first word (nor its start to the
+  previous speaker's last): `snap_to_segments` takes starts for starts and ends for ends. A
+  saved cut ending at 12.86 s as the next speaker came in at 12.86 s played the attack of his
+  first word.
+- The render no longer silences speech at the end of a clip. The fade out began where the
+  transcript said the speech ended, and everything after it was zero: when Whisper's end was
+  early, or the clip ran into more speech, up to 2 s of real speech were erased and a hold
+  after the last word played digital silence. The fade is now the last `audio_fade_s` of the
+  clip and never starts before the last voiced sound in it (with the speech stage run); the
+  closing hold plays the room's sound when no one speaks in it. Proxies built with the old fade
+  are not reused.
+
 ## [0.15.0] — 2026-11-11
 
 ### Added

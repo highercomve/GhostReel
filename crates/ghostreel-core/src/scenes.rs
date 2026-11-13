@@ -155,10 +155,43 @@ fn in_tile_band(o: &FaceObs) -> bool {
     o.cy >= 1.0 - TILE_BAND || o.cy <= TILE_BAND * 0.7 || o.cx <= TILE_SIDE_BAND || o.cx >= 1.0 - TILE_SIDE_BAND
 }
 
+/// Two tile faces are a pair when they sit in a row (same height in the picture) or a column (same
+/// distance from the side) and are about the same size: how a conferencing tool lays out its
+/// participants.
+fn tile_pair(a: &FaceObs, b: &FaceObs) -> bool {
+    let same_size = a.h.max(b.h) <= a.h.min(b.h) * 1.6;
+    let row = (a.cy - b.cy).abs() < 0.06 && (a.cx - b.cx).abs() > 0.03;
+    let column = (a.cx - b.cx).abs() < 0.06 && (a.cy - b.cy).abs() > 0.03;
+    same_size && (row || column)
+}
+
+/// Whether the faces include camera tiles over a shared screen: a pair of small faces in the tile
+/// band, or two or more tall participant tiles stacked along one side of the picture. The shared
+/// content around them can itself hold faces (a slide, a gallery, a video), big or small, which say
+/// nothing about the camera.
+fn has_camera_tiles(faces: &[&&FaceObs]) -> bool {
+    let tiles: Vec<&&&FaceObs> = faces.iter().filter(|o| o.h < FRAMED_FACE_H && in_tile_band(o)).collect();
+    let small_pair = tiles.iter().enumerate().any(|(i, a)| tiles[i + 1..].iter().any(|b| tile_pair(a, b)));
+    let tall: Vec<&&&FaceObs> = faces.iter().filter(|o| o.h >= FRAMED_FACE_H).collect();
+    // Tall tiles hug one side and stack (two hosts side by side in a real two-shot do not).
+    let on_one_side = |side: fn(f64) -> bool| tall.len() >= 2 && tall.iter().all(|o| side(o.cx));
+    let spread = |tall: &[&&&FaceObs]| {
+        let (lo, hi) = tall.iter().fold((1.0f64, 0.0f64), |(lo, hi), o| (lo.min(o.cx), hi.max(o.cx)));
+        hi - lo
+    };
+    let tall_column = (on_one_side(|cx| cx >= 0.7) || on_one_side(|cx| cx <= 0.3)) && spread(&tall) < 0.12;
+    small_pair || tall_column
+}
+
 /// The scene of one instant's faces.
 fn classify(faces: &[&FaceObs]) -> Scene {
     let faces: Vec<&&FaceObs> = faces.iter().filter(|o| o.h >= MIN_FACE_H).collect();
     let big = faces.iter().filter(|o| o.h >= FRAMED_FACE_H).count();
+    // Camera tiles with anything but one framed person beside them are a screen share: with one
+    // person framed it is a speaker view with thumbnails, and that person is the picture.
+    if big != 1 && has_camera_tiles(&faces) {
+        return Scene::ScreenShare;
+    }
     match big {
         0 if faces.is_empty() => Scene::NoFace,
         0 if faces.iter().all(|o| in_tile_band(o)) => Scene::ScreenShare,
@@ -178,10 +211,12 @@ fn classify(faces: &[&FaceObs]) -> Scene {
 /// Classify `from..to` from the faces seen in it (any order; observations outside the range are
 /// ignored). Every instant of the range lands in exactly one span; spans are in order, touch end
 /// to end, and none is shorter than [`MIN_SCENE_S`] unless the range itself is.
-pub fn segment(obs: &[FaceObs], from: f64, to: f64) -> Vec<SceneSpan> {
+/// The picture in bins of [`BIN_S`] over `from..to`: the observations in each bin, and each bin's
+/// scene (the most common among its instants).
+fn bin_labels(obs: &[FaceObs], from: f64, to: f64) -> (Vec<Vec<&FaceObs>>, Vec<Scene>) {
     let dur = to - from;
     if dur <= 0.0 {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
     let n = ((dur / BIN_S).ceil() as usize).max(1);
     let mut bins: Vec<Vec<&FaceObs>> = vec![Vec::new(); n];
@@ -204,6 +239,15 @@ pub fn segment(obs: &[FaceObs], from: f64, to: f64) -> Vec<SceneSpan> {
             majority(&votes).unwrap_or(Scene::NoFace)
         })
         .collect();
+    (bins, labels)
+}
+
+pub fn segment(obs: &[FaceObs], from: f64, to: f64) -> Vec<SceneSpan> {
+    let (bins, labels) = bin_labels(obs, from, to);
+    let n = labels.len();
+    if n == 0 {
+        return Vec::new();
+    }
     // Smooth over one bin either side, so a single missed detection doesn't flicker.
     let smoothed: Vec<Scene> = (0..n)
         .map(|i| {
@@ -361,18 +405,72 @@ pub fn load_obs(db: &Db, video_id: i64, from: f64, to: f64) -> Result<Vec<FaceOb
     Ok(rows.filter_map(Result::ok).collect())
 }
 
+/// What most of `a..b` shows when it is not faces: `"screen"` for a screen share, `"no face"` when
+/// nobody is on screen. `None` when faces fill most of it, or nothing covers it.
+pub fn picture_label(spans: &[SceneSpan], a: f64, b: f64) -> Option<&'static str> {
+    let len = (b - a).max(1e-6);
+    let share = |kind: Scene| -> f64 {
+        spans.iter().filter(|s| s.scene == kind).map(|s| (s.end.min(b) - s.start.max(a)).max(0.0)).sum::<f64>() / len
+    };
+    if share(Scene::ScreenShare) > 0.5 {
+        Some("screen")
+    } else if share(Scene::NoFace) > 0.5 {
+        Some("no face")
+    } else {
+        None
+    }
+}
+
+/// The share of `a..b` with a face on screen (a single face or a two-shot), 0-1.
+pub fn face_share(spans: &[SceneSpan], a: f64, b: f64) -> f64 {
+    let len = (b - a).max(1e-6);
+    spans
+        .iter()
+        .filter(|s| matches!(s.scene, Scene::SingleFace | Scene::TwoShot))
+        .map(|s| (s.end.min(b) - s.start.max(a)).max(0.0))
+        .sum::<f64>()
+        / len
+}
+
 /// The scenes of `from..to` of a video on the source clock; `None` when its faces were never
 /// looked for (then nothing is known, which is not the same as "no faces").
+///
+/// The whole video is segmented and the spans clipped to the range: segmenting only the range
+/// smooths differently near its edges, so two tools asking about the same moment over different
+/// ranges were told different scene edges.
 pub fn for_range(db: &Db, video_id: i64, from: f64, to: f64) -> Result<Option<Vec<SceneSpan>>, Error> {
     if !faces_analysed(db, video_id) {
         return Ok(None);
     }
-    Ok(Some(segment(&load_obs(db, video_id, from, to)?, from, to)))
+    let duration: f64 = db
+        .conn
+        .query_row("SELECT COALESCE(duration_s, 0) FROM videos WHERE id = ?1", [video_id], |r| r.get(0))
+        .unwrap_or(0.0);
+    let end = if duration > 0.0 { duration } else { to };
+    let all = segment(&load_obs(db, video_id, 0.0, end)?, 0.0, end);
+    Ok(Some(
+        all.into_iter()
+            .filter(|s| s.end > from && s.start < to)
+            .map(|s| SceneSpan { start: s.start.max(from), end: s.end.min(to), ..s })
+            .filter(|s| !s.is_empty())
+            .collect(),
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stretch_is_labelled_by_the_picture_most_of_it_shows() {
+        let span = |start, end, scene| SceneSpan { start, end, scene, faces: 1.0, face_h: 0.3 };
+        let spans =
+            [span(0.0, 10.0, Scene::TwoShot), span(10.0, 20.0, Scene::ScreenShare), span(20.0, 25.0, Scene::NoFace)];
+        assert_eq!(picture_label(&spans, 2.0, 8.0), None, "faces need no label");
+        assert_eq!(picture_label(&spans, 9.0, 15.0), Some("screen"));
+        assert_eq!(picture_label(&spans, 21.0, 24.0), Some("no face"));
+        assert!((face_share(&spans, 0.0, 20.0) - 0.5).abs() < 1e-9);
+    }
 
     /// A face every 0.2 s over `a..b`.
     fn faces(a: f64, b: f64, cx: f64, cy: f64, h: f64) -> Vec<FaceObs> {
@@ -426,6 +524,75 @@ mod tests {
         assert_eq!(segment(&obs, 0.0, 5.0)[0].scene, Scene::TwoShot);
         assert_eq!(segment(&[], 0.0, 5.0)[0].scene, Scene::NoFace);
         assert!(segment(&[], 3.0, 3.0).is_empty());
+    }
+
+    #[test]
+    fn camera_tiles_over_a_shared_screen_are_a_screen_share_whatever_the_screen_shows() {
+        // Two tall participant tiles stacked down the right side, and faces in the shared content.
+        let mut obs = faces(0.0, 10.0, 0.80, 0.22, 0.23);
+        obs.extend(faces(0.0, 10.0, 0.82, 0.71, 0.23));
+        obs.extend(faces(0.0, 10.0, 0.30, 0.72, 0.08));
+        obs.extend(faces(0.0, 10.0, 0.16, 0.67, 0.11));
+        assert_eq!(segment(&obs, 0.0, 10.0)[0].scene, Scene::ScreenShare);
+        // Small tiles in a row at the bottom, with bigger faces on the shared screen: the same.
+        let mut obs = faces(0.0, 10.0, 0.72, 0.88, 0.07);
+        obs.extend(faces(0.0, 10.0, 0.90, 0.88, 0.07));
+        obs.extend(faces(0.0, 10.0, 0.50, 0.52, 0.26));
+        obs.extend(faces(0.0, 10.0, 0.28, 0.53, 0.27));
+        assert_eq!(segment(&obs, 0.0, 10.0)[0].scene, Scene::ScreenShare);
+        // Small faces in the middle among small tiles: still the tiles decide.
+        let mut obs = faces(0.0, 10.0, 0.72, 0.87, 0.07);
+        obs.extend(faces(0.0, 10.0, 0.90, 0.88, 0.07));
+        obs.extend(faces(0.0, 10.0, 0.45, 0.41, 0.07));
+        assert_eq!(segment(&obs, 0.0, 10.0)[0].scene, Scene::ScreenShare);
+        // One person framed with thumbnails beside them is that person, not a screen.
+        let mut obs = faces(0.0, 10.0, 0.5, 0.4, 0.4);
+        obs.extend(faces(0.0, 10.0, 0.72, 0.88, 0.07));
+        obs.extend(faces(0.0, 10.0, 0.90, 0.88, 0.07));
+        assert_eq!(segment(&obs, 0.0, 10.0)[0].scene, Scene::SingleFace);
+        // Two hosts side by side stay a two-shot, tall as they are.
+        let mut obs = faces(0.0, 10.0, 0.23, 0.42, 0.45);
+        obs.extend(faces(0.0, 10.0, 0.74, 0.40, 0.44));
+        assert_eq!(segment(&obs, 0.0, 10.0)[0].scene, Scene::TwoShot);
+    }
+
+    #[test]
+    fn a_short_screen_share_survives_a_long_range_as_it_does_a_narrow_one() {
+        // Half an hour of two hosts, with an 8 s screen share and a 3.4 s one inside it.
+        let mut obs = Vec::new();
+        for (a, b, share) in [
+            (0.0, 900.0, false),
+            (900.0, 908.0, true),
+            (908.0, 1200.0, false),
+            (1200.0, 1203.4, true),
+            (1203.4, 1800.0, false),
+        ] {
+            if share {
+                obs.extend(faces(a, b, 0.72, 0.88, 0.07));
+                obs.extend(faces(a, b, 0.90, 0.88, 0.07));
+            } else {
+                obs.extend(faces(a, b, 0.23, 0.42, 0.45));
+                obs.extend(faces(a, b, 0.74, 0.40, 0.44));
+            }
+        }
+        let long = segment(&obs, 0.0, 1800.0);
+        let shares = |spans: &[SceneSpan]| -> Vec<(f64, f64)> {
+            spans.iter().filter(|s| s.scene == Scene::ScreenShare).map(|s| (s.start, s.end)).collect()
+        };
+        let long_shares = shares(&long);
+        assert_eq!(long_shares.len(), 2, "{long:?}");
+        for ((s, e), (want_s, want_e)) in long_shares.iter().zip([(900.0, 908.0), (1200.0, 1203.4)]) {
+            assert!((s - want_s).abs() <= BIN_S && (e - want_e).abs() <= BIN_S, "{long_shares:?}");
+        }
+        // The same stretches when only a minute around each is asked for.
+        for (from, to, want) in [(870.0, 940.0, (900.0, 908.0)), (1170.0, 1240.0, (1200.0, 1203.4))] {
+            let narrow = shares(&segment(&obs, from, to));
+            assert_eq!(narrow.len(), 1, "{narrow:?}");
+            assert!((narrow[0].0 - want.0).abs() <= BIN_S && (narrow[0].1 - want.1).abs() <= BIN_S, "{narrow:?}");
+        }
+        // And the mix over the long range counts them.
+        let m = mix(&long, 0.0, 1800.0);
+        assert!((m.screen_share - 11.4 / 1800.0).abs() < 0.01, "{m:?}");
     }
 
     #[test]

@@ -21,6 +21,12 @@ pub struct Segment {
 pub struct Transcript {
     pub segments: Vec<Segment>,
     pub language: Option<String>,
+    /// When each word was said, on the engine's clock, for the engines that give it (the local
+    /// helper from whisper's token timestamps, the server when it answers
+    /// `timestamp_granularities[]=word`). Empty when the engine gave none: nothing is invented.
+    /// Each word belongs to the segment it falls in when the transcript is stored.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub words: Vec<crate::sentences::Word>,
 }
 
 #[derive(Debug, Clone)]
@@ -241,9 +247,10 @@ impl LocalWorker {
         while let Some(line) = self.lines.next_line().await.map_err(|e| Error::Stt(e.to_string()))? {
             match serde_json::from_str::<AsrLine>(&line) {
                 Ok(AsrLine::Progress { percent }) => progress(duration_s * percent.clamp(0.0, 100.0) / 100.0),
-                Ok(AsrLine::Segment { start, end, text, no_speech }) => {
+                Ok(AsrLine::Segment { start, end, text, no_speech, words }) => {
                     if no_speech.unwrap_or(0.0) <= MAX_NO_SPEECH && !text.trim().is_empty() {
                         out.segments.push(Segment { start, end, text: text.trim().into() });
+                        out.words.extend(words.into_iter().map(AsrWord::into_word));
                     }
                 }
                 Ok(AsrLine::Done { language }) => {
@@ -340,7 +347,9 @@ async fn transcribe_server(
         if out.language.is_none() {
             out.language = body.language.filter(|l| !l.is_empty());
         }
+        let before = out.segments.len();
         merge_chunk(&mut out.segments, from, start, if last { f64::INFINITY } else { end }, body.segments);
+        merge_words(&mut out.words, from, &out.segments[before..], body.words);
         on_progress(end.min(duration_s));
     }
     Ok(out)
@@ -402,6 +411,16 @@ struct VerboseJson {
     language: Option<String>,
     #[serde(default)]
     segments: Option<Vec<Segment>>,
+    /// Present when the server honours `timestamp_granularities[]=word` (OpenAI's shape).
+    #[serde(default)]
+    words: Option<Vec<ServerWord>>,
+}
+
+#[derive(Deserialize)]
+struct ServerWord {
+    word: String,
+    start: f64,
+    end: f64,
 }
 
 async fn post_chunk(
@@ -418,7 +437,11 @@ async fn post_chunk(
                 .mime_str("audio/ogg")
                 .map_err(|e| Error::Stt(e.to_string()))?,
         )
-        .text("response_format", "verbose_json");
+        .text("response_format", "verbose_json")
+        // Words for cutting inside a sentence, and the segments the rest of GhostReel reads (a
+        // request for words alone may come back without them).
+        .text("timestamp_granularities[]", "word")
+        .text("timestamp_granularities[]", "segment");
     if let Some(p) = prompt {
         form = form.text("prompt", p.to_string());
     }
@@ -465,6 +488,24 @@ fn merge_chunk(
     }
 }
 
+/// Append a chunk's words (times relative to `audio_from`) to `acc`: the ones that fall in the
+/// segments this chunk contributed. The pre-roll and the overlap are heard twice; each word is
+/// kept once, with the segment that was.
+fn merge_words(
+    acc: &mut Vec<crate::sentences::Word>,
+    audio_from: f64,
+    fresh: &[Segment],
+    words: Option<Vec<ServerWord>>,
+) {
+    for w in words.unwrap_or_default() {
+        let (start, end) = (w.start + audio_from, w.end + audio_from);
+        let mid = (start + end) / 2.0;
+        if !w.word.trim().is_empty() && fresh.iter().any(|s| mid >= s.start - 0.05 && mid <= s.end + 0.05) {
+            acc.push(crate::sentences::Word { start, end: end.max(start), text: w.word.trim().to_string() });
+        }
+    }
+}
+
 /// Cut `[start, start+len]` of the audio as mono 16 kHz Opus in Ogg (small uploads).
 async fn extract_opus(ffmpeg: &Path, video: &Path, start: f64, len: f64) -> Result<Vec<u8>, Error> {
     let out = crate::proc::command(ffmpeg)
@@ -484,6 +525,20 @@ async fn extract_opus(ffmpeg: &Path, video: &Path, start: f64, len: f64) -> Resu
 
 // ---- local (ghostreel-asr) --------------------------------------------------------------------
 
+/// One word as the helper writes it: `{"w": "Esto", "s": 0.1, "e": 0.4}`.
+#[derive(Deserialize)]
+struct AsrWord {
+    w: String,
+    s: f64,
+    e: f64,
+}
+
+impl AsrWord {
+    fn into_word(self) -> crate::sentences::Word {
+        crate::sentences::Word { start: self.s, end: self.e.max(self.s), text: self.w }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 enum AsrLine {
@@ -500,6 +555,9 @@ enum AsrLine {
         text: String,
         #[serde(default)]
         no_speech: Option<f64>,
+        /// The segment's words with whisper's token times; absent from older helpers.
+        #[serde(default)]
+        words: Vec<AsrWord>,
     },
     Done {
         language: Option<String>,
@@ -580,9 +638,10 @@ async fn transcribe_local(
     while let Some(line) = lines.next_line().await.map_err(|e| Error::Stt(e.to_string()))? {
         match serde_json::from_str::<AsrLine>(&line) {
             Ok(AsrLine::Progress { percent }) => on_progress(duration_s * percent.clamp(0.0, 100.0) / 100.0),
-            Ok(AsrLine::Segment { start, end, text, no_speech }) => {
+            Ok(AsrLine::Segment { start, end, text, no_speech, words }) => {
                 if no_speech.unwrap_or(0.0) <= MAX_NO_SPEECH && !text.trim().is_empty() {
                     out.segments.push(Segment { start, end, text: text.trim().to_string() });
+                    out.words.extend(words.into_iter().map(AsrWord::into_word));
                 }
             }
             Ok(AsrLine::Done { language }) => {
@@ -692,6 +751,59 @@ done
         assert_eq!(lines.len(), 2);
         let req_json_none: serde_json::Value = serde_json::from_str(&lines[1]).unwrap();
         assert!(req_json_none.get("prompt").is_none());
+    }
+
+    #[test]
+    fn server_words_are_kept_once_with_the_segments_that_were() {
+        let word = |w: &str, a: f64, b: f64| ServerWord { word: format!(" {w}"), start: a, end: b };
+        // Chunk 1's audio starts at 8 s; its first segment (re-heard) was already taken by chunk 0.
+        let fresh = [seg(10.0, 12.0, "Chapter ten")];
+        let mut acc = Vec::new();
+        merge_words(
+            &mut acc,
+            8.0,
+            &fresh,
+            Some(vec![word("two", 0.0, 1.8), word("Chapter", 2.0, 2.9), word("ten", 3.0, 3.8)]),
+        );
+        let got: Vec<(&str, f64)> = acc.iter().map(|w| (w.text.as_str(), w.start)).collect();
+        assert_eq!(got, [("Chapter", 10.0), ("ten", 11.0)]);
+        // No words from the server (it ignores the option): none stored, none invented.
+        let mut none = Vec::new();
+        merge_words(&mut none, 0.0, &fresh, None);
+        assert!(none.is_empty());
+        // The answer parses with and without words.
+        let with: VerboseJson =
+            serde_json::from_str(r#"{"language":"en","segments":[],"words":[{"word":"hi","start":0.1,"end":0.3}]}"#)
+                .unwrap();
+        assert_eq!(with.words.unwrap().len(), 1);
+        let without: VerboseJson = serde_json::from_str(r#"{"segments":[]}"#).unwrap();
+        assert!(without.words.is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_local_helpers_words_come_through_with_their_segments() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("worker");
+        std::fs::write(
+            &bin,
+            r#"#!/bin/sh
+echo '{"type":"loaded","gpu":true}'
+while IFS= read -r request; do
+ echo '{"type":"segment","start":0,"end":2,"text":"hola mundo","words":[{"w":"hola","s":0.1,"e":0.5},{"w":"mundo","s":0.6,"e":1.1}]}'
+ echo '{"type":"segment","start":2,"end":3,"text":"older helper"}'
+ echo '{"type":"done","language":"es"}'
+done
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut worker = LocalWorker::start(&bin, Path::new("model"), "auto").unwrap();
+        let t = worker.transcribe(Path::new("audio.f32"), 3.0, &mut |_| {}, None).await.unwrap();
+        assert_eq!(t.segments.len(), 2);
+        let words: Vec<(&str, f64, f64)> = t.words.iter().map(|w| (w.text.as_str(), w.start, w.end)).collect();
+        assert_eq!(words, [("hola", 0.1, 0.5), ("mundo", 0.6, 1.1)]);
     }
 
     fn seg(start: f64, end: f64, text: &str) -> Segment {

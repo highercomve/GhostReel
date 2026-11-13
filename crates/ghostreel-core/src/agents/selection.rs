@@ -43,11 +43,7 @@ impl AgentSelection {
 
     /// The orchestrator this level chooses: `Some(None)` = none (pick by score).
     fn orchestrator_choice(&self) -> Option<Option<&String>> {
-        if self.pick_by_score == Some(true) {
-            Some(None)
-        } else {
-            self.orchestrator.as_ref().map(Some)
-        }
+        if self.pick_by_score == Some(true) { Some(None) } else { self.orchestrator.as_ref().map(Some) }
     }
 }
 
@@ -86,11 +82,19 @@ impl std::fmt::Display for SelectionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             SelectionError::UnknownAgent { id, known } => {
-                write!(f, "unknown agent '{id}' (configured: {})", if known.is_empty() { "none".into() } else { known.join(", ") })
+                write!(
+                    f,
+                    "unknown agent '{id}' (configured: {})",
+                    if known.is_empty() { "none".into() } else { known.join(", ") }
+                )
             }
             SelectionError::Disabled { id } => write!(f, "agent '{id}' is disabled; enable it in Models > Agents"),
             SelectionError::MissingRole { id, role } => {
-                write!(f, "agent '{id}' cannot be used as {}: give it the {role} role in Models > Agents", article(*role))
+                write!(
+                    f,
+                    "agent '{id}' cannot be used as {}: give it the {role} role in Models > Agents",
+                    article(*role)
+                )
             }
             SelectionError::NoAgent { role } => write!(f, "no enabled agent has the {role} role"),
             SelectionError::ZeroParallel => write!(f, "max_parallel and calls at once must be at least 1"),
@@ -167,7 +171,11 @@ impl ResolvedSelection {
             .enumerate()
             .map(|(i, a)| {
                 let n = a.capacity();
-                if i == 0 { format!("{} ({n} at a time)", a.display_name()) } else { format!("{} ({n})", a.display_name()) }
+                if i == 0 {
+                    format!("{} ({n} at a time)", a.display_name())
+                } else {
+                    format!("{} ({n})", a.display_name())
+                }
             })
             .collect();
         let scorers = match workers.as_slice() {

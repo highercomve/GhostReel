@@ -433,6 +433,102 @@ const MIGRATIONS: &[&str] = &[
         created_at INTEGER NOT NULL
     );
     "#,
+    // v22 — where somebody is talking, measured from the audio itself (`speech.rs`): one row per
+    // region of speech on the video's chosen audio track, and the quietest 10 ms frame of the
+    // pause that follows it. Whisper's segment times are approximate; cuts are placed on these.
+    r#"
+    CREATE TABLE speech_regions (
+        video_id INTEGER NOT NULL REFERENCES videos(id) ON DELETE CASCADE,
+        start_s REAL NOT NULL,
+        end_s REAL NOT NULL,
+        quiet_after_s REAL,
+        PRIMARY KEY (video_id, start_s)
+    );
+    "#,
+    // v23 — when each word of a transcript sentence was said (`sentences.rs`), from the speech
+    // engine's word timestamps, so a cut can be made at a word inside a 29 s sentence
+    // (`from: "s412@3"`). A word belongs to its sentence (the transcript segment) and goes with it
+    // when the video is transcribed again. Engines that give no word timings leave the table empty
+    // for the video; nothing is invented.
+    r#"
+    CREATE TABLE transcript_words (
+        segment_id INTEGER NOT NULL REFERENCES transcript_segments(id) ON DELETE CASCADE,
+        idx INTEGER NOT NULL,
+        start_s REAL NOT NULL,
+        end_s REAL NOT NULL,
+        text TEXT NOT NULL,
+        PRIMARY KEY (segment_id, idx)
+    );
+    "#,
+    // v24 — chapters (`chapters.rs`): each speech video split into topical stretches, with a title,
+    // a one-sentence summary and 1-3 standout lines, for `get_outline`. A chapter is bounded by two
+    // transcript sentences; it goes with them when the video is transcribed again. `titled` is 0
+    // when the title is only the first sentence (no chat model was available) so the stage can
+    // refresh it later.
+    r#"
+    CREATE TABLE chapters (
+        id INTEGER PRIMARY KEY,
+        video_id INTEGER NOT NULL REFERENCES videos(id) ON DELETE CASCADE,
+        idx INTEGER NOT NULL,
+        start_s REAL NOT NULL,
+        end_s REAL NOT NULL,
+        first_sentence_id INTEGER NOT NULL REFERENCES transcript_segments(id) ON DELETE CASCADE,
+        last_sentence_id INTEGER NOT NULL REFERENCES transcript_segments(id) ON DELETE CASCADE,
+        title TEXT NOT NULL,
+        summary TEXT NOT NULL DEFAULT '',
+        standout_json TEXT NOT NULL DEFAULT '[]',
+        titled INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX chapters_video ON chapters(video_id, idx);
+    "#,
+    // v25 — real sentences (`sentence_split.rs`). Whisper's segments are ~2 s display fragments or
+    // 30 s run-ons, not sentences; these are rebuilt from them at full stops, speaker changes and
+    // pauses, each boundary on a pause of the measured speech. Sentence ids (`s412`) name these
+    // rows. They are derived data, built on first use and dropped when the transcript or the
+    // measured speech changes. Chapters are bounded by sentences now, so they are split again.
+    r#"
+    CREATE TABLE transcript_sentences (
+        id INTEGER PRIMARY KEY,
+        video_id INTEGER NOT NULL REFERENCES videos(id) ON DELETE CASCADE,
+        start_s REAL NOT NULL,
+        end_s REAL NOT NULL,
+        text TEXT NOT NULL
+    );
+    CREATE INDEX transcript_sentences_video ON transcript_sentences(video_id, start_s);
+    DROP TABLE chapters;
+    CREATE TABLE chapters (
+        id INTEGER PRIMARY KEY,
+        video_id INTEGER NOT NULL REFERENCES videos(id) ON DELETE CASCADE,
+        idx INTEGER NOT NULL,
+        start_s REAL NOT NULL,
+        end_s REAL NOT NULL,
+        first_sentence_id INTEGER NOT NULL REFERENCES transcript_sentences(id) ON DELETE CASCADE,
+        last_sentence_id INTEGER NOT NULL REFERENCES transcript_sentences(id) ON DELETE CASCADE,
+        title TEXT NOT NULL,
+        summary TEXT NOT NULL DEFAULT '',
+        standout_json TEXT NOT NULL DEFAULT '[]',
+        titled INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX chapters_video ON chapters(video_id, idx);
+    DELETE FROM jobs WHERE stage = 'chapters';
+    "#,
+    // v26 — each sentence keeps its own words with their times (`words_json`, one [start, end]
+    // per word of its text), so "s412@3" names the third word of what the sentence says. Looking
+    // the words up by time instead lost or borrowed words wherever the engine's word timings drift
+    // from the measured pauses the sentence edges sit on. Sentences are built again to fill it.
+    r#"
+    ALTER TABLE transcript_sentences ADD COLUMN words_json TEXT;
+    DELETE FROM chapters;
+    DELETE FROM transcript_sentences;
+    DELETE FROM jobs WHERE stage = 'chapters';
+    "#,
+    // v27 — which version of the splitting rules built a video's sentences
+    // (`sentence_split::SPLIT_VERSION`). A video built by an older one is split again on first use,
+    // keeping its chapters (their sentence ids are found again by time), so a change to the rules
+    // reaches indexed projects without a model run to title chapters again.
+    r#"
+    ALTER TABLE videos ADD COLUMN sentence_split INTEGER NOT NULL DEFAULT 0;
+    "#,
 ];
 
 static REGISTER_VEC: Once = Once::new();
@@ -828,8 +924,10 @@ mod tests {
         }
         let db = Db::open(&path).unwrap();
         assert_eq!(db.schema_version().unwrap(), MIGRATIONS.len() as u32);
-        let (set_id, kind): (Option<String>, Option<String>) =
-            db.conn.query_row("SELECT set_id, kind FROM scripts WHERE id = 5", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        let (set_id, kind): (Option<String>, Option<String>) = db
+            .conn
+            .query_row("SELECT set_id, kind FROM scripts WHERE id = 5", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
         assert_eq!((set_id, kind), (None, None));
         let sets: i64 = db.conn.query_row("SELECT count(*) FROM clip_sets", [], |r| r.get(0)).unwrap();
         assert_eq!(sets, 0);
@@ -889,6 +987,125 @@ mod tests {
         assert_eq!(crate::script::list(&db, 1).unwrap().len(), 1);
         assert_eq!(crate::clips::list_sets(&db, 1).unwrap().len(), 1);
         assert!(crate::trash::list(&db, None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn speech_regions_migration_keeps_videos_and_marks_them_unmeasured() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v21.db");
+        register_sqlite_vec();
+        {
+            let mut conn = Connection::open(&path).unwrap();
+            let tx = conn.transaction().unwrap();
+            for sql in &MIGRATIONS[0..21] {
+                tx.execute_batch(sql).unwrap();
+            }
+            tx.pragma_update(None, "user_version", 21).unwrap();
+            tx.execute_batch(
+                "INSERT INTO videos(id, content_hash, size, duration_s) VALUES (7, 'h7', 1, 60.0);
+                 INSERT INTO jobs(video_id, stage, state, attempts, updated_at) VALUES (7, 'steadiness', 'done', 0, 1);",
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.schema_version().unwrap(), MIGRATIONS.len() as u32);
+        assert!(MIGRATIONS.len() >= 22, "the speech_regions table is v22");
+        let videos: i64 = db.conn.query_row("SELECT COUNT(*) FROM videos", [], |r| r.get(0)).unwrap();
+        assert_eq!(videos, 1);
+        // An already-indexed video has no regions and no speech job: the stage is pending for it.
+        assert!(!crate::speech::analysed(&db, 7));
+        db.set_speech_regions(7, &[crate::speech::SpeechRegion::new(1.0, 2.0)]).unwrap();
+        assert!(crate::speech::analysed(&db, 7));
+    }
+
+    #[test]
+    fn words_and_chapters_migrations_keep_the_index_and_start_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v22.db");
+        register_sqlite_vec();
+        {
+            let mut conn = Connection::open(&path).unwrap();
+            let tx = conn.transaction().unwrap();
+            for sql in &MIGRATIONS[0..22] {
+                tx.execute_batch(sql).unwrap();
+            }
+            tx.pragma_update(None, "user_version", 22).unwrap();
+            tx.execute_batch(
+                "INSERT INTO videos(id, content_hash, size, duration_s) VALUES (7, 'h7', 1, 600.0);
+                 INSERT INTO transcript_segments(id, video_id, start_s, end_s, text) VALUES (41, 7, 0, 5, 'hola');",
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.schema_version().unwrap(), MIGRATIONS.len() as u32);
+        assert_eq!(
+            MIGRATIONS.len(),
+            27,
+            "transcript_words is v23, chapters v24, sentences v25, their words v26, the split version v27"
+        );
+        // Nothing lost; the sentence the word and the chapter will hang on is still there.
+        let text: String =
+            db.conn.query_row("SELECT text FROM transcript_segments WHERE id = 41", [], |r| r.get(0)).unwrap();
+        assert_eq!(text, "hola");
+        // An already-indexed video has no word timings, sentences or chapters: they come later.
+        let sentences: i64 = db.conn.query_row("SELECT COUNT(*) FROM transcript_sentences", [], |r| r.get(0)).unwrap();
+        assert_eq!(sentences, 0);
+        assert_eq!(crate::sentences::word_count(&db, 7), 0);
+        assert!(crate::chapters::load(&db, 7).unwrap().is_empty());
+        // Both tables work, and go with their sentences.
+        db.conn
+            .execute(
+                "INSERT INTO transcript_words(segment_id, idx, start_s, end_s, text) VALUES (41, 1, 0.1, 0.4, 'hola')",
+                [],
+            )
+            .unwrap();
+        crate::sentence_split::ensure(&db, 7).unwrap();
+        let sid: i64 =
+            db.conn.query_row("SELECT id FROM transcript_sentences WHERE video_id = 7", [], |r| r.get(0)).unwrap();
+        crate::chapters::store(
+            &db,
+            7,
+            &[crate::chapters::Chapter {
+                video_id: 7,
+                idx: 0,
+                start_s: 0.0,
+                end_s: 5.0,
+                first_sentence_id: sid,
+                last_sentence_id: sid,
+                title: "hola".into(),
+                summary: String::new(),
+                standout: Vec::new(),
+                titled: false,
+            }],
+        )
+        .unwrap();
+        assert_eq!(crate::sentences::word_count(&db, 7), 1);
+        assert_eq!(crate::chapters::load(&db, 7).unwrap().len(), 1);
+        // Sentences built by older splitting rules are built again on first use, and the chapters
+        // stay: title kept, sentence ids found again among the new sentences.
+        db.conn.execute("UPDATE videos SET sentence_split = 0 WHERE id = 7", []).unwrap();
+        crate::sentence_split::ensure(&db, 7).unwrap();
+        let kept = crate::chapters::load(&db, 7).unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].title, "hola");
+        let first_exists: bool = db
+            .conn
+            .query_row("SELECT EXISTS (SELECT 1 FROM transcript_sentences WHERE id = ?1)", [kept[0].first_sentence_id], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(first_exists);
+        let version: i64 = db.conn.query_row("SELECT sentence_split FROM videos WHERE id = 7", [], |r| r.get(0)).unwrap();
+        assert_eq!(version, crate::sentence_split::SPLIT_VERSION);
+        // Transcribed again: the words go with their segment, the chapters with their sentences.
+        crate::sentence_split::invalidate(&db.conn, 7).unwrap();
+        db.conn.execute("DELETE FROM transcript_segments WHERE id = 41", []).unwrap();
+        assert_eq!(crate::sentences::word_count(&db, 7), 0);
+        assert!(crate::chapters::load(&db, 7).unwrap().is_empty());
+        // The video going takes the rest with it.
+        db.conn.execute("DELETE FROM videos WHERE id = 7", []).unwrap();
     }
 
     #[test]

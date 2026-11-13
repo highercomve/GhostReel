@@ -216,6 +216,9 @@ pub fn repair_framing(db: &Db, script: &mut Script, overrun: f64, min_clip_s: Op
     }
     for bi in 0..script.beats.len() {
         for ci in 0..script.beats[bi].clips.len() {
+            if script.beats[bi].clips[ci].exact {
+                continue;
+            }
             let Some((a, b)) = framing_trim(db, script, bi, ci, min_clip_s, overrun) else { continue };
             let c = &script.beats[bi].clips[ci];
             let (old_in, old_out, video) = (c.in_s, c.out_s, c.video_id);
@@ -307,6 +310,16 @@ pub fn apply_fix(db: &mut Db, project_id: i64, script: &mut Script, fix: &FixAct
             clip.framing = Some(base.with_override(from, to, *layout));
             Ok(Applied {
                 note: format!("video #{}: {from:.1}–{to:.1} s framed as {}", clip.video_id, layout.label()),
+                run_stage: None,
+            })
+        }
+        FixAction::SetAudio { beat_id, clip_index, audio } => {
+            let bi = find_clip(script, beat_id, *clip_index)?;
+            let clip = &mut script.beats[bi].clips[*clip_index];
+            clip.audio = *audio;
+            let label = if *audio == crate::script::Audio::Source { "plays its own sound" } else { "is muted" };
+            Ok(Applied {
+                note: format!("video #{}: {:.1}–{:.1} s {label}", clip.video_id, clip.in_s, clip.out_s),
                 run_stage: None,
             })
         }

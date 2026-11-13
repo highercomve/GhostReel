@@ -76,10 +76,10 @@ enum Command {
         /// When --redo frames is used, old keyframe files are deleted and re-extracted.
         #[arg(long, value_name = "STAGE")]
         redo: Option<String>,
-        /// Explicit stages to run (comma-separated: probe, transcribe, frames, describe, embed, steadiness, faces, speakers).
+        /// Explicit stages to run (comma-separated: probe, transcribe, frames, describe, embed, steadiness, faces, speakers, speech, chapters).
         #[arg(long, value_delimiter = ',')]
         stages: Option<Vec<String>>,
-        /// Skip these pipeline stages (comma-separated: probe, transcribe, frames, describe, embed, steadiness, faces, speakers).
+        /// Skip these pipeline stages (comma-separated: probe, transcribe, frames, describe, embed, steadiness, faces, speakers, speech, chapters).
         #[arg(long, value_delimiter = ',')]
         skip: Option<Vec<String>>,
         /// Shorthand to skip speech-to-text transcription.
@@ -148,6 +148,36 @@ enum Command {
         /// Re-run face tracking even on videos already processed.
         #[arg(long)]
         force: bool,
+    },
+    /// Find where speech is from the audio itself, so cuts land on it and not on the transcript's
+    /// approximate times. Same as `index --stages speech`, with a report per video.
+    Speech {
+        /// Only this project's folders (default: all projects).
+        #[arg(long, short)]
+        project: Option<String>,
+        /// Measure every video again, even those already measured.
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Split each speech video into topical chapters with a title, a one-sentence summary and
+    /// standout lines (what `get_outline` shows). Boundaries are found from the stored
+    /// embeddings; the titles come from the configured chat model, and without one the chapters
+    /// are stored with their first sentence as the title. Same as `index --stages chapters`, with
+    /// a report per video.
+    Chapters {
+        /// Only this project's folders (default: all projects).
+        #[arg(long, short)]
+        project: Option<String>,
+        /// Split every video again, even those already split.
+        #[arg(long)]
+        force: bool,
+        /// Keep the boundaries; only title the chapters that were stored without a model's title.
+        #[arg(long)]
+        refresh_titles: bool,
+        #[arg(long)]
+        json: bool,
     },
     /// Find who speaks when (by voice), group faces into people, and link each voice to a face.
     Speakers {
@@ -364,7 +394,8 @@ enum ScriptAction {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Export a script as an OpenTimelineIO (.otio) or Final Cut Pro 7 XML (.xml) timeline.
+    /// Export a script as an OpenTimelineIO (.otio) or Final Cut Pro 7 XML (.xml) timeline, or as
+    /// the finished full-size video (`--format mp4`).
     Export {
         id: i64,
         #[arg(long, default_value = "fcp_xml")]
@@ -438,17 +469,17 @@ enum ProjectAction {
         /// Disable speech-to-text transcription for this project.
         #[arg(long)]
         no_transcribe: bool,
-        /// Enabled pipeline stages (comma-separated: probe, transcribe, frames, describe, embed, steadiness, faces, speakers).
+        /// Enabled pipeline stages (comma-separated: probe, transcribe, frames, describe, embed, steadiness, faces, speakers, speech, chapters).
         #[arg(long, value_delimiter = ',')]
         stages: Option<Vec<String>>,
     },
     /// Configure pipeline stages and settings for a project.
     Config {
         name: String,
-        /// Enable pipeline stages (comma-separated: probe, transcribe, frames, describe, embed, steadiness, faces, speakers).
+        /// Enable pipeline stages (comma-separated: probe, transcribe, frames, describe, embed, steadiness, faces, speakers, speech, chapters).
         #[arg(long, value_delimiter = ',')]
         enable: Option<Vec<String>>,
-        /// Disable pipeline stages (comma-separated: probe, transcribe, frames, describe, embed, steadiness, faces, speakers).
+        /// Disable pipeline stages (comma-separated: probe, transcribe, frames, describe, embed, steadiness, faces, speakers, speech, chapters).
         #[arg(long, value_delimiter = ',')]
         disable: Option<Vec<String>>,
         /// Disable speech-to-text transcription for this project.
@@ -625,10 +656,12 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
-        Command::Faces { project, force } => {
-            faces_cmd(&paths, project.as_deref(), force).await
-        }
+        Command::Faces { project, force } => faces_cmd(&paths, project.as_deref(), force).await,
         Command::Speakers { project, force, json } => speakers_cmd(&paths, project.as_deref(), force, json).await,
+        Command::Speech { project, force, json } => speech_cmd(&paths, project.as_deref(), force, json).await,
+        Command::Chapters { project, force, refresh_titles, json } => {
+            chapters_cmd(&paths, project.as_deref(), force, refresh_titles, json).await
+        }
         Command::Crop { video_id, from_s, to_s, layout, width, height, person, out, json } => {
             let db = open_db(&paths)?;
             let ffmpeg = doctor::locate("ffmpeg").context("ffmpeg not found")?;
@@ -903,6 +936,8 @@ fn project_cmd(paths: &Paths, action: ProjectAction) -> anyhow::Result<ExitCode>
                 pipeline.steadiness = stages.iter().any(|s| s == "steadiness");
                 pipeline.faces = stages.iter().any(|s| s == "faces");
                 pipeline.speakers = stages.iter().any(|s| s == "speakers");
+                pipeline.speech = stages.iter().any(|s| s == "speech");
+                pipeline.chapters = stages.iter().any(|s| s == "chapters");
             }
             if no_transcribe {
                 pipeline.transcribe = false;
@@ -1190,7 +1225,8 @@ async fn script_cmd(paths: &Paths, action: ScriptAction) -> anyhow::Result<ExitC
             let p = db.require_project(&project)?;
             let content = std::fs::read_to_string(&file)
                 .with_context(|| format!("cannot read script file '{}'", file.display()))?;
-            let mut script = Script::parse_for_project(&content, &p).with_context(|| "failed to parse script JSON")?;
+            let mut script = ghostreel_core::sentences::parse_for_project(&db, &content, &p)
+                .with_context(|| "failed to parse script JSON")?;
             // Same treatment a drafted script gets (snap, beds, whole sentences, closing hold).
             let script_cfg = Config::load(&paths.config_file).unwrap_or_default().script;
             for note in ghostreel_core::script_check::repair_for_import(&db, p.id, &mut script, &script_cfg, None)? {
@@ -1444,7 +1480,13 @@ async fn script_cmd(paths: &Paths, action: ScriptAction) -> anyhow::Result<ExitC
             let cfg = Config::load(&paths.config_file).unwrap_or_default().script;
             let min = ghostreel_core::clips::length_range(&db, stored.project_id, &stored.title).map(|r| r.0);
             let mut script = stored.script.clone();
-            let notes = ghostreel_core::script_fix::repair_framing(&db, &mut script, cfg.speech_overrun_s, min);
+            let mut notes = ghostreel_core::script_fix::repair_framing(&db, &mut script, cfg.speech_overrun_s, min);
+            // Cuts on the measured speech, for footage the speech stage has been run on.
+            notes.extend(
+                ghostreel_core::cuts::place_cuts(&db, &mut script, &cfg)
+                    .iter()
+                    .map(ghostreel_core::cuts::CutMove::message),
+            );
             for n in &notes {
                 println!("  [repaired] {n}");
             }
@@ -1508,6 +1550,15 @@ async fn script_cmd(paths: &Paths, action: ScriptAction) -> anyhow::Result<ExitC
                 }
             }
         }
+        ScriptAction::Export { id, format, out }
+            if format.trim().trim_start_matches('.').eq_ignore_ascii_case("mp4") =>
+        {
+            let ffmpeg = doctor::locate("ffmpeg").context("ffmpeg not found")?;
+            let cfg = Config::load(&paths.config_file).unwrap_or_default().script;
+            let opts = ghostreel_core::preview::PreviewOptions::deliverable(&cfg, out, None);
+            let res = ghostreel_core::preview::render_preview(&db, &paths.data_dir, &ffmpeg, id, &opts, |_, _| {})?;
+            println!("{}", res.path.display());
+        }
         ScriptAction::Export { id, format, out } => {
             let export_fmt = ExportFormat::from_str(&format)?;
             let res = ghostreel_core::export::export_script(&db, id, export_fmt, &out)?;
@@ -1562,7 +1613,8 @@ async fn script_cmd(paths: &Paths, action: ScriptAction) -> anyhow::Result<ExitC
             let p = db.require_project(&project)?;
             let config = Config::load(&paths.config_file)?;
             let cut = ghostreel_core::chat::cut_agents(&db, None, Some(session));
-            let lease = ghostreel_core::chat::lease_backend(paths, &config, None, cut.as_ref(), |w| eprintln!("{w}")).await?;
+            let lease =
+                ghostreel_core::chat::lease_backend(paths, &config, None, cut.as_ref(), |w| eprintln!("{w}")).await?;
             eprintln!("Chat model: {}", lease.describe);
             let (backend, _slot, max_tool_rounds) = (lease.backend, lease.slot, lease.max_tool_rounds);
             let mut embedder = None;
@@ -1607,7 +1659,8 @@ async fn script_cmd(paths: &Paths, action: ScriptAction) -> anyhow::Result<ExitC
             let p = db.require_project(&project)?;
             let config = Config::load(&paths.config_file)?;
             let cut = ghostreel_core::chat::cut_agents(&db, None, session);
-            let lease = ghostreel_core::chat::lease_backend(paths, &config, None, cut.as_ref(), |w| eprintln!("{w}")).await?;
+            let lease =
+                ghostreel_core::chat::lease_backend(paths, &config, None, cut.as_ref(), |w| eprintln!("{w}")).await?;
             eprintln!("Chat model: {}", lease.describe);
             let (backend, _slot, max_tool_rounds) = (lease.backend, lease.slot, lease.max_tool_rounds);
 
@@ -2014,11 +2067,7 @@ fn finish_cli_run<T>(
     }
 }
 
-async fn faces_cmd(
-    paths: &Paths,
-    project: Option<&str>,
-    force: bool,
-) -> anyhow::Result<ExitCode> {
+async fn faces_cmd(paths: &Paths, project: Option<&str>, force: bool) -> anyhow::Result<ExitCode> {
     let mut db = open_db(paths)?;
     let pid = project_id(&db, project)?;
     let config = Config::load(&paths.config_file)?;
@@ -2115,8 +2164,7 @@ async fn faces_cmd(
         // To estimate prominent people, filter out transient noise / low-quality screen-share icons
         // (min 5 faces, box height >= 12% of frame) and count clusters representing >= 5% of faces.
         // Fallback to all tracks / clusters if none meet quality criteria.
-        let quality_tracks: Vec<_> =
-            tracks.iter().filter(|t| t.n_faces >= 5 && t.avg_box_h >= 0.12).cloned().collect();
+        let quality_tracks: Vec<_> = tracks.iter().filter(|t| t.n_faces >= 5 && t.avg_box_h >= 0.12).cloned().collect();
         let target_tracks = if !quality_tracks.is_empty() { quality_tracks } else { tracks.clone() };
         let clusters = ghostreel_core::faces::cluster_tracks_average_linkage(&target_tracks, 0.5);
         let total_clustered_faces: usize = target_tracks.iter().map(|t| t.n_faces).sum();
@@ -2129,14 +2177,170 @@ async fn faces_cmd(
             })
             .count()
             .max(if total_faces > 0 { 1 } else { 0 });
-        println!(
-            "Video #{vid} ({filename}): {} tracks, {} faces, people ≈ {}",
-            tracks.len(),
-            total_faces,
-            n_people
-        );
+        println!("Video #{vid} ({filename}): {} tracks, {} faces, people ≈ {}", tracks.len(), total_faces, n_people);
     }
 
+    Ok(if summary.failed > 0 { ExitCode::from(1) } else { ExitCode::SUCCESS })
+}
+
+async fn speech_cmd(paths: &Paths, project: Option<&str>, force: bool, json: bool) -> anyhow::Result<ExitCode> {
+    let mut db = open_db(paths)?;
+    let pid = project_id(&db, project)?;
+    let config = Config::load(&paths.config_file)?;
+    let rt = runtime::resolve(paths, &config).await?;
+    let mut rec = cli_run(&db, pid, "speech", "Find speech");
+    let lock = match IndexLock::acquire(&paths.data_dir) {
+        Ok(l) => l,
+        Err(ghostreel_core::Error::Busy(msg)) => {
+            eprintln!("ghostreel: {msg}");
+            return Ok(ExitCode::from(1));
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let tty = std::io::stderr().is_terminal();
+    let mut bar_visible = false;
+    let mut on_event = |e: Event| {
+        record_event(&mut rec, &e);
+        if bar_visible && !matches!(e, Event::Progress(_) | Event::JobDone { .. } | Event::JobStarted { .. }) {
+            eprint!("\r\x1b[2K");
+            bar_visible = false;
+        }
+        match e {
+            Event::JobStarted { path, .. } if !tty && !json => println!("speech {}", path.display()),
+            Event::JobFailed { video_id, stage, error } => eprintln!("  ✗ {stage} #{video_id}: {error}"),
+            Event::Progress(p) if tty => {
+                eprint!("\r\x1b[2K{}", progress_line(&p));
+                let _ = std::io::stderr().flush();
+                bar_visible = true;
+            }
+            _ => {}
+        }
+    };
+    let mut tracker = Tracker::new(&[("speech", 1.0)]);
+    let opts = index::Options { project_id: pid, ..Default::default() };
+    let res = index::run_speech_jobs(&mut db, &rt, &opts, force, &mut tracker, &mut on_event).await;
+    if bar_visible {
+        eprint!("\r\x1b[2K");
+    }
+    drop(lock);
+    finish_cli_run(&db, rec, &res, |s| format!("Found speech on {} of {} videos", s.measured, s.total));
+    let summary = res?;
+
+    // What is stored now for the videos in scope.
+    let mut st = db.conn.prepare(
+        "SELECT v.id, COALESCE(MIN(vf.path), ''), COUNT(r.start_s), COALESCE(SUM(r.end_s - r.start_s), 0)
+           FROM videos v
+           JOIN video_files vf ON vf.video_id = v.id
+           LEFT JOIN speech_regions r ON r.video_id = v.id
+          WHERE v.duration_s > 0
+            AND (?1 IS NULL OR vf.folder_id IN (SELECT folder_id FROM project_folders WHERE project_id = ?1))
+          GROUP BY v.id ORDER BY v.id",
+    )?;
+    let rows: Vec<(i64, String, i64, f64)> =
+        st.query_map([pid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<Result<_, _>>()?;
+    if json {
+        let videos: Vec<_> = rows
+            .iter()
+            .map(|(id, path, n, secs)| {
+                serde_json::json!({ "video_id": id, "path": path, "regions": n, "speech_s": secs })
+            })
+            .collect();
+        let out = serde_json::json!({ "summary": summary, "videos": videos });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+    } else {
+        println!("\n--- Speech activity ---");
+        println!("{} of {} videos measured, {} failed", summary.measured, summary.total, summary.failed);
+        for (id, path, n, secs) in &rows {
+            let name = std::path::Path::new(path).file_name().unwrap_or_default().to_string_lossy();
+            println!("Video #{id} ({name}): {n} regions, {secs:.0} s of speech");
+        }
+    }
+    Ok(if summary.failed > 0 { ExitCode::from(1) } else { ExitCode::SUCCESS })
+}
+
+async fn chapters_cmd(
+    paths: &Paths,
+    project: Option<&str>,
+    force: bool,
+    refresh_titles: bool,
+    json: bool,
+) -> anyhow::Result<ExitCode> {
+    let mut db = open_db(paths)?;
+    let pid = project_id(&db, project)?;
+    let config = Config::load(&paths.config_file)?;
+    let mut rec = cli_run(&db, pid, "chapters", "Split into chapters");
+    let lock = match IndexLock::acquire(&paths.data_dir) {
+        Ok(l) => l,
+        Err(ghostreel_core::Error::Busy(msg)) => {
+            eprintln!("ghostreel: {msg}");
+            return Ok(ExitCode::from(1));
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let tty = std::io::stderr().is_terminal();
+    let mut bar_visible = false;
+    let mut on_event = |e: Event| {
+        record_event(&mut rec, &e);
+        if bar_visible && !matches!(e, Event::Progress(_) | Event::JobDone { .. } | Event::JobStarted { .. }) {
+            eprint!("\r\x1b[2K");
+            bar_visible = false;
+        }
+        match e {
+            Event::JobStarted { path, .. } if !tty && !json => println!("chapters {}", path.display()),
+            Event::JobFailed { video_id, stage, error } => eprintln!("  ✗ {stage} #{video_id}: {error}"),
+            Event::Progress(p) if tty => {
+                eprint!("\r\x1b[2K{}", progress_line(&p));
+                let _ = std::io::stderr().flush();
+                bar_visible = true;
+            }
+            _ => {}
+        }
+    };
+    let mut tracker = Tracker::new(&[("chapters", 1.0)]);
+    let opts = index::Options { project_id: pid, ..Default::default() };
+    let run = index::ChaptersRun { paths, config: &config, force, refresh_titles };
+    let res = index::run_chapter_jobs(&mut db, &opts, &run, &mut tracker, &mut on_event).await;
+    if bar_visible {
+        eprint!("\r\x1b[2K");
+    }
+    drop(lock);
+    finish_cli_run(&db, rec, &res, |s| format!("Split {} videos into {} chapters", s.videos, s.chapters));
+    let summary = res?;
+
+    // What is stored now for the videos in scope.
+    let mut st = db.conn.prepare(
+        "SELECT v.id, COALESCE(MIN(vf.path), ''), (SELECT COUNT(*) FROM chapters c WHERE c.video_id = v.id),
+                (SELECT COUNT(*) FROM chapters c WHERE c.video_id = v.id AND c.titled = 1)
+           FROM videos v JOIN video_files vf ON vf.video_id = v.id
+          WHERE EXISTS (SELECT 1 FROM transcript_segments t WHERE t.video_id = v.id)
+            AND (?1 IS NULL OR vf.folder_id IN (SELECT folder_id FROM project_folders WHERE project_id = ?1))
+          GROUP BY v.id ORDER BY v.id",
+    )?;
+    let rows: Vec<(i64, String, i64, i64)> =
+        st.query_map([pid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<Result<_, _>>()?;
+    if json {
+        let videos: Vec<_> = rows
+            .iter()
+            .map(|(id, path, n, titled)| {
+                serde_json::json!({ "video_id": id, "path": path, "chapters": n, "titled": titled })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&serde_json::json!({ "summary": summary, "videos": videos }))?);
+    } else {
+        println!("\n--- Chapters ---");
+        println!(
+            "{} videos split into {} chapters ({} titled by the model, {} with their first sentence as the title)",
+            summary.videos, summary.chapters, summary.titled, summary.untitled
+        );
+        if let Some(note) = &summary.model_note {
+            println!("note: {note}");
+            println!("      run `ghostreel chapters --refresh-titles` once a chat model is available");
+        }
+        for (id, path, n, titled) in &rows {
+            let name = std::path::Path::new(path).file_name().unwrap_or_default().to_string_lossy();
+            println!("Video #{id} ({name}): {n} chapters, {titled} titled");
+        }
+    }
     Ok(if summary.failed > 0 { ExitCode::from(1) } else { ExitCode::SUCCESS })
 }
 

@@ -129,6 +129,28 @@ pub fn title_defaults(width: u32, height: u32) -> TextStyle {
     }
 }
 
+/// What a section card's title looks like when nothing says otherwise: large bold white type in
+/// the middle of the frame, no box (the card is its own background).
+pub fn card_defaults(width: u32, height: u32) -> TextStyle {
+    let (w, h) = (width.max(1) as f64, height.max(1) as f64);
+    let em = (1.0 / 10.0f64).min(w / (12.0 * h));
+    TextStyle {
+        font: Some("Arial".into()),
+        size: Some(em * cell_em("Arial")),
+        bold: Some(true),
+        uppercase: Some(false),
+        color: Some("#ffffff".into()),
+        outline_color: Some("#000000".into()),
+        outline: Some(0.0),
+        shadow: Some(0.0),
+        boxed: Some(false),
+        box_color: Some("#000000".into()),
+        box_opacity: Some(0.0),
+        align: Some("center".into()),
+        max_width: Some(0.8),
+    }
+}
+
 /// What a caption looks like when nothing says otherwise: the old captions ASS — bold white
 /// Arial, a 3 px outline and a soft shadow on 30 px type. A vertical frame sizes off its width.
 pub fn caption_defaults(width: u32, height: u32, legacy_scale: f64) -> TextStyle {
@@ -180,6 +202,9 @@ pub struct Overlay {
     /// A caption's cue (anchors, edit state).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cue: Option<Cue>,
+    /// A section card's background, `#rrggbb`: the whole frame is this colour behind the text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<String>,
 }
 
 /// All burnt-in text of a cut, in the frame it is laid out for.
@@ -188,6 +213,10 @@ pub struct Overlays {
     pub width: u32,
     pub height: u32,
     pub titles: Vec<Overlay>,
+    /// Section cards (kind `card`), each with its `background`, on the stretch of the timeline
+    /// the card takes before its beat.
+    #[serde(default)]
+    pub cards: Vec<Overlay>,
     /// Every caption cue, hidden ones included (`cue.hidden`); renders skip those.
     pub captions: Vec<Overlay>,
     /// The caption style and place, also when there are no cues to show it on.
@@ -279,8 +308,7 @@ fn caption_placement(script: &Script, width: u32, height: u32) -> (ResolvedStyle
     let style = resolve(&caption_defaults(width, height, cap.size).merged(&cap.style));
     let portrait = height > width;
     // A stacked cut puts its captions on the seam between the two faces.
-    let at_seam =
-        portrait && script.framing.as_ref().is_some_and(|f| f.layout == crate::framing::Layout::Stacked);
+    let at_seam = portrait && script.framing.as_ref().is_some_and(|f| f.layout == crate::framing::Layout::Stacked);
     let default_x = match style.align.as_str() {
         "left" => (1.0 - style.max_width) / 2.0,
         "right" => 1.0 - (1.0 - style.max_width) / 2.0,
@@ -301,11 +329,34 @@ pub fn layout(script: &Script, cues: &[Cue]) -> Overlays {
     let base = title_defaults(width, height).merged(script.title_style.as_ref().unwrap_or(&TextStyle::default()));
 
     let mut titles = Vec::new();
-    let mut t = 0.0;
-    for (i, beat) in script.beats.iter().enumerate() {
-        let dur: f64 = beat.clips.iter().map(|c| (c.out_s - c.in_s).max(0.0)).sum();
-        let (beat_start, beat_end) = (t, t + dur);
-        t = beat_end;
+    let mut cards = Vec::new();
+    let card_base = card_defaults(width, height)
+        .merged(script.card_style.as_ref().and_then(|c| c.style.as_ref()).unwrap_or(&TextStyle::default()));
+    for (i, (beat, at)) in script.beats.iter().zip(script.beat_times()).enumerate() {
+        if let Some(card) = beat.card.as_ref().filter(|_| at.clips_start_s > at.card_start_s) {
+            let style = resolve(&card_base.merged(card.style.as_ref().unwrap_or(&TextStyle::default())));
+            let lines = lines_for(&card.text, &style, width, height);
+            let x = match style.align.as_str() {
+                "left" => (1.0 - style.max_width) / 2.0,
+                "right" => 1.0 - (1.0 - style.max_width) / 2.0,
+                _ => 0.5,
+            };
+            cards.push(Overlay {
+                kind: "card".into(),
+                beat_index: Some(i),
+                start_s: at.card_start_s,
+                end_s: at.clips_start_s,
+                lines,
+                x,
+                y: 0.5,
+                v_anchor: VAnchor::Middle,
+                style,
+                cue: None,
+                background: Some(script.card_background(beat)),
+            });
+        }
+        let dur = at.end_s - at.clips_start_s;
+        let (beat_start, beat_end) = (at.clips_start_s, at.end_s);
         let Some(text) = beat.on_screen_text.as_deref().filter(|s| !s.trim().is_empty()) else { continue };
         if dur <= 0.0 {
             continue;
@@ -333,6 +384,7 @@ pub fn layout(script: &Script, cues: &[Cue]) -> Overlays {
             v_anchor: VAnchor::Middle,
             style,
             cue: None,
+            background: None,
         });
     }
 
@@ -360,11 +412,12 @@ pub fn layout(script: &Script, cues: &[Cue]) -> Overlays {
                 v_anchor: caption_v_anchor,
                 style: caption_style.clone(),
                 cue: Some(cue.clone()),
+                background: None,
             }
         })
         .collect();
 
-    Overlays { width, height, titles, captions, caption_style, caption_x, caption_y, caption_v_anchor }
+    Overlays { width, height, titles, cards, captions, caption_style, caption_x, caption_y, caption_v_anchor }
 }
 
 /// Lay out a cut's titles and its speech captions (hidden cues included), read from the index.
@@ -441,11 +494,20 @@ pub fn to_ass(ov: &Overlays, width: u32, height: u32) -> String {
     };
     let mut events = String::new();
     let visible_captions = ov.captions.iter().filter(|c| !c.cue.as_ref().is_some_and(|q| q.hidden));
-    for (layer, o) in visible_captions.map(|o| (0, o)).chain(ov.titles.iter().map(|o| (1, o))) {
+    // A card's background is the picture under it (the renderer plays a plain colour there), so
+    // only its text is drawn here.
+    let layered =
+        visible_captions.map(|o| (0, o)).chain(ov.titles.iter().map(|o| (1, o))).chain(ov.cards.iter().map(|o| (2, o)));
+    for (layer, o) in layered {
         if o.lines.is_empty() || o.end_s <= o.start_s {
             continue;
         }
-        let name = style_name(&o.style, o.v_anchor, if o.kind == "title" { "Title" } else { "Caption" });
+        let prefix = match o.kind.as_str() {
+            "title" => "Title",
+            "card" => "Card",
+            _ => "Caption",
+        };
+        let name = style_name(&o.style, o.v_anchor, prefix);
         let text = o.lines.iter().map(|l| escape_ass_text(l)).collect::<Vec<_>>().join("\\N");
         let (px, py) = (o.x * width as f64, o.y * height as f64);
         writeln!(
@@ -495,7 +557,8 @@ mod tests {
                 narration: None,
                 on_screen_text: text.map(Into::into),
                 title_layout: None,
-                clips: vec![ScriptClip {
+                clips: vec![ScriptClip { exact: false,
+                    sentences: None,
                     video_id: 1,
                     in_s: 10.0,
                     out_s: 20.0,
@@ -506,11 +569,13 @@ mod tests {
                 }],
                 bed: None,
                 notes: None,
+                card: None,
             }],
             captions: None,
             title_style: None,
             caption_edits: Vec::new(),
             agents: None,
+            card_style: None,
         }
     }
 
@@ -536,7 +601,10 @@ mod tests {
         let ass = to_ass(&ov, 960, 540);
         // 30 px bold white Arial, 3 px black outline, 1.5 px shadow, bottom centre at 92%.
         assert!(ass.contains("Style: Caption0,Arial,29.70,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,2.97,1.49,2,"), "{ass}");
-        assert!(ass.contains("Dialogue: 0,0:00:01.00,0:00:02.00,Caption0,,0,0,0,,{\\an2\\pos(480.0,496.8)}hola"), "{ass}");
+        assert!(
+            ass.contains("Dialogue: 0,0:00:01.00,0:00:02.00,Caption0,,0,0,0,,{\\an2\\pos(480.0,496.8)}hola"),
+            "{ass}"
+        );
         // A vertical frame keeps captions above the lower fifth.
         let v = layout(&script(1080, 1920, None), &[cue(1.0, 2.0, "hola")]);
         assert_eq!((v.captions[0].y, v.captions[0].v_anchor), (0.8, VAnchor::Bottom));
@@ -564,7 +632,12 @@ mod tests {
         s.captions = Some(CaptionStyle {
             x: Some(0.5),
             y: Some(0.3),
-            style: TextStyle { boxed: Some(true), box_color: Some("#112233".into()), box_opacity: Some(1.0), ..TextStyle::default() },
+            style: TextStyle {
+                boxed: Some(true),
+                box_color: Some("#112233".into()),
+                box_opacity: Some(1.0),
+                ..TextStyle::default()
+            },
             ..CaptionStyle::default()
         });
         let ov = layout(&s, &[cue(3.0, 4.0, "dicho")]);
@@ -572,7 +645,12 @@ mod tests {
         assert!(ass.contains("Dialogue: 1,0:00:02.00,0:00:05.00,Title"), "{ass}");
         assert!(ass.contains("{\\an4\\pos(100.0,750.0)}LOWER THIRD"), "{ass}");
         // Yellow (#ffcc00 → &H0000CCFF), bold, 50 px, 5 px outline, left-middle.
-        assert!(ass.contains(",Arial,50.00,&H0000CCFF,&H000000FF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,5.00,0.00,4,"), "{ass}");
+        assert!(
+            ass.contains(
+                ",Arial,50.00,&H0000CCFF,&H000000FF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,5.00,0.00,4,"
+            ),
+            "{ass}"
+        );
         // Captions in a solid box (BorderStyle 3, box colour as outline colour), bottom at 30%.
         assert!(ass.contains(",&H00332211,&H80000000,-1,0,0,0,100,100,0,0,3,"), "{ass}");
         assert!(ass.contains("{\\an2\\pos(500.0,300.0)}dicho"), "{ass}");
@@ -581,7 +659,8 @@ mod tests {
     #[test]
     fn title_times_stay_inside_their_beat() {
         let mut s = script(1920, 1080, Some("x"));
-        s.beats[0].title_layout = Some(TitleLayout { start_s: Some(-3.0), end_s: Some(50.0), ..TitleLayout::default() });
+        s.beats[0].title_layout =
+            Some(TitleLayout { start_s: Some(-3.0), end_s: Some(50.0), ..TitleLayout::default() });
         let t = &layout(&s, &[]).titles[0];
         assert_eq!((t.start_s, t.end_s), (0.0, 10.0));
     }
@@ -617,10 +696,10 @@ mod tests {
 
     #[test]
     fn wrapping_is_balanced() {
-        assert_eq!(wrap_lines("Y entonces bueno, de ahí podemos hacer lo que sea", 36), vec![
-            "Y entonces bueno, de ahí",
-            "podemos hacer lo que sea"
-        ]);
+        assert_eq!(
+            wrap_lines("Y entonces bueno, de ahí podemos hacer lo que sea", 36),
+            vec!["Y entonces bueno, de ahí", "podemos hacer lo que sea"]
+        );
         assert_eq!(wrap_lines("corto", 16), vec!["corto"]);
         assert_eq!(wrap_lines("uno\ndos tres", 40), vec!["uno", "dos tres"]);
     }
