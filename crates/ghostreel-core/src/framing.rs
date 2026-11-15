@@ -131,8 +131,11 @@ pub struct NormBox {
     pub h: f64,
 }
 
-/// Framing for a clip (`ScriptClip::framing`) or the whole cut (`Script::framing`).
+/// Framing for a clip (`ScriptClip::framing`) or the whole cut (`Script::framing`). Written as the
+/// object, or as just its layout's name (`"fixed"`, `"follow_speaker"`): models write the short form
+/// as often as the long one, and both say the same thing.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(try_from = "FramingWire")]
 pub struct Framing {
     #[serde(default)]
     pub layout: Layout,
@@ -146,6 +149,33 @@ pub struct Framing {
     /// seconds): an editor's choice, or a fix a check offered.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub overrides: Vec<LayoutOverride>,
+}
+
+/// What `Framing` is read from: the whole object, or a layout name alone.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum FramingWire {
+    Name(String),
+    Full {
+        #[serde(default)]
+        layout: Layout,
+        #[serde(default)]
+        person_id: Option<i64>,
+        #[serde(rename = "box", default)]
+        box_: Option<NormBox>,
+        #[serde(default)]
+        overrides: Vec<LayoutOverride>,
+    },
+}
+
+impl TryFrom<FramingWire> for Framing {
+    type Error = String;
+    fn try_from(w: FramingWire) -> Result<Self, String> {
+        Ok(match w {
+            FramingWire::Name(name) => Framing { layout: name.parse().map_err(|e: Error| e.to_string())?, ..Default::default() },
+            FramingWire::Full { layout, person_id, box_, overrides } => Framing { layout, person_id, box_, overrides },
+        })
+    }
 }
 
 /// One stretch of a clip framed with a chosen layout, in source seconds.
@@ -1829,6 +1859,15 @@ pub fn plans_for_script(db: &Db, ffmpeg: Option<&Path>, script: &Script) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn framing_is_read_from_the_object_or_from_a_layout_name_alone() {
+        let short: Framing = serde_json::from_str(r#""fixed""#).unwrap();
+        assert_eq!(short.layout, Layout::Fixed);
+        let long: Framing = serde_json::from_str(r#"{"layout": "follow_speaker", "person_id": 3}"#).unwrap();
+        assert_eq!((long.layout, long.person_id), (Layout::FollowSpeaker, Some(3)));
+        assert!(serde_json::from_str::<Framing>(r#""sideways""#).is_err(), "an unknown name is still an error");
+    }
 
     const W: f64 = 1280.0;
     const H: f64 = 720.0;

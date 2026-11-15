@@ -144,6 +144,10 @@ pub struct Runtime {
     pub ffmpeg: PathBuf,
     pub ffprobe: PathBuf,
     pub stt: SttSetup,
+    /// An engine that times each word, for transcripts made without word timings: the local
+    /// helper when its model is on disk. The configured engine when it is that helper; a server
+    /// answers no word times, so the helper stands in for that one job. `None`: no word timings.
+    pub word_stt: Option<Engine>,
     /// Where frames and other derived files live.
     pub data_dir: PathBuf,
     /// Keyframe extraction settings; `None` disables the frames stage (tests).
@@ -203,6 +207,9 @@ pub fn locate_helper(name: &str) -> Option<PathBuf> {
     })
 }
 
+/// Whisper models a word-timing pass may use when they are on disk, best first.
+const WORD_MODELS: &[&str] = &["large-v3-turbo", "large-v3-turbo-q8_0", "large-v3-turbo-q5_0", "small", "base"];
+
 pub async fn resolve(paths: &Paths, config: &Config) -> Result<Runtime, crate::Error> {
     let ffmpeg =
         locate("ffmpeg").ok_or_else(|| crate::Error::Invalid("ffmpeg not found (see `ghostreel doctor`)".into()))?;
@@ -223,10 +230,27 @@ pub async fn resolve(paths: &Paths, config: &Config) -> Result<Runtime, crate::E
         _ => config.vision.describe_concurrency,
     };
     let describe_concurrency = crate::doctor::calculate_describe_concurrency(requested, total_vram, model_mb);
+    let word_stt = match &stt {
+        SttSetup::Ready(e @ Engine::Local { .. }) => Some(e.clone()),
+        _ => {
+            let models_dir = models::effective_models_dir(paths, config);
+            let roots = models::search_roots(&models_dir, &config.models.search_paths);
+            // The configured model when it is on disk, else the best one that is: nothing is
+            // downloaded for this.
+            let configured = crate::doctor::selected_whisper_model(&config.stt.model, &gpus, &roots);
+            std::iter::once(configured.as_str()).chain(WORD_MODELS.iter().copied()).find_map(|m| {
+                match local_stt(&models_dir, &config.models.search_paths, m) {
+                    SttSetup::Ready(e) => Some(e),
+                    _ => None,
+                }
+            })
+        }
+    };
     Ok(Runtime {
         ffmpeg,
         ffprobe,
         stt,
+        word_stt,
         data_dir: paths.data_dir.clone(),
         frames: Some(crate::frames::FrameOptions::from_config(&config.frames)),
         describe_concurrency,

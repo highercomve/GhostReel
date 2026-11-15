@@ -51,8 +51,13 @@ pub struct OutlineVideo {
     pub category: String,
     pub has_speech: bool,
     pub sentences: i64,
-    /// Empty for a video with no speech, and for one the chapters stage has not reached.
+    /// Empty for a video with no speech, for b-roll (its talk is ambience), and for one the chapters
+    /// stage has not reached.
     pub chapters: Vec<OutlineChapter>,
+    /// For b-roll and a video with no speech, which have no chapters: what its keyframes show, a few
+    /// distinct descriptions in order. Without them b-roll is a list of file names a model never opens.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub pictures: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -92,16 +97,21 @@ pub fn build(db: &Db, project: &Project, only_video: Option<i64>) -> Result<Outl
     let rows = index::videos(db, Some(project.id))?;
     let mut videos = Vec::new();
     for v in rows.into_iter().filter(|v| only_video.is_none_or(|id| id == v.id)) {
-        let stored = chapters::load(db, v.id)?;
+        // B-roll's sound is ambience: chapters summarised from the crowd's chatter ("the speaker
+        // introduces their phosphorobiolens…") read like interviews to a writer, who then cuts sound
+        // from a party shot. Its pictures are what it offers; its transcript stays in get_transcript.
+        let ambience = crate::classify::plays_ambience(&v.category, v.category_confidence, &v.category_source);
+        let stored = if ambience { Vec::new() } else { chapters::load(db, v.id)? };
         let spans = crate::scenes::for_range(db, v.id, 0.0, v.duration_s.unwrap_or(0.0)).ok().flatten();
         videos.push(OutlineVideo {
             id: v.id,
             file: v.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
             duration_s: v.duration_s.unwrap_or(0.0),
             category: v.category.clone(),
-            has_speech: v.segments > 0,
+            has_speech: v.segments > 0 && !ambience,
             sentences: v.segments,
             chapters: stored.iter().map(|c| outline_chapter(db, c, spans.as_deref())).collect(),
+            pictures: if v.segments > 0 && !ambience { Vec::new() } else { pictures(db, v.id) },
         });
     }
     let people = db
@@ -121,6 +131,42 @@ pub fn build(db: &Db, project: &Project, only_video: Option<i64>) -> Result<Outl
         .collect();
     let glossary = project.glossary.terms.iter().map(|t| t.term.clone()).collect();
     Ok(Outline { project: project.name.clone(), videos, people, glossary })
+}
+
+/// Most keyframe descriptions shown for one video with no speech.
+const PICTURES_PER_VIDEO: usize = 3;
+const PICTURE_CHARS: usize = 90;
+
+/// What a video's keyframes show: up to [`PICTURES_PER_VIDEO`] distinct descriptions spread over it.
+fn pictures(db: &Db, video_id: i64) -> Vec<String> {
+    let Ok(mut stmt) = db.conn.prepare(
+        "SELECT description_json FROM frames WHERE video_id = ?1 AND description_json IS NOT NULL ORDER BY t_s",
+    ) else {
+        return Vec::new();
+    };
+    let mut all: Vec<String> = stmt
+        .query_map([video_id], |r| r.get::<_, String>(0))
+        .map(|rows| {
+            rows.flatten()
+                .filter_map(|j| serde_json::from_str::<serde_json::Value>(&j).ok())
+                .filter_map(|v| v["description"].as_str().map(|s| s.trim().to_string()))
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    all.dedup();
+    if all.len() <= PICTURES_PER_VIDEO {
+        return all;
+    }
+    // First, middle and last: the opening, the body and where the shot ends up.
+    let n = all.len();
+    let mut picked: Vec<String> = Vec::new();
+    for i in [0, n / 2, n - 1] {
+        if !picked.contains(&all[i]) {
+            picked.push(all[i].clone());
+        }
+    }
+    picked
 }
 
 fn outline_chapter(db: &Db, c: &Chapter, spans: Option<&[crate::scenes::SceneSpan]>) -> OutlineChapter {
@@ -191,6 +237,17 @@ impl Outline {
         }
         if !self.glossary.is_empty() {
             out.push_str(&format!("GLOSSARY {}\n", self.glossary.join(", ")));
+        }
+        let silent: Vec<&OutlineVideo> = self.videos.iter().filter(|v| !v.pictures.is_empty()).collect();
+        if !silent.is_empty() {
+            out.push_str(
+                "PICTURES (b-roll and videos with no speech: what their keyframes show; get_manifest for the rest)\n",
+            );
+            let take = if detail == Detail::Titles { 1 } else { PICTURES_PER_VIDEO };
+            for v in silent {
+                let shown: Vec<String> = v.pictures.iter().take(take).map(|p| clip(p, PICTURE_CHARS)).collect();
+                out.push_str(&format!("  v{} {} · {}: {}\n", v.id, v.file, clock(v.duration_s), shown.join(" / ")));
+            }
         }
         for v in self.videos.iter().filter(|v| v.has_speech) {
             if v.chapters.is_empty() {
@@ -325,6 +382,110 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::seventy_minute_project;
     use super::*;
+
+    #[test]
+    fn b_roll_with_no_speech_says_what_its_pictures_show() {
+        let (db, project) = seventy_minute_project();
+        let folder: i64 = db.conn.query_row("SELECT folder_id FROM project_folders LIMIT 1", [], |r| r.get(0)).unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO videos(id, content_hash, size, duration_s, category) VALUES (7, 'b', 1, 20.0, 'broll')",
+                [],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO video_files(video_id, folder_id, path, size, mtime, last_seen) VALUES (7, ?1, '/m/patio.mp4', 1, 0, 0)",
+                [folder],
+            )
+            .unwrap();
+        for (t, d) in [
+            (1.0, "Guests toast under string lights"),
+            (2.0, "Guests toast under string lights"),
+            (9.0, "A chef plates tacos"),
+            (18.0, "Wide of the patio at night"),
+        ] {
+            db.conn
+                .execute(
+                    "INSERT INTO frames(video_id, t_s, description_json) VALUES (7, ?1, ?2)",
+                    rusqlite::params![t, serde_json::json!({ "description": d }).to_string()],
+                )
+                .unwrap();
+        }
+        let outline = build(&db, &project, None).unwrap();
+        let text = outline.render(Detail::Full);
+        assert!(text.contains("PICTURES (b-roll and videos with no speech"), "{text}");
+        assert!(
+            text.contains("v7 patio.mp4 · 0:20.0: Guests toast under string lights / A chef plates tacos / Wide of the patio at night"),
+            "{text}"
+        );
+        // The interview has chapters for that; its keyframes are not listed.
+        assert!(outline.videos.iter().find(|v| v.id == 104).unwrap().pictures.is_empty());
+    }
+
+    /// GreetMag v136: a party shot, b-roll, whose crowd chatter the recogniser wrote down and the
+    /// chapters stage summarised ("The speaker introduces their phosphorobiolens…"). Listed as a
+    /// speaking video with that chapter, ahead of the interviews, it was what a small model cut its
+    /// "testimonials" from. The outline shows what its pictures show instead; the interview keeps
+    /// its chapters.
+    #[test]
+    fn b_roll_with_talk_in_it_is_shown_by_its_pictures_not_its_chatter() {
+        let (db, project) = seventy_minute_project();
+        let folder: i64 = db.conn.query_row("SELECT folder_id FROM project_folders LIMIT 1", [], |r| r.get(0)).unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO videos(id, content_hash, size, duration_s, category, category_confidence) VALUES (8, 'p', 1, 15.3, 'broll', 0.8)",
+                [],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO video_files(video_id, folder_id, path, size, mtime, last_seen) VALUES (8, ?1, '/m/481_2619.mp4', 1, 0, 0)",
+                [folder],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO transcript_segments(video_id, start_s, end_s, text) VALUES
+                 (8, 0.0, 15.3, 'I am like, this was all my phosphorobiolens, called Pyroviolens.')",
+                [],
+            )
+            .unwrap();
+        crate::sentence_split::mirror_segments(&db, 8);
+        let first: i64 =
+            db.conn.query_row("SELECT id FROM transcript_sentences WHERE video_id = 8", [], |r| r.get(0)).unwrap();
+        chapters::store(
+            &db,
+            8,
+            &[Chapter {
+                video_id: 8,
+                idx: 0,
+                start_s: 0.0,
+                end_s: 15.3,
+                first_sentence_id: first,
+                last_sentence_id: first,
+                title: "Pyroviolens".into(),
+                summary: "The speaker introduces their phosphorobiolens called Pyroviolens".into(),
+                standout: Vec::new(),
+                titled: true,
+            }],
+        )
+        .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO frames(video_id, t_s, description_json) VALUES (8, 2.0, ?1)",
+                [serde_json::json!({ "description": "Two bald men in suits talking at a party" }).to_string()],
+            )
+            .unwrap();
+        let outline = build(&db, &project, None).unwrap();
+        let party = outline.videos.iter().find(|v| v.id == 8).unwrap();
+        assert!(party.chapters.is_empty() && !party.has_speech, "{party:?}");
+        let text = outline.render(Detail::Full);
+        assert!(!text.contains("phosphorobiolens"), "{text}");
+        assert!(text.contains("v8 481_2619.mp4 · 0:15.3: Two bald men in suits talking at a party"), "{text}");
+        assert!(text.contains("v8 481_2619.mp4 · 0:15.3 · broll\n"), "no 'speech' mark: {text}");
+        assert!(!outline.videos.iter().find(|v| v.id == 104).unwrap().chapters.is_empty());
+    }
 
     #[test]
     fn the_outline_of_a_seventy_minute_episode_stays_small() {

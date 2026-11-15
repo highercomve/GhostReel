@@ -105,11 +105,21 @@ static APPLY_FIX: ToolSpec = ToolSpec {
 
 async fn apply_fix(ctx: &mut ToolCtx<'_>, a: Args<'_>) -> ToolResult {
     let stored = script::load(ctx.db, a.i64("script_id")?)?;
-    let fix: script::FixAction =
-        serde_json::from_value(a.get("fix").cloned().ok_or_else(|| ToolError::invalid("missing 'fix' object"))?)
-            .map_err(|e| {
-                ToolError::Invalid(format!("fix does not match {{kind: trim|set_layout|set_audio|run_stage, ...}}: {e}"))
-            })?;
+    let mut raw_fix = a.get("fix").cloned().ok_or_else(|| ToolError::invalid("missing 'fix' object"))?;
+    // A trim that moves one edge says nothing about the other: it stays where the clip has it.
+    if raw_fix["kind"] == "trim"
+        && let (Some(beat), Some(i)) = (raw_fix["beat_id"].as_str(), raw_fix["clip_index"].as_u64())
+        && let Some(clip) = stored.script.beats.iter().find(|b| b.id == beat).and_then(|b| b.clips.get(i as usize))
+    {
+        for (key, current) in [("in_s", clip.in_s), ("out_s", clip.out_s)] {
+            if raw_fix.get(key).is_none_or(Value::is_null) {
+                raw_fix[key] = json!(current);
+            }
+        }
+    }
+    let fix: script::FixAction = serde_json::from_value(raw_fix).map_err(|e| {
+        ToolError::Invalid(format!("fix does not match {{kind: trim|set_layout|set_audio|run_stage, ...}}: {e}"))
+    })?;
     let dry_run = a.bool_or("dry_run", false);
     let mut s = stored.script.clone();
     let applied = crate::script_fix::apply_fix(ctx.db, stored.project_id, &mut s, &fix)?;
@@ -118,15 +128,38 @@ async fn apply_fix(ctx: &mut ToolCtx<'_>, a: Args<'_>) -> ToolResult {
         ran = super::project::run_stage(ctx, stored.project_id, stage).await?;
     }
     let min = crate::clips::length_range(ctx.db, stored.project_id, &stored.title).map(|r| r.0);
-    let opts = script_check::CheckOptions { trim_min_s: min, ..Default::default() };
+    let opts = script_check::CheckOptions { trim_min_s: min, pictures: true, ..Default::default() };
     let issues = script_check::check(ctx.db, stored.project_id, &s, &ctx.config.script, &opts)?;
+    // A fix applied to a version that is no longer the newest of its cut starts from that version:
+    // what the newer ones changed — a fix just applied, say — is not in the result. Two fixes sent
+    // to the same id each undid the other, and the editor read the cut back unchanged.
+    let newest: Option<i64> = ctx
+        .db
+        .conn
+        .query_row(
+            "SELECT MAX(id) FROM scripts WHERE project_id = ?1 AND title = ?2 AND trash_id IS NULL",
+            rusqlite::params![stored.project_id, stored.title],
+            |r| r.get(0),
+        )
+        .ok()
+        .flatten();
+    let stale = newest.filter(|n| *n > stored.id).map(|n| {
+        format!(
+            "script #{} is not the newest version of this cut (#{n} is): the fix was applied to #{}, so what #{n} \
+             changed is not in it. Apply the next fix to the script_id this call returns.",
+            stored.id, stored.id
+        )
+    });
     let script_id = if dry_run || s == stored.script {
         stored.id
     } else {
         script::save_version(ctx.db, stored.project_id, &s, None)?
     };
-    Ok(ToolOutput::json(json!({ "script_id": script_id, "note": applied.note, "stage_run": ran, "issues": issues }))
-        .summary(format!("script #{script_id}")))
+    let mut out = json!({ "script_id": script_id, "note": applied.note, "stage_run": ran, "issues": issues });
+    if let Some(stale) = stale {
+        out["stale"] = json!(stale);
+    }
+    Ok(ToolOutput::json(out).summary(format!("script #{script_id}")))
 }
 
 static DRAFT_SCRIPT: ToolSpec = ToolSpec {
@@ -267,24 +300,29 @@ fn prepare_script(
     raw: &Value,
     repair: bool,
 ) -> Result<(script::Script, Option<f64>, Vec<String>), ToolError> {
-    let mut s: script::Script = serde_json::from_value(raw.clone())
-        .map_err(|e| ToolError::Invalid(format!("script JSON does not match the schema: {e}")))?;
+    // The error names the field (`beats[0].clips[1].framing: …`): "invalid type: map, expected a
+    // string" alone leaves a model guessing which of forty fields it got wrong.
+    let mut s: script::Script = serde_path_to_error::deserialize(raw.clone()).map_err(|e| {
+        let at = e.path().to_string();
+        ToolError::Invalid(format!("script JSON does not match the schema at `{at}`: {}", e.into_inner()))
+    })?;
     s.fill_from_project(p);
+    // A sentence names its own video: a clip that names another is corrected, and the editor told.
     // Clips written with sentence ids become seconds here; the repair below then places the cuts.
-    let by_sentence = crate::sentences::resolve_script(ctx.db, &mut s)?;
+    let (by_sentence, mut notes) = crate::sentences::resolve_script_noting(ctx.db, &mut s)?;
     if let Some(sel) = &s.agents {
         crate::agents::validate_selection(&ctx.config.agents(), sel).map_err(|e| ToolError::Invalid(e.to_string()))?;
     }
     let cfg = &ctx.config.script;
     let min = crate::clips::length_range(ctx.db, p.id, &s.title).map(|r| r.0);
-    let mut notes = Vec::new();
     if by_sentence > 0 {
         notes.push(format!("resolved {by_sentence} sentence range(s) to seconds (see `script`)"));
     }
     if repair {
-        notes.extend(crate::script_fix::repair_framing(ctx.db, &mut s, cfg.speech_overrun_s, min));
-        // Cuts on the sound itself, for footage whose speech was measured.
-        notes.extend(crate::cuts::place_cuts(ctx.db, &mut s, cfg).iter().map(crate::cuts::CutMove::message));
+        // The finish every cut gets, whoever wrote it: the same chain as a chat turn's, at the
+        // length the editor wrote.
+        let profile = crate::finish::Profile::save(min);
+        notes.extend(crate::finish::run(ctx.db, p.id, &mut s, cfg, &profile)?.into_iter().map(|n| n.message));
     }
     Ok((s, min, notes))
 }
@@ -305,7 +343,7 @@ async fn save_script(ctx: &mut ToolCtx<'_>, a: Args<'_>) -> ToolResult {
         None => {}
     }
     let cfg = &ctx.config.script;
-    let opts = script_check::CheckOptions { trim_min_s: min, ..Default::default() };
+    let opts = script_check::CheckOptions { trim_min_s: min, pictures: true, ..Default::default() };
     let issues = script_check::check(ctx.db, p.id, &s, cfg, &opts)?;
     let errors = issues.iter().filter(|i| i.severity == script::IssueSeverity::Error).count();
     let dry_run = a.bool_or("dry_run", false);
@@ -394,7 +432,7 @@ async fn read_cut(ctx: &mut ToolCtx<'_>, a: Args<'_>) -> ToolResult {
         return Err(ToolError::invalid("give script_id (a saved version) or script (a draft)"));
     };
     let cfg = &ctx.config.script;
-    let opts = script_check::CheckOptions { trim_min_s: min, ..Default::default() };
+    let opts = script_check::CheckOptions { trim_min_s: min, pictures: true, ..Default::default() };
     let issues = script_check::check(ctx.db, project_id, &s, cfg, &opts)?;
     let reading = crate::readcut::read_cut(ctx.db, project_id, &s, cfg, issues)?;
     let flagged = reading
@@ -611,4 +649,58 @@ async fn review_render(ctx: &mut ToolCtx<'_>, a: Args<'_>) -> ToolResult {
         out = out.images(images);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod preparation_tests {
+    use super::*;
+
+    #[test]
+    fn prepare_keeps_correction_notes_and_resolves_clips_and_beds_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::paths::Paths::in_dir(tmp.path());
+        let config = crate::config::Config::default();
+        let mut db = crate::db::Db::open_in_memory().unwrap();
+        let project = db.create_project(&crate::projects::NewProject::named("P")).unwrap();
+        for v in [1, 2] {
+            db.conn
+                .execute(
+                    "INSERT INTO videos(id, content_hash, size, duration_s) VALUES (?1, ?2, 1, 60.0)",
+                    rusqlite::params![v, format!("h{v}")],
+                )
+                .unwrap();
+        }
+        db.conn
+            .execute(
+                "INSERT INTO transcript_segments(id, video_id, start_s, end_s, text)
+             VALUES (100, 1, 2.0, 6.0, 'A whole sentence.')",
+                [],
+            )
+            .unwrap();
+        crate::sentence_split::mirror_segments(&db, 1);
+        let raw = json!({"title": "test", "beats": [{"id": "b1", "purpose": "p",
+            "clips": [
+                {"video_id": 2, "from": "s100", "to": "s100", "audio": "source"},
+                {"video_id": 2, "from": "s100", "to": "s100", "audio": "mute", "in_s": 0.0, "out_s": 6.6}
+            ],
+            "bed": {"video_id": 2, "from": "s100", "to": "s100"}
+        }]});
+        let mut embedder = None;
+        let mut ctx = ToolCtx::new(&paths, &config, &mut db, &mut embedder, super::super::Origin::External);
+        let (s, _, notes) = prepare_script(&mut ctx, &project, &raw, false).unwrap();
+        assert_eq!(notes.len(), 4, "three corrections and one resolution summary: {notes:?}");
+        assert!(notes.iter().any(|n| n.contains("clip now plays video #1")), "{notes:?}");
+        assert!(notes.iter().any(|n| n.contains("muted, so kept its pictures")), "{notes:?}");
+        assert!(notes.iter().any(|n| n.contains("bed: its sentences are in video #1")), "{notes:?}");
+        assert!(notes.iter().any(|n| n.contains("resolved 2 sentence range(s)")), "{notes:?}");
+        let beat = &s.beats[0];
+        assert_eq!((beat.clips[0].video_id, beat.clips[0].in_s, beat.clips[0].out_s), (1, 2.0, 6.0));
+        assert_eq!((beat.clips[1].video_id, beat.clips[1].out_s), (2, 6.6));
+        assert!(beat.clips[1].sentences.is_none());
+        let bed = beat.bed.as_ref().unwrap();
+        assert_eq!((bed.video_id, bed.in_s, bed.out_s), (1, 2.0, 6.0));
+        let (_, _, repeated_notes) =
+            prepare_script(&mut ctx, &project, &serde_json::to_value(s).unwrap(), false).unwrap();
+        assert!(repeated_notes.is_empty(), "{repeated_notes:?}");
+    }
 }

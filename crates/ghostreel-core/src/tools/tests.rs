@@ -202,6 +202,12 @@ async fn the_manifest_lays_the_measured_facts_on_one_clock() {
     let out = call(&mut ctx, "get_manifest", &json!({ "video_id": 10, "end_s": 12.0 })).await.unwrap();
     let text = out.text.expect("text by default");
     assert!(text.starts_with("=== video 10 (clip.mp4, 0:30.0"), "{text}");
+    // from/to as times, the way a model that has the times in front of it writes them: read, not refused.
+    for (from, to) in [(json!("5.0"), json!("12.0")), (json!(5.0), json!(12.0)), (json!("s2"), json!("s2"))] {
+        let part = call(&mut ctx, "get_manifest", &json!({ "video_id": 10, "from": from, "to": to })).await;
+        let part = part.unwrap_or_else(|e| panic!("from {from} to {to}: {e}")).text.unwrap();
+        assert!(part.contains("s2 0:05.2–") && !part.contains("s1 0:00.0"), "from {from} to {to}: {part}");
+    }
     // A sentence carries the measured silence before and after it, not a verdict on it.
     assert!(text.contains("s1 0:00.0–0:03.9 pause 0.10/1.30: welcome"), "{text}");
     assert!(text.contains("s2 0:05.2–"), "{text}");
@@ -297,6 +303,15 @@ async fn an_argument_the_tool_does_not_take_is_an_error_that_lists_what_it_takes
     let mut ctx = ToolCtx::new(&f.paths, &f.config, &mut f.db, &mut embedder, Origin::External).with_project(project);
     let err = call(&mut ctx, "list_videos", &json!({ "frm": "s1" })).await.unwrap_err().to_string();
     assert!(err.contains("does not take 'frm'") && err.contains("it takes: project"), "{err}");
+    // Except `project`: every editor is told it may pass it to any tool, so a tool keyed by video
+    // id takes it and has no use for it rather than costing the model a round.
+    let id: i64 = f_video_id(&ctx);
+    let ok = call(&mut ctx, "get_video", &json!({ "video_id": id, "project": "anything" })).await;
+    assert!(ok.is_ok(), "{ok:?}");
+}
+
+fn f_video_id(ctx: &ToolCtx<'_>) -> i64 {
+    ctx.db.conn.query_row("SELECT MIN(id) FROM videos", [], |r| r.get(0)).unwrap()
 }
 
 #[tokio::test]
@@ -398,6 +413,44 @@ async fn a_model_that_repeats_a_read_is_told_and_then_stopped() {
     );
     assert!(!results[3].stop);
     assert!(results[4].stop, "still asking: the run moves on to its answer");
+}
+
+/// The 9B's run 34: after reading each video's outline it counted `video_id` up past the library
+/// (139, 140, … 588), every call "not in project" and none a repeat, for an hour and 450 calls.
+/// A run of failures ends the research, and so does walking one reading tool past its cap.
+#[tokio::test]
+async fn a_model_that_keeps_failing_or_walks_the_library_is_stopped() {
+    let mut f = fixture();
+    let mut embedder = None;
+    let project = f.project.clone();
+    let mut session = ToolSession::new(8000);
+    let mut stopped_at = None;
+    for (n, id) in (900..1000).enumerate() {
+        let mut ctx = ToolCtx::new(&f.paths, &f.config, &mut f.db, &mut embedder, Origin::ScriptChat)
+            .with_project(project.clone());
+        let called = session.call(&mut ctx, "get_outline", &json!({ "video_id": id })).await;
+        assert!(called.is_error, "video #{id} is not in the project: {}", called.model_text);
+        if called.stop {
+            assert!(called.model_text.contains("give your final answer"), "{}", called.model_text);
+            stopped_at = Some(n + 1);
+            break;
+        }
+    }
+    assert_eq!(stopped_at, Some(session::STOP_AFTER_FAILURES as usize));
+
+    // Calls that succeed, each new: stopped at the cap for one tool.
+    let mut session = ToolSession::new(8000);
+    let mut last = None;
+    for q in 0..(session::MAX_CALLS_PER_TOOL + 1) {
+        let mut ctx = ToolCtx::new(&f.paths, &f.config, &mut f.db, &mut embedder, Origin::ScriptChat)
+            .with_project(project.clone());
+        last = Some(session.call(&mut ctx, "search", &json!({ "query": format!("words {q}") })).await);
+        if last.as_ref().is_some_and(|c| c.stop) {
+            break;
+        }
+    }
+    let last = last.unwrap();
+    assert!(last.stop && last.summary.contains("refused"), "{} / {}", last.summary, last.model_text);
 }
 
 #[tokio::test]
@@ -701,6 +754,37 @@ fn replies_to_the_action_protocol_are_read_leniently() {
     assert_eq!(step(json!({ "action": "tool", "tool": "get_video", "args": { "video_id": 1 } })), "tool get_video");
     assert_eq!(step(json!({ "action": "final", "answer": { "nope": 1 } })), "unusable");
     assert_eq!(step(json!({ "hello": 1 })), "unusable");
+    assert_eq!(
+        step(json!({ "action": "call", "picks": [] })),
+        "unusable",
+        "unknown action key must not silently fall through as an answer"
+    );
+    assert_eq!(step(json!({ "action": 123, "picks": [] })), "unusable");
+}
+
+#[tokio::test]
+async fn clip_run_profile_only_offers_and_allows_read_only_tools() {
+    assert_eq!(CLIP_RUN_TOOLS.len(), 14);
+    for name in CLIP_RUN_TOOLS {
+        assert_eq!(lookup(name).unwrap().spec.effect, Effect::Read, "{name} in CLIP_RUN_TOOLS must be read-only");
+    }
+    let f = fixture();
+    let (url, seen) = scripted_server(|request, n| {
+        let looked = request["messages"].as_array().unwrap().iter().any(|m| m["role"] == "tool");
+        if looked { answer() } else { tool_call(n, "save_clips", json!({ "clips": [] })) }
+    })
+    .await;
+    let mut backend = server_backend(url);
+    let scoped = access(&f).with_profile(ToolProfile::ClipRun);
+    run_agent_json(&mut backend, "Pick clips.", &schema(), 512, 10, Some(&scoped)).await.unwrap();
+    let seen = seen.lock().unwrap();
+    let offered = openai_names(&seen[0]["tools"]);
+    assert_eq!(offered, profile_names(ToolProfile::ClipRun).iter().map(|s| s.to_string()).collect::<Vec<_>>());
+    assert!(!offered.contains(&"save_clips".to_string()));
+    assert!(!offered.contains(&"delete_project".to_string()));
+    let tool_msg =
+        seen[1]["messages"].as_array().unwrap().iter().find(|m| m["role"] == "tool").unwrap()["content"].to_string();
+    assert!(tool_msg.contains("not available in this clip run"), "{tool_msg}");
 }
 
 /// A CLI agent that replies with the next of `replies` each time it is called (the last one
@@ -896,7 +980,7 @@ async fn a_clip_written_with_sentence_ids_is_resolved_repaired_and_saved_with_it
         "title": "Mixed",
         "beats": [{ "id": "b1", "purpose": "p", "clips": [
             { "video_id": 10, "in_s": 5.0, "out_s": 12.0 },
-            { "video_id": 10, "from": "s1", "to": "s2" }
+            { "video_id": 10, "from": "s1", "to": "s1" }
         ] }]
     });
     let out = call(&mut ctx, "save_script", &json!({ "project": "TestProj", "script": mixed, "dry_run": true }))
@@ -904,6 +988,76 @@ async fn a_clip_written_with_sentence_ids_is_resolved_repaired_and_saved_with_it
         .unwrap();
     assert!(out.value["script_id"].is_null());
     assert_eq!(out.value["clips"], 2);
+}
+
+#[tokio::test]
+async fn the_same_footage_twice_is_dropped_on_save_and_reported_by_the_check() {
+    let mut f = fixture();
+    let mut embedder = None;
+    let mut ctx = ToolCtx::new(&f.paths, &f.config, &mut f.db, &mut embedder, Origin::External);
+    let twice = json!({
+        "title": "Twice",
+        "beats": [
+            { "id": "b1", "purpose": "p", "clips": [{ "video_id": 10, "from": "s2", "to": "s2" }] },
+            { "id": "b2", "purpose": "p", "clips": [
+                { "video_id": 10, "from": "s1", "to": "s1" },
+                { "video_id": 10, "from": "s2", "to": "s2" }
+            ] }
+        ]
+    });
+    let out = call(&mut ctx, "save_script", &json!({ "project": "TestProj", "script": twice, "dry_run": true }))
+        .await
+        .unwrap();
+    assert_eq!(out.value["clips"], 2, "{}", out.value);
+    let notes = out.value["notes"].to_string();
+    assert!(notes.contains("dropped 1 clip(s) that repeated footage"), "{notes}");
+    // A script stored before (or saved without the repair): the check says so.
+    let project = ctx.db.project_by_name("TestProj").ok().flatten().map(|p| p.id).unwrap_or(1);
+    let s: crate::script::Script = serde_json::from_value(json!({
+        "title": "Twice", "beats": [{ "id": "b1", "purpose": "p", "clips": [
+            { "video_id": 10, "in_s": 5.0, "out_s": 12.0, "audio": "source" },
+            { "video_id": 10, "in_s": 6.0, "out_s": 11.0, "audio": "source" }
+        ] }]
+    }))
+    .unwrap();
+    let issues = crate::script_check::check(ctx.db, project, &s, &f.config.script, &Default::default()).unwrap();
+    assert!(issues.iter().any(|i| i.message.starts_with("repeats footage")), "{issues:?}");
+}
+
+#[tokio::test]
+async fn a_trim_that_moves_one_edge_keeps_the_other() {
+    let mut f = fixture();
+    let mut embedder = None;
+    let mut ctx = ToolCtx::new(&f.paths, &f.config, &mut f.db, &mut embedder, Origin::External);
+    let cut = json!({ "title": "Trim", "beats": [{ "id": "b1", "purpose": "p", "clips": [
+        { "video_id": 10, "in_s": 5.0, "out_s": 12.0, "exact": true }
+    ] }] });
+    let saved =
+        call(&mut ctx, "save_script", &json!({ "project": "TestProj", "script": cut, "repair": false })).await.unwrap();
+    let id = saved.value["script_id"].as_i64().unwrap();
+    let out = call(
+        &mut ctx,
+        "apply_fix",
+        &json!({ "script_id": id, "dry_run": true, "fix": { "kind": "trim", "beat_id": "b1", "clip_index": 0, "out_s": 10.0 } }),
+    )
+    .await;
+    let out = out.unwrap_or_else(|e| panic!("a trim with only out_s is applied: {e}"));
+    assert!(out.value["note"].is_string(), "{}", out.value);
+}
+
+#[tokio::test]
+async fn a_script_that_does_not_match_the_schema_says_which_field() {
+    let mut f = fixture();
+    let mut embedder = None;
+    let mut ctx = ToolCtx::new(&f.paths, &f.config, &mut f.db, &mut embedder, Origin::External);
+    let bad = json!({ "title": "Bad", "beats": [{ "id": "b1", "purpose": "p", "clips": [
+        { "video_id": 10, "in_s": 5.0, "out_s": 12.0, "audio": { "volume": 1 } }
+    ] }] });
+    let err = call(&mut ctx, "save_script", &json!({ "project": "TestProj", "script": bad, "dry_run": true }))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("beats[0].clips[0].audio"), "{err}");
 }
 
 #[tokio::test]
@@ -1176,22 +1330,30 @@ async fn export_script_renders_the_full_size_mp4() {
 fn every_model_reads_the_same_instructions_and_they_steer_the_workflow() {
     let prompt = INSTRUCTIONS;
     let first = prompt.find("get_outline").expect("the outline comes first");
-    for later in ["get_manifest", "get_transcript", "read_cut", "get_frames"] {
+    for later in ["find_clip_candidates", "get_manifest", "read_cut", "get_frames"] {
         assert!(prompt.find(later).unwrap() > first, "{later} is not mentioned after get_outline");
     }
     for needle in [
-        "from: \"s412\", to: \"s418\"",          // clips by sentence id
+        "from: \"s412\", to: \"s418\"",                              // clips by sentence id
+        "lines code has flagged as off the microphone are kept out", // M14 honest guarantee
+        "read_cut shows any it missed",
         "placed by code on the measured speech", // what code guarantees
-        "a hook in the first 3 seconds",         // editorial rules
-        "one idea per beat",
+        "A hook in the first 3 seconds",         // editorial rules
+        "One idea per beat",
         "end on a complete thought",
-        "show the face when someone speaks",
+        "Read the pictures before you choose", // the manifest before save_script
+        "B-roll plays under a voice",
+        "open on the most specific moment",
+        "Choose the spoken lines from moments",
+        "people's names",
+        "Show the face when someone speaks",
         "J-cut",
-        "no screen share in a 9:16 cut",
+        "No screen share in a 9:16 cut",
         "only when the picture decides", // cost
     ] {
         assert!(prompt.contains(needle), "the instructions lack: {needle}");
     }
+    assert!(!prompt.contains("nobody off the microphone"), "instructions still overstate the guarantee");
     // The script chat gives them, whole and unchanged, to every model it drives: the same words
     // whatever the window, and no transcript pasted in ahead of them.
     let db = crate::db::Db::open_in_memory().unwrap();
@@ -1201,4 +1363,109 @@ fn every_model_reads_the_same_instructions_and_they_steer_the_workflow() {
         assert!(chat.contains(INSTRUCTIONS), "the chat prompt ({detail:?}) does not carry the instructions");
         assert!(!chat.contains("WHAT PEOPLE SAY"));
     }
+}
+
+#[tokio::test]
+async fn get_manifest_and_transcript_reject_ambiguous_bare_integers_and_non_finite_edges() {
+    let mut f = fixture();
+    let mut embedder = None;
+    let mut ctx = ToolCtx::new(&f.paths, &f.config, &mut f.db, &mut embedder, Origin::External);
+    for tool in ["get_manifest", "get_transcript"] {
+        let err =
+            call(&mut ctx, tool, &json!({ "video_id": 10, "from": "412", "to": "418" })).await.unwrap_err().to_string();
+        assert!(
+            err.contains("s412") && (err.contains("412s") || err.contains("412.0")),
+            "{tool} bare integer error must name both forms: {err}"
+        );
+        for bad in ["NaN", "inf", "-inf", "NaNs", "infs"] {
+            let err = call(&mut ctx, tool, &json!({ "video_id": 10, "from": bad, "to": "12.0" }))
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(!err.is_empty(), "{tool} must reject {bad}");
+        }
+        // Unambiguous forms (JSON integer/float, decimal string, trailing 's', sentence id) all work.
+        for (from, to) in [
+            (json!(5), json!(12)),
+            (json!("5s"), json!("12s")),
+            (json!("5.0"), json!("12.0")),
+            (json!("s1"), json!("s2")),
+        ] {
+            let ok = call(&mut ctx, tool, &json!({ "video_id": 10, "from": from, "to": to })).await;
+            assert!(ok.is_ok(), "{tool} ({from}..{to}) failed: {ok:?}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn check_clips_accepts_sentence_ids_and_reports_diagnostics_and_save_clips_refuses_clip_run() {
+    use crate::speech::SpeechRegion;
+    let mut f = fixture();
+    f.db.set_speech_regions(
+        10,
+        &[SpeechRegion { start_s: 0.20, end_s: 4.60, quiet_after_s: Some(4.8) }, SpeechRegion::new(5.05, 11.5)],
+    )
+    .unwrap();
+    crate::sentence_split::ensure(&f.db, 10).unwrap();
+    let sents = crate::index::transcript(&f.db, 10).unwrap();
+    let from = format!("s{}@2", sents[0].id);
+    let to = format!("s{}", sents[1].id);
+    let span = format!("{from}–{to}");
+    let words = vec![(0.2, 1.0), (1.0, 2.0), (2.0, 3.0), (3.0, 4.6)];
+    f.db.conn
+        .execute(
+            "UPDATE transcript_sentences SET words_json = ?1 WHERE id = ?2",
+            rusqlite::params![serde_json::to_string(&words).unwrap(), sents[0].id],
+        )
+        .unwrap();
+
+    let mut embedder = None;
+    let mut ctx = ToolCtx::new(&f.paths, &f.config, &mut f.db, &mut embedder, Origin::External);
+    let out = call(
+        &mut ctx,
+        "check_clips",
+        &json!({
+            "project": "TestProj",
+            "min_s": 5.0,
+            "max_s": 30.0,
+            "clips": [{
+                "video_id": 10,
+                "from": from,
+                "to": to,
+                "title": "Clip by sentence",
+                "hook": "Hook"
+            }]
+        }),
+    )
+    .await
+    .unwrap();
+    let clip = &out.value["clips"][0];
+    assert_eq!((clip["from"].as_str(), clip["to"].as_str()), (Some(from.as_str()), Some(to.as_str())));
+    assert!((clip["in_s"].as_f64().unwrap() - 1.0).abs() < 0.05, "{clip}");
+    let text = out.text.as_deref().unwrap();
+    assert!(text.contains(&span), "{text}");
+    assert!(text.contains("edges:"), "{text}");
+
+    // save_clips is refused inside Origin::ClipRun.
+    let mut run_ctx = ToolCtx::new(&f.paths, &f.config, &mut f.db, &mut embedder, Origin::ClipRun);
+    let err = call(
+        &mut run_ctx,
+        "save_clips",
+        &json!({
+            "project": "TestProj",
+            "min_s": 5.0,
+            "max_s": 30.0,
+            "clips": [{
+                "video_id": 10,
+                "from": format!("s{}", sents[0].id),
+                "to": to,
+                "title": "Nope",
+                "hook": "Hook"
+            }]
+        }),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("clip run"), "{err}");
 }

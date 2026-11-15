@@ -9,7 +9,7 @@
 //! to keep it at zero.
 
 use crate::db::Db;
-use crate::script::{Audio, Issue, IssueSeverity, Script};
+use crate::script::{Audio, Issue, IssueSeverity, Script, SentenceRange};
 
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
 pub struct ScriptMetrics {
@@ -26,7 +26,7 @@ pub struct ScriptMetrics {
     /// against, so "one voice" is only a fault when there were others to choose.
     pub speaking_sources_available: usize,
     pub speech_s: f64,
-    /// Clips whose out point falls strictly inside a transcript segment. `end_on_sentences` exists
+    /// Clips whose out point falls strictly inside a sentence. `end_on_sentences` exists
     /// to drive this to zero; any non-zero value is a regression in a named pass.
     pub mid_sentence_cuts: usize,
     /// Seconds of picture with nothing to hear: no source audio, no bed over it, no narration.
@@ -59,13 +59,20 @@ pub fn measure(db: &Db, draft: Option<&Script>, script: &Script, issues: &[Issue
     }
 
     let mut voices = std::collections::HashSet::new();
-    for beat in &script.beats {
+    let mut edge_cache: std::collections::HashMap<i64, Vec<(f64, f64)>> = std::collections::HashMap::new();
+    // The breath a beat's last b-roll shot runs on after its voice is meant, not a gap: it counts
+    // as heard. The default length: the score compares cuts, not settings.
+    let breath_cfg = crate::config::ScriptConfig::default();
+    for (bi, beat) in script.beats.iter().enumerate() {
         let narrated = beat.narration.as_deref().map(str::trim).is_some_and(|n| !n.is_empty());
-        let bed_s = beat.bed.as_ref().map(|b| b.duration_s()).unwrap_or(0.0);
+        let bed_s = beat.bed.as_ref().map(|b| b.duration_s()).unwrap_or(0.0)
+            + crate::finish::pictures::breath_after(script, bi, &breath_cfg);
         if let Some(bed) = &beat.bed {
             voices.insert(bed.video_id);
             m.speech_s += bed.duration_s();
-            if ends_mid_sentence(db, bed.video_id, bed.in_s, bed.out_s) {
+            if !has_word_end(bed.sentences.as_ref())
+                && ends_mid_sentence_cached(db, &mut edge_cache, bed.video_id, bed.in_s, bed.out_s)
+            {
                 m.mid_sentence_cuts += 1;
             }
         }
@@ -77,7 +84,9 @@ pub fn measure(db: &Db, draft: Option<&Script>, script: &Script, issues: &[Issue
             if c.audio == Audio::Source && beat.bed.is_none() {
                 voices.insert(c.video_id);
                 m.speech_s += dur;
-                if ends_mid_sentence(db, c.video_id, c.in_s, c.out_s) {
+                if !has_word_end(c.sentences.as_ref())
+                    && ends_mid_sentence_cached(db, &mut edge_cache, c.video_id, c.in_s, c.out_s)
+                {
                     m.mid_sentence_cuts += 1;
                 }
             }
@@ -123,24 +132,37 @@ pub fn measure(db: &Db, draft: Option<&Script>, script: &Script, issues: &[Issue
     m
 }
 
-/// Does this range stop while someone is still speaking?
-///
-/// A range that ends on a sentence boundary still reaches a little into the next one: the cut runs
-/// past the last word on purpose, so its decay is not chopped off. Touching the next sentence is
-/// not cutting into it — only a range that plays a real part of a sentence and then stops counts,
-/// which is what a listener would call being cut off.
-const CUT_INTO_SENTENCE_S: f64 = 0.6;
+/// Whether the range explicitly ends on a word boundary (`to: "sX@N"`).
+fn has_word_end(sentences: Option<&SentenceRange>) -> bool {
+    sentences.and_then(|r| crate::sentences::SentenceRef::parse(&r.to).ok()).and_then(|s| s.word).is_some()
+}
 
-fn ends_mid_sentence(db: &Db, video_id: i64, _in_s: f64, out_s: f64) -> bool {
-    db.conn
-        .query_row(
-            "SELECT COUNT(*) FROM transcript_segments
-              WHERE video_id = ?1 AND end_s > ?2 + 0.25 AND start_s < ?2 - ?3",
-            rusqlite::params![video_id, out_s, CUT_INTO_SENTENCE_S],
-            |r| r.get::<_, i64>(0),
-        )
-        .unwrap_or(0)
-        > 0
+fn video_edges<'a>(
+    db: &Db,
+    cache: &'a mut std::collections::HashMap<i64, Vec<(f64, f64)>>,
+    video_id: i64,
+) -> &'a [(f64, f64)] {
+    cache.entry(video_id).or_insert_with(|| {
+        let edges = crate::sentence_split::edges(db, video_id);
+        if !edges.is_empty() {
+            return edges;
+        }
+        // Only fall back to raw segments when no sentences exist for this video.
+        db.conn
+            .prepare_cached("SELECT start_s, end_s FROM transcript_segments WHERE video_id = ?1 ORDER BY start_s")
+            .and_then(|mut st| st.query_map([video_id], |r| Ok((r.get(0)?, r.get(1)?)))?.collect())
+            .unwrap_or_default()
+    })
+}
+
+fn ends_mid_sentence_cached(
+    db: &Db,
+    cache: &mut std::collections::HashMap<i64, Vec<(f64, f64)>>,
+    video_id: i64,
+    _in_s: f64,
+    out_s: f64,
+) -> bool {
+    crate::sentence_split::cuts_into_a_sentence(video_edges(db, cache, video_id), out_s)
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -239,7 +261,18 @@ mod tests {
     }
 
     fn clip(video_id: i64, in_s: f64, out_s: f64, audio: Audio) -> ScriptClip {
-        ScriptClip { exact: false, sentences: None, video_id, in_s, out_s, audio, why: None, tracks: None, framing: None }
+        ScriptClip {
+            exact: false,
+            gain_db: None,
+            sentences: None,
+            video_id,
+            in_s,
+            out_s,
+            audio,
+            why: None,
+            tracks: None,
+            framing: None,
+        }
     }
 
     #[test]
@@ -373,5 +406,58 @@ mod tests {
         s.beats[2].purpose = String::new(); // said not at all
         let m = measure(&db, None, &s, &[]);
         assert_eq!(m.beats_without_purpose, 2);
+    }
+
+    #[test]
+    fn sentence_edges_govern_mid_sentence_cuts_not_raw_whisper_fragments() {
+        let db = Db::open_in_memory().unwrap();
+        db.conn.execute("INSERT INTO videos(id, content_hash, size, duration_s) VALUES (1,'a',1,30.0)", []).unwrap();
+        // Fragmented Whisper segments that join into one sentence (0..6.0) plus a run-on segment
+        // split by punctuation at 6.0..12.0.
+        db.conn
+            .execute(
+                "INSERT INTO transcript_segments(video_id, start_s, end_s, text) VALUES (1, 0.0, 2.5, 'cuando usas agentes')",
+                [],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO transcript_segments(video_id, start_s, end_s, text) VALUES (1, 2.5, 6.0, 'en producción pasa esto.')",
+                [],
+            )
+            .unwrap();
+        // A run-on segment containing two punctuated sentences.
+        db.conn
+            .execute(
+                "INSERT INTO transcript_segments(video_id, start_s, end_s, text) VALUES (1, 6.0, 12.0, 'Primero falla. Luego funciona.')",
+                [],
+            )
+            .unwrap();
+
+        // Ending at 9.0 cuts between "Primero falla." and "Luego funciona." (a sentence edge inside
+        // the 6..12 raw Whisper segment): NOT a mid-sentence cut.
+        let edges = crate::sentence_split::edges(&db, 1);
+        assert_eq!(edges.len(), 3, "{edges:?}");
+        let boundary = edges[1].1;
+        let clean = script_of(vec![beat("b1", vec![clip(1, 0.0, boundary, Audio::Source)], None)], Some(boundary));
+        assert_eq!(measure(&db, None, &clean, &[]).mid_sentence_cuts, 0);
+
+        // Ending mid-sentence inside the joined first sentence (at 2.5, raw segment boundary) IS a cut.
+        let mid = script_of(vec![beat("b1", vec![clip(1, 0.0, 2.5, Audio::Source)], None)], Some(2.5));
+        assert_eq!(measure(&db, None, &mid, &[]).mid_sentence_cuts, 1);
+    }
+
+    #[test]
+    fn explicit_word_end_is_exempt_while_word_start_alone_is_not() {
+        let db = db_with_speech();
+        let mut to_word = clip(1, 0.0, 7.0, Audio::Source);
+        to_word.sentences = Some(SentenceRange { from: "s1".into(), to: "s1@2".into() });
+        let s_to = script_of(vec![beat("b1", vec![to_word], None)], Some(7.0));
+        assert_eq!(measure(&db, None, &s_to, &[]).mid_sentence_cuts, 0);
+
+        let mut from_word_only = clip(1, 2.0, 7.0, Audio::Source);
+        from_word_only.sentences = Some(SentenceRange { from: "s1@2".into(), to: "s1".into() });
+        let s_from = script_of(vec![beat("b1", vec![from_word_only], None)], Some(5.0));
+        assert_eq!(measure(&db, None, &s_from, &[]).mid_sentence_cuts, 1);
     }
 }

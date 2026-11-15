@@ -125,6 +125,17 @@ pub const STOP_AFTER_REFUSALS: u32 = 2;
 /// Counted across the whole run, not in a row: a model going round a cycle of calls never repeats
 /// the one it just made.
 pub const STOP_AFTER_WITHHELD: u32 = 3;
+/// Failed calls in a row after which the research ends. A model counting `video_id` up from the
+/// last real one (139, 140, … 588, each "not in project") never repeats a call, so neither guard
+/// above sees it: what it repeats is failing.
+pub const STOP_AFTER_FAILURES: u32 = 8;
+/// Calls of one reading tool in a turn after which the research ends: past this a model is walking
+/// the library one id at a time rather than reading what it found (the outline lists every video
+/// already; a 9B asked for each of them, then for ids that do not exist, 450 calls in an hour).
+pub const MAX_CALLS_PER_TOOL: u32 = 60;
+/// Versions a turn may save (save_script, apply_fix) before the research ends: a model going round
+/// save, fix, read and save again made thirty-six versions of one cut without changing it.
+pub const MAX_SAVES_PER_TURN: u32 = 20;
 
 /// Notices a model calling the same tool with the same arguments, and getting the same result,
 /// over and over. Judged by result as well as arguments: `index` is called again and again with the
@@ -223,20 +234,101 @@ pub struct ToolSession {
     /// Calls made, including repeats and refusals.
     pub calls: u32,
     withheld: u32,
+    /// Calls that failed since the last one that did not.
+    failed_in_a_row: u32,
+    /// Calls of each reading tool this turn.
+    per_tool: std::collections::HashMap<String, u32>,
+    /// Versions saved this turn (save_script, apply_fix, not dry runs), including refused ones.
+    saves: u32,
+    /// MCP sessions live for a process, not a chat turn, so their per-turn quotas do not apply.
+    persistent: bool,
     /// The last script version a call saved (save_script, apply_fix): what the session delivered,
     /// the way an MCP client's work ends in the version it saved last.
     pub saved_script: Option<i64>,
+    /// Videos whose pictures this session has read (get_manifest, get_video, get_frames,
+    /// get_scenes, get_faces): a cut chosen from the others was chosen from words alone.
+    pictures_seen: std::collections::HashSet<i64>,
+}
+
+/// The video ids a call names (`video_id`, `video_ids`).
+fn video_ids_of(args: &Value) -> Vec<i64> {
+    let mut ids: Vec<i64> =
+        args["video_ids"].as_array().map(|a| a.iter().filter_map(Value::as_i64).collect()).unwrap_or_default();
+    ids.extend(args["video_id"].as_i64());
+    ids
 }
 
 impl ToolSession {
+    fn invalidate_reads(&mut self) {
+        self.memo = ToolMemo::default();
+        self.withheld = 0;
+    }
+
+    fn should_refuse_read(&mut self, tool: &str) -> bool {
+        if self.persistent {
+            return false;
+        }
+        let n = self.per_tool.entry(tool.to_string()).or_default();
+        *n += 1;
+        *n > MAX_CALLS_PER_TOOL
+    }
+
+    fn should_refuse_save(&mut self, tool: &str, args: &Value) -> bool {
+        if self.persistent || !matches!(tool, "save_script" | "apply_fix") || args["dry_run"].as_bool().unwrap_or(false)
+        {
+            return false;
+        }
+        self.saves += 1;
+        self.saves > MAX_SAVES_PER_TURN
+    }
+
+    /// Sound sources in the resolved script, including voices carried by audio beds.
+    fn unseen_pictures(&self, db: &crate::db::Db, raw: &Value) -> Vec<i64> {
+        let Ok(mut script) = serde_json::from_value::<crate::script::Script>(raw.clone()) else { return Vec::new() };
+        // Use the same sentence ownership and resolution as the save handler. In particular a
+        // model's raw video_id may be replaced by the video the sentence actually belongs to.
+        if crate::sentences::resolve_script(db, &mut script).is_err() {
+            return Vec::new();
+        }
+        let mut out: Vec<i64> = script
+            .beats
+            .iter()
+            .flat_map(|beat| {
+                beat.clips
+                    .iter()
+                    .filter(|c| c.audio != crate::script::Audio::Mute)
+                    .map(|c| c.video_id)
+                    .chain(beat.bed.iter().map(|b| b.video_id))
+            })
+            .filter(|v| !self.pictures_seen.contains(v))
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
     pub fn new(max_chars: usize) -> Self {
+        Self::with_persistent(max_chars, false)
+    }
+
+    /// Create a session whose lifetime is not bounded by chat-turn quotas.
+    pub fn persistent(max_chars: usize) -> Self {
+        Self::with_persistent(max_chars, true)
+    }
+
+    fn with_persistent(max_chars: usize, persistent: bool) -> Self {
         Self {
             memo: ToolMemo::default(),
             guard: CallGuard::default(),
             max_chars,
             calls: 0,
             withheld: 0,
+            failed_in_a_row: 0,
+            per_tool: Default::default(),
+            saves: 0,
+            persistent,
             saved_script: None,
+            pictures_seen: Default::default(),
         }
     }
 
@@ -253,6 +345,30 @@ impl ToolSession {
         }
 
         let effect = lookup(&tool).map(|t| t.spec.effect);
+        if effect == Some(Effect::Read) {
+            let count = self.per_tool.get(&tool).copied().unwrap_or(0) + 1;
+            if self.should_refuse_read(&tool) {
+                called.is_error = true;
+                called.stop = true;
+                called.summary = format!("{tool} called {count} times — refused");
+                called.model_text = format!(
+                    "You have called {tool} {count} times this turn. Stop reading and give your final answer with what \
+                     you have."
+                );
+                return called;
+            }
+        }
+        if self.should_refuse_save(&tool, args) {
+            called.is_error = true;
+            called.stop = true;
+            called.summary = format!("{} saves this turn — refused", self.saves - 1);
+            called.model_text = format!(
+                "You have saved {} versions this turn. Stop saving and give your final answer: the last \
+                 version you saved is the cut.",
+                self.saves - 1
+            );
+            return called;
+        }
         if effect == Some(Effect::Read)
             && let Some((text, summary)) = self.memo.recall(&tool, args)
         {
@@ -270,6 +386,14 @@ impl ToolSession {
         ctx.max_chars = Some(self.max_chars);
         match super::call(ctx, &tool, args).await {
             Ok(mut out) => {
+                self.failed_in_a_row = 0;
+                // Inspect the prepared script before output sizing can truncate it. When the
+                // handler made no changes it omits `script`, so resolve the original instead.
+                let unseen = if tool == "save_script" {
+                    self.unseen_pictures(ctx.db, out.value.get("script").unwrap_or(&args["script"]))
+                } else {
+                    Vec::new()
+                };
                 fit(&mut out, self.max_chars);
                 called.model_text = out.model_text();
                 called.summary = if out.summary.is_empty() { "ok".into() } else { out.summary.clone() };
@@ -278,6 +402,10 @@ impl ToolSession {
                 if effect == Some(Effect::Read) {
                     self.memo.remember(&tool, args, &called.model_text, &called.summary);
                 }
+                // A write changes what the reads said: answer them afresh after it.
+                if effect == Some(Effect::Write) && !args["dry_run"].as_bool().unwrap_or(false) {
+                    self.invalidate_reads();
+                }
                 self.guard.note(&key, fingerprint(&called.model_text));
                 if effect == Some(Effect::Write)
                     && matches!(tool.as_str(), "save_script" | "apply_fix")
@@ -285,6 +413,19 @@ impl ToolSession {
                     && let Some(id) = out.value["script_id"].as_i64()
                 {
                     self.saved_script = Some(id);
+                }
+                if matches!(tool.as_str(), "get_manifest" | "get_video" | "get_frames" | "get_scenes" | "get_faces") {
+                    self.pictures_seen.extend(video_ids_of(args));
+                }
+                if !unseen.is_empty() {
+                    let list = unseen.iter().map(|v| format!("#{v}")).collect::<Vec<_>>().join(", ");
+                    called.model_text.push_str(&format!(
+                            "\nNOTE: you chose clips from video {list} without reading its pictures in this session. \
+                             A clip is a picture as well as words: get_manifest (video_ids: [{}]) shows who is on \
+                             screen, the framing and what each moment looks like. Read it, and save again if it changes \
+                             your choices.\n",
+                            unseen.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(", ")
+                        ));
                 }
                 called.value = Some(out.value);
             }
@@ -297,6 +438,21 @@ impl ToolSession {
                 };
                 called.summary = format!("error: {}", one_line(&e.to_string(), 100));
                 called.model_text = json!({ "error": message }).to_string();
+                if !called.cancelled {
+                    self.failed_in_a_row += 1;
+                    if self.failed_in_a_row >= STOP_AFTER_FAILURES {
+                        called.stop = true;
+                        called.model_text = json!({
+                            "error": message,
+                            "stop": format!(
+                                "Your last {} calls all failed. Stop calling tools and give your final answer with \
+                                 what you have.",
+                                self.failed_in_a_row
+                            ),
+                        })
+                        .to_string();
+                    }
+                }
             }
         }
         called
@@ -395,5 +551,67 @@ pub fn shrink_value(value: &mut Value, max: usize) {
         && let Value::Object(o) = value
     {
         o.insert("truncated".into(), json!(format!("{dropped} items left out to fit; ask for a narrower range")));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn picture_warning_uses_resolved_sentence_video() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        db.conn
+            .execute_batch(
+                "INSERT INTO videos(id, content_hash, size, duration_s) VALUES (1,'a',1,60), (2,'b',1,60);
+            INSERT INTO transcript_sentences(id,video_id,start_s,end_s,text) VALUES (12,2,20,30,'Answer.');",
+            )
+            .unwrap();
+        let mut session = ToolSession::new(8000);
+        session.pictures_seen.insert(1);
+        let args = json!({"script": {"title":"Sentence", "beats":[{"id":"1", "purpose":"test", "clips":[
+            {"video_id":1,"from":"s12","to":"s12"}
+        ]}]}});
+        // The same correction the save handler applies must determine the reminder's source.
+        assert_eq!(session.unseen_pictures(&db, &args["script"]), vec![2]);
+    }
+
+    #[test]
+    fn picture_warning_includes_audio_beds() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = ToolSession::new(8000);
+        let args = json!({"script": {"title":"Bed", "beats":[{"id":"1", "purpose":"test", "clips":[
+            {"video_id":1,"in_s":0.0,"out_s":5.0,"audio":"mute"}
+        ], "bed":{"video_id":2,"in_s":0.0,"out_s":5.0}}]}});
+        assert_eq!(session.unseen_pictures(&db, &args["script"]), vec![2]);
+    }
+
+    #[test]
+    fn persistent_session_has_no_turn_save_or_read_quotas() {
+        let mut session = ToolSession::persistent(8000);
+        let args = json!({});
+        for _ in 0..(MAX_CALLS_PER_TOOL + 5) {
+            assert!(!session.should_refuse_read("list_projects"));
+        }
+        for _ in 0..(MAX_SAVES_PER_TURN + 5) {
+            assert!(!session.should_refuse_save("save_script", &args));
+        }
+    }
+
+    #[test]
+    fn successful_write_invalidates_read_memo_and_repeat_state() {
+        let mut session = ToolSession::new(8000);
+        let args = json!({"project":"A"});
+        session.memo.remember("list_scripts", &args, "old answer", "old");
+        session.memo.recall("list_scripts", &args).unwrap();
+        session.guard.note_same(&ToolMemo::key("list_scripts", &args));
+        session.withheld = 2;
+
+        session.invalidate_reads(); // successful non-dry-run write
+        session.guard.note("set_glossary{}", fingerprint("write result"));
+
+        assert!(session.memo.recall("list_scripts", &args).is_none());
+        assert_eq!(session.withheld, 0);
+        assert_eq!(session.guard.check(&ToolMemo::key("list_scripts", &args)), Verdict::Allow);
     }
 }

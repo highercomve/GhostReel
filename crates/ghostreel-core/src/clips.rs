@@ -14,6 +14,8 @@
 //! 4. **Check + save (code).** The same repair passes `script import` runs, then
 //!    `script_check::check`; saved with `kind = 'clip'` and a shared `set_id`.
 
+use crate::lexicon::{CONNECTIVES, REPLIES};
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -148,9 +150,11 @@ pub struct Segment {
     pub speaker: Option<String>,
 }
 
-/// Consecutive segments that make one sentence (or as near as an unpunctuated transcript allows).
+/// One sentence (or unit) of speech, with its optional stored sentence id.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Unit {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<i64>,
     pub start_s: f64,
     pub end_s: f64,
     pub text: String,
@@ -249,6 +253,7 @@ pub struct VideoSurvey {
     pub video_id: i64,
     pub duration_s: f64,
     pub units: Vec<Unit>,
+    chapters: Vec<crate::chapters::Chapter>,
     frames: Vec<FrameNote>,
     tracks: Vec<Track>,
     motion: Vec<crate::steadiness::Window>,
@@ -304,6 +309,7 @@ pub fn sentence_units(segs: &[Segment]) -> Vec<Unit> {
     for (i, seg) in segs.iter().enumerate() {
         let next = segs.get(i + 1);
         let u = cur.get_or_insert_with(|| Unit {
+            id: None,
             start_s: seg.start_s,
             end_s: seg.end_s,
             text: String::new(),
@@ -322,11 +328,15 @@ pub fn sentence_units(segs: &[Segment]) -> Vec<Unit> {
             u.speakers.push(s.clone());
         }
         let hole = next.is_some_and(|n| n.start_s - seg.end_s > TRANSCRIPT_HOLE_S);
+        // Someone off the microphone (an interviewer's "Okay.", a question from behind the camera)
+        // is never inside another person's unit: a unit is all on the mic or all off it, so a
+        // moment can stop before such a line instead of carrying it.
+        let mic_changes = next.is_some_and(|n| n.off_mic != seg.off_mic);
         let end = sentence_end(seg, next);
         let forced = end.is_none()
             && u.end_s - u.start_s > LONG_UNIT_S
             && !FUNCTION_WORDS.contains(&last_word(&seg.text).as_str());
-        if end.is_some() || hole || forced || next.is_none() {
+        if end.is_some() || hole || forced || mic_changes || next.is_none() {
             let mut done = cur.take().unwrap();
             done.strong_end = end == Some(true);
             units.push(done);
@@ -377,33 +387,26 @@ pub fn project_videos(db: &Db, project_id: i64, requested: &[i64]) -> Result<Vec
 
 impl VideoSurvey {
     pub fn load(db: &Db, video_id: i64) -> Result<Self, Error> {
-        // Who speaks each line: the person's name, else the person or voice number.
-        let sql = "SELECT ts.start_s, ts.end_s, ts.text, COALESCE(ts.off_mic, 0),
-                    COALESCE(NULLIF(TRIM(p.name), ''),
-                             CASE WHEN ts.person_id IS NOT NULL THEN 'Person ' || ts.person_id END,
-                             CASE WHEN ts.speaker IS NOT NULL THEN 'Speaker ' || ts.speaker END)
-             FROM transcript_segments ts LEFT JOIN people p ON p.id = ts.person_id
-             WHERE ts.video_id = ?1 AND TRIM(ts.text) <> '' ORDER BY ts.start_s";
         let glossary = db.glossary_for_video(video_id).unwrap_or_default();
-        let segs: Vec<Segment> = db
-            .conn
-            .prepare(sql)?
-            .query_map([video_id], |r| {
-                Ok(Segment {
-                    start_s: r.get(0)?,
-                    end_s: r.get(1)?,
-                    text: r.get(2)?,
-                    off_mic: r.get::<_, i64>(3)? != 0,
-                    speaker: r.get(4)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?
+        let units: Vec<Unit> = crate::index::transcript(db, video_id)?
             .into_iter()
-            .map(|mut s| {
-                s.text = glossary.correct(&s.text);
-                s
+            .filter(|s| !s.text.trim().is_empty())
+            .map(|s| {
+                let text = glossary.correct(&s.text);
+                let trimmed = text.trim_end().trim_end_matches(['"', '\'', '”', '’', '»', ')', ']']);
+                let strong_end = trimmed.ends_with(['.', '!', '?', '…']);
+                Unit {
+                    id: Some(s.id),
+                    start_s: s.start,
+                    end_s: s.end,
+                    text,
+                    starts_off_mic: s.off_mic,
+                    strong_end,
+                    speakers: s.speaker.into_iter().collect(),
+                }
             })
             .collect();
+        let chapters = crate::chapters::load(db, video_id).unwrap_or_default();
         let frames = db
             .conn
             .prepare("SELECT t_s, description_json FROM frames WHERE video_id = ?1 AND description_json IS NOT NULL ORDER BY t_s")?
@@ -427,7 +430,8 @@ impl VideoSurvey {
         Ok(Self {
             video_id,
             duration_s,
-            units: sentence_units(&segs),
+            units,
+            chapters,
             frames,
             tracks,
             motion: db.motion_windows(video_id).unwrap_or_default(),
@@ -441,6 +445,7 @@ impl VideoSurvey {
             video_id,
             duration_s: units.last().map(|u| u.end_s).unwrap_or(0.0),
             units,
+            chapters: Vec::new(),
             frames: Vec::new(),
             tracks: Vec::new(),
             motion: Vec::new(),
@@ -528,6 +533,39 @@ impl VideoSurvey {
             .join(" ")
     }
 
+    /// Whole-sentence span from stored unit ids (`s120`..`s126`, no `@word`).
+    pub fn sentence_span(&self, from: &str, to: &str) -> Option<(f64, f64)> {
+        let a = crate::sentences::SentenceRef::parse(from).ok()?;
+        let b = crate::sentences::SentenceRef::parse(to).ok()?;
+        if a.word.is_some() || b.word.is_some() {
+            return None;
+        }
+        let u_from = self.units.iter().find(|u| u.id == Some(a.sentence_id))?;
+        let u_to = self.units.iter().find(|u| u.id == Some(b.sentence_id))?;
+        (u_to.end_s > u_from.start_s).then_some((u_from.start_s, u_to.end_s))
+    }
+
+    /// Resolve a `from`/`to` sentence range (supporting `@word` when `db` is provided).
+    pub fn resolve_range(&self, db: Option<&Db>, from: &str, to: &str) -> Option<(f64, f64)> {
+        if let Some(db) = db {
+            crate::sentences::resolve_range(db, self.video_id, from, to).ok()
+        } else {
+            self.sentence_span(from, to)
+        }
+    }
+
+    /// Sentence id range covering `in_s..out_s`, when units carry stored sentence ids.
+    pub fn sentence_ids_for(&self, in_s: f64, out_s: f64) -> Option<(String, String)> {
+        let inside: Vec<i64> = self
+            .units
+            .iter()
+            .filter(|u| u.end_s > in_s + 0.05 && u.start_s < out_s - 0.05)
+            .filter_map(|u| u.id)
+            .collect();
+        let (first, last) = (inside.first()?, inside.last()?);
+        Some((crate::sentences::format_id(*first), crate::sentences::format_id(*last)))
+    }
+
     /// Move a range onto unit edges: the nearest unit start at or around `in_s` (not off-mic) and
     /// the nearest unit end around `out_s`.
     pub fn snap(&self, in_s: f64, out_s: f64) -> Option<(f64, f64)> {
@@ -566,6 +604,10 @@ impl VideoSurvey {
 pub struct Candidate {
     pub id: String,
     pub video_id: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
     pub in_s: f64,
     pub out_s: f64,
     pub text: String,
@@ -593,6 +635,30 @@ fn round2(x: f64) -> f64 {
     (x * 100.0).round() / 100.0
 }
 
+fn opener_penalty(units: &[Unit], i: usize) -> f64 {
+    if i == 0 {
+        return 0.0;
+    }
+    let gap = units[i].start_s - units[i - 1].end_s;
+    if gap >= 3.0 {
+        return 0.0;
+    }
+    let first_word = units[i]
+        .text
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim_matches(|c: char| !c.is_alphanumeric())
+        .to_lowercase();
+    if REPLIES.contains(&first_word.as_str()) {
+        -2.5
+    } else if CONNECTIVES.contains(&first_word.as_str()) {
+        -1.0
+    } else {
+        0.0
+    }
+}
+
 /// Every usable sentence-bounded window of one video, best first per start, de-duplicated.
 pub fn candidates(survey: &VideoSurvey, cfg: &ScriptConfig, opts: &ClipOptions) -> Vec<Candidate> {
     let units = &survey.units;
@@ -602,11 +668,24 @@ pub fn candidates(survey: &VideoSurvey, cfg: &ScriptConfig, opts: &ClipOptions) 
         if units[i].starts_off_mic {
             continue;
         }
+        if i > 0
+            && units[i].start_s - units[i - 1].end_s < 1.5
+            && units[i].speakers == units[i - 1].speakers
+            && crate::lexicon::opens_as_continuation(&units[i].text)
+        {
+            continue;
+        }
         // A clip opens where a sentence opens: after a unit that ended one, or at the top.
         let clean_start = i == 0 || units[i - 1].strong_end || units[i].start_s - units[i - 1].end_s >= 0.6;
+        let open_pen = opener_penalty(units, i);
         let mut best: Option<Candidate> = None;
         for j in i..units.len() {
             if j > i && units[j].start_s - units[j - 1].end_s > TRANSCRIPT_HOLE_S {
+                break;
+            }
+            // A moment ends before anyone off the microphone speaks: never on their line, never
+            // through it. (Units are all on or all off the mic, see `sentence_units`.)
+            if units[j].starts_off_mic {
                 break;
             }
             let (in_s, out_s) = (units[i].start_s, units[j].end_s);
@@ -628,6 +707,13 @@ pub fn candidates(survey: &VideoSurvey, cfg: &ScriptConfig, opts: &ClipOptions) 
             let mut prescore = 0.0;
             prescore += if strong_end { 1.0 } else { 0.3 };
             prescore += if clean_start { 0.5 } else { 0.0 };
+            prescore += open_pen;
+            if units[j].text.trim_end().ends_with('?')
+                && !crate::sentence_split::ends_on_tag(&units[j].text)
+                && units.get(j + 1).is_some_and(|n| n.start_s - units[j].end_s < 3.0 && n.speakers != units[j].speakers)
+            {
+                prescore -= 2.0;
+            }
             prescore -= if shaky_s > dur * crate::script_check::SHAKY_SHARE {
                 2.0
             } else if shaky_s > 0.0 {
@@ -642,6 +728,8 @@ pub fn candidates(survey: &VideoSurvey, cfg: &ScriptConfig, opts: &ClipOptions) 
             let c = Candidate {
                 id: String::new(),
                 video_id: survey.video_id,
+                from: units[i].id.map(crate::sentences::format_id),
+                to: units[j].id.map(crate::sentences::format_id),
                 in_s: round2(in_s),
                 out_s: round2(out_s),
                 text,
@@ -689,6 +777,11 @@ fn dedupe(mut items: Vec<Candidate>, max_share: f64, cap: usize) -> Vec<Candidat
     kept
 }
 
+/// Whether `video_id` is b-roll or an aerial ([`crate::classify::plays_ambience`]).
+fn ambience(db: &Db, video_id: i64) -> bool {
+    crate::classify::video_plays_ambience(db, video_id)
+}
+
 /// Candidates for every requested video of a project.
 pub fn find_candidates(
     db: &Db,
@@ -698,6 +791,11 @@ pub fn find_candidates(
 ) -> Result<Vec<Candidate>, Error> {
     let mut all = Vec::new();
     for vid in project_videos(db, project_id, &opts.video_ids)? {
+        // The whole library means its spoken footage: b-roll's talk is the crowd, not a moment.
+        // A video asked for by id is searched whatever it is.
+        if opts.video_ids.is_empty() && ambience(db, vid) {
+            continue;
+        }
         let survey = VideoSurvey::load(db, vid)?;
         all.extend(candidates(&survey, cfg, opts));
     }
@@ -713,7 +811,13 @@ pub struct Pick {
     #[serde(default)]
     pub id: String,
     pub video_id: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
+    #[serde(default)]
     pub in_s: f64,
+    #[serde(default)]
     pub out_s: f64,
     #[serde(default)]
     pub title: String,
@@ -757,9 +861,11 @@ pub fn worker_schema() -> Value {
                 "items": {
                     "type": "object",
                     "additionalProperties": false,
-                    "required": ["candidate", "in_s", "out_s", "title", "quote", "why", "score", "hook"],
+                    "required": ["candidate", "title", "quote", "why", "score", "hook"],
                     "properties": {
                         "candidate": { "type": "string" },
+                        "from": { "type": "string" },
+                        "to": { "type": "string" },
                         "in_s": { "type": "number" },
                         "out_s": { "type": "number" },
                         "title": { "type": "string" },
@@ -785,12 +891,18 @@ pub fn orchestrator_schema() -> Value {
                 "items": {
                     "type": "object",
                     "additionalProperties": false,
-                    "required": ["id", "title", "hook", "why"],
+                    "required": ["title", "hook", "why"],
                     "properties": {
                         "id": { "type": "string" },
+                        "video_id": { "type": "integer" },
+                        "from": { "type": "string" },
+                        "to": { "type": "string" },
+                        "in_s": { "type": "number" },
+                        "out_s": { "type": "number" },
                         "title": { "type": "string" },
                         "hook": { "type": "string" },
-                        "why": { "type": "string" }
+                        "why": { "type": "string" },
+                        "quote": { "type": "string" }
                     }
                 }
             }
@@ -869,19 +981,44 @@ pub fn worker_prompt(
         opts.min_s,
         opts.max_s
     ));
+    let chs: Vec<&crate::chapters::Chapter> =
+        survey.chapters.iter().filter(|c| c.end_s > from_s && c.start_s < to_s).collect();
+    if !chs.is_empty() {
+        p.push_str("Chapters in this stretch:\n");
+        for ch in chs {
+            let sum = if ch.summary.trim().is_empty() { String::new() } else { format!(" — {}", ch.summary.trim()) };
+            p.push_str(&format!(
+                "- {}–{} ({:.0}–{:.0} s): {}{}\n",
+                ch.first_sentence(),
+                ch.last_sentence(),
+                ch.start_s,
+                ch.end_s,
+                ch.title.trim(),
+                sum
+            ));
+        }
+        p.push('\n');
+    }
     p.push_str(&format!(
-        "Transcript of video #{} from {:.0} s to {:.0} s ([start–end] seconds; (off-mic) = someone away from the microphone):\n",
+        "Transcript of video #{} from {:.0} s to {:.0} s (sentence id, [start–end] seconds; (off-mic) = someone away from the microphone):\n",
         survey.video_id, from_s, to_s
     ));
     for u in survey.units.iter().filter(|u| u.end_s > from_s && u.start_s < to_s) {
         let who = if u.speakers.is_empty() { String::new() } else { format!(" {}:", u.speakers.join("/")) };
         let off = if u.starts_off_mic { " (off-mic)" } else { "" };
-        p.push_str(&format!("[{:.1}–{:.1}]{off}{who} {}\n", u.start_s, u.end_s, u.text.trim()));
+        let sid = u.id.map(|id| format!("{} ", crate::sentences::format_id(id))).unwrap_or_default();
+        p.push_str(&format!("{sid}[{:.1}–{:.1}]{off}{who} {}\n", u.start_s, u.end_s, u.text.trim()));
     }
-    p.push_str("\nCandidate clips (sentence-bounded; prefer these, or move in_s/out_s to other line edges above):\n");
+    p.push_str(
+        "\nCandidate clips (sentence-bounded; prefer these, or set `from`/`to` to sentence ids above, e.g. \"s412\"–\"s418\"):\n",
+    );
     for c in cands {
+        let span = match (&c.from, &c.to) {
+            (Some(a), Some(b)) => format!(" {a}–{b}"),
+            _ => String::new(),
+        };
         p.push_str(&format!(
-            "{}  {:.1}–{:.1}  {:.0} s  {}  \"{}\" … \"{}\"\n",
+            "{}{span}  {:.1}–{:.1}  {:.0} s  {}  \"{}\" … \"{}\"\n",
             c.id,
             c.in_s,
             c.out_s,
@@ -893,16 +1030,28 @@ pub fn worker_prompt(
     }
     p.push_str(&format!(
         "\nPick up to {want} of the best clips here (fewer if few are good, none if none are). For each give: \
-         candidate (its id, or \"\" if you moved the bounds), in_s, out_s, title (≤ 60 characters, in the \
+         candidate (its id, or \"\" if you changed the sentence range), from & to (sentence ids, e.g. \"s412\", \
+         or in_s/out_s in seconds if sentence ids are not shown), title (≤ 60 characters, in the \
          transcript's language), quote (its key line, verbatim), why (one sentence), score (0–10: 10 = works \
          perfectly on its own), hook (a 2–6 word on-screen hook in the transcript's language)."
     ));
     p
 }
 
-/// Turn a worker's answer into picks: bounds resolved against the candidates and snapped onto
-/// sentence edges, too-short / too-long ranges dropped.
+/// Turn a worker's answer into picks: bounds resolved against `from`/`to` sentence ids, candidates,
+/// or snapped onto sentence edges; too-short / too-long / shaky / hole-spanning ranges dropped.
 pub fn parse_worker_picks(
+    answer: &Value,
+    survey: &VideoSurvey,
+    cands: &[&Candidate],
+    opts: &ClipOptions,
+    cfg: &ScriptConfig,
+) -> Vec<Pick> {
+    parse_worker_picks_in(None, answer, survey, cands, opts, cfg)
+}
+
+pub fn parse_worker_picks_in(
+    db: Option<&Db>,
     answer: &Value,
     survey: &VideoSurvey,
     cands: &[&Candidate],
@@ -913,31 +1062,59 @@ pub fn parse_worker_picks(
     for item in answer["picks"].as_array().cloned().unwrap_or_default() {
         let cid = item["candidate"].as_str().unwrap_or_default().trim().to_string();
         let cand = cands.iter().find(|c| c.id == cid);
+        let req_from = item["from"].as_str().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+        let req_to = item["to"].as_str().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
         let (mut in_s, mut out_s) = (item["in_s"].as_f64().unwrap_or(0.0), item["out_s"].as_f64().unwrap_or(0.0));
-        let bounds = match cand {
-            // Asked bounds within a second of the candidate's: the candidate's exact edges.
-            Some(c) if (in_s - c.in_s).abs() <= 1.0 && (out_s - c.out_s).abs() <= 1.0 => Some((c.in_s, c.out_s)),
-            Some(c) if out_s <= in_s => Some((c.in_s, c.out_s)),
-            _ if out_s > in_s => survey.snap(in_s, out_s),
-            _ => None,
+        let (mut bounds, mut resolved_range) = match (&req_from, &req_to) {
+            (Some(a), Some(b)) => (survey.resolve_range(db, a, b), Some((a.clone(), b.clone()))),
+            _ => (None, None),
         };
+        if bounds.is_none() {
+            resolved_range = None;
+            bounds = match cand {
+                // Asked bounds within a second of the candidate's: the candidate's exact edges.
+                Some(c) if (in_s - c.in_s).abs() <= 1.0 && (out_s - c.out_s).abs() <= 1.0 => Some((c.in_s, c.out_s)),
+                Some(c) if out_s <= in_s => Some((c.in_s, c.out_s)),
+                _ if out_s > in_s => survey.snap(in_s, out_s),
+                _ => None,
+            };
+        }
         let Some(b) = bounds else { continue };
         (in_s, out_s) = b;
         let dur = out_s - in_s;
         if dur < opts.min_s * 0.85 || dur > opts.max_s + 2.0 || survey.spans_hole(in_s, out_s) {
             // A nudge that broke the range falls back to the candidate it came from.
             match cand {
-                Some(c) => (in_s, out_s) = (c.in_s, c.out_s),
+                Some(c) => {
+                    (in_s, out_s) = (c.in_s, c.out_s);
+                    resolved_range = c.from.clone().zip(c.to.clone());
+                }
                 None => continue,
             }
         }
         if survey.shaky_s(cfg, in_s, out_s) > (out_s - in_s) * crate::script_check::SHAKY_SHARE {
             continue;
         }
+        let (from, to) = match resolved_range {
+            Some((a, b)) => (Some(a), Some(b)),
+            None => match cand.and_then(|c| {
+                ((in_s - c.in_s).abs() < 0.1 && (out_s - c.out_s).abs() < 0.1)
+                    .then(|| c.from.clone().zip(c.to.clone()))
+                    .flatten()
+            }) {
+                Some((a, b)) => (Some(a), Some(b)),
+                None => match survey.sentence_ids_for(in_s, out_s) {
+                    Some((a, b)) => (Some(a), Some(b)),
+                    None => (None, None),
+                },
+            },
+        };
         let quote = item["quote"].as_str().unwrap_or_default().trim().to_string();
         out.push(Pick {
             id: String::new(),
             video_id: survey.video_id,
+            from,
+            to,
             in_s: round2(in_s),
             out_s: round2(out_s),
             title: shorten(item["title"].as_str().unwrap_or_default(), 80),
@@ -1023,6 +1200,16 @@ pub fn orchestrator_pool(merged: &[Pick], opts: &ClipOptions) -> Vec<Pick> {
 
 /// The orchestrator's prompt: the merged pool, best first.
 pub fn orchestrator_prompt(pool: &[Pick], opts: &ClipOptions, glossary: Option<&str>) -> String {
+    orchestrator_prompt_with_notes(pool, opts, glossary, &[])
+}
+
+/// The orchestrator's prompt with optional per-proposal check notes from host-side preflight.
+fn orchestrator_prompt_with_notes(
+    pool: &[Pick],
+    opts: &ClipOptions,
+    glossary: Option<&str>,
+    notes: &[String],
+) -> String {
     let mut p = String::new();
     p.push_str(&format!(
         "You are the editor choosing the final {} clips for social media from proposals your assistants scored. \
@@ -1040,10 +1227,16 @@ pub fn orchestrator_prompt(pool: &[Pick], opts: &ClipOptions, glossary: Option<&
         p.push_str(g);
         p.push('\n');
     }
-    p.push_str("\nProposals (id · video · seconds · picture · speakers · assistant score · title · why · quote):\n");
-    for c in pool {
+    p.push_str(
+        "\nProposals (id · video · sentences · seconds · picture · speakers · assistant score · title · why · quote):\n",
+    );
+    for (i, c) in pool.iter().enumerate() {
+        let span = match (&c.from, &c.to) {
+            (Some(a), Some(b)) => format!(" {a}–{b}"),
+            _ => String::new(),
+        };
         p.push_str(&format!(
-            "{} · v{} {:.1}–{:.1} ({:.0} s) · {} · {} · {:.1} · {} · {} · \"{}\"\n",
+            "{} · v{}{span} {:.1}–{:.1} ({:.0} s) · {} · {} · {:.1} · {} · {} · \"{}\"\n",
             c.id,
             c.video_id,
             c.in_s,
@@ -1056,30 +1249,358 @@ pub fn orchestrator_prompt(pool: &[Pick], opts: &ClipOptions, glossary: Option<&
             c.why,
             shorten(&c.quote, 200)
         ));
+        if let Some(note) = notes.get(i).filter(|n| !n.is_empty()) {
+            p.push_str(&format!("   check: {note}\n"));
+        }
     }
     p.push_str(
-        "\nFor each chosen clip, in the order they should be published, give: id; title (≤ 60 characters, the \
-         clip's name, in the transcript's language); hook (2–6 words shown on screen in the first seconds, in \
-         the transcript's language, punchy, no emoji, no hashtags); why (one sentence).",
+        "\nBefore returning your final selection, when tools are offered: inspect shortlisted or edge-suspect picks \
+         with `get_manifest` (around their sentence range; use `words: true` when trimming inside a sentence), refine \
+         any weak opening/closing using `from`/`to` (`sX` or `sX@n`, or discover better moments via `get_outline` / \
+         `get_manifest` if needed), and run `check_clips` on your chosen set to confirm there are no story, framing, \
+         boundary or duration warnings (never call `save_clips` — code saves the final set).\n\n\
+         For each chosen clip, in the order they should be published, give: id (the proposal id, or \"\" for a new pick \
+         found with tools, in which case give video_id and from/to); optional adjusted from/to (or in_s/out_s) if you \
+         trimmed or moved the edges; title (≤ 60 characters, the clip's name, in the transcript's language); hook \
+         (2–6 words shown on screen in the first seconds, in the transcript's language, punchy, no emoji, no hashtags); \
+         why (one sentence).",
     );
     p
 }
 
-/// Apply the orchestrator's answer to the pool: known ids in its order, overlaps and duplicates
-/// skipped, its titles and hooks taken; topped up by code when it chose too few.
+/// Deterministic pre-check of the merged pool so the orchestrator immediately sees which
+/// candidates have edge, story, framing, or repair flags before inspecting them with tools.
+fn pool_precheck_notes(
+    db: &Db,
+    project: &Project,
+    cfg: &ScriptConfig,
+    pool: &[Pick],
+    opts: &ClipOptions,
+) -> Vec<String> {
+    if pool.is_empty() {
+        return Vec::new();
+    }
+    let Ok(checked) = check_clips(db, project, cfg, pool, opts) else {
+        return vec![String::new(); pool.len()];
+    };
+    pool.iter()
+        .zip(checked.iter())
+        .map(|(orig, c)| {
+            let mut flags = Vec::new();
+            if (c.pick.in_s - orig.in_s).abs() > 0.25 || (c.pick.out_s - orig.out_s).abs() > 0.25 {
+                let span = match (&c.pick.from, &c.pick.to) {
+                    (Some(a), Some(b)) => format!("{a}–{b} "),
+                    _ => String::new(),
+                };
+                flags.push(format!("repaired to {span}({:.0}s)", c.pick.duration_s()));
+            }
+            if let Ok(reading) = crate::readcut::read_cut(db, project.id, &c.script, cfg, c.issues.clone())
+                && let Some(cr) = reading.beats.first().and_then(|b| b.clips.first())
+            {
+                for s in &cr.story {
+                    flags.push(s.clone());
+                }
+                if let Some(st) = &cr.start
+                    && !st.flag.is_clean()
+                {
+                    flags.push(format!("in: {}", st.detail()));
+                }
+                if let Some(en) = &cr.end
+                    && !en.flag.is_clean()
+                {
+                    flags.push(format!("out: {}", en.detail()));
+                }
+                if let Some(crop) = &cr.crop
+                    && (crop.contains("face lost") || crop.contains("cut off") || crop.contains("letterboxed"))
+                {
+                    flags.push(format!("crop: {crop}"));
+                }
+            }
+            for iss in &c.issues {
+                if iss.severity != IssueSeverity::Info && !iss.message.starts_with("overlaps clip ") {
+                    flags.push(iss.message.clone());
+                }
+            }
+            flags.join("; ")
+        })
+        .collect()
+}
+
+struct ChosenVerification {
+    actionable_issues: usize,
+    report: String,
+}
+
+fn verify_chosen_clips(
+    db: &Db,
+    project: &Project,
+    cfg: &ScriptConfig,
+    chosen: &[Pick],
+    opts: &ClipOptions,
+) -> Result<ChosenVerification, Error> {
+    let checked = check_clips(db, project, cfg, chosen, opts)?;
+    let mut actionable = 0usize;
+    let mut lines = String::new();
+    for (i, c) in checked.iter().enumerate() {
+        let reading = crate::readcut::read_cut(db, project.id, &c.script, cfg, c.issues.clone())?;
+        let cr = reading.beats.first().and_then(|b| b.clips.first());
+        let mut clip_flags = Vec::new();
+        if let Some(cr) = cr {
+            for s in &cr.story {
+                clip_flags.push(format!("story: {s}"));
+            }
+            if let Some(st) = &cr.start
+                && !st.flag.is_clean()
+            {
+                clip_flags.push(format!("in: {}", st.detail()));
+            }
+            if let Some(en) = &cr.end
+                && !en.flag.is_clean()
+            {
+                clip_flags.push(format!("out: {}", en.detail()));
+            }
+            if let Some(crop) = &cr.crop
+                && (crop.contains("face lost") || crop.contains("cut off") || crop.contains("letterboxed"))
+            {
+                clip_flags.push(format!("crop: {crop}"));
+            }
+        }
+        for iss in &c.issues {
+            if iss.severity != IssueSeverity::Info {
+                let sev = if iss.severity == IssueSeverity::Error { "error" } else { "warning" };
+                clip_flags.push(format!("[{sev}] {}", iss.message));
+            }
+        }
+        let span = match (&c.pick.from, &c.pick.to) {
+            (Some(f), Some(t)) => format!(" {f}–{t}"),
+            _ => String::new(),
+        };
+        if clip_flags.is_empty() {
+            lines.push_str(&format!(
+                "{}. [ok] {} (v{}{span} {:.1}–{:.1}, {:.1}s)\n",
+                i + 1,
+                c.pick.id,
+                c.pick.video_id,
+                c.pick.in_s,
+                c.pick.out_s,
+                c.pick.duration_s()
+            ));
+        } else {
+            actionable += clip_flags.len();
+            lines.push_str(&format!(
+                "{}. [FIX] {} (v{}{span} {:.1}–{:.1}, {:.1}s) — {}\n",
+                i + 1,
+                c.pick.id,
+                c.pick.video_id,
+                c.pick.in_s,
+                c.pick.out_s,
+                c.pick.duration_s(),
+                clip_flags.join("; ")
+            ));
+        }
+    }
+    Ok(ChosenVerification { actionable_issues: actionable, report: lines })
+}
+
+fn orchestrator_repair_prompt(
+    chosen: &[Pick],
+    pool: &[Pick],
+    pool_notes: &[String],
+    verification: &ChosenVerification,
+    opts: &ClipOptions,
+) -> String {
+    let mut p = String::new();
+    p.push_str(&format!(
+        "The host verified your {} chosen clips with `check_clips` and found {} actionable issue(s):\n\n{}\n",
+        chosen.len(),
+        verification.actionable_issues,
+        verification.report
+    ));
+    p.push_str("Current chosen clips:\n");
+    for (i, c) in chosen.iter().enumerate() {
+        let span = match (&c.from, &c.to) {
+            (Some(a), Some(b)) => format!(" {a}–{b}"),
+            _ => String::new(),
+        };
+        p.push_str(&format!(
+            "{}. id=\"{}\" v{}{span} ({:.1}–{:.1}, {:.0}s) · title=\"{}\" · hook=\"{}\"\n",
+            i + 1,
+            c.id,
+            c.video_id,
+            c.in_s,
+            c.out_s,
+            c.duration_s(),
+            c.title,
+            c.hook
+        ));
+    }
+    let unused: Vec<(usize, &Pick)> =
+        pool.iter().enumerate().filter(|(_, c)| !chosen.iter().any(|k| k.id == c.id)).collect();
+    if !unused.is_empty() {
+        p.push_str("\nUnused candidates from the pool (swap in if cleaner):\n");
+        for (idx, c) in unused.into_iter().take(12) {
+            let span = match (&c.from, &c.to) {
+                (Some(a), Some(b)) => format!(" {a}–{b}"),
+                _ => String::new(),
+            };
+            let note =
+                pool_notes.get(idx).filter(|n| !n.is_empty()).map(|n| format!(" [check: {n}]")).unwrap_or_default();
+            p.push_str(&format!(
+                "- {} · v{}{span} ({:.0}s) · {} · {:.1} · {}{note}\n",
+                c.id,
+                c.video_id,
+                c.duration_s(),
+                c.visual.summary(),
+                c.score,
+                c.title
+            ));
+        }
+    }
+    p.push_str(&format!(
+        "\nFix ONLY the [FIX] clips above (for example by inspecting `get_manifest` with `words: true` to adjust \
+         `from`/`to` via `sX` or `sX@n`, verifying with `check_clips`, or swapping in a cleaner candidate) and return \
+         the complete corrected JSON `{{\"clips\": [...]}}` with {} non-overlapping clips.",
+        opts.count
+    ));
+    p
+}
+
+/// Apply the orchestrator's answer to the pool: known ids in its order (with optional refined
+/// bounds), plus fresh picks discovered with tools; overlaps and duplicates skipped, topped up by
+/// code when too few usable picks remain.
 pub fn apply_orchestrator(pool: &[Pick], answer: &Value, n: usize, format: ClipFormat) -> Vec<Pick> {
+    apply_orchestrator_in(
+        None,
+        &[],
+        pool,
+        answer,
+        &ClipOptions { count: n, format, ..ClipOptions::default() },
+        &ScriptConfig::default(),
+    )
+}
+
+pub fn apply_orchestrator_in(
+    db: Option<&Db>,
+    surveys: &[VideoSurvey],
+    pool: &[Pick],
+    answer: &Value,
+    opts: &ClipOptions,
+    cfg: &ScriptConfig,
+) -> Vec<Pick> {
+    let n = opts.count;
+    let format = opts.format;
     let mut chosen: Vec<Pick> = Vec::new();
     for item in answer["clips"].as_array().cloned().unwrap_or_default() {
         if chosen.len() >= n {
             break;
         }
         let id = item["id"].as_str().unwrap_or_default().trim();
-        let Some(p) = pool.iter().find(|p| p.id == id) else { continue };
-        if chosen.iter().any(|c| c.id == p.id || (c.video_id == p.video_id && overlap(c.range(), p.range()) > 0.0)) {
+        let base = (!id.is_empty()).then(|| pool.iter().find(|p| p.id == id)).flatten();
+        let video_id = item["video_id"].as_i64().or_else(|| base.map(|b| b.video_id));
+        let Some(video_id) = video_id else { continue };
+        // A proposal's identity includes its source and all source-derived metadata. Changing
+        // videos requires a fresh pick, never bounds resolved against a different source.
+        if base.is_some_and(|b| b.video_id != video_id) {
             continue;
         }
-        let mut p = p.clone();
-        for (field, key, max) in [(&mut p.title, "title", 80), (&mut p.hook, "hook", 48), (&mut p.why, "why", 400)] {
+        let survey = surveys.iter().find(|s| s.video_id == video_id);
+        // The legacy pool-only wrapper has no surveys; its pool defines the allowed sources.
+        if survey.is_none() && (!surveys.is_empty() || !pool.iter().any(|p| p.video_id == video_id)) {
+            continue;
+        }
+
+        let req_from = item["from"].as_str().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+        let req_to = item["to"].as_str().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+        let req_in = item["in_s"].as_f64();
+        let req_out = item["out_s"].as_f64();
+
+        let mut p = match base {
+            Some(b) => b.clone(),
+            None => Pick {
+                id: String::new(),
+                video_id,
+                from: None,
+                to: None,
+                in_s: 0.0,
+                out_s: 0.0,
+                title: String::new(),
+                quote: String::new(),
+                why: String::new(),
+                score: 8.0,
+                hook: String::new(),
+                candidate: None,
+                visual: Visual::default(),
+                speakers: Vec::new(),
+            },
+        };
+
+        let mut moved = false;
+        let same_as_base = base.is_some_and(|b| b.from == req_from && b.to == req_to && b.from.is_some());
+        if let (Some(a), Some(b)) = (&req_from, &req_to)
+            && !same_as_base
+        {
+            let resolved = survey
+                .and_then(|s| s.resolve_range(db, a, b))
+                .or_else(|| db.and_then(|d| crate::sentences::resolve_range(d, video_id, a, b).ok()));
+            if let Some((in_s, out_s)) = resolved {
+                let dur = out_s - in_s;
+                let hole = survey.is_some_and(|s| s.spans_hole(in_s, out_s));
+                let shaky =
+                    survey.is_some_and(|s| s.shaky_s(cfg, in_s, out_s) > dur * crate::script_check::SHAKY_SHARE);
+                if dur >= opts.min_s * 0.8 && dur <= opts.max_s * 1.25 && !hole && !shaky {
+                    p.from = Some(a.clone());
+                    p.to = Some(b.clone());
+                    p.in_s = round2(in_s);
+                    p.out_s = round2(out_s);
+                    moved = true;
+                }
+            }
+        } else if let (Some(in_s), Some(out_s)) = (req_in, req_out)
+            && out_s > in_s
+            && base.is_none_or(|b| (in_s - b.in_s).abs() > 0.2 || (out_s - b.out_s).abs() > 0.2)
+        {
+            let (in_s, out_s) = survey.and_then(|s| s.snap(in_s, out_s)).unwrap_or((in_s, out_s));
+            let dur = out_s - in_s;
+            let hole = survey.is_some_and(|s| s.spans_hole(in_s, out_s));
+            let shaky = survey.is_some_and(|s| s.shaky_s(cfg, in_s, out_s) > dur * crate::script_check::SHAKY_SHARE);
+            if dur >= opts.min_s * 0.8 && dur <= opts.max_s * 1.25 && !hole && !shaky {
+                p.in_s = round2(in_s);
+                p.out_s = round2(out_s);
+                p.from = None;
+                p.to = None;
+                if let Some((a, b)) = survey.and_then(|s| s.sentence_ids_for(in_s, out_s)) {
+                    p.from = Some(a);
+                    p.to = Some(b);
+                }
+                moved = true;
+            }
+        }
+
+        if base.is_none() && p.out_s <= p.in_s {
+            continue;
+        }
+        if moved && let Some(s) = survey {
+            p.visual = s.visual(p.in_s, p.out_s);
+            p.speakers = s.speakers(p.in_s, p.out_s);
+            if p.quote.is_empty() || item["quote"].as_str().is_none_or(|q| q.trim().is_empty()) {
+                let txt = s.text(p.in_s, p.out_s);
+                if !txt.is_empty() {
+                    p.quote = shorten(&txt, 160);
+                }
+            }
+        }
+
+        if chosen.iter().any(|c| {
+            (!p.id.is_empty() && c.id == p.id) || (c.video_id == p.video_id && overlap(c.range(), p.range()) > 0.0)
+        }) {
+            continue;
+        }
+        for (field, key, max) in [
+            (&mut p.title, "title", 80),
+            (&mut p.hook, "hook", 48),
+            (&mut p.why, "why", 400),
+            (&mut p.quote, "quote", 200),
+        ] {
             let v = item[key].as_str().unwrap_or_default().trim();
             if !v.is_empty() {
                 *field = shorten(v, max);
@@ -1143,8 +1664,14 @@ pub fn clip_script(pick: &Pick, index: usize, total: usize, opts: &ClipOptions) 
             narration: None,
             on_screen_text: Some(hook),
             title_layout: None,
-            clips: vec![ScriptClip { exact: false,
-                sentences: None,
+            clips: vec![ScriptClip {
+                exact: false,
+                gain_db: None,
+                sentences: pick
+                    .from
+                    .clone()
+                    .zip(pick.to.clone())
+                    .map(|(from, to)| crate::script::SentenceRange { from, to }),
                 video_id: pick.video_id,
                 in_s: pick.in_s,
                 out_s: pick.out_s,
@@ -1176,7 +1703,15 @@ pub fn check_clips(
 ) -> Result<Vec<CheckedClip>, Error> {
     let mut out: Vec<CheckedClip> = Vec::new();
     for (i, pick) in picks.iter().enumerate() {
-        let mut script = clip_script(pick, i, picks.len(), opts);
+        let mut pick = pick.clone();
+        if pick.out_s <= pick.in_s
+            && let (Some(from), Some(to)) = (&pick.from, &pick.to)
+        {
+            let (in_s, out_s) = crate::sentences::resolve_range(db, pick.video_id, from, to)?;
+            pick.in_s = round2(in_s);
+            pick.out_s = round2(out_s);
+        }
+        let mut script = clip_script(&pick, i, picks.len(), opts);
         script.fill_from_project(project);
         let notes = crate::script_check::repair_for_import(db, project.id, &mut script, cfg, Some(opts.min_s))?;
         // A clip's target is its own length: the picked range as the repair left it (snapped to
@@ -1231,10 +1766,11 @@ pub fn check_clips(
             }
         }
         // The pick follows the repaired bounds, so the grid shows what will play.
-        let mut pick = pick.clone();
         if let Some(m) = main {
             pick.in_s = round2(m.in_s);
             pick.out_s = round2(m.out_s);
+            pick.from = m.sentences.as_ref().map(|s| s.from.clone());
+            pick.to = m.sentences.as_ref().map(|s| s.to.clone());
         }
         out.push(CheckedClip { pick, script, notes, issues, script_id: None });
     }
@@ -1595,7 +2131,10 @@ impl Backends {
                 }
             }
         }
-        let tools = Some(crate::tools::ToolAccess::new(paths.clone(), Arc::new(config.clone()), 0, None));
+        let tools = Some(
+            crate::tools::ToolAccess::new(paths.clone(), Arc::new(config.clone()), 0, None)
+                .with_profile(crate::tools::ToolProfile::ClipRun),
+        );
         Ok(Self { workers, orchestrator, orchestrator_skipped, orchestrator_timeout_s, selection, tools })
     }
 
@@ -1691,6 +2230,51 @@ fn cancelled(cancel: &Option<Arc<AtomicBool>>) -> Result<(), Error> {
         return Err(Error::Invalid(crate::chat::CANCELLED.into()));
     }
     Ok(())
+}
+
+async fn wait_cancelled(cancel: &Option<Arc<AtomicBool>>) {
+    let Some(flag) = cancel.as_ref() else {
+        std::future::pending::<()>().await;
+        return;
+    };
+    while !flag.load(Ordering::SeqCst) {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+async fn run_cancellable<T>(
+    cancel: &Option<Arc<AtomicBool>>,
+    fut: impl std::future::Future<Output = Result<T, Error>>,
+) -> Result<T, Error> {
+    cancelled(cancel)?;
+    tokio::select! {
+        biased;
+        _ = wait_cancelled(cancel) => Err(Error::Invalid(crate::chat::CANCELLED.into())),
+        res = fut => res,
+    }
+}
+
+fn apply_verified_repair<F>(
+    chosen: &mut Vec<Pick>,
+    repaired: Vec<Pick>,
+    issues_before: usize,
+    verify: F,
+) -> (usize, bool, Option<String>)
+where
+    F: FnOnce(&[Pick]) -> Result<ChosenVerification, Error>,
+{
+    match verify(&repaired) {
+        Ok(v_after) => {
+            if v_after.actionable_issues <= issues_before {
+                let after = v_after.actionable_issues;
+                *chosen = repaired;
+                (after, true, None)
+            } else {
+                (issues_before, false, None)
+            }
+        }
+        Err(e) => (issues_before, false, Some(e.to_string())),
+    }
 }
 
 /// Worker jobs for every video: one per `window_s` of timeline, with the candidates that start in it.
@@ -1874,7 +2458,7 @@ pub async fn run(
         let cs: Vec<&Candidate> = cands[plan.survey_idx].iter().filter(|c| plan.cand_ids.contains(&c.id)).collect();
         match &r.value {
             Ok(v) => {
-                let got = parse_worker_picks(v, s, &cs, opts, cfg);
+                let got = parse_worker_picks_in(Some(db), v, s, &cs, opts, cfg);
                 worker_log.push(json!({ "window": r.label, "agent": r.agent, "attempts": r.attempts, "seconds": round2(r.seconds), "candidates": cs.len(), "picks": got.len(), "tool_calls": trail_lines(&trails[r.index]) }));
                 picks.extend(got);
             }
@@ -1909,21 +2493,29 @@ pub async fn run(
                 "orchestrator",
                 &format!("Choosing {} of {} with {} ({})", opts.count, pool.len(), agent.id, setup.describe()),
             );
-            let prompt = orchestrator_prompt(&pool, opts, glossary.as_deref());
+            let pool_notes = pool_precheck_notes(db, &project, cfg, &pool, opts);
+            let prompt = orchestrator_prompt_with_notes(&pool, opts, glossary.as_deref(), &pool_notes);
             // Its endpoint's slot, shared with every other feature using that model.
             let _slot = crate::agents::acquire_for(setup, agent.capacity()).await;
             // Busy: asked again after a pause; quota gone: the endpoint rests for every feature.
             let key = crate::agents::EndpointKey::for_setup(setup);
             let timeout_s = backends.orchestrator_timeout_s;
-            let (orchestrator_access, orchestrator_trail) =
-                match access.as_ref().map(|a| a.with_max_rounds(*max_tool_rounds).with_trail()) {
-                    Some((a, t)) => (Some(a), Some(t)),
-                    None => (None, None),
-                };
-            let answer = crate::agents::call_once(&agent.id, key.as_ref(), || {
-                let prompt = &prompt;
-                let access = orchestrator_access.as_ref();
-                async move {
+            let (orchestrator_access, orchestrator_trail) = match access
+                .as_ref()
+                .map(|a| a.with_max_rounds(*max_tool_rounds).with_verify_with_tools(true).with_trail())
+            {
+                Some((a, t)) => (Some(a), Some(t)),
+                None => (None, None),
+            };
+            async fn call_orchestrator_turn(
+                agent_id: &str,
+                key: Option<&crate::agents::EndpointKey>,
+                setup: &crate::runtime::VisionSetup,
+                timeout_s: u64,
+                access: Option<&crate::tools::ToolAccess>,
+                prompt: &str,
+            ) -> Result<Value, Error> {
+                crate::agents::call_once(agent_id, key, || async move {
                     let mut backend = crate::chat::ChatBackend::from_vision_setup(setup, timeout_s).await?;
                     let v = crate::tools::run_agent_json(
                         &mut backend,
@@ -1938,15 +2530,107 @@ pub async fn run(
                         helper.kill().await;
                     }
                     v
-                }
-            })
+                })
+                .await
+            }
+            let answer = run_cancellable(
+                &cancel,
+                call_orchestrator_turn(
+                    &agent.id,
+                    key.as_ref(),
+                    setup,
+                    timeout_s,
+                    orchestrator_access.as_ref(),
+                    &prompt,
+                ),
+            )
             .await;
             match answer {
                 Ok(v) => {
-                    orchestrator_log = json!({ "used": true, "agent": agent.id, "backend": setup.describe(), "answered": v["clips"].as_array().map(|a| a.len()), "tool_calls": trail_lines(&orchestrator_trail) });
-                    apply_orchestrator(&pool, &v, opts.count, opts.format)
+                    let mut chosen = apply_orchestrator_in(Some(db), &surveys, &pool, &v, opts, cfg);
+                    let mut issues_before = 0usize;
+                    let mut issues_after = 0usize;
+                    let mut host_check_error: Option<String> = None;
+                    let mut repair_attempted = false;
+                    let mut repair_applied = false;
+                    let mut repair_error: Option<String> = None;
+
+                    match verify_chosen_clips(db, &project, cfg, &chosen, opts) {
+                        Ok(verification) => {
+                            issues_before = verification.actionable_issues;
+                            issues_after = issues_before;
+                            if verification.actionable_issues > 0 {
+                                repair_attempted = true;
+                                on_progress.progress(
+                                    0.84,
+                                    "orchestrator",
+                                    &format!(
+                                        "Fixing {} flagged clip check(s) with {}",
+                                        verification.actionable_issues, agent.id
+                                    ),
+                                );
+                                let repair_prompt =
+                                    orchestrator_repair_prompt(&chosen, &pool, &pool_notes, &verification, opts);
+                                match run_cancellable(
+                                    &cancel,
+                                    call_orchestrator_turn(
+                                        &agent.id,
+                                        key.as_ref(),
+                                        setup,
+                                        timeout_s,
+                                        orchestrator_access.as_ref(),
+                                        &repair_prompt,
+                                    ),
+                                )
+                                .await
+                                {
+                                    Ok(v2) => {
+                                        let repaired = apply_orchestrator_in(Some(db), &surveys, &pool, &v2, opts, cfg);
+                                        let (after, applied, err) = apply_verified_repair(
+                                            &mut chosen,
+                                            repaired,
+                                            verification.actionable_issues,
+                                            |p| verify_chosen_clips(db, &project, cfg, p, opts),
+                                        );
+                                        issues_after = after;
+                                        repair_applied = applied;
+                                        repair_error = err;
+                                    }
+                                    Err(e) => {
+                                        cancelled(&cancel)?;
+                                        if e.is_cancelled() {
+                                            return Err(e);
+                                        }
+                                        repair_error = Some(e.to_string());
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            host_check_error = Some(e.to_string());
+                        }
+                    }
+
+                    orchestrator_log = json!({
+                        "used": true,
+                        "agent": agent.id,
+                        "backend": setup.describe(),
+                        "answered": v["clips"].as_array().map(|a| a.len()),
+                        "host_check_issues_before": issues_before,
+                        "host_check_issues_after": issues_after,
+                        "host_check_error": host_check_error,
+                        "repair_attempted": repair_attempted,
+                        "repair_applied": repair_applied,
+                        "repair_error": repair_error,
+                        "tool_calls": trail_lines(&orchestrator_trail)
+                    });
+                    chosen
                 }
                 Err(e) => {
+                    cancelled(&cancel)?;
+                    if e.is_cancelled() {
+                        return Err(e);
+                    }
                     orchestrator_log = json!({ "used": false, "agent": agent.id, "backend": setup.describe(), "error": e.to_string(), "error_detail": e.agent_error(), "tool_calls": trail_lines(&orchestrator_trail) });
                     let ev = crate::runs::StepEvent::warning(format!("orchestrator failed, code picks instead: {e}"));
                     on_progress.event(match e.agent_error() {
@@ -2083,7 +2767,15 @@ mod tests {
     use super::*;
 
     fn unit(a: f64, b: f64, t: &str) -> Unit {
-        Unit { start_s: a, end_s: b, text: t.into(), starts_off_mic: false, strong_end: true, speakers: Vec::new() }
+        Unit {
+            id: None,
+            start_s: a,
+            end_s: b,
+            text: t.into(),
+            starts_off_mic: false,
+            strong_end: true,
+            speakers: Vec::new(),
+        }
     }
 
     #[test]
@@ -2211,6 +2903,52 @@ mod tests {
         assert!(plain.visual(10.0, 40.0).layout.is_none());
     }
 
+    /// GreetMag: the crowd chatter in a party shot (b-roll) came back as "moments" alongside the
+    /// interviews when a writer searched the whole library. The whole library now means the spoken
+    /// footage; a b-roll video asked for by id is still searched.
+    #[test]
+    fn the_whole_library_means_its_spoken_footage_not_b_rolls_chatter() {
+        let mut db = Db::open_in_memory().unwrap();
+        let project = db.create_project(&crate::projects::NewProject::named("P")).unwrap();
+        let tmp = std::env::temp_dir().join("ghostreel-candidates-broll");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let folder = db.add_folder(project.id, &tmp, true).unwrap();
+        for (id, category) in [(1, "interview"), (2, "broll")] {
+            db.conn
+                .execute(
+                    "INSERT INTO videos(id, content_hash, size, duration_s, category, category_confidence) VALUES (?1, ?2, 1, 60.0, ?3, 0.8)",
+                    rusqlite::params![id, format!("h{id}"), category],
+                )
+                .unwrap();
+            db.conn
+                .execute(
+                    "INSERT INTO video_files(video_id, folder_id, path, size, mtime, last_seen) VALUES (?1, ?2, ?3, 1, 0, 0)",
+                    rusqlite::params![id, folder.id, format!("/m/{id}.mp4")],
+                )
+                .unwrap();
+            for i in 0..6 {
+                db.conn
+                    .execute(
+                        "INSERT INTO transcript_segments(video_id, start_s, end_s, text) VALUES (?1, ?2, ?3, ?4)",
+                        rusqlite::params![
+                            id,
+                            i as f64 * 5.0,
+                            (i + 1) as f64 * 5.0,
+                            format!("This is sentence number {i} with several words in it.")
+                        ],
+                    )
+                    .unwrap();
+            }
+            crate::sentence_split::mirror_segments(&db, id);
+        }
+        let videos = |o: &ClipOptions| -> std::collections::BTreeSet<i64> {
+            find_candidates(&db, project.id, &cfg(), o).unwrap().iter().map(|c| c.video_id).collect()
+        };
+        assert_eq!(videos(&opts(4.0, 15.0)), [1].into(), "the whole library: the interview only");
+        let asked = ClipOptions { video_ids: vec![2], ..opts(4.0, 15.0) };
+        assert_eq!(videos(&asked), [2].into(), "asked for by id: searched");
+    }
+
     #[test]
     fn candidates_respect_length_off_mic_and_overlap() {
         let mut segs = talk(30, 5.0);
@@ -2237,6 +2975,8 @@ mod tests {
         Pick {
             id: id.into(),
             video_id: v,
+            from: None,
+            to: None,
             in_s: a,
             out_s: b,
             title: format!("t{id}"),
@@ -2313,6 +3053,34 @@ mod tests {
         assert_eq!(out[0].hook, "Corregí, corregí");
         assert_eq!(out[0].title, "Corregite");
         assert_eq!(out[1].title, "tp3", "a topped-up pick keeps the worker's title");
+    }
+
+    #[test]
+    fn orchestrator_rejects_cross_video_revisions_and_outside_sources() {
+        let mut a = unit(0.0, 10.0, "Original.");
+        a.id = Some(101);
+        let mut b = unit(20.0, 30.0, "Other video.");
+        b.id = Some(202);
+        let surveys = vec![VideoSurvey::from_units(1, vec![a]), VideoSurvey::from_units(2, vec![b])];
+        let pool = vec![pick("p1", 1, 0.0, 10.0, 8.0, "speaker")];
+        let options = ClipOptions { count: 1, ..opts(5.0, 40.0) };
+        for revision in [
+            json!({"id":"p1", "video_id":2, "in_s":20.0, "out_s":30.0}),
+            json!({"id":"p1", "video_id":2, "from":"s202", "to":"s202"}),
+            json!({"video_id":999, "in_s":20.0, "out_s":30.0}),
+        ] {
+            let out = apply_orchestrator_in(None, &surveys, &pool, &json!({"clips":[revision]}), &options, &cfg());
+            assert_eq!(out.len(), 1);
+            assert_eq!((out[0].video_id, out[0].in_s, out[0].out_s), (1, 0.0, 10.0), "{revision}");
+            assert!(out[0].from.is_none(), "rejected revision must leave references unchanged");
+        }
+        // A new pick may choose another surveyed video, in either notation.
+        for fresh in
+            [json!({"video_id":2, "in_s":20.0, "out_s":30.0}), json!({"video_id":2, "from":"s202", "to":"s202"})]
+        {
+            let out = apply_orchestrator_in(None, &surveys, &pool, &json!({"clips":[fresh]}), &options, &cfg());
+            assert_eq!((out[0].video_id, out[0].in_s, out[0].out_s), (2, 20.0, 30.0));
+        }
     }
 
     #[test]
@@ -2821,5 +3589,215 @@ mod tests {
             "{}",
             res.log["orchestrator"]
         );
+    }
+
+    #[test]
+    fn worker_picks_resolve_sentence_ids_and_orchestrator_refines_bounds() {
+        let (db, pid, _dir) = library();
+        let survey = VideoSurvey::load(&db, 1).unwrap();
+        let o = opts(20.0, 40.0);
+        let cands = candidates(&survey, &cfg(), &o);
+        let refs: Vec<&Candidate> = cands.iter().collect();
+        let c0 = &cands[0];
+        assert!(c0.from.is_some() && c0.to.is_some(), "candidates carry sentence ids");
+        let w = worker_prompt(&survey, 0.0, 100.0, &refs, &o, None, 2);
+        assert!(w.contains("s1 [0.0–5.0]"), "worker prompt lists sentence ids:\n{w}");
+
+        // Worker supplies custom from/to sentence range directly.
+        let answer = json!({ "picks": [
+            { "candidate": "", "from": "s3", "to": "s7", "title": "Sent", "quote": "", "why": "w", "score": 8.0, "hook": "Hook" }
+        ]});
+        let picks = parse_worker_picks_in(Some(&db), &answer, &survey, &refs, &o, &cfg());
+        assert_eq!(picks.len(), 1);
+        assert_eq!((picks[0].from.as_deref(), picks[0].to.as_deref()), (Some("s3"), Some("s7")));
+        assert_eq!((picks[0].in_s, picks[0].out_s), (10.0, 35.0));
+
+        // Orchestrator trims p1 via sentence ids and adds a fresh pick discovered with tools.
+        let mut p1 = picks[0].clone();
+        p1.id = "p1".into();
+        let pool = vec![p1];
+        let orch = json!({ "clips": [
+            { "id": "p1", "from": "s3", "to": "s6", "title": "Trimmed", "hook": "H1", "why": "W1" },
+            { "id": "", "video_id": 1, "from": "s20", "to": "s24", "title": "Fresh", "hook": "H2", "why": "W2" },
+            // Invalid length falls back to base proposal? Here base was already claimed so skipped;
+            // verify out-of-range fallback on a clean pool below.
+        ]});
+        let chosen = apply_orchestrator_in(Some(&db), &[survey], &pool, &orch, &opts(20.0, 40.0), &cfg());
+        assert_eq!(chosen.len(), 2);
+        assert_eq!((chosen[0].from.as_deref(), chosen[0].to.as_deref()), (Some("s3"), Some("s6")));
+        assert_eq!((chosen[0].in_s, chosen[0].out_s), (10.0, 30.0));
+        assert_eq!((chosen[1].from.as_deref(), chosen[1].to.as_deref()), (Some("s20"), Some("s24")));
+        assert_eq!((chosen[1].in_s, chosen[1].out_s), (95.0, 120.0));
+
+        // Sentence ranges survive into check_clips and saved ScriptClip.
+        let project = db.project(pid).unwrap();
+        let checked = check_clips(&db, &project, &cfg(), &chosen, &o).unwrap();
+        let sc = &checked[0].script.beats[0].clips[0];
+        assert_eq!(sc.sentences.as_ref().map(|s| (s.from.as_str(), s.to.as_str())), Some(("s3", "s6")));
+    }
+
+    #[test]
+    fn word_edge_picks_survive_check_clips_without_snapping_back_to_segment_edges() {
+        let (db, pid, _dir) = library();
+        crate::sentence_split::ensure(&db, 1).unwrap();
+        let sents = crate::index::transcript(&db, 1).unwrap();
+        let words = vec![(0.0, 1.0), (1.0, 2.0), (2.0, 3.0), (3.0, 4.0), (4.0, 5.0)];
+        db.conn
+            .execute(
+                "UPDATE transcript_sentences SET words_json = ?1 WHERE id = ?2",
+                rusqlite::params![serde_json::to_string(&words).unwrap(), sents[0].id],
+            )
+            .unwrap();
+        let project = db.project(pid).unwrap();
+        let from = format!("s{}@3", sents[0].id);
+        let to = format!("s{}", sents[4].id);
+        let mut p = pick("p1", 1, 0.0, 0.0, 8.0, "faces");
+        p.from = Some(from.clone());
+        p.to = Some(to.clone());
+        let checked = check_clips(&db, &project, &cfg(), &[p], &opts(20.0, 40.0)).unwrap();
+        assert_eq!(checked[0].pick.from.as_deref(), Some(from.as_str()));
+        assert_eq!(checked[0].pick.to.as_deref(), Some(to.as_str()));
+        assert!((checked[0].pick.in_s - 2.0).abs() < 0.05, "kept @3 start: {}", checked[0].pick.in_s);
+        assert_eq!(
+            checked[0].script.beats[0].clips[0].sentences.as_ref().map(|s| s.from.as_str()),
+            Some(from.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn pool_precheck_and_bounded_orchestrator_repair() {
+        let (mut db, pid, dir) = library_on_disk();
+        let project = db.project(pid).unwrap();
+        let paths = crate::paths::Paths::in_dir(dir.path());
+        // Add a mid-speech + too-short scenario in video 1 at 100..116.5 (inside 100.1..134.0 continuous
+        // speech), while 200..230 and 300..330 end cleanly in quiet pauses.
+        crate::sentence_split::ensure(&db, 1).unwrap();
+        let mut speech = vec![
+            crate::speech::SpeechRegion::new(100.1, 134.0),
+            crate::speech::SpeechRegion { start_s: 200.1, end_s: 229.6, quiet_after_s: Some(229.8) },
+            crate::speech::SpeechRegion { start_s: 300.1, end_s: 329.6, quiet_after_s: Some(329.8) },
+        ];
+        speech.sort_by(|a, b| a.start_s.total_cmp(&b.start_s));
+        db.set_speech_regions(1, &speech).unwrap();
+
+        let p_bad = pick("p1", 1, 100.0, 116.5, 9.0, "faces");
+        let p_good1 = pick("p2", 1, 200.0, 230.0, 8.0, "faces");
+        let p_good2 = pick("p3", 1, 300.0, 330.0, 7.0, "faces");
+        let pre_good =
+            verify_chosen_clips(&db, &project, &cfg(), &[p_good1.clone(), p_good2.clone()], &opts(20.0, 40.0)).unwrap();
+        assert_eq!(pre_good.actionable_issues, 0, "seeded good picks must be clean:\n{}", pre_good.report);
+        let pool = vec![p_bad, p_good1, p_good2];
+        let notes = pool_precheck_notes(&db, &project, &cfg(), &pool, &opts(20.0, 40.0));
+        assert!(!notes[0].is_empty(), "precheck flags issue on p1: {notes:?}");
+        let prompt = orchestrator_prompt_with_notes(&pool, &opts(20.0, 40.0), None, &notes);
+        assert!(prompt.contains("   check: "), "prompt includes precheck line:\n{prompt}");
+
+        let orch_turns = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let orch_turns_srv = orch_turns.clone();
+        let (url, seen) = crate::tools::tests::scripted_server(move |request, _n| {
+            let text = request.to_string();
+            if text.contains("The host verified your") {
+                orch_turns_srv.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                return json!({ "content": json!({ "clips": [
+                    { "id": "", "video_id": 1, "in_s": 200.0, "out_s": 230.0, "title": "Clean 1", "hook": "H1", "why": "W1" },
+                    { "id": "", "video_id": 1, "in_s": 300.0, "out_s": 330.0, "title": "Clean 2", "hook": "H2", "why": "W2" }
+                ] }).to_string() });
+            }
+            if text.contains("Proposals") {
+                orch_turns_srv.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // Pick an intentionally too-short + mid-speech slice to trigger verify_chosen_clips.
+                return json!({ "content": json!({ "clips": [
+                    { "id": "", "video_id": 1, "in_s": 100.0, "out_s": 116.5, "title": "Too short", "hook": "H1", "why": "W1" },
+                    { "id": "", "video_id": 1, "in_s": 200.0, "out_s": 230.0, "title": "Clean 1", "hook": "H2", "why": "W2" }
+                ] }).to_string() });
+            }
+            let id = text
+                .split("v1c")
+                .nth(1)
+                .map(|r| format!("v1c{}", r.chars().take_while(|c| c.is_ascii_digit()).collect::<String>()))
+                .unwrap_or_default();
+            json!({ "content": json!({ "picks": [{ "candidate": id, "in_s": 0, "out_s": 0, "title": "T", "quote": "Q", "why": "W", "score": 7, "hook": "H" }] }).to_string() })
+        })
+        .await;
+
+        use crate::agents::{AgentTarget, EndpointKey, ModelRunner, PoolAgent, SlotRegistry};
+        let worker = PoolAgent {
+            spec: AgentSpec {
+                id: "srv".into(),
+                max_concurrent: 2,
+                roles: [AgentRole::Worker].into(),
+                ..AgentSpec::default()
+            },
+            key: EndpointKey::Server { url: url.clone(), model: String::new() },
+            capacity: 2,
+            target: AgentTarget::Server {
+                url: url.clone(),
+                model: String::new(),
+                api_key: String::new(),
+                timeout_s: 10,
+            },
+            describe: "srv".into(),
+            max_tool_rounds: 0,
+        };
+        let selection = crate::agents::resolve_selection(
+            std::slice::from_ref(&worker.spec),
+            None,
+            None,
+            &AgentSelection::default(),
+        )
+        .unwrap();
+        let backends = Backends {
+            workers: AgentPool::new(vec![worker], 2, SlotRegistry::new(), Arc::new(ModelRunner::default())),
+            orchestrator: Some(Orchestrator {
+                agent: AgentSpec { id: "boss".into(), roles: [AgentRole::Orchestrator].into(), ..AgentSpec::default() },
+                setup: crate::runtime::VisionSetup::Server(crate::vision::ServerVision::new(&url, "", "")),
+                max_tool_rounds: 0,
+            }),
+            orchestrator_skipped: None,
+            orchestrator_timeout_s: 10,
+            selection,
+            tools: Some(
+                crate::tools::ToolAccess::new(paths, Arc::new(Config::default()), 0, None)
+                    .with_profile(crate::tools::ToolProfile::ClipRun),
+            ),
+        };
+        let o = ClipOptions { count: 2, window_s: 200.0, ..opts(20.0, 40.0) };
+        let res = run(&mut db, pid, &cfg(), &backends, &o, None, &mut |_: f64, _: &str, _: &str| {}).await.unwrap();
+        assert_eq!(res.set.items.len(), 2);
+        assert_eq!(orch_turns.load(std::sync::atomic::Ordering::SeqCst), 2, "initial + 1 bounded repair turn");
+        assert_eq!(res.log["orchestrator"]["repair_attempted"], true, "{}", res.log["orchestrator"]);
+        assert_eq!(res.log["orchestrator"]["repair_applied"], true, "{}", res.log["orchestrator"]);
+        assert!(res.log["orchestrator"]["host_check_issues_before"].as_u64().unwrap() > 0);
+        assert_eq!(res.log["orchestrator"]["host_check_issues_after"], 0);
+        let reqs = seen.lock().unwrap();
+        assert!(reqs.iter().any(|r| r.to_string().contains("The host verified your")));
+    }
+
+    #[test]
+    fn orchestrator_repair_keeps_checked_picks_when_reverify_fails() {
+        let mut chosen = vec![pick("checked", 1, 10.0, 30.0, 8.0, "faces")];
+        let repaired = vec![pick("unverified", 1, 40.0, 60.0, 9.0, "faces")];
+        let (issues_after, applied, err) =
+            apply_verified_repair(&mut chosen, repaired, 2, |_| Err(Error::Invalid("verify failed".into())));
+        assert_eq!(chosen[0].id, "checked");
+        assert_eq!(issues_after, 2);
+        assert!(!applied);
+        assert!(err.as_deref().is_some_and(|m| m.contains("verify failed")));
+    }
+
+    #[tokio::test]
+    async fn orchestrator_turn_stops_promptly_on_cancel() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let trigger = flag.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            trigger.store(true, Ordering::SeqCst);
+        });
+        let started = std::time::Instant::now();
+        let err = run_cancellable(&Some(flag), std::future::pending::<Result<Value, Error>>())
+            .await
+            .expect_err("cancel must stop the turn");
+        assert!(err.is_cancelled(), "unexpected error: {err}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2), "took {:?}", started.elapsed());
     }
 }

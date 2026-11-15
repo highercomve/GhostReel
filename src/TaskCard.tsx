@@ -83,15 +83,18 @@ export default function TaskCard({
   const logRef = useRef<HTMLDivElement>(null);
 
   // A script chat's real progress is the tools it calls; its steps alone say almost nothing.
-  // Only listened to while the card is open, so closed cards cost nothing.
+  // Backfill from `task.chat_events` on open and append live `chat-progress` updates.
   const sessionId = task.kind.type === "chat" ? task.kind.session_id : null;
   useEffect(() => {
     if (!open || sessionId == null) return;
+    if (task.chat_events && task.chat_events.length > 0) {
+      setLog(task.chat_events.map(chatLine).slice(-200));
+    }
     return onEvent<ChatProgress>("chat-progress", (p) => {
       if (p.session_id !== sessionId) return;
       setLog((prev) => [...prev, chatLine(p.event)].slice(-200));
     });
-  }, [open, sessionId]);
+  }, [open, sessionId, task.chat_events]);
 
   useEffect(() => {
     const el = logRef.current;

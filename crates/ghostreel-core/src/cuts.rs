@@ -3,9 +3,9 @@
 //!
 //! Whisper's times are approximate: often late at a start, early or quantised at an end. A clip
 //! that ends on a segment boundary can end exactly as the next speaker's first word begins, and
-//! you hear its attack. This is the last pass of the repair chain (`script_check::repair_for_import`,
-//! `chat::repair::finish_script`), after everything that moves a clip has moved it, and it only
-//! runs for videos the speech stage has measured.
+//! you hear its attack. This is the last pass of the finishing chain (`finish::run`), after
+//! everything that moves a clip has moved it, and it only runs for videos the speech stage has
+//! measured.
 //!
 //! The rules, for a clip or an audio bed with `[in, out]`:
 //!
@@ -29,7 +29,7 @@ use rusqlite::OptionalExtension;
 
 use crate::config::ScriptConfig;
 use crate::db::Db;
-use crate::script::{Audio, Script};
+use crate::script::{Audio, CLOSING_PICTURE, Script, on_word};
 use crate::speech::SpeechRegion;
 
 /// A pause shorter than the guard plus this has no room for both a tail and a guard (s).
@@ -79,6 +79,17 @@ pub enum CutKind {
     StartRetimed,
     /// A closing hold carried sound; it is muted now.
     HoldMuted,
+    /// The clip opened on a reply or a filler said on its own breath ("yeah so…"); it starts on
+    /// the words after it now.
+    StartAfterFiller,
+    /// The clip opened on someone off the microphone (the interviewer); it starts after them now.
+    StartAfterOffMic,
+    /// The clip ended on someone off the microphone; it ends before them now.
+    EndBeforeOffMic,
+    /// The clip ended on a sound no word accounts for (an "umm", a laugh); it ends on the words.
+    EndBeforeUnworded,
+    /// The clip opened on a sound no word accounts for; it opens on the words.
+    StartAfterUnworded,
 }
 
 impl CutMove {
@@ -104,6 +115,19 @@ impl CutMove {
             CutKind::StartBeforeFirstWord => format!("opened {subject} before its first word starts ({moved})"),
             CutKind::StartRetimed => format!("placed the start of {subject} just before its first word ({moved})"),
             CutKind::HoldMuted => format!("muted the closing hold after {subject}: it would carry the next voice"),
+            CutKind::StartAfterOffMic => {
+                format!("started {subject} after the off-mic line it opened on ({moved})")
+            }
+            CutKind::EndBeforeOffMic => format!("ended {subject} before the off-mic line it closed on ({moved})"),
+            CutKind::EndBeforeUnworded => {
+                format!("ended {subject} on its last word, before an \"umm\" or other sound no word accounts for ({moved})")
+            }
+            CutKind::StartAfterUnworded => {
+                format!("opened {subject} on its first word, after an \"umm\" or other sound no word accounts for ({moved})")
+            }
+            CutKind::StartAfterFiller => {
+                format!("started {subject} after its opening reply or filler, said on its own breath ({moved})")
+            }
         }
     }
 }
@@ -183,7 +207,10 @@ pub fn place_out(
 ) -> Option<(f64, CutKind)> {
     // The speech the range really contains: it starts a guard or more before the end. A voice that
     // comes in inside that last guard is the next speaker's, not this clip's.
-    let li = regions.iter().rposition(|x| x.start_s < out_s - r.guard && x.end_s > in_s)?;
+    // Nor is a voice that starts after the next sentence does (`push_limit`): it is that sentence.
+    let li = regions.iter().rposition(|x| {
+        x.start_s < out_s - r.guard && x.end_s > in_s && push_limit.is_none_or(|l| x.start_s < l + r.guard)
+    })?;
     let last = &regions[li];
     let next = regions.get(li + 1);
 
@@ -213,7 +240,14 @@ fn finish_out(
     push_limit: Option<f64>,
 ) -> Option<(f64, CutKind)> {
     let mut target = target;
+    // The transcript's limit is for a voice the sound cannot split (one region running from this
+    // sentence into the next). When the measured speech of this sentence ends before the next one
+    // starts, the pause is right there and the target was already placed in it: capping it at the
+    // transcript's start-minus-guard would cut inside the last word ("Viata" at 67.87, voice to 67.93,
+    // next voice at 68.01) and leave a flag no editor can fix.
+    let own_pause = push_limit.is_some_and(|l| last.end_s <= l + r.guard + 0.02);
     if target > out_s
+        && !own_pause
         && let Some(limit) = push_limit
     {
         let capped = target.min(limit.max(out_s));
@@ -590,12 +624,15 @@ fn word_boundary(
     quietest(&levels, (from - pad).max(0.0), from, to)
 }
 
-/// The start of the next sentence after `out_s`, minus the guard.
-fn push_limit(db: &Db, video_id: i64, out_s: f64, guard: f64) -> Option<f64> {
+/// The start of the next sentence after `out_s`, minus the guard. A sentence that starts inside
+/// the last `reach` of the range counts as the next one: the passes before this one end a clip a
+/// tail past its last sentence, and when the speaker runs straight on that tail is the next
+/// sentence's first word, not this one's.
+fn push_limit(db: &Db, video_id: i64, out_s: f64, guard: f64, reach: f64) -> Option<f64> {
     db.conn
         .query_row(
             "SELECT MIN(start_s) FROM transcript_sentences WHERE video_id = ?1 AND start_s > ?2",
-            rusqlite::params![video_id, out_s - 0.05],
+            rusqlite::params![video_id, out_s - reach.max(0.05)],
             |r| r.get::<_, Option<f64>>(0),
         )
         .optional()
@@ -620,6 +657,230 @@ fn pull_limit(db: &Db, video_id: i64, in_s: f64) -> Option<f64> {
         .flatten()
 }
 
+/// The longest end of a sentence that runs on past an off-mic segment's edge (s): a word or two.
+const MAX_CARRIED_TAIL_S: f64 = 1.5;
+
+/// The part of `in_s..out_s` left once lines said off the microphone (the interviewer's question,
+/// a crew member's "Okay.") are taken off its start and its end — the same rule a clip-run moment
+/// follows (`clips::candidates` never lets one in). A line in the middle stays: taking it out would
+/// leave a jump cut, so the check reports it instead. `None` when nothing changes, or when nothing
+/// on the microphone would be left.
+pub fn on_mic_span(db: &Db, video_id: i64, in_s: f64, out_s: f64) -> Option<(f64, f64)> {
+    let segs: Vec<(f64, f64, bool)> = db
+        .conn
+        .prepare(
+            "SELECT start_s, end_s, COALESCE(off_mic, 0) FROM transcript_segments
+              WHERE video_id = ?1 AND end_s > ?2 + 0.1 AND start_s < ?3 - 0.1 ORDER BY start_s",
+        )
+        .and_then(|mut st| {
+            st.query_map(rusqlite::params![video_id, in_s, out_s], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect()
+        })
+        .ok()?;
+    let first = segs.iter().position(|s| !s.2)?;
+    let last = segs.iter().rposition(|s| !s.2)?;
+    let a = if first > 0 { segs[first].0 } else { in_s };
+    let mut b = if last + 1 < segs.len() { segs[last].1 } else { out_s };
+    if b < out_s {
+        // The speaker's sentence can finish a word or two into the next, off-mic segment, where
+        // the transcript broke it ("…that's a real" / "thing. So this event…"): sentences are split
+        // after that tail (`sentence_split::carry_tails`), so one running across this edge is the
+        // speaker's own and ends where it ends.
+        let tail: Option<f64> = db
+            .conn
+            .query_row(
+                "SELECT MAX(end_s) FROM transcript_sentences
+                  WHERE video_id = ?1 AND start_s < ?2 - 0.05 AND end_s > ?2 + 0.05 AND end_s <= ?2 + ?3",
+                rusqlite::params![video_id, b, MAX_CARRIED_TAIL_S],
+                |r| r.get(0),
+            )
+            .ok()
+            .flatten();
+        if let Some(end) = tail {
+            b = end.min(out_s);
+        }
+    }
+    ((a, b) != (in_s, out_s) && b - a >= 1.0).then_some((a, b))
+}
+
+/// Why [`spoken_span`] moved an edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpanCut {
+    /// A line said off the microphone at that end.
+    OffMic,
+    /// A reply or filler said on its own breath before the sentence ([`after_opening_filler`]).
+    Filler,
+}
+
+/// What [`spoken_span`] keeps of a range, and why each edge moved (`None`: it did not).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Span {
+    pub in_s: f64,
+    pub out_s: f64,
+    pub start: Option<SpanCut>,
+    pub end: Option<SpanCut>,
+    /// Everything said in the range is off the microphone: nothing of it is anyone's answer.
+    pub off_mic_only: bool,
+}
+
+/// The one rule for what a speaking range keeps: lines said off the microphone come off either end
+/// ([`on_mic_span`]), and with `filler` (a clip, not a bed) a reply or filler said on its own breath
+/// comes off the start. An edge written on a word (`s412@3`) is where the editor asked for it and
+/// stays. The finishing pass (`finish::trim_unspoken_edges`) and the cut placement
+/// ([`place_cuts`]) both ask this, so neither undoes the other.
+pub fn spoken_span(
+    db: &Db,
+    video_id: i64,
+    in_s: f64,
+    out_s: f64,
+    range: Option<&crate::script::SentenceRange>,
+    filler: bool,
+) -> Span {
+    let (word_in, word_out) = (on_word(range, true), on_word(range, false));
+    let trimmed = on_mic_span(db, video_id, in_s, out_s);
+    let off_mic_only = trimmed.is_none() && says_only_off_mic(db, video_id, in_s, out_s);
+    let (mut a, mut b) = trimmed.unwrap_or((in_s, out_s));
+    if word_in {
+        a = in_s;
+    }
+    if word_out {
+        b = out_s;
+    }
+    let mut start = (a != in_s).then_some(SpanCut::OffMic);
+    let end = (b != out_s).then_some(SpanCut::OffMic);
+    if filler
+        && !word_in
+        && let Some(t) = after_opening_filler(db, video_id, a).filter(|t| *t > a && *t < b - 1.0)
+    {
+        a = t;
+        start = Some(SpanCut::Filler);
+    }
+    Span { in_s: a, out_s: b, start, end, off_mic_only }
+}
+
+/// Whether `in_s..out_s` has transcribed speech and all of it is off the microphone.
+fn says_only_off_mic(db: &Db, video_id: i64, in_s: f64, out_s: f64) -> bool {
+    db.conn
+        .query_row(
+            "SELECT COUNT(*) > 0 AND SUM(COALESCE(off_mic, 0) = 0) = 0 FROM transcript_segments
+              WHERE video_id = ?1 AND end_s > ?2 + 0.1 AND start_s < ?3 - 0.1",
+            rusqlite::params![video_id, in_s, out_s],
+            |r| r.get::<_, Option<bool>>(0),
+        )
+        .ok()
+        .flatten()
+        .unwrap_or(false)
+}
+
+/// Words a clip should not open on when they are said on their own breath: a reply to a question
+/// nobody hears ("yeah", "exacto") or a filler before the thought ("so", "okay", "um").
+use crate::lexicon::FILLERS;
+/// At most this many such words are dropped.
+const MAX_FILLERS: usize = 3;
+
+/// When the sentence a range opens on starts with a reply or filler said on its own breath — a short
+/// burst of speech, then a pause, then the rest ("yeah so · hi, my name is…") — where the rest
+/// starts. Measured on the sound, so it needs no word timings; a filler run straight into the
+/// sentence ("And Mark and Kayla…") has no pause to cut in and is left alone.
+pub fn after_opening_filler(db: &Db, video_id: i64, in_s: f64) -> Option<f64> {
+    let (start, text): (f64, String) = db
+        .conn
+        .query_row(
+            "SELECT start_s, text FROM transcript_sentences WHERE video_id = ?1 AND end_s > ?2 + 0.05 AND start_s < ?2 + 0.8
+              ORDER BY start_s LIMIT 1",
+            rusqlite::params![video_id, in_s],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .ok()
+        .flatten()?;
+    // Only for a range that opens on the sentence's start (the passes before pad it a little
+    // earlier), not one placed inside it on purpose.
+    if in_s > start + 0.3 {
+        return None;
+    }
+    let words: Vec<String> =
+        text.split_whitespace().map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase()).collect();
+    let n = words.iter().take(MAX_FILLERS).take_while(|w| FILLERS.contains(&w.as_str())).count();
+    if n == 0 || words.len() < n + 3 {
+        return None;
+    }
+    let regions = crate::speech::speech_regions(db, video_id, start - 0.3, start + 3.0).ok()?;
+    let i = regions.iter().position(|r| r.end_s > start + 0.02)?;
+    let (burst, rest) = (&regions[i], regions.get(i + 1)?);
+    let pause = rest.start_s - burst.end_s;
+    let short = burst.end_s - burst.start_s <= 0.25 + 0.35 * n as f64;
+    (burst.start_s <= start + 0.4 && short && (0.08..=1.0).contains(&pause)).then_some(rest.start_s)
+}
+
+/// Where a range's words end and start when its edges hold measured speech that no sentence
+/// covers: the "umm", "uh" or laugh Whisper does not write, which the sentence split leaves between
+/// sentences ([`crate::sentence_split`]). `(start, end)`, each `None` where that edge is on words.
+/// A range that holds no sentence at all is left alone: it was chosen for its sound.
+fn unworded_edges(db: &Db, video_id: i64, in_s: f64, out_s: f64, regions: &[SpeechRegion]) -> (Option<f64>, Option<f64>) {
+    let sentences: Vec<(f64, f64)> = crate::sentence_split::edges(db, video_id)
+        .into_iter()
+        .filter(|&(a, b)| b > in_s + 0.05 && a < out_s - 0.05)
+        .collect();
+    let (Some(first), Some(last)) = (sentences.first().copied(), sentences.last().copied()) else {
+        return (None, None);
+    };
+    let worded = |r: &SpeechRegion| sentences.iter().any(|&(a, b)| a < r.end_s - 0.02 && b > r.start_s + 0.02);
+    // Voiced sound after the last sentence ends, inside the range, that no sentence covers.
+    let tail = last.1 < out_s
+        && regions.iter().any(|r| r.start_s >= last.1 && r.start_s < out_s - 0.05 && !worded(r));
+    let head = first.0 > in_s
+        && regions.iter().any(|r| r.end_s <= first.0 && r.end_s > in_s + 0.05 && !worded(r));
+    (head.then_some(first.0), tail.then_some(last.1))
+}
+
+/// How long the speaker stays quiet after the last voice a range holds, before they talk again
+/// (s): from the end of the last measured speech that starts inside it to the next. `None` when
+/// the video is not measured or nobody speaks again nearby. It does not depend on where the out
+/// point sits in that pause, so a check made before cut placement agrees with one made after.
+pub fn quiet_after_voice(db: &Db, video_id: i64, in_s: f64, out_s: f64) -> Option<f64> {
+    let regions = crate::speech::speech_regions(db, video_id, in_s, out_s + 10.0).ok()?;
+    let li = regions.iter().rposition(|r| r.start_s < out_s - 0.05 && r.end_s > in_s)?;
+    let next = regions.get(li + 1)?;
+    Some(next.start_s - regions[li].end_s)
+}
+
+/// How far before the speaker's next sound a same-shot closing hold stops (s).
+const HOLD_QUIET_MARGIN_S: f64 = 0.15;
+/// A closing hold shorter than this is a flash; it goes (s).
+const MIN_HOLD_S: f64 = 0.2;
+
+/// Stop a closing hold that continues the last shot before its speaker talks again: the hold is
+/// muted, and a face seen talking with the sound gone makes the cut seem to go mute before it ends.
+/// Run on the placed cut, so the same cut always gets the same hold.
+fn hold_until_quiet(db: &Db, beat: &mut crate::script::Beat) {
+    let n = beat.clips.len();
+    if n < 2 {
+        return;
+    }
+    let (clip, hold) = (&beat.clips[n - 2], &beat.clips[n - 1]);
+    if hold.why.as_deref() != Some(CLOSING_PICTURE)
+        || hold.video_id != clip.video_id
+        || (hold.in_s - clip.out_s).abs() >= HOLD_JOIN_S
+    {
+        return;
+    }
+    let Some(quiet) = quiet_after_voice(db, clip.video_id, clip.in_s, clip.out_s) else { return };
+    let Some(voice_end) = crate::speech::speech_regions(db, clip.video_id, clip.in_s, clip.out_s)
+        .ok()
+        .and_then(|r| r.iter().rev().find(|r| r.start_s < clip.out_s - 0.05).map(|r| r.end_s))
+    else {
+        return;
+    };
+    let until = voice_end + quiet - HOLD_QUIET_MARGIN_S;
+    let hold = &mut beat.clips[n - 1];
+    if hold.out_s > until {
+        hold.out_s = until.max(hold.in_s);
+    }
+    if hold.out_s - hold.in_s < MIN_HOLD_S {
+        beat.clips.pop();
+    }
+}
+
 /// Place one range on the sound. `None` when the video has no measured speech near it.
 fn place_range(
     db: &Db,
@@ -642,10 +903,14 @@ fn place_range(
         .filter(|d| *d > 0.0)
         .unwrap_or(f64::MAX);
     let rules = Rules::from_config(cfg, fps, duration);
+    // An "umm" at either edge is not the clip's: it ends and opens on its words, then is placed.
+    let (head, tail) = unworded_edges(db, video_id, in_s, out_s, &regions);
+    let (in_s, out_s) = (head.unwrap_or(in_s), tail.unwrap_or(out_s));
     // A clip written to end on a word stops before the next word starts, and one written to start
     // on a word opens after the previous one ends: inside running speech the next pause is the
     // sentence's end, and the whole rest of the sentence is not what was asked for.
-    let mut limit = push_limit(db, video_id, out_s, rules.guard);
+    // Only for a range that starts well before it: a range that opens on that sentence is its own.
+    let mut limit = push_limit(db, video_id, out_s, rules.guard, (rules.tail + 0.05).min((out_s - in_s) / 2.0));
     if let Some((_, next)) = words.end {
         limit = Some(limit.map_or(next, |l| l.min(next)) - WORD_GAP_S);
     }
@@ -690,6 +955,12 @@ fn place_range(
     if let (Some((this_end, next_start)), Some(m)) = (words.end, new_out.as_mut()) {
         m.0 = m.0.min(rules.floor_frame((this_end + next_start) / 2.0)).max(out_s.min(m.0));
     }
+    if tail.is_some() {
+        new_out = Some((new_out.map_or(out_s, |m| m.0), CutKind::EndBeforeUnworded));
+    }
+    if head.is_some() {
+        new_in = Some((new_in.map_or(in_s, |m| m.0), CutKind::StartAfterUnworded));
+    }
     let (a, b) = (new_in.map_or(in_s, |m| m.0), new_out.map_or(out_s, |m| m.0));
     if b - a < MIN_KEPT_S {
         return None;
@@ -717,6 +988,16 @@ struct RangeMove {
 /// A closing hold this close to the end of its clip continues that shot (s): about a frame, the
 /// rounding the passes before leave between the two.
 const HOLD_JOIN_S: f64 = 0.05;
+/// How much longer the last picture under a bed may be held so the voice can finish (s).
+const MAX_PICTURE_HOLD_S: f64 = 1.0;
+
+fn video_duration(db: &Db, video_id: i64) -> Option<f64> {
+    db.conn
+        .query_row("SELECT duration_s FROM videos WHERE id = ?1", [video_id], |r| r.get::<_, Option<f64>>(0))
+        .ok()
+        .flatten()
+        .filter(|d| *d > 0.0)
+}
 
 pub fn place_cuts(db: &Db, script: &mut Script, cfg: &ScriptConfig) -> Vec<CutMove> {
     let mut moves = Vec::new();
@@ -733,23 +1014,48 @@ pub fn place_cuts(db: &Db, script: &mut Script, cfg: &ScriptConfig) -> Vec<CutMo
         for ci in 0..beat.clips.len() {
             let clip = beat.clips[ci].clone();
             // A hold after a speaking clip is quiet, whatever else it is.
-            if clip.why.as_deref() == Some(crate::chat::CLOSING_PICTURE) {
+            if clip.why.as_deref() == Some(CLOSING_PICTURE) {
                 if clip.audio == Audio::Source {
                     beat.clips[ci].audio = Audio::Mute;
                     moves.push(note(Some(ci.saturating_sub(1)), CutKind::HoldMuted, clip.in_s, clip.out_s));
                 }
                 continue;
             }
-            // Written to be kept exactly as it is.
+            // Written to be kept exactly as it is. An edge written on a word is still settled on the
+            // quiet beside that word below, never past the middle of the gap to its neighbour
+            // (`ScriptClip::movable`'s one exception).
             if clip.exact || has_bed || clip.audio != Audio::Source || clip.tracks.as_ref().is_some_and(Vec::is_empty) {
                 continue;
             }
-            let words = crate::sentences::WordEdges::of(db, clip.sentences.as_ref());
-            let Some(m) = place_range(db, clip.video_id, clip.in_s, clip.out_s, words, cfg, fps) else { continue };
-            if let Some((to, kind)) = m.new_in.filter(|(to, _)| (to - clip.in_s).abs() >= NOTE_MIN_S) {
+            let mut words = crate::sentences::WordEdges::of(db, clip.sentences.as_ref());
+            // The interviewer off the edges and a filler opener off the start, by the one span rule:
+            // the sentences asked for were the subject's, and a question or an "Awesome." at either
+            // end is someone else's line. A word edge it moved is no longer the edge written.
+            let span = spoken_span(db, clip.video_id, clip.in_s, clip.out_s, clip.sentences.as_ref(), true);
+            if span.start.is_some() {
+                words.start = None;
+                words.start_span = None;
+            }
+            if span.end.is_some() {
+                words.end = None;
+                words.end_span = None;
+            }
+            let (from_in, mic_out) = (span.in_s, span.out_s);
+            let trimmed = from_in != clip.in_s || mic_out != clip.out_s;
+            let m = place_range(db, clip.video_id, from_in, mic_out, words, cfg, fps).or_else(|| {
+                trimmed.then_some(RangeMove { in_s: from_in, out_s: mic_out, new_in: None, new_out: None })
+            });
+            let Some(m) = m else { continue };
+            if span.start == Some(SpanCut::Filler) {
+                moves.push(note(Some(ci), CutKind::StartAfterFiller, clip.in_s, m.in_s));
+            } else if span.start == Some(SpanCut::OffMic) {
+                moves.push(note(Some(ci), CutKind::StartAfterOffMic, clip.in_s, m.in_s));
+            } else if let Some((to, kind)) = m.new_in.filter(|(to, _)| (to - clip.in_s).abs() >= NOTE_MIN_S) {
                 moves.push(note(Some(ci), kind, clip.in_s, to));
             }
-            if let Some((to, kind)) = m.new_out.filter(|(to, _)| (to - clip.out_s).abs() >= NOTE_MIN_S) {
+            if span.end.is_some() {
+                moves.push(note(Some(ci), CutKind::EndBeforeOffMic, clip.out_s, m.out_s));
+            } else if let Some((to, kind)) = m.new_out.filter(|(to, _)| (to - clip.out_s).abs() >= NOTE_MIN_S) {
                 moves.push(note(Some(ci), kind, clip.out_s, to));
             }
             beat.clips[ci].in_s = m.in_s;
@@ -757,7 +1063,7 @@ pub fn place_cuts(db: &Db, script: &mut Script, cfg: &ScriptConfig) -> Vec<CutMo
             // A closing hold continues the shot this clip ends: it follows the cut.
             let delta = m.out_s - clip.out_s;
             if let Some(hold) = beat.clips.get_mut(ci + 1)
-                && hold.why.as_deref() == Some(crate::chat::CLOSING_PICTURE)
+                && hold.why.as_deref() == Some(CLOSING_PICTURE)
                 && hold.video_id == clip.video_id
                 && (hold.in_s - clip.out_s).abs() < HOLD_JOIN_S
                 && delta.abs() > 1e-9
@@ -767,25 +1073,71 @@ pub fn place_cuts(db: &Db, script: &mut Script, cfg: &ScriptConfig) -> Vec<CutMo
                 hold.out_s = m.out_s + len;
             }
         }
+        hold_until_quiet(db, beat);
         if let Some(bed) = &mut beat.bed
             && !bed.tracks.as_ref().is_some_and(Vec::is_empty)
-            && let Some(m) = place_range(
-                db,
-                bed.video_id,
-                bed.in_s,
-                bed.out_s,
-                crate::sentences::WordEdges::of(db, bed.sentences.as_ref()),
-                cfg,
-                fps,
-            )
         {
-            // A bed never outlasts the pictures it plays under.
-            let out_s = if pictures > 0.0 && m.out_s - m.in_s > pictures { m.in_s + pictures } else { m.out_s };
-            if let Some((to, kind)) = m.new_in.filter(|(to, _)| (to - bed.in_s).abs() >= NOTE_MIN_S) {
+            // The voice under the pictures follows the same rule as a clip's: no interviewer at
+            // either end.
+            let mut words = crate::sentences::WordEdges::of(db, bed.sentences.as_ref());
+            let span = spoken_span(db, bed.video_id, bed.in_s, bed.out_s, bed.sentences.as_ref(), false);
+            if span.start.is_some() {
+                words.start = None;
+                words.start_span = None;
+            }
+            if span.end.is_some() {
+                words.end = None;
+                words.end_span = None;
+            }
+            let (mic_in, mic_out) = (span.in_s, span.out_s);
+            let trimmed = (mic_in, mic_out) != (bed.in_s, bed.out_s);
+            let Some(m) = place_range(db, bed.video_id, mic_in, mic_out, words, cfg, fps)
+                .or_else(|| trimmed.then_some(RangeMove { in_s: mic_in, out_s: mic_out, new_in: None, new_out: None }))
+            else {
+                continue;
+            };
+            // A bed never outlasts the pictures it plays under. When the voice runs a little past
+            // them, the last picture is held for it instead: cutting the bed there takes the last
+            // word with it ("welcoming vi—"), and a shot a fraction longer costs nothing.
+            let over = m.out_s - m.in_s - pictures;
+            let mut covered = pictures;
+            if pictures > 0.0
+                && over > 1e-6
+                && over <= MAX_PICTURE_HOLD_S
+                && let Some(last) = beat.clips.last_mut().filter(|c| c.movable(crate::script::Side::Out))
+            {
+                let room = video_duration(db, last.video_id).map_or(f64::MAX, |d| d - last.out_s);
+                if room >= over {
+                    last.out_s += over;
+                    covered += over;
+                }
+            }
+            let out_s = if pictures > 0.0 && m.out_s - m.in_s > covered { m.in_s + covered } else { m.out_s };
+            if span.start.is_some() {
+                moves.push(note(None, CutKind::StartAfterOffMic, bed.in_s, m.in_s));
+            } else if let Some((to, kind)) = m.new_in.filter(|(to, _)| (to - bed.in_s).abs() >= NOTE_MIN_S) {
                 moves.push(note(None, kind, bed.in_s, to));
             }
-            if let Some((to, kind)) = m.new_out.filter(|(to, _)| (to - bed.out_s).abs() >= NOTE_MIN_S) {
+            if span.end.is_some() {
+                moves.push(note(None, CutKind::EndBeforeOffMic, bed.out_s, out_s));
+            } else if let Some((to, kind)) = m.new_out.filter(|(to, _)| (to - bed.out_s).abs() >= NOTE_MIN_S) {
                 moves.push(note(None, kind, bed.out_s, to));
+            }
+            // The pictures playing the very moment the bed plays (the face whose voice it is, in
+            // sync) move with its start, onto exactly the moment the bed now plays there: settling the bed on the sound alone put the lips a frame
+            // or more off their words, which the check then reported as someone else talking.
+            let shift = m.in_s - bed.in_s;
+            if shift.abs() > 1e-9 {
+                let mut at = 0.0;
+                for c in beat.clips.iter_mut() {
+                    let len = (c.out_s - c.in_s).max(0.0);
+                    let in_sync = c.video_id == bed.video_id && (c.in_s - (bed.in_s + at)).abs() <= IN_SYNC_S;
+                    if in_sync && c.movable(crate::script::Side::In) && c.movable(crate::script::Side::Out) {
+                        c.in_s = m.in_s + at;
+                        c.out_s = c.in_s + len;
+                    }
+                    at += len;
+                }
             }
             bed.in_s = m.in_s;
             bed.out_s = out_s;
@@ -793,6 +1145,11 @@ pub fn place_cuts(db: &Db, script: &mut Script, cfg: &ScriptConfig) -> Vec<CutMo
     }
     moves
 }
+
+/// How close a picture's source time must be to the bed's at that point of the beat to be the same
+/// moment — the face the voice belongs to (s). The rule `finish::lay_audio_beds` and the check hold
+/// a bed to.
+const IN_SYNC_S: f64 = 0.05 + 1e-6;
 
 #[cfg(test)]
 mod tests {
@@ -847,6 +1204,31 @@ mod tests {
         assert_eq!((kind, out), (CutKind::EndLetWordFinish, 12.4));
         // Already there: nothing to do.
         assert_eq!(place_out(&handover(), 0.0, 12.4, None, &r), None);
+    }
+
+    #[test]
+    fn a_sentence_that_starts_in_the_tail_is_the_next_ones_and_not_kept() {
+        // Kara, v154: s1978 ends 83.22 and s1979 ("And so we…") starts there, voiced 83.25–83.59.
+        // An earlier pass ended the clip a 0.35 s tail past 83.22, on "And so"; the end goes back
+        // into the pause before it instead of out past it.
+        let regions =
+            vec![region(82.34, 83.17, Some(83.18)), region(83.25, 83.59, Some(83.83)), region(84.12, 84.51, None)];
+        let (out, kind) = place_out(&regions, 74.0, 83.57, Some(83.22 - 0.12), &rules()).unwrap();
+        assert_eq!(kind, CutKind::EndOffNextSpeaker);
+        assert!((83.17..83.25).contains(&out), "{out}");
+    }
+
+    #[test]
+    fn a_short_pause_before_the_next_sentence_is_cut_in_not_the_last_word() {
+        // Mary Ellen, v151: "I love Hotel Viata." voiced to 67.93; the next sentence starts at 68.00
+        // on the transcript and its voice at 68.01. The cut goes in that pause, not at 68.00 - guard
+        // (67.88), inside "Viata".
+        let regions = vec![region(66.06, 67.93, Some(67.97)), region(68.01, 68.34, Some(68.43))];
+        let (out, _) = place_out(&regions, 66.0, 67.6, Some(68.0 - 0.12), &rules()).unwrap();
+        assert!(out > 67.93 && out < 68.01, "{out}");
+        // And reading it back, the last word is not clipped: no flag left that nobody can fix.
+        let read = judge_end(&regions, 66.0, out, &rules());
+        assert_ne!(read.flag, EndFlag::ClipsLastWord, "{read:?}");
     }
 
     #[test]
@@ -1059,7 +1441,9 @@ mod tests {
     }
 
     fn clip(in_s: f64, out_s: f64) -> ScriptClip {
-        ScriptClip { exact: false,
+        ScriptClip {
+            exact: false,
+            gain_db: None,
             sentences: None,
             video_id: VIDEO,
             in_s,
@@ -1179,7 +1563,9 @@ mod tests {
         // And it says so in the JSON only when set.
         let json = serde_json::to_value(&s.beats[0].clips[1]).unwrap();
         assert!(json.get("exact").is_none());
-        let back: ScriptClip = serde_json::from_value(serde_json::json!({"video_id": 104, "in_s": 1.0, "out_s": 2.0, "exact": true})).unwrap();
+        let back: ScriptClip =
+            serde_json::from_value(serde_json::json!({"video_id": 104, "in_s": 1.0, "out_s": 2.0, "exact": true}))
+                .unwrap();
         assert!(back.exact);
     }
 
@@ -1200,8 +1586,7 @@ mod tests {
         let (db, pid) = db_with_handover();
         // After A stops (12.06) and 0.68 s before B starts (12.88).
         let s = script(vec![clip(12.20, 16.60)]);
-        let issues =
-            crate::script_check::check(&db, pid, &s, &ScriptConfig::default(), &Default::default()).unwrap();
+        let issues = crate::script_check::check(&db, pid, &s, &ScriptConfig::default(), &Default::default()).unwrap();
         let dead = issues.iter().find(|i| i.message.contains("dead air")).expect("flagged");
         assert!(dead.message.contains("before the first word"), "{}", dead.message);
         let crate::script::FixAction::Trim { in_s, .. } = dead.fixes[0].action else { panic!("{dead:?}") };
@@ -1247,6 +1632,144 @@ mod tests {
         assert_eq!(bedded.beats[0].clips[0].out_s, 12.86);
     }
 
+    /// Garlar, v153: "yeah so" on its own breath (0.00–0.46), then "hi, my name is…" from 0.63; and
+    /// Kara's "And Mark and Kayla…" in one breath from 20.0.
+    fn db_with_openers() -> Db {
+        let db = Db::open_in_memory().unwrap();
+        db.conn
+            .execute("INSERT INTO videos(id, content_hash, size, duration_s) VALUES (104, 'h', 1, 60.0)", [])
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO transcript_segments(video_id, start_s, end_s, text) VALUES
+                 (104, 0.00, 9.05, 'yeah so hi my name is Garlar Stephenson I live in Westlake'),
+                 (104, 20.00, 23.56, 'And Mark and Kayla are just incredible connectors of people.')",
+                [],
+            )
+            .unwrap();
+        db.set_speech_regions(
+            VIDEO,
+            &[region(0.00, 0.46, Some(0.52)), region(0.63, 9.05, Some(9.2)), region(20.0, 23.56, None)],
+        )
+        .unwrap();
+        // After the regions: storing them re-splits the sentences, and these are the ones wanted.
+        crate::sentence_split::mirror_segments(&db, 104);
+        db
+    }
+
+    /// Garlar, v153: Whisper ended his segment one word early ("…that's a real") and the
+    /// interviewer's segment opens with his "thing.". The off-mic trim cut the clip at the segment
+    /// edge and lost the word; the sentence now ends after it, and so does the clip.
+    #[test]
+    fn a_word_the_speaker_finishes_in_the_interviewers_segment_stays_in_the_clip() {
+        let db = Db::open_in_memory().unwrap();
+        db.conn
+            .execute("INSERT INTO videos(id, content_hash, size, duration_s) VALUES (104, 'h', 1, 60.0)", [])
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO transcript_segments(video_id, start_s, end_s, text, off_mic) VALUES
+                 (104, 73.68, 81.47, 'and the vibe, welcoming vibe. People are nice and the southern hospitality, that''s a real', 0),
+                 (104, 81.47, 87.3, 'thing. So this event there are a lot of other business owners, why is it', 1)",
+                [],
+            )
+            .unwrap();
+        crate::sentence_split::rebuild(&db, 104).unwrap();
+        let ends: Vec<(String, f64)> = db
+            .conn
+            .prepare("SELECT text, end_s FROM transcript_sentences WHERE video_id = 104 ORDER BY start_s")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let hospitality = ends.iter().find(|(t, _)| t.contains("hospitality")).expect("{ends:?}");
+        assert!(hospitality.0.ends_with("real thing."), "{ends:?}");
+        let (_, b) = on_mic_span(&db, VIDEO, 73.68, 87.3).expect("the question is taken off");
+        assert!(b > 81.6 && b < 82.5, "the clip keeps \"thing.\": ends at {b}");
+    }
+
+    #[test]
+    fn an_interviewers_line_at_either_end_of_a_clip_is_taken_off_and_one_inside_is_left() {
+        let db = Db::open_in_memory().unwrap();
+        db.conn
+            .execute("INSERT INTO videos(id, content_hash, size, duration_s) VALUES (104, 'h', 1, 60.0)", [])
+            .unwrap();
+        // Kara, v154: two lines of hers, then the interviewer's question (off-mic).
+        db.conn
+            .execute(
+                "INSERT INTO transcript_segments(video_id, start_s, end_s, text, off_mic) VALUES
+                 (104, 1.0, 3.6, 'Okay, so we are talking about it.', 1),
+                 (104, 4.0, 7.0, 'So these events are always great for networking.', 0),
+                 (104, 7.2, 8.6, 'We always meet someone great.', 0),
+                 (104, 9.0, 10.8, 'What made you want to sponsor the bar?', 1),
+                 (104, 11.2, 14.0, 'Well we love this hotel.', 0)",
+                [],
+            )
+            .unwrap();
+        assert_eq!(on_mic_span(&db, VIDEO, 4.0, 10.8), Some((4.0, 8.6)), "the question at the end goes");
+        assert_eq!(on_mic_span(&db, VIDEO, 1.0, 8.6), Some((4.0, 8.6)), "the prompt at the start goes");
+        assert_eq!(on_mic_span(&db, VIDEO, 4.0, 14.0), None, "one inside is left for the check to report");
+        assert_eq!(on_mic_span(&db, VIDEO, 9.0, 10.8), None, "nothing on the mic would be left");
+
+        let mut s = script(vec![clip(4.0, 10.8)]);
+        let moves = place_cuts(&db, &mut s, &ScriptConfig::default());
+        let c = &s.beats[0].clips[0];
+        assert!(c.out_s <= 9.0 && c.out_s >= 8.6, "ends before the question: {}", c.out_s);
+        assert!(moves.iter().any(|m| m.kind == CutKind::EndBeforeOffMic), "{moves:?}");
+    }
+
+    #[test]
+    fn a_clip_opening_on_yeah_so_said_on_its_own_breath_starts_after_it() {
+        let db = db_with_openers();
+        assert_eq!(after_opening_filler(&db, VIDEO, 0.0), Some(0.63));
+        // Padded a little earlier by the passes before: still the same sentence.
+        assert_eq!(after_opening_filler(&db, VIDEO, -0.5_f64.max(0.0)), Some(0.63));
+        // Run straight into the sentence: no pause to cut in.
+        assert_eq!(after_opening_filler(&db, VIDEO, 20.0), None);
+        // Placed inside the sentence on purpose: left alone.
+        assert_eq!(after_opening_filler(&db, VIDEO, 2.0), None);
+
+        let mut s = script(vec![clip(0.0, 9.05)]);
+        let moves = place_cuts(&db, &mut s, &ScriptConfig::default());
+        let c = &s.beats[0].clips[0];
+        assert!((0.46..0.63).contains(&c.in_s), "opens in the pause before \"hi\": {}", c.in_s);
+        assert!(moves.iter().any(|m| m.kind == CutKind::StartAfterFiller), "{moves:?}");
+        // And reading it back, that is a clean start, not one inside the sentence.
+        let notes = crate::readcut::story(&db, VIDEO, c.in_s, c.out_s);
+        assert!(!notes.iter().any(|n| n.contains("mid-sentence") || n.contains("reply")), "{notes:?}");
+    }
+
+    /// The face whose voice a bed carries plays the same moment as the bed. Settling the bed's start
+    /// on the sound moved the voice alone, and the lips ran 0.2 s ahead of the words (the benchmark
+    /// cut's b5, flagged by the check as someone else talking): the picture moves with it.
+    #[test]
+    fn the_face_under_a_bed_moves_with_the_bed_start() {
+        let (db, _) = db_with_handover();
+        // The bed opens in the quiet before B's first word (12.88); the face is B at the same moment.
+        let mut face = clip(12.40, 15.40);
+        face.audio = Audio::Mute;
+        let mut broll = ScriptClip { video_id: 7, ..clip(0.0, 1.0) };
+        broll.audio = Audio::Mute;
+        let mut s = script(vec![face, broll]);
+        s.beats[0].bed = Some(crate::script::AudioBed {
+            sentences: None,
+            video_id: VIDEO,
+            in_s: 12.40,
+            out_s: 16.40,
+            why: None,
+            inferred: false,
+            tracks: None,
+        });
+        place_cuts(&db, &mut s, &ScriptConfig::default());
+        let bed = s.beats[0].bed.as_ref().unwrap();
+        assert!(bed.in_s > 12.40 + 0.1, "the bed opens on the voice: {bed:?}");
+        let c = &s.beats[0].clips[0];
+        assert!((c.in_s - bed.in_s).abs() < 1e-9, "the face plays its own words: {c:?} under {bed:?}");
+        assert!((c.out_s - c.in_s - 3.0).abs() < 1e-9, "and keeps its length: {c:?}");
+        assert_eq!((s.beats[0].clips[1].in_s, s.beats[0].clips[1].out_s), (0.0, 1.0), "b-roll stays");
+    }
+
     #[test]
     fn an_audio_bed_is_placed_like_a_clip_and_stays_inside_its_pictures() {
         let (db, _) = db_with_handover();
@@ -1266,26 +1789,39 @@ mod tests {
         let bed = s.beats[0].bed.as_ref().unwrap();
         assert!((12.30..=12.75).contains(&bed.out_s), "{}", bed.out_s);
         assert!(moves.iter().any(|m| m.clip_index.is_none() && m.kind == CutKind::EndOffNextSpeaker));
-        // The pictures are shorter than the voice would like: the bed is capped to them.
+        // The pictures are a little shorter than the voice: the last picture is held for it, rather
+        // than the bed cutting off A's last word.
         let mut short = s.clone();
         short.beats[0].clips[0].out_s = 12.0;
         short.beats[0].bed.as_mut().unwrap().out_s = 12.0;
         short.beats[0].bed.as_mut().unwrap().in_s = 0.0;
         place_cuts(&db, &mut short, &ScriptConfig::default());
         let bed = short.beats[0].bed.as_ref().unwrap();
-        assert!(bed.out_s - bed.in_s <= 12.0 + 1e-9, "{bed:?}");
+        let pictures = short.beats[0].clips[0].out_s - short.beats[0].clips[0].in_s;
+        assert!(bed.out_s >= 12.30, "the voice finishes: {bed:?}");
+        assert!((bed.out_s - bed.in_s - pictures).abs() < 1e-9, "and the pictures cover it: {pictures}");
+        // Far shorter: holding a shot that much longer is a different edit, so the bed is capped.
+        let mut shorter = s.clone();
+        shorter.beats[0].clips[0].out_s = 10.0;
+        shorter.beats[0].bed.as_mut().unwrap().in_s = 0.0;
+        place_cuts(&db, &mut shorter, &ScriptConfig::default());
+        let bed = shorter.beats[0].bed.as_ref().unwrap();
+        assert!(bed.out_s - bed.in_s <= 10.0 + 1e-9, "{bed:?}");
+        assert!((shorter.beats[0].clips[0].out_s - 10.0).abs() < 1e-9);
     }
 
     #[test]
     fn the_closing_hold_follows_the_cut_and_is_never_sound() {
         let (db, _) = db_with_handover();
-        let hold = |audio| ScriptClip { exact: false,
+        let hold = |audio| ScriptClip {
+            exact: false,
+            gain_db: None,
             sentences: None,
             video_id: VIDEO,
             in_s: 12.86,
             out_s: 14.86,
             audio,
-            why: Some(crate::chat::CLOSING_PICTURE.into()),
+            why: Some(CLOSING_PICTURE.into()),
             tracks: None,
             framing: None,
         };
@@ -1294,7 +1830,10 @@ mod tests {
         let (c, h) = (&s.beats[0].clips[0], &s.beats[0].clips[1]);
         assert_eq!(h.audio, Audio::Mute);
         assert!((h.in_s - c.out_s).abs() < 1e-9, "the hold continues the shot: {} vs {}", h.in_s, c.out_s);
-        assert!((h.out_s - h.in_s - 2.0).abs() < 1e-9, "and keeps its length");
+        // B speaks from 12.88 s: the muted hold stops before them rather than showing them talk
+        // with the sound gone.
+        assert!(h.out_s <= 12.88 - HOLD_QUIET_MARGIN_S + 1e-9, "the hold runs into the next voice: {}", h.out_s);
+        assert!(h.out_s - h.in_s >= MIN_HOLD_S, "and is not a flash");
 
         // A hold that carried sound is muted, and the note says so.
         let mut loud = script(vec![clip(0.0, 12.4), hold(Audio::Source)]);
@@ -1330,15 +1869,53 @@ mod tests {
     fn the_chat_chain_places_cuts_last_and_is_stable_too() {
         let (db, project_id) = db_with_handover();
         let cfg = ScriptConfig::default();
-        let mut s = script(vec![clip(0.0, 12.86), clip(12.86, 16.2)]);
-        let issues = crate::chat::repair::finish_script(&db, project_id, &mut s, false, &cfg).unwrap().unwrap();
+        // The two speakers in two beats: inside one beat the chain lays the first voice under the
+        // second picture as a bed (`finish::lay_audio_beds`), and there is no cut between them.
+        let mut s = script(vec![clip(0.0, 12.86)]);
+        let mut reply = s.beats[0].clone();
+        reply.id = "b2".into();
+        reply.clips = vec![clip(12.86, 16.2)];
+        s.beats.push(reply);
+        // The chain's passes, not the draft rules (this video is in no project).
+        let profile = crate::finish::Profile { draft: false, ..crate::finish::Profile::chat(false) };
+        let issues = crate::finish::run(&db, project_id, &mut s, &cfg, &profile).unwrap();
         let first = &s.beats[0].clips[0];
         assert!(12.86 - rendered_end(first.in_s, first.out_s, 30.0) >= 0.12, "{first:?}");
-        let second = &s.beats[0].clips[1];
+        let second = &s.beats[1].clips[0];
         assert!(second.in_s >= first.out_s - 1e-9 && second.in_s < 12.88, "{second:?}");
         assert!(issues.iter().any(|i| i.message.contains("first word")), "{issues:?}");
         let once = s.clone();
-        crate::chat::repair::finish_script(&db, project_id, &mut s, false, &cfg).unwrap().unwrap();
+        crate::finish::run(&db, project_id, &mut s, &cfg, &profile).unwrap();
         assert_eq!(s, once, "a second repair moved the cut");
+    }
+
+    /// One span rule: an edge written on a word stays where it was asked for in the finishing pass
+    /// and in the cut placement alike. Placement used to take the interviewer off it anyway and
+    /// forget the word, undoing what the pass before had kept.
+    #[test]
+    fn an_edge_written_on_a_word_is_kept_by_the_span_rule_and_by_placement() {
+        let db = Db::open_in_memory().unwrap();
+        db.conn.execute("INSERT INTO videos(id, content_hash, size, duration_s) VALUES (7, 'h', 1, 60.0)", []).unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO transcript_segments(video_id, start_s, end_s, text, off_mic) VALUES
+                 (7, 6.5, 8.5, 'What made you want to sponsor it?', 1),
+                 (7, 9.0, 14.0, 'We love this hotel and the people in it.', 0)",
+                [],
+            )
+            .unwrap();
+        let on_word = crate::script::SentenceRange { from: "s1@4".into(), to: "s2".into() };
+        let whole = crate::script::SentenceRange { from: "s1".into(), to: "s2".into() };
+        let span = spoken_span(&db, 7, 6.5, 14.0, Some(&on_word), true);
+        assert_eq!((span.in_s, span.start), (6.5, None), "asked for on a word");
+        let span = spoken_span(&db, 7, 6.5, 14.0, Some(&whole), true);
+        assert_eq!((span.in_s, span.start), (9.0, Some(SpanCut::OffMic)), "a whole sentence loses the interviewer");
+
+        let mut s = script(vec![ScriptClip { video_id: 7, sentences: Some(on_word), ..clip(6.5, 14.0) }]);
+        place_cuts(&db, &mut s, &ScriptConfig::default());
+        assert_eq!(s.beats[0].clips[0].in_s, 6.5, "placement keeps the word edge too");
+        let mut s = script(vec![ScriptClip { video_id: 7, sentences: Some(whole), ..clip(6.5, 14.0) }]);
+        place_cuts(&db, &mut s, &ScriptConfig::default());
+        assert_eq!(s.beats[0].clips[0].in_s, 9.0);
     }
 }

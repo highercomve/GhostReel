@@ -529,6 +529,25 @@ const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE videos ADD COLUMN sentence_split INTEGER NOT NULL DEFAULT 0;
     "#,
+    // v28 — keep sentence ids (`transcript_sentences.id`) monotonic across rebuilds and
+    // invalidations (`AUTOINCREMENT`), so an old script clip or reference from before a rebuild
+    // never silently resolves to another video's newly inserted sentence that happened to reuse the
+    // freed integer row id.
+    r#"
+    CREATE TABLE transcript_sentences_new (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        video_id INTEGER NOT NULL REFERENCES videos(id) ON DELETE CASCADE,
+        start_s REAL NOT NULL,
+        end_s REAL NOT NULL,
+        text TEXT NOT NULL,
+        words_json TEXT
+    );
+    INSERT INTO transcript_sentences_new(id, video_id, start_s, end_s, text, words_json)
+        SELECT id, video_id, start_s, end_s, text, words_json FROM transcript_sentences;
+    DROP TABLE transcript_sentences;
+    ALTER TABLE transcript_sentences_new RENAME TO transcript_sentences;
+    CREATE INDEX transcript_sentences_video ON transcript_sentences(video_id, start_s);
+    "#,
 ];
 
 static REGISTER_VEC: Once = Once::new();
@@ -573,7 +592,46 @@ impl Db {
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         let mut db = Self { conn };
         db.migrate()?;
+        db.backfill_voice_off_mic();
         Ok(db)
+    }
+
+    /// Once per library: mark the interviewer's lines in videos whose speakers were found before
+    /// `interviewer::mark_by_voice` existed (new ones get it from the speakers stage). Cheap SQL,
+    /// and a failure only leaves the old flags, so it never stops the library from opening.
+    fn backfill_voice_off_mic(&self) {
+        const KEY: &str = "voice_off_mic_v1";
+        match self.meta(KEY) {
+            Ok(Some(_)) => return,
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!("voice_off_mic backfill meta check failed: {e}");
+                return;
+            }
+        }
+        let videos: Vec<i64> = match self
+            .conn
+            .prepare("SELECT DISTINCT video_id FROM transcript_segments WHERE speaker IS NOT NULL")
+            .and_then(|mut st| st.query_map([], |r| r.get(0))?.collect::<Result<Vec<_>, _>>())
+        {
+            Ok(vs) => vs,
+            Err(e) => {
+                tracing::warn!("voice_off_mic backfill video query failed: {e}");
+                return;
+            }
+        };
+        let mut all_ok = true;
+        for v in videos {
+            if let Err(e) = crate::interviewer::mark_by_voice(self, v) {
+                tracing::warn!(video_id = v, "voice_off_mic backfill mark_by_voice failed: {e}");
+                all_ok = false;
+            }
+        }
+        if all_ok
+            && let Err(e) = self.conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?1, '1')", [KEY])
+        {
+            tracing::warn!("voice_off_mic backfill failed to record completion: {e}");
+        }
     }
 
     pub fn schema_version(&self) -> Result<u32, Error> {
@@ -743,14 +801,44 @@ impl Db {
     pub fn set_off_mic(&self, video_id: i64, flags: &[(f64, Option<bool>)]) -> Result<(), Error> {
         // 'level': measured, not read. The semantic pass records itself separately and never
         // overwrites one of these, so re-running either is safe.
-        let mut st = self.conn.prepare(
-            "UPDATE transcript_segments SET off_mic = ?3, off_mic_source = 'level', off_mic_p = NULL
-             WHERE video_id = ?1 AND start_s = ?2",
-        )?;
-        for (start_s, flag) in flags {
-            st.execute(rusqlite::params![video_id, start_s, flag])?;
+        let off_mic_ids = |conn: &rusqlite::Connection| -> Result<Vec<i64>, Error> {
+            let mut st = conn.prepare(
+                "SELECT id FROM transcript_segments WHERE video_id = ?1 AND COALESCE(off_mic, 0) = 1 ORDER BY id",
+            )?;
+            Ok(st.query_map([video_id], |r| r.get(0))?.collect::<Result<_, _>>()?)
+        };
+        let tx = self.conn.unchecked_transaction()?;
+        let before = off_mic_ids(&tx)?;
+        {
+            let mut st = tx.prepare(
+                "UPDATE transcript_segments SET off_mic = ?3, off_mic_source = 'level', off_mic_p = NULL
+                 WHERE video_id = ?1 AND start_s = ?2",
+            )?;
+            for (start_s, flag) in flags {
+                st.execute(rusqlite::params![video_id, start_s, flag])?;
+            }
         }
+        let after = off_mic_ids(&tx)?;
+        if before != after {
+            crate::sentence_split::invalidate(&tx, video_id)?;
+        }
+        tx.commit()?;
         Ok(())
+    }
+
+    /// Project membership shared by tools and editorial callers. Excluded reference/removed videos
+    /// do not count as footage; a failed lookup fails closed.
+    pub fn is_video_in_project(&self, project_id: i64, video_id: i64) -> bool {
+        self.conn.query_row(
+            "SELECT 1 FROM video_files vf
+             JOIN folders f ON f.id = vf.folder_id
+             JOIN project_folders pf ON pf.folder_id = f.id
+             WHERE pf.project_id = ?1 AND vf.video_id = ?2
+               AND NOT EXISTS (SELECT 1 FROM project_exclusions x WHERE x.project_id = pf.project_id AND x.video_id = vf.video_id)
+             LIMIT 1",
+            rusqlite::params![project_id, video_id],
+            |r| r.get::<_, i64>(0),
+        ).is_ok()
     }
 
     /// Whether a clip *opens* on someone close to the microphone.
@@ -1042,8 +1130,8 @@ mod tests {
         assert_eq!(db.schema_version().unwrap(), MIGRATIONS.len() as u32);
         assert_eq!(
             MIGRATIONS.len(),
-            27,
-            "transcript_words is v23, chapters v24, sentences v25, their words v26, the split version v27"
+            28,
+            "transcript_words is v23, chapters v24, sentences v25, their words v26, the split version v27, monotonic sentence ids v28"
         );
         // Nothing lost; the sentence the word and the chapter will hang on is still there.
         let text: String =
@@ -1224,5 +1312,98 @@ mod tests {
         let n: i64 =
             c.query_row("SELECT count(*) FROM chunks_fts WHERE chunks_fts MATCH 'unboxing'", [], |r| r.get(0)).unwrap();
         assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn backfill_records_completion_only_when_every_video_succeeds() {
+        let db = Db::open_in_memory().unwrap();
+        db.conn.execute("DELETE FROM meta WHERE key = 'voice_off_mic_v1'", []).unwrap();
+        db.conn.execute("INSERT INTO videos(id, content_hash, size, duration_s) VALUES (1, 'h', 1, 60.0)", []).unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO transcript_segments(video_id, start_s, end_s, text, speaker, person_id, off_mic, off_mic_source) VALUES
+                 (1, 0.0, 2.0, 'Q1', 3, NULL, 1, 'level'),
+                 (1, 3.0, 5.0, 'Q2', 3, NULL, 1, 'level'),
+                 (1, 6.0, 8.0, 'Q3', 3, NULL, 0, NULL)",
+                [],
+            )
+            .unwrap();
+        // Force mark_by_voice to fail on UPDATE.
+        db.conn
+            .execute_batch(
+                "CREATE TRIGGER fail_voice_update BEFORE UPDATE ON transcript_segments BEGIN
+                     SELECT RAISE(ABORT, 'simulated failure');
+                 END;",
+            )
+            .unwrap();
+        db.backfill_voice_off_mic();
+        assert_eq!(db.meta("voice_off_mic_v1").unwrap(), None, "failed backfill must not record completion");
+
+        db.conn.execute("DROP TRIGGER fail_voice_update", []).unwrap();
+        db.backfill_voice_off_mic();
+        assert_eq!(db.meta("voice_off_mic_v1").unwrap().as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn sentence_ids_are_not_reused_after_invalidation() {
+        let db = Db::open_in_memory().unwrap();
+        for v in [1, 2] {
+            db.conn
+                .execute(
+                    "INSERT INTO videos(id, content_hash, size, duration_s) VALUES (?1, ?2, 1, 60.0)",
+                    params![v, format!("h{v}")],
+                )
+                .unwrap();
+            db.conn
+                .execute(
+                    "INSERT INTO transcript_segments(video_id, start_s, end_s, text) VALUES (?1, 0.0, 5.0, 'Hello world.')",
+                    [v],
+                )
+                .unwrap();
+        }
+        crate::sentence_split::ensure(&db, 1).unwrap();
+        let v1_id: i64 =
+            db.conn.query_row("SELECT MAX(id) FROM transcript_sentences WHERE video_id = 1", [], |r| r.get(0)).unwrap();
+        crate::sentence_split::invalidate(&db.conn, 1).unwrap();
+        crate::sentence_split::ensure(&db, 2).unwrap();
+        let v2_id: i64 =
+            db.conn.query_row("SELECT MIN(id) FROM transcript_sentences WHERE video_id = 2", [], |r| r.get(0)).unwrap();
+        assert!(v2_id > v1_id, "video 2 reused deleted sentence id {v1_id} (got {v2_id})");
+    }
+
+    #[test]
+    fn v27_to_v28_keeps_sentence_ids_and_prevents_reuse() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v27.db");
+        register_sqlite_vec();
+        {
+            let mut conn = Connection::open(&path).unwrap();
+            let tx = conn.transaction().unwrap();
+            for sql in &MIGRATIONS[0..27] {
+                tx.execute_batch(sql).unwrap();
+            }
+            tx.pragma_update(None, "user_version", 27).unwrap();
+            tx.execute_batch(
+                "INSERT INTO videos(id, content_hash, size, duration_s) VALUES (1, 'h1', 1, 60.0), (2, 'h2', 1, 60.0);
+                 INSERT INTO transcript_segments(video_id, start_s, end_s, text) VALUES
+                     (1, 0.0, 5.0, 'First.'),
+                     (2, 0.0, 5.0, 'Second.');
+                 INSERT INTO transcript_sentences(id, video_id, start_s, end_s, text) VALUES (42, 1, 0.0, 5.0, 'First.');
+                 INSERT INTO chapters(id, video_id, idx, start_s, end_s, first_sentence_id, last_sentence_id, title)
+                     VALUES (1, 1, 0, 0.0, 5.0, 42, 42, 'Ch1');",
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.schema_version().unwrap(), MIGRATIONS.len() as u32);
+        let kept_ch: i64 =
+            db.conn.query_row("SELECT first_sentence_id FROM chapters WHERE id = 1", [], |r| r.get(0)).unwrap();
+        assert_eq!(kept_ch, 42);
+        crate::sentence_split::invalidate(&db.conn, 1).unwrap();
+        crate::sentence_split::ensure(&db, 2).unwrap();
+        let v2_id: i64 =
+            db.conn.query_row("SELECT MIN(id) FROM transcript_sentences WHERE video_id = 2", [], |r| r.get(0)).unwrap();
+        assert!(v2_id > 42, "new sentence id after v28 migration reused or went below 42 (got {v2_id})");
     }
 }

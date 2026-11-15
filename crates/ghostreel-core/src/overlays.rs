@@ -557,7 +557,7 @@ mod tests {
                 narration: None,
                 on_screen_text: text.map(Into::into),
                 title_layout: None,
-                clips: vec![ScriptClip { exact: false,
+                clips: vec![ScriptClip { exact: false, gain_db: None,
                     sentences: None,
                     video_id: 1,
                     in_s: 10.0,

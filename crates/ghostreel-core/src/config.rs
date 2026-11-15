@@ -229,6 +229,10 @@ pub struct ScriptConfig {
     /// or written to the config file.
     #[serde(skip)]
     pub style: crate::script::ChatStyle,
+    /// The videos a brief named by file ("use only 481_2635.mp4, …"), set per turn: what GhostReel
+    /// itself may add (a closing cutaway) stays inside them. Empty = the whole project.
+    #[serde(skip)]
+    pub footage: Vec<i64>,
     /// Slack around a range a tool returned, when checking a clip came from real footage (s).
     pub grounding_slack_s: f64,
     /// Longer than this and the model pasted a whole tool range rather than choosing a shot (s).
@@ -277,6 +281,11 @@ pub struct ScriptConfig {
     /// stopping (s). 0 turns it off. Every brain tested ends on the last word; an editor holds
     /// the closing image for a beat and lets it go quiet.
     pub closing_hold_s: f64,
+    /// How long the last b-roll shot of a beat with an audio bed runs on, muted, after the voice
+    /// stops and before the next beat starts (s). A breath between two people talking, so the
+    /// next voice does not land on top of the last one. 0 turns it off; the closing beat has
+    /// `closing_hold_s` instead.
+    pub broll_breath_s: f64,
     /// Ceiling on a single model answer, in tokens. Generous: a long script with forty clips is
     /// thousands of tokens and must never be cut off. It exists only so a model that will not
     /// stop fails as itself instead of as a dead socket.
@@ -444,6 +453,7 @@ impl Default for ScriptConfig {
             infer_audio_beds: true,
             tool_docs: "auto".into(),
             closing_hold_s: 2.0,
+            broll_breath_s: 2.0,
             max_answer_tokens: 16384,
             server_timeout_s: 1800,
             max_bed_extend_s: 20.0,
@@ -462,6 +472,7 @@ impl Default for ScriptConfig {
             cut_lead_s: 0.15,
             cut_max_move_s: 0.8,
             style: Default::default(),
+            footage: Vec::new(),
         }
     }
 }
@@ -952,6 +963,7 @@ impl Config {
                 "infer_audio_beds" => f.infer_audio_beds = flag(value),
                 "tool_docs" => f.tool_docs = value.to_string(),
                 "closing_hold_s" => f.closing_hold_s = num(key, value)?,
+                "broll_breath_s" => f.broll_breath_s = num(key, value)?,
                 "max_answer_tokens" => f.max_answer_tokens = num(key, value)?,
                 "server_timeout_s" => f.server_timeout_s = num(key, value)?,
                 "max_bed_extend_s" => f.max_bed_extend_s = num(key, value)?,

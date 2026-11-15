@@ -583,7 +583,9 @@ mod tests {
                 narration: None,
                 on_screen_text: None,
                 title_layout: None,
-                clips: vec![ScriptClip { exact: false,
+                clips: vec![ScriptClip {
+                    exact: false,
+                    gain_db: None,
                     sentences: None,
                     framing: None,
                     video_id: 2,
@@ -853,7 +855,9 @@ mod tests {
             .unwrap();
 
         let mut script = bedded_script();
-        script.beats[0].clips[0] = ScriptClip { exact: false,
+        script.beats[0].clips[0] = ScriptClip {
+            exact: false,
+            gain_db: None,
             sentences: None,
             framing: None,
             video_id: 1,

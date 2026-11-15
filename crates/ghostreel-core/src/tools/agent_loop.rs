@@ -19,7 +19,8 @@ use std::sync::atomic::AtomicBool;
 use serde_json::{Value, json};
 
 use super::{
-    Detail, Origin, RenderOpts, ToolBudget, ToolCtx, ToolSession, action_branches, render_openai, tools_prose,
+    Detail, Origin, RenderOpts, ToolBudget, ToolCtx, ToolProfile, ToolSession, action_branches, render_openai,
+    tools_prose,
 };
 use crate::Error;
 use crate::agents::{AgentError, AgentErrorKind};
@@ -42,6 +43,10 @@ pub struct ToolAccess {
     pub max_rounds: u32,
     /// Where the job's calls are noted ("tool: summary"), for its run log.
     pub trail: Option<ToolTrail>,
+    /// Encourage verifying and refining shortlisted picks with tools before answering.
+    pub verify_with_tools: bool,
+    /// Which subset of the registry this job is offered and allowed to call.
+    pub profile: ToolProfile,
 }
 
 /// The calls one job made, one line each, shared with whoever logs the job.
@@ -49,7 +54,16 @@ pub type ToolTrail = Arc<std::sync::Mutex<Vec<String>>>;
 
 impl ToolAccess {
     pub fn new(paths: Paths, config: Arc<Config>, project_id: i64, cancel: Option<Arc<AtomicBool>>) -> Self {
-        Self { paths, config, project_id, cancel, max_rounds: 0, trail: None }
+        Self {
+            paths,
+            config,
+            project_id,
+            cancel,
+            max_rounds: 0,
+            trail: None,
+            verify_with_tools: false,
+            profile: ToolProfile::All,
+        }
     }
 
     /// The same access noting its calls in a fresh trail, returned for the job's log.
@@ -61,6 +75,16 @@ impl ToolAccess {
     /// The same access with the agent's own cap on rounds.
     pub fn with_max_rounds(&self, max_rounds: u32) -> Self {
         Self { max_rounds, ..self.clone() }
+    }
+
+    /// Ask the model to verify and refine its picks with tools before answering.
+    pub fn with_verify_with_tools(&self, verify_with_tools: bool) -> Self {
+        Self { verify_with_tools, ..self.clone() }
+    }
+
+    /// Restrict the offered and callable tools to `profile`.
+    pub fn with_profile(&self, profile: ToolProfile) -> Self {
+        Self { profile, ..self.clone() }
     }
 }
 
@@ -74,10 +98,23 @@ a tool only to check what it leaves open (what a picture shows, more of a transc
 as soon as you can. Tools marked [changes things] or [destructive] act on the real project: use one only if the \
 request asks for it.";
 
+const VERIFY_PROTOCOL: &str = "You have tools listed below to inspect the footage and verify your cuts before you \
+answer. Reply with ONE JSON object each time: either a tool action {\"action\":\"tool\",\"tool\":\"<name>\",\"args\":{...}}, \
+or, when you are ready, {\"action\":\"final\",\"answer\":<your answer>}. Inspect shortlisted clips with get_manifest \
+(around their sentence range, adding words: true only when trimming inside a sentence with sX@n) and call check_clips \
+with your chosen clips to verify there are no story, framing, cut-point or duration warnings BEFORE returning your \
+final answer. Do NOT call tools marked [changes things] or [destructive] (never call save_clips).";
+
 const SERVER_PROTOCOL: &str = "You can call the tools you are given to check what the request leaves open (what a \
 picture shows, more of a transcript, who is speaking), but everything the request needs is usually in it already: \
 answer as soon as you can. Tools that change things act on the real project: use one only if the request asks for \
 it. When you answer, reply with ONLY the JSON object the request describes: no prose, no code fences.";
+
+const VERIFY_SERVER_PROTOCOL: &str = "You have tools to inspect the footage and verify your cuts before you answer. \
+Inspect shortlisted clips with get_manifest (around their sentence range, adding words: true only when trimming \
+inside a sentence with sX@n) and call check_clips with your chosen clips to verify there are no story, framing, \
+cut-point or duration warnings BEFORE giving your final answer. Do NOT call tools that change things (never call \
+save_clips). When you answer, reply with ONLY the JSON object the request describes: no prose, no code fences.";
 
 fn unusable(msg: impl Into<String>) -> Error {
     Error::Agent(AgentError::new("", AgentErrorKind::BadAnswer, msg))
@@ -99,7 +136,8 @@ enum Step {
 }
 
 /// Read one reply: a tool action, a final answer in its wrapper, or (from a model that skipped
-/// the wrapper) the answer itself.
+/// the wrapper) the answer itself. Replies carrying an unknown `action` value are rejected
+/// instead of silently falling through as unwrapped answers.
 fn read_step(reply: Value, schema: &Value) -> Result<Step, Error> {
     match reply.get("action").and_then(Value::as_str) {
         Some("tool") => {
@@ -113,8 +151,10 @@ fn read_step(reply: Value, schema: &Value) -> Result<Step, Error> {
             Some(a) if satisfies(schema, a) => Ok(Step::Answer(a.clone())),
             _ => Err(unusable("the final answer does not match the schema")),
         },
-        _ if satisfies(schema, &reply) => Ok(Step::Answer(reply)),
-        _ => Err(unusable(format!(
+        Some(other) => Err(unusable(format!("unknown action '{other}': use \"tool\" or \"final\""))),
+        None if reply.get("action").is_some() => Err(unusable("action must be \"tool\" or \"final\"")),
+        None if satisfies(schema, &reply) => Ok(Step::Answer(reply)),
+        None => Err(unusable(format!(
             "not a tool action or an answer: {}",
             super::util::clip_chars(&reply.to_string(), 160)
         ))),
@@ -178,7 +218,7 @@ impl<'a> Run<'a> {
     }
 
     fn opts(&self) -> RenderOpts {
-        RenderOpts::new(self.detail, true)
+        RenderOpts::new(self.detail, true).with_profile(self.access.profile)
     }
 
     fn check_cancel(&self) -> Result<(), Error> {
@@ -189,6 +229,27 @@ impl<'a> Run<'a> {
     }
 
     async fn call(&mut self, name: &str, args: &Value) -> super::Called {
+        if self.access.profile != ToolProfile::All && !super::allows(self.access.profile, name) {
+            let tool = super::canonical_name(name).to_string();
+            let message = format!(
+                "tool '{name}' is not available in this clip run; available tools: {}",
+                super::profile_names(self.access.profile).join(", ")
+            );
+            let called = super::Called {
+                tool,
+                args: args.clone(),
+                model_text: json!({ "error": message }).to_string(),
+                summary: format!("error: tool '{name}' is not available"),
+                is_error: true,
+                ..Default::default()
+            };
+            if let Some(trail) = &self.access.trail
+                && let Ok(mut t) = trail.lock()
+            {
+                t.push(format!("{}: {}", called.tool, called.summary));
+            }
+            return called;
+        }
         let mut ctx =
             ToolCtx::new(&self.access.paths, &self.access.config, &mut self.db, &mut self.embedder, Origin::ClipRun)
                 .with_project(self.project.clone())
@@ -239,8 +300,9 @@ async fn server_loop(
     timeout_s: u64,
 ) -> Result<Value, Error> {
     let tools = render_openai(run.opts());
+    let protocol = if run.access.verify_with_tools { VERIFY_SERVER_PROTOCOL } else { SERVER_PROTOCOL };
     let mut messages =
-        vec![json!({ "role": "system", "content": SERVER_PROTOCOL }), json!({ "role": "user", "content": prompt })];
+        vec![json!({ "role": "system", "content": protocol }), json!({ "role": "user", "content": prompt })];
     let window = SERVER_WINDOW_TOKENS * 3 / 4;
     loop {
         run.check_cancel()?;
@@ -310,8 +372,9 @@ async fn local_loop(
 ) -> Result<Value, Error> {
     let output = crate::chat::local_output_budget(ctx_tokens, max_tokens as u32);
     let grammar = action_schema(schema, Some(run.opts()));
+    let protocol = if run.access.verify_with_tools { VERIFY_PROTOCOL } else { PROTOCOL };
     let mut transcript = format!(
-        "<|im_start|>system\n{PROTOCOL}{}<|im_end|>\n<|im_start|>user\n{prompt}<|im_end|>\n",
+        "<|im_start|>system\n{protocol}{}<|im_end|>\n<|im_start|>user\n{prompt}<|im_end|>\n",
         tools_prose(run.opts())
     );
     loop {
@@ -351,6 +414,54 @@ async fn local_loop(
     }
 }
 
+pub(crate) struct TempTrailFile(pub(crate) std::path::PathBuf);
+
+impl TempTrailFile {
+    pub(crate) fn create() -> Option<Self> {
+        Self::create_named("trail")
+    }
+
+    pub(crate) fn create_named(prefix: &str) -> Option<Self> {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join("ghostreel-mcp-trails");
+        std::fs::create_dir_all(&dir).ok()?;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = dir.join(format!("{prefix}-{}-{}-{seq}.log", std::process::id(), nanos));
+        std::fs::write(&path, "").ok()?;
+        Some(Self(path))
+    }
+
+    pub(crate) fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for TempTrailFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn drain_mcp_trail(path: &std::path::Path, seen_lines: &mut usize, trail: Option<&ToolTrail>) {
+    let Ok(content) = std::fs::read_to_string(path) else { return };
+    let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+    if lines.len() <= *seen_lines {
+        return;
+    }
+    if let Some(trail) = trail
+        && let Ok(mut t) = trail.lock()
+    {
+        for line in &lines[*seen_lines..] {
+            t.push((*line).to_string());
+        }
+    }
+    *seen_lines = lines.len();
+}
+
 async fn cli_loop(
     run: &mut Run<'_>,
     agent: &crate::cliagent::CliAgent,
@@ -358,10 +469,28 @@ async fn cli_loop(
     schema: &Value,
 ) -> Result<Value, Error> {
     let schema_text = serde_json::to_string(schema).unwrap_or_default();
+    let protocol = if run.access.verify_with_tools { VERIFY_PROTOCOL } else { PROTOCOL };
     let mut next = format!(
-        "{PROTOCOL}{}\n\nThe answer must be a JSON object matching this JSON schema:\n{schema_text}\n\nThe request:\n{prompt}\n\nReply ONLY with one JSON object (no prose, no code fences).",
+        "{protocol}{}\n\nThe answer must be a JSON object matching this JSON schema:\n{schema_text}\n\nThe request:\n{prompt}\n\nReply ONLY with one JSON object (no prose, no code fences).",
         tools_prose(run.opts())
     );
+    let project_str = run.project.id.to_string();
+    let profile_str = match run.access.profile {
+        ToolProfile::ClipRun => "clip_run",
+        ToolProfile::All => "all",
+    };
+    let trail_file = TempTrailFile::create();
+    let trail_path_str = trail_file.as_ref().map(|f| f.0.to_string_lossy().into_owned());
+    let mut env_pairs: Vec<(&str, &str)> = vec![
+        ("GHOSTREEL_MCP_ORIGIN", "clip_run"),
+        ("GHOSTREEL_MCP_PROJECT", &project_str),
+        ("GHOSTREEL_MCP_PROFILE", profile_str),
+    ];
+    if let Some(path) = trail_path_str.as_deref() {
+        env_pairs.push(("GHOSTREEL_MCP_TRAIL_FILE", path));
+    }
+    let mut seen_mcp_lines = 0usize;
+
     let mut continued = false;
     loop {
         run.check_cancel()?;
@@ -371,7 +500,11 @@ async fn cli_loop(
         run.budget.spend();
         // The first round carries the whole request; after that the tool continues its own
         // conversation and hears only what is new.
-        let out = agent.complete_continuing(&next, continued).await?;
+        let res = agent.complete_continuing_with_env(&next, continued, &env_pairs).await;
+        if let Some(tf) = &trail_file {
+            drain_mcp_trail(&tf.0, &mut seen_mcp_lines, run.access.trail.as_ref());
+        }
+        let out = res?;
         continued = true;
         let reply = workers::parse_object(&out).map_err(|e| unusable(e.to_string()))?;
         match read_step(reply, schema)? {
@@ -393,13 +526,17 @@ async fn cli_loop(
     }
     // A fresh session (the cap was zero or nothing ran) has not seen the request yet.
     let ask = if continued {
-        "Give your final answer now. Reply ONLY with {\"action\":\"final\",\"answer\":<a JSON object matching the schema>}.".to_string()
+        "Give your final answer now. Reply ONLY with {\"action\":\"final\",\"answer\":<a JSON object matching the schema>} (no prose, no code fences).".to_string()
     } else {
         format!(
             "{prompt}\n\nReply ONLY with one JSON object matching this JSON schema (no prose, no code fences):\n{schema_text}"
         )
     };
-    let out = agent.complete_continuing(&ask, continued).await?;
+    let res = agent.complete_continuing_with_env(&ask, continued, &env_pairs).await;
+    if let Some(tf) = &trail_file {
+        drain_mcp_trail(&tf.0, &mut seen_mcp_lines, run.access.trail.as_ref());
+    }
+    let out = res?;
     let reply = workers::parse_object(&out).map_err(|e| unusable(e.to_string()))?;
     match read_step(reply, schema)? {
         Step::Answer(a) => Ok(a),

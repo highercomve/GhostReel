@@ -8,7 +8,7 @@
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
-use super::cluster::{centroid, cluster_average_linkage};
+use super::cluster::{centroid, cluster_average_linkage_apart};
 use crate::Error;
 use crate::db::Db;
 use crate::faces::{FaceTrack, blob_to_embedding, cosine_similarity, embedding_to_blob};
@@ -23,8 +23,9 @@ const QUALITY_MIN_BOX_H: f32 = 0.12;
 const MIN_PERSON_S: f64 = 20.0;
 /// ...and at least this share of the most-seen person's time (drops faces in screen shares).
 const MIN_PERSON_SHARE: f64 = 0.10;
-/// Other tracks (small, short) join a person when this similar to them.
-const JOIN_THRESHOLD: f32 = 0.3;
+/// Other tracks (small, short) join a person when this similar to them. At 0.3 a 24-pixel face in
+/// the crowd joined whoever was nearest; a face too small to tell stays nobody instead.
+const JOIN_THRESHOLD: f32 = 0.45;
 /// A new cluster is an existing person when this similar to one of their faces.
 const MATCH_THRESHOLD: f32 = 0.5;
 
@@ -62,6 +63,12 @@ pub struct PeopleReport {
     pub created: usize,
 }
 
+/// Two tracks on screen at the same moment of the same video (overlapping by more than half a
+/// second): two different people.
+fn together(a: &FaceTrack, b: &FaceTrack) -> bool {
+    a.video_id == b.video_id && a.end_s.min(b.end_s) - a.start_s.max(b.start_s) > 0.5
+}
+
 fn track_secs(t: &FaceTrack) -> f64 {
     (t.end_s - t.start_s) + 0.2
 }
@@ -78,7 +85,10 @@ pub fn group_tracks(tracks: &[FaceTrack]) -> (Vec<Vec<usize>>, usize) {
         quality = (0..tracks.len()).collect();
     }
     let embs: Vec<&[f32]> = quality.iter().map(|&i| tracks[i].mean_embedding.as_slice()).collect();
-    let clusters = cluster_average_linkage(&embs, PEOPLE_THRESHOLD);
+    // Two faces on screen together are two people, however alike the model finds them: a couple
+    // interviewed side by side came out as one person.
+    let clusters =
+        cluster_average_linkage_apart(&embs, PEOPLE_THRESHOLD, |a, b| together(&tracks[quality[a]], &tracks[quality[b]]));
     let mut scored: Vec<(f64, Vec<usize>)> = clusters
         .into_iter()
         .map(|c| {
@@ -103,9 +113,11 @@ pub fn group_tracks(tracks: &[FaceTrack]) -> (Vec<Vec<usize>>, usize) {
         if assigned.contains(&i) {
             continue;
         }
+        // Never into a person already on screen at the same time in the same video.
         let best = cents
             .iter()
             .enumerate()
+            .filter(|(k, _)| !people[*k].iter().any(|&j| together(&tracks[j], t)))
             .map(|(k, c)| (k, cosine_similarity(&t.mean_embedding, c)))
             .max_by(|a, b| a.1.total_cmp(&b.1));
         if let Some((k, s)) = best
@@ -115,6 +127,32 @@ pub fn group_tracks(tracks: &[FaceTrack]) -> (Vec<Vec<usize>>, usize) {
         }
     }
     (people, dropped)
+}
+
+/// The name in a self-introduction: the capitalised words after "my name is", "mi nombre es" or
+/// "me llamo" (one to three of them, stopping at punctuation or a lowercase word). `None` when the
+/// text has no such introduction, or what follows is not a name.
+pub fn introduced_name(text: &str) -> Option<String> {
+    let lower = text.to_lowercase();
+    let at = ["my name is ", "mi nombre es ", "me llamo ", "my name's "]
+        .iter()
+        .filter_map(|cue| lower.find(cue).map(|i| i + cue.len()))
+        .min()?;
+    // Byte offsets of the lowercase copy match the original only for ASCII; count characters.
+    let rest: String = text.chars().skip(lower[..at].chars().count()).collect();
+    let mut words = Vec::new();
+    for raw in rest.split_whitespace() {
+        let word = raw.trim_matches(|c: char| !c.is_alphanumeric() && c != '-' && c != '\'');
+        let starts_upper = word.chars().next().is_some_and(char::is_uppercase);
+        if word.is_empty() || !starts_upper || words.len() == 3 {
+            break;
+        }
+        words.push(word.to_string());
+        if raw.ends_with([',', '.', '!', '?', ';', ':']) {
+            break;
+        }
+    }
+    (!words.is_empty()).then(|| words.join(" "))
 }
 
 impl Db {
@@ -203,8 +241,16 @@ impl Db {
         let mut members: Vec<(i64, Vec<usize>)> = Vec::new();
         for g in &groups {
             let c = centroid(&g.iter().map(|&i| tracks[i].mean_embedding.as_slice()).collect::<Vec<_>>());
+            // An existing person this group is on screen together with (in tracks already given to
+            // them in this run) is somebody else, however alike they look.
+            let clashes = |id: i64| {
+                members.iter().any(|(pid, m)| {
+                    *pid == id && m.iter().any(|&j| g.iter().any(|&i| together(&tracks[i], &tracks[j])))
+                })
+            };
             let best = known
                 .iter()
+                .filter(|(id, _)| !clashes(*id))
                 .map(|(id, embs)| {
                     (*id, embs.iter().map(|e| cosine_similarity(e, &c)).fold(f32::NEG_INFINITY, f32::max))
                 })
@@ -250,6 +296,55 @@ impl Db {
         tx.commit()?;
         report.people.sort_by(|a, b| b.2.total_cmp(&a.2));
         Ok(report)
+    }
+
+    /// Name people from what they say about themselves: "my name is Mary Ellen King" in a stretch
+    /// whose voice is linked to a person (`speaker_turns.person_id`). Only fills a name nobody set;
+    /// a name the user wrote is never touched. Returns (person, name) for each name it set.
+    pub fn name_people_from_introductions(&self, project_id: i64) -> Result<Vec<(i64, String)>, Error> {
+        let mut heard: std::collections::HashMap<i64, Vec<String>> = std::collections::HashMap::new();
+        for vid in self.project_video_ids(project_id)? {
+            let segs: Vec<(f64, f64, String)> = self
+                .conn
+                .prepare("SELECT start_s, end_s, text FROM transcript_segments WHERE video_id = ?1 AND NOT off_mic")?
+                .query_map([vid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .collect::<Result<_, _>>()?;
+            for (a, b, text) in segs {
+                let Some(name) = introduced_name(&text) else { continue };
+                let person: Option<i64> = self
+                    .conn
+                    .query_row(
+                        "SELECT person_id FROM speaker_turns WHERE video_id = ?1 AND person_id IS NOT NULL \
+                         AND start_s < ?3 AND end_s > ?2 ORDER BY MIN(end_s, ?3) - MAX(start_s, ?2) DESC LIMIT 1",
+                        params![vid, a, b],
+                        |r| r.get(0),
+                    )
+                    .ok();
+                if let Some(p) = person {
+                    heard.entry(p).or_default().push(name);
+                }
+            }
+        }
+        let mut set = Vec::new();
+        for p in self.people(project_id)? {
+            if p.name.as_deref().is_some_and(|n| !n.trim().is_empty()) {
+                continue;
+            }
+            let Some(names) = heard.get(&p.id) else { continue };
+            // The name said most often (a person introduced twice says the same thing).
+            let mut counts: Vec<(&String, usize)> = Vec::new();
+            for n in names {
+                match counts.iter_mut().find(|(m, _)| *m == n) {
+                    Some((_, c)) => *c += 1,
+                    None => counts.push((n, 1)),
+                }
+            }
+            counts.sort_by(|a, b| b.1.cmp(&a.1));
+            let name = counts[0].0.clone();
+            self.conn.execute("UPDATE people SET name = ?2 WHERE id = ?1", params![p.id, name])?;
+            set.push((p.id, name));
+        }
+        Ok(set)
     }
 
     /// Change a person's name, handle or role (`Some("")` clears a field, `None` leaves it).
@@ -410,12 +505,40 @@ mod tests {
             tracks.push(track(i, 1, i as f64 * 60.0, 50.0, 1, 0.3)); // B: 400 s
         }
         tracks.push(track(30, 1, 5.0, 3.0, 2, 0.3)); // C: a 3 s glimpse
-        tracks.push(track(31, 1, 9.0, 40.0, 0, 0.05)); // A, but small: joins A
+        tracks.push(track(31, 2, 9.0, 40.0, 0, 0.05)); // A, but small, in another video: joins A
         let (groups, dropped) = group_tracks(&tracks);
         assert_eq!(groups.len(), 2);
         assert_eq!(dropped, 1);
         assert!(groups[0].contains(&19), "small face of A joins A");
         assert!(!groups.iter().flatten().any(|&i| i == 18), "glimpse is nobody");
+    }
+
+    /// A couple interviewed side by side: the model finds their faces alike, but they are on screen
+    /// together the whole time, so they are two people — and a small face never joins a person who
+    /// is already on screen at that moment.
+    #[test]
+    fn two_faces_on_screen_together_are_two_people() {
+        let tracks = vec![
+            track(1, 7, 0.0, 300.0, 3, 0.18), // her
+            track(2, 7, 5.0, 295.0, 3, 0.16), // him: same direction, same time
+            track(3, 7, 40.0, 30.0, 3, 0.05), // a small face, also on screen with both
+        ];
+        let (groups, _) = group_tracks(&tracks);
+        assert_eq!(groups.len(), 2, "{groups:?}");
+        assert!(groups.iter().all(|g| !(g.contains(&0) && g.contains(&1))));
+        assert!(!groups.iter().flatten().any(|&i| i == 2), "joins neither: both are on screen then");
+    }
+
+    #[test]
+    fn a_self_introduction_gives_the_name() {
+        assert_eq!(
+            introduced_name("Okay. My name is Mary Ellen King and I am a civil litigator").as_deref(),
+            Some("Mary Ellen King")
+        );
+        assert_eq!(introduced_name("My name is Kara Keenan and...").as_deref(), Some("Kara Keenan"));
+        assert_eq!(introduced_name("hola, me llamo Aníbal Rojas, ¿ok?").as_deref(), Some("Aníbal Rojas"));
+        assert_eq!(introduced_name("I'm not sure."), None);
+        assert_eq!(introduced_name("my name is not important"), None, "not a name");
     }
 
     fn setup() -> (Db, i64) {

@@ -512,7 +512,7 @@ mod tests {
 
         // Clip from 6.0 to 9.0 in source video, starting at timeline 0.0
         let script = make_script(
-            vec![ScriptClip { exact: false,
+            vec![ScriptClip { exact: false, gain_db: None,
                 sentences: None,
                 framing: None,
                 video_id: 1,
@@ -556,7 +556,7 @@ mod tests {
             .unwrap();
 
         let script = make_script(
-            vec![ScriptClip { exact: false,
+            vec![ScriptClip { exact: false, gain_db: None,
                 sentences: None,
                 framing: None,
                 video_id: 1,
@@ -616,7 +616,7 @@ mod tests {
             .unwrap();
 
         let script = make_script(
-            vec![ScriptClip { exact: false,
+            vec![ScriptClip { exact: false, gain_db: None,
                 sentences: None,
                 framing: None,
                 video_id: 1,
@@ -654,7 +654,7 @@ mod tests {
             .unwrap();
 
         let script = make_script(
-            vec![ScriptClip { exact: false,
+            vec![ScriptClip { exact: false, gain_db: None,
                 sentences: None,
                 framing: None,
                 video_id: 1,
@@ -732,7 +732,7 @@ Another cue\n\
     }
 
     fn clip(video_id: i64, in_s: f64, out_s: f64) -> ScriptClip {
-        ScriptClip { exact: false,
+        ScriptClip { exact: false, gain_db: None,
             sentences: None,
             framing: None,
             video_id,

@@ -84,7 +84,13 @@ impl Store {
             self.next.insert(id, next);
         }
         let seq = self.next[&id];
-        let entry = LogEntry { seq, ts_ms: timestamp(), session_id: Some(id), kind: kind.into(), text };
+        let entry = LogEntry {
+            seq,
+            ts_ms: timestamp(),
+            session_id: Some(id),
+            kind: kind.into(),
+            text: redact_data_urls(&text),
+        };
         let mut bytes = serde_json::to_vec(&entry)?;
         bytes.push(b'\n');
         file.write_all(&bytes)?;
@@ -131,6 +137,48 @@ impl Store {
         }
         Ok(out)
     }
+}
+
+/// Replace inline base64 data URL payloads while keeping their MIME type visible in logs.
+fn redact_data_urls(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        let Some(rel) = text[cursor..].find("data:") else {
+            out.push_str(&text[cursor..]);
+            break;
+        };
+        let start = cursor + rel;
+        out.push_str(&text[cursor..start]);
+        // A data URL's header ("data:image/png;base64,") is short and has no spaces or quotes; a
+        // ";base64," further on belongs to something else.
+        let header_rel = text[start..]
+            .char_indices()
+            .take(64)
+            .take_while(|(_, c)| !c.is_whitespace() && !matches!(c, '"' | '\'' | '<' | '>'))
+            .find(|(i, _)| text[start + i..].starts_with(";base64,"))
+            .map(|(i, _)| i);
+        let Some(header_rel) = header_rel else {
+            out.push_str("data:");
+            cursor = start + 5;
+            continue;
+        };
+        let payload_start = start + header_rel + ";base64,".len();
+        let mut end = payload_start;
+        while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || matches!(bytes[end], b'+' | b'/' | b'=')) {
+            end += 1;
+        }
+        if end == payload_start {
+            out.push_str("data:");
+            cursor = start + 5;
+            continue;
+        }
+        out.push_str(&text[start..payload_start]);
+        out.push_str(&format!("<{} bytes>", end - payload_start));
+        cursor = end;
+    }
+    out
 }
 pub fn timestamp() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
@@ -198,6 +246,15 @@ mod tests {
     fn missing_chat_log_is_empty() {
         let dir = tempfile::tempdir().unwrap();
         assert!(store(dir.path()).since(42, 0).unwrap().is_empty());
+    }
+    #[test]
+    fn appended_logs_redact_data_url_payloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = store(dir.path());
+        log.append(3, "request", r#"{"image":"data:image/png;base64,QUJDREVGRw=="}"#.into()).unwrap();
+        let text = &log.since(3, 0).unwrap()[0].text;
+        assert_eq!(text, r#"{"image":"data:image/png;base64,<12 bytes>"}"#);
+        assert!(!text.contains("QUJD"));
     }
     #[test]
     fn bounded_reads_can_catch_up_without_skipping_entries() {

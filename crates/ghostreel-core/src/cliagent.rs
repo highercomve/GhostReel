@@ -93,18 +93,25 @@ fn as_plain_brief(prompt: &str) -> String {
         "You are the editor described below. These are your instructions, not a transcript to \
          comment on: follow them and reply with only the JSON object they ask for.\n\n",
     );
-    for chunk in prompt.split("<|im_start|>") {
+    for (i, chunk) in prompt.split("<|im_start|>").enumerate() {
         let chunk = chunk.trim_end_matches("<|im_end|>").trim_end().trim_end_matches("<|im_end|>");
         let chunk = chunk.trim();
         if chunk.is_empty() {
             continue;
         }
-        let (role, body) = chunk.split_once('\n').unwrap_or(("", chunk));
+        // Only text after a `<|im_start|>` marker opens with a role line. What comes before the first
+        // marker — all of a continued prompt, which carries none — is body from its first line:
+        // reading that line as a role dropped "REVIEW 1 of 2: …" and "Tool result for X:".
+        let (role, body) = match chunk.split_once('\n') {
+            Some((r, b)) if i > 0 && matches!(r.trim(), "system" | "user" | "assistant") => (r.trim(), b),
+            _ if i > 0 && matches!(chunk, "system" | "user" | "assistant") => (chunk, ""),
+            _ => ("", chunk),
+        };
         let body = body.replace("<|im_end|>", "").trim().to_string();
         if body.is_empty() {
             continue;
         }
-        match role.trim() {
+        match role {
             "system" => out.push_str(&format!("{body}\n\n")),
             "user" => out.push_str(&format!("WHAT YOU WERE ASKED\n{body}\n\n")),
             "assistant" => out.push_str(&format!("WHAT YOU ANSWERED LAST\n{body}\n\n")),
@@ -120,6 +127,11 @@ pub struct CliAgent {
     /// resumed by id afterwards. `--continue` resumed whatever ran last in the working folder,
     /// which could be the user's own session in a terminal.
     session: std::sync::Mutex<Option<String>>,
+    /// The folder this agent runs in: its own, new and empty. Without one it ran wherever the app
+    /// was started, and a coding CLI reads that folder as a project — claude loaded its CLAUDE.md
+    /// and its saved memory, so notes from other work (and other cuts) leaked into a new cut.
+    /// One per agent, not per call: a resumed conversation is looked up by folder.
+    workdir: std::sync::OnceLock<Option<PathBuf>>,
 }
 
 /// A fresh random UUID (v4 layout) for `claude --session-id`, which rejects anything else.
@@ -201,7 +213,7 @@ fn extract_attached_image_paths(prompt: &str) -> Vec<PathBuf> {
 
 impl CliAgent {
     pub fn new(cfg: CliAgentConfig) -> Self {
-        Self { cfg, session: std::sync::Mutex::new(None) }
+        Self { cfg, session: std::sync::Mutex::new(None), workdir: std::sync::OnceLock::new() }
     }
 
     /// Resolve binary or return `None`.
@@ -241,6 +253,7 @@ impl CliAgent {
                 args.push(full_prompt.into());
                 args.push("--output-format".into());
                 args.push("json".into());
+                args.push("--strict-mcp-config".into());
                 args.push("--allowedTools".into());
                 args.push("Read".into());
                 if !self.cfg.model.is_empty() {
@@ -252,6 +265,7 @@ impl CliAgent {
             "agy" => {
                 args.push(bin.as_os_str().to_owned());
                 args.push("--dangerously-skip-permissions".into());
+                args.push("--disable-slash-commands".into());
                 // Grant access to the directory containing the frame.
                 if let Some(dir) = image.parent() {
                     args.push("--add-dir".into());
@@ -304,10 +318,10 @@ impl CliAgent {
 
     /// Build argv for a text-only complete call.
     ///
-    /// With `continued`, the tool picks up its own most recent conversation and `prompt` is only
-    /// what is new. Every round otherwise re-sends the whole transcript as a fresh invocation,
-    /// which grows quadratically: on a 96-video library agy needed more than three minutes for a
-    /// single round and hit the timeout.
+    /// With `continued`, the tool picks up its own conversation and `prompt` is only what is new.
+    /// Every round otherwise re-sends the whole transcript as a fresh invocation, which grows
+    /// quadratically: on a 96-video library agy needed more than three minutes for a single round
+    /// and hit the timeout.
     fn build_argv_complete_from(&self, bin: &Path, prompt: &str, continued: bool) -> Vec<std::ffi::OsString> {
         let mut args = self.build_argv_complete(bin, prompt, continued);
         if !continued {
@@ -316,14 +330,28 @@ impl CliAgent {
         match self.cfg.tool.as_str() {
             // claude resumes its own session by id (see `session`); `build_argv_complete` does it.
             "claude" => {}
-            // agy takes the flag anywhere; the prompt stays as the new message.
-            "agy" => args.insert(1, "--continue".into()),
-            // codex resumes by subcommand: `codex exec resume --last`.
-            "codex" => {
-                if let Some(i) = args.iter().position(|a| a == "exec") {
-                    args.insert(i + 1, "resume".into());
-                    args.insert(i + 2, "--last".into());
+            // agy resumes the exact conversation captured from turn 1 when available.
+            "agy" => {
+                let id = self.session.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                match id {
+                    Some(id) => {
+                        args.insert(1, "--conversation".into());
+                        args.insert(2, id.into());
+                    }
+                    None => args.insert(1, "--continue".into()),
                 }
+            }
+            // codex puts `-s` / `-c` on `exec`, then `resume <thread_id|--last>` before the rest.
+            "codex" => {
+                let pos = codex_exec_prefix(bin).len().min(args.len());
+                let target = self
+                    .session
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone()
+                    .unwrap_or_else(|| "--last".to_string());
+                args.insert(pos, "resume".into());
+                args.insert(pos + 1, target.into());
             }
             // opencode continues too — `run -c`. It has to come after the `run` subcommand.
             "opencode" => {
@@ -372,6 +400,7 @@ impl CliAgent {
                 args.push("-p".into());
                 args.push("--output-format".into());
                 args.push("json".into());
+                args.push("--strict-mcp-config".into());
                 // First call pins a new session; later ones in this agent resume exactly it.
                 {
                     let mut session = self.session.lock().unwrap_or_else(|e| e.into_inner());
@@ -407,6 +436,7 @@ impl CliAgent {
             "agy" => {
                 args.push(bin.as_os_str().to_owned());
                 args.push("--dangerously-skip-permissions".into());
+                args.push("--disable-slash-commands".into());
                 for dir in &grant_dirs {
                     args.push("--add-dir".into());
                     args.push(dir.as_os_str().to_owned());
@@ -486,12 +516,35 @@ impl CliAgent {
     }
 
     /// Run a CLI and return stdout.
-    async fn run_cli(&self, bin: &Path, args: &[std::ffi::OsString], stdin: Option<String>) -> Result<String, Error> {
+    /// This agent's own empty working folder, made on first use (`None` if it cannot be made, and
+    /// then the CLI runs where it always did).
+    fn workdir(&self) -> Option<&Path> {
+        self.workdir
+            .get_or_init(|| {
+                let dir = std::env::temp_dir().join("ghostreel-agents").join(new_session_id());
+                std::fs::create_dir_all(&dir).ok().map(|_| dir)
+            })
+            .as_deref()
+    }
+
+    async fn run_cli(
+        &self,
+        bin: &Path,
+        args: &[std::ffi::OsString],
+        stdin: Option<String>,
+        env: &[(&str, &str)],
+    ) -> Result<String, Error> {
         if args.is_empty() {
             return Err(self.fail(AgentErrorKind::NotInstalled, format!("unknown CLI tool '{}'", self.cfg.tool)));
         }
         // args[0] is the binary itself; pass args[1..] to the command.
         let mut cmd = crate::proc::command(bin);
+        if let Some(dir) = self.workdir() {
+            cmd.current_dir(dir);
+        }
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
         for a in args.iter().skip(1) {
             cmd.arg(a);
         }
@@ -564,6 +617,22 @@ impl CliAgent {
         self.fail(AgentErrorKind::NotInstalled, format!("'{}' was not found on PATH", self.cfg.tool))
     }
 
+    /// Extract the conversation/thread id emitted by tools whose session id is assigned on turn 1.
+    fn extract_session_id(tool: &str, raw: &str) -> Option<String> {
+        match tool {
+            "agy" => serde_json::from_str::<serde_json::Value>(raw.trim())
+                .ok()
+                .and_then(|v| v["conversation_id"].as_str().filter(|s| !s.is_empty()).map(str::to_string)),
+            "codex" => raw.lines().find_map(|line| {
+                let v = serde_json::from_str::<serde_json::Value>(line.trim()).ok()?;
+                (v["type"] == "thread.started")
+                    .then(|| v["thread_id"].as_str().filter(|s| !s.is_empty()).map(str::to_string))
+                    .flatten()
+            }),
+            _ => None,
+        }
+    }
+
     /// Extract the model's text answer from the tool's stdout.
     fn extract_text(tool: &str, raw: &str) -> Result<String, Error> {
         match tool {
@@ -633,7 +702,7 @@ impl CliAgent {
     pub async fn describe(&self, image: &Path, schema_hint: &str) -> Result<String, Error> {
         let bin = self.available().ok_or_else(|| self.not_installed())?;
         let args = self.build_argv_describe(&bin, image, schema_hint);
-        let raw = self.run_cli(&bin, &args, None).await?;
+        let raw = self.run_cli(&bin, &args, None, &[]).await?;
         let text = Self::extract_text(&self.cfg.tool, &raw)?;
         Self::extract_json_object(&text)
     }
@@ -646,18 +715,33 @@ impl CliAgent {
     /// `complete`, optionally continuing the tool's own most recent conversation so only the new
     /// message is sent.
     pub async fn complete_continuing(&self, prompt: &str, continued: bool) -> Result<String, Error> {
+        self.complete_continuing_with_env(prompt, continued, &[]).await
+    }
+
+    /// `complete_continuing` with extra environment variables passed only to this CLI invocation
+    /// (for example `GHOSTREEL_MCP_*` scoping a headless clip-run session).
+    pub async fn complete_continuing_with_env(
+        &self,
+        prompt: &str,
+        continued: bool,
+        env: &[(&str, &str)],
+    ) -> Result<String, Error> {
         let bin = self.available().ok_or_else(|| self.not_installed())?;
         let args = self.build_argv_complete_from(&bin, prompt, continued);
         let stdin = self.stdin_prompt(prompt, continued);
         let shown = args.iter().skip(1).map(|a| a.to_string_lossy()).collect::<Vec<_>>().join(" ");
         crate::llmlog::push("prompt", format!("{} {shown}\n\n{}", self.cfg.tool, stdin.as_deref().unwrap_or(prompt)));
-        let raw = match self.run_cli(&bin, &args, stdin).await {
+        let raw = match self.run_cli(&bin, &args, stdin, env).await {
             Ok(raw) => raw,
             Err(e) => {
                 crate::llmlog::push("answer", format!("error: {e}"));
                 return Err(e);
             }
         };
+        if let Some(id) = Self::extract_session_id(&self.cfg.tool, &raw) {
+            let mut session = self.session.lock().unwrap_or_else(|e| e.into_inner());
+            *session = Some(id);
+        }
         crate::llmlog::push("answer", raw.as_str());
         let text = Self::extract_text(&self.cfg.tool, &raw)?;
         Self::extract_json_object(&text)
@@ -695,6 +779,8 @@ fn codex_exec_prefix(bin: &Path) -> Vec<std::ffi::OsString> {
         "--skip-git-repo-check".into(),
         "-s".into(),
         "read-only".into(),
+        "-c".into(),
+        "mcp_servers={}".into(),
     ]
 }
 
@@ -734,10 +820,23 @@ fn strip_code_fences(s: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_continued_prompt_keeps_its_first_line() {
+        // A continued prompt carries no ChatML markers: its first line is what the editor must read.
+        let brief = as_plain_brief("REVIEW 1 of 2: your script could not be used: s9 is unknown\nFix it.");
+        assert!(brief.contains("REVIEW 1 of 2: your script could not be used"), "{brief}");
+        let brief = as_plain_brief("Tool result for get_outline:\nPROJECT \"P\"");
+        assert!(brief.contains("Tool result for get_outline:"), "{brief}");
+        // A marked transcript still has its roles read.
+        let brief = as_plain_brief("<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\nCut it.<|im_end|>\n");
+        assert!(brief.contains("Be brief.") && brief.contains("WHAT YOU WERE ASKED\nCut it."), "{brief}");
+        assert!(!brief.contains("system\n"), "{brief}");
+    }
     use crate::config::CliAgentConfig;
 
     #[cfg(unix)]
-    fn write_fake_cli(dir: &Path, name: &str, script: &str) -> PathBuf {
+    pub(super) fn write_fake_cli(dir: &Path, name: &str, script: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let p = dir.join(name);
         // Write, close, then chmod: exec'ing a file whose handle is still open fails with ETXTBSY.
@@ -1341,5 +1440,97 @@ mod brief_tests {
         assert!(!next.contains(&"--continue".to_string()), "{next:?}");
         let r = next.iter().position(|a| a == "--resume").expect("--resume");
         assert_eq!(next[r + 1], id);
+    }
+
+    #[test]
+    fn cli_tools_isolate_mcp_and_slash_commands() {
+        let bin = Path::new("/bin/true");
+        let flat = |tool: &str| -> Vec<String> {
+            CliAgent::new(CliAgentConfig { tool: tool.into(), ..Default::default() })
+                .build_argv_complete_from(bin, "p", false)
+                .into_iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+        };
+
+        let claude = flat("claude");
+        assert!(claude.contains(&"--strict-mcp-config".to_string()), "{claude:?}");
+
+        let agy = flat("agy");
+        assert!(agy.contains(&"--disable-slash-commands".to_string()), "{agy:?}");
+
+        let codex = flat("codex");
+        assert!(codex.windows(2).any(|w| w[0] == "-c" && w[1] == "mcp_servers={}"), "{codex:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_captures_thread_id_and_places_resume_after_exec_flags() {
+        let tmp = tempfile::tempdir().unwrap();
+        let argv_log = tmp.path().join("argv.log");
+        let env_log = tmp.path().join("env.log");
+        let script = format!(
+            "echo \"$@\" >> '{}'\necho \"$GHOSTREEL_MCP_PROFILE:$GHOSTREEL_MCP_PROJECT\" >> '{}'\nprintf '%s\\n' \\\n'{{\"type\":\"thread.started\",\"thread_id\":\"th_abc123\"}}' \\\n'{{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":\"{{\\\"ok\\\":true}}\"}}}}'\n",
+            argv_log.display(),
+            env_log.display(),
+        );
+        let bin = super::tests::write_fake_cli(tmp.path(), "codex", &script);
+        let agent = CliAgent::new(CliAgentConfig {
+            tool: "codex".into(),
+            command: bin.to_string_lossy().into_owned(),
+            timeout_secs: 30,
+            ..Default::default()
+        });
+
+        let r1 = agent
+            .complete_continuing_with_env("first", false, &[("GHOSTREEL_MCP_PROFILE", "clip_run"), ("GHOSTREEL_MCP_PROJECT", "42")])
+            .await
+            .unwrap();
+        assert_eq!(r1, r#"{"ok":true}"#);
+
+        let r2 = agent
+            .complete_continuing_with_env("second", true, &[("GHOSTREEL_MCP_PROFILE", "clip_run"), ("GHOSTREEL_MCP_PROJECT", "42")])
+            .await
+            .unwrap();
+        assert_eq!(r2, r#"{"ok":true}"#);
+
+        let argv_lines: Vec<String> = std::fs::read_to_string(&argv_log).unwrap().lines().map(str::to_string).collect();
+        assert_eq!(argv_lines.len(), 2);
+        assert!(!argv_lines[0].contains("resume "), "turn 1: {}", argv_lines[0]);
+        // `-s read-only` and `-c mcp_servers={}` belong to `codex exec`, BEFORE `resume th_abc123`.
+        let ro_pos = argv_lines[1].find("-s read-only").expect("read-only");
+        let mcp_pos = argv_lines[1].find("mcp_servers={}").expect("mcp_servers");
+        let res_pos = argv_lines[1].find("resume th_abc123").expect("resume thread_id");
+        assert!(ro_pos < res_pos && mcp_pos < res_pos, "turn 2 argv ordering wrong: {}", argv_lines[1]);
+
+        let envs = std::fs::read_to_string(&env_log).unwrap();
+        assert!(envs.contains("clip_run:42"), "{envs}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agy_captures_conversation_id_and_resumes_exact_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let argv_log = tmp.path().join("argv.log");
+        let script = format!(
+            "echo \"$@\" >> '{}'\nprintf '%s\\n' '{{\"conversation_id\":\"conv_xyz789\",\"response\":\"{{\\\"ok\\\":true}}\"}}'\n",
+            argv_log.display(),
+        );
+        let bin = super::tests::write_fake_cli(tmp.path(), "agy", &script);
+        let agent = CliAgent::new(CliAgentConfig {
+            tool: "agy".into(),
+            command: bin.to_string_lossy().into_owned(),
+            timeout_secs: 30,
+            ..Default::default()
+        });
+
+        agent.complete_continuing_with_env("first", false, &[]).await.unwrap();
+        agent.complete_continuing_with_env("second", true, &[]).await.unwrap();
+
+        let argv_lines: Vec<String> = std::fs::read_to_string(&argv_log).unwrap().lines().map(str::to_string).collect();
+        assert_eq!(argv_lines.len(), 2);
+        assert!(!argv_lines[0].contains("--conversation"), "turn 1: {}", argv_lines[0]);
+        assert!(argv_lines[1].contains("--conversation conv_xyz789"), "turn 2: {}", argv_lines[1]);
+        assert!(!argv_lines[1].contains("--continue"), "must not use --continue: {}", argv_lines[1]);
     }
 }

@@ -33,7 +33,7 @@ pub const PAUSE_BREAK_S: f64 = 0.65;
 pub const MAX_SENTENCE_S: f64 = 14.0;
 /// The version of the splitting rules. A video whose sentences were built by an older one
 /// (`videos.sentence_split`) has them built again on first use, its chapters kept.
-pub const SPLIT_VERSION: i64 = 3;
+pub const SPLIT_VERSION: i64 = 6;
 /// A pause does not end a sentence when the engine wrote punctuation this close to it (s): it is
 /// punctuating here, so its full stops say where sentences end.
 const PUNCTUATION_NEAR_S: f64 = 10.0;
@@ -60,6 +60,9 @@ pub struct SegIn {
     pub text: String,
     /// The voice or person speaking, when known: a change between segments ends a sentence.
     pub speaker: Option<i64>,
+    /// Whether this segment was flagged off-mic: a change between on-mic and off-mic ends a
+    /// sentence even when `speaker` is unknown.
+    pub off_mic: bool,
     /// Timed words heard in this segment, in order, when an engine gave them. They need not be
     /// the segment's own words: another engine's words are matched to the text ([`align`]).
     pub words: Vec<WordIn>,
@@ -200,23 +203,7 @@ pub(crate) fn ends_on_tag(text: &str) -> bool {
     text.split_whitespace().last().is_some_and(is_tag_question)
 }
 
-/// Words that cannot open a thought: a preposition or a relative needs the clause before it
-/// ("En API de Opus, lo cual…" is the rest of "esto nos cuesta 10 dólares, ¿ok?").
-const CONTINUATIONS: &[&str] = &[
-    "en", "de", "del", "con", "para", "al", "a", "que", "cual", "cuales", "donde", "cuyo", "cuya", "lo", "of", "in",
-    "with", "for", "to", "than", "which", "whose", "whom",
-];
-
-/// Whether `text` opens on a word that continues the clause before it (see [`CONTINUATIONS`]);
-/// "lo" only as "lo cual" (on its own it opens "lo que pasa es…").
-pub(crate) fn opens_as_continuation(text: &str) -> bool {
-    let mut words = text.split_whitespace().map(bare);
-    match words.next().as_deref() {
-        Some("lo") => words.next().as_deref() == Some("cual"),
-        Some(w) => CONTINUATIONS.contains(&w),
-        None => false,
-    }
-}
+pub(crate) use crate::lexicon::opens_as_continuation;
 
 /// A comma, colon or semicolon after the word: a place to split a run-on that has no full stop.
 fn ends_clause(word: &str) -> bool {
@@ -233,13 +220,18 @@ fn tokens(segs: &[SegIn]) -> Vec<Tok> {
             continue;
         }
         let times = align(&words, &s.words, s.start, s.end);
-        // The voice changes before the next segment: it has a known speaker other than the last one
-        // known so far (a segment nobody was matched to does not end a turn, nor start one).
-        if s.speaker.is_some() {
+        // A mic change (on-mic <-> off-mic) always ends a turn, even when `speaker` is unknown
+        // (e.g. semantic interviewer detection without speaker clustering). Off-mic segments never
+        // adopt or carry over an on-mic speaker identity.
+        if s.off_mic {
+            last_known = None;
+        } else if s.speaker.is_some() {
             last_known = s.speaker;
         }
-        let next_speaker = segs.get(si + 1).and_then(|n| n.speaker);
-        let turn = matches!((last_known, next_speaker), (Some(a), Some(b)) if a != b);
+        let next = segs[si + 1..].iter().find(|n| n.text.split_whitespace().next().is_some());
+        let mic_change = next.is_some_and(|n| n.off_mic != s.off_mic);
+        let next_speaker = next.and_then(|n| if n.off_mic { None } else { n.speaker });
+        let turn = mic_change || matches!((last_known, next_speaker), (Some(a), Some(b)) if a != b);
         let n = words.len();
         for (i, (w, (a, b))) in words.iter().zip(times).enumerate() {
             out.push(Tok {
@@ -266,6 +258,37 @@ fn gaps(regions: &[SpeechRegion]) -> Vec<(f64, f64)> {
         .collect()
 }
 
+/// Measured speech longer than this between two words is not a filler but a passage the
+/// transcript lost; the boundary is placed as usual.
+const MAX_UNTRANSCRIBED_S: f64 = 2.0;
+
+/// Where a sentence ending on `last` stops and the next one, opening on `next`, starts, when the
+/// measured speech holds sound between them that no word accounts for: Whisper writes no "umm",
+/// "uh" or laugh, so a voiced region after the last word ends and before the next one starts is
+/// one of those. Only where those times are the engine's own (a segment edge, or timed words):
+/// a time estimated inside a segment says nothing about what lies between. `(end, start)`: the
+/// pause before the first such region and the one after the last, both on the measured speech.
+fn untranscribed_between(
+    last: &Tok,
+    next: &Tok,
+    regions: &[SpeechRegion],
+    gaps: &[(f64, f64)],
+) -> Option<(f64, f64)> {
+    if gaps.is_empty() || !(last.seg_last || (last.timed && next.timed)) {
+        return None;
+    }
+    let mut lost = regions.iter().filter(|r| r.start_s >= last.end - 0.02 && r.end_s <= next.start + 0.02);
+    let first = lost.next()?;
+    let final_ = lost.last().unwrap_or(first);
+    if final_.end_s - first.start_s > MAX_UNTRANSCRIBED_S {
+        return None;
+    }
+    let near = |a: f64, b: f64| (a - b).abs() < 1e-6;
+    let before = gaps.iter().find(|g| near(g.1, first.start_s))?;
+    let after = gaps.iter().find(|g| near(g.0, final_.end_s))?;
+    Some((before.0, after.1))
+}
+
 /// How far around the boundary after token `i` its true time may be: a segment edge is Whisper's
 /// own timestamp, close; a word inside a segment was estimated, and the estimate drifts with the
 /// segment's length.
@@ -273,9 +296,67 @@ fn window(toks: &[Tok], i: usize, seg_len: f64) -> f64 {
     if toks[i].seg_last { SNAP_EDGE_S } else { (seg_len * 0.12).clamp(0.4, 1.5) }
 }
 
+/// At most this many words, ending a sentence, at the head of a segment across a mic change are
+/// the previous speaker's sentence finishing ([`carry_tails`]).
+const MAX_TAIL_WORDS: usize = 2;
+
+/// Give the previous speaker back the end of their sentence where the transcript broke it across a
+/// mic change: "…that's a real" (on the microphone) then "thing. So this event…" (the interviewer).
+/// The engine's segment edge fell one word early, so splitting at the mic change made "that's a
+/// real" a sentence and left "thing." on the interviewer's side, where every rule that keeps
+/// off-mic lines out cut it. A head of at most [`MAX_TAIL_WORDS`] words that starts lower case and
+/// ends a sentence, after a segment that does not end one, is moved back onto that segment — its
+/// words, text and time — so the mic change falls after it. A capitalised "Okay." or "Right." is a
+/// line of its own and stays.
+pub(crate) fn carry_tails(segs: &[SegIn]) -> std::borrow::Cow<'_, [SegIn]> {
+    let carries = |a: &SegIn, b: &SegIn| -> Option<usize> {
+        if a.off_mic == b.off_mic || a.text.split_whitespace().last().is_none_or(ends_sentence) {
+            return None;
+        }
+        let words: Vec<&str> = b.text.split_whitespace().collect();
+        let first = words.first()?;
+        if !first.chars().find(|c| c.is_alphabetic()).is_some_and(char::is_lowercase) {
+            return None;
+        }
+        (1..=MAX_TAIL_WORDS.min(words.len())).find(|&k| ends_sentence(words[k - 1]))
+    };
+    if !segs.windows(2).any(|w| carries(&w[0], &w[1]).is_some()) {
+        return std::borrow::Cow::Borrowed(segs);
+    }
+    let mut out = segs.to_vec();
+    for i in 1..out.len() {
+        let Some(k) = carries(&out[i - 1], &out[i]) else { continue };
+        let b = out[i].clone();
+        let words: Vec<&str> = b.text.split_whitespace().collect();
+        // Where the head ends: the engine's word time when it timed them, else its share of the
+        // segment by letters.
+        let cut = if b.words.is_empty() {
+            let len = |ws: &[&str]| ws.iter().map(|w| w.chars().count() + 1).sum::<usize>() as f64;
+            b.start + (b.end - b.start) * len(&words[..k]) / len(&words).max(1.0)
+        } else {
+            align(&words, &b.words, b.start, b.end)[k - 1].1
+        }
+        .clamp(b.start, b.end);
+        let head = words[..k].join(" ");
+        let rest = words[k..].join(" ");
+        let (moved, kept): (Vec<WordIn>, Vec<WordIn>) = b.words.iter().cloned().partition(|w| w.end <= cut + 0.02);
+        let a = &mut out[i - 1];
+        a.text = format!("{} {head}", a.text.trim_end());
+        a.end = a.end.max(cut);
+        a.words.extend(moved);
+        let b = &mut out[i];
+        b.text = rest;
+        b.start = cut;
+        b.words = kept;
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 /// Split segments into sentences, with each boundary placed on a pause of `regions` (the measured
 /// speech, in order; empty when it was not measured).
 pub fn split(segs: &[SegIn], regions: &[SpeechRegion]) -> Vec<SentenceOut> {
+    let segs = carry_tails(segs);
+    let segs = segs.as_ref();
     let toks = tokens(segs);
     if toks.is_empty() {
         return Vec::new();
@@ -417,6 +498,18 @@ pub fn split(segs: &[SegIn], regions: &[SpeechRegion]) -> Vec<SentenceOut> {
         .collect();
     for k in 0..out.len().saturating_sub(1) {
         let b = ranges[k].1;
+        let lo = out[k].start + 0.05;
+        let hi = out[k + 1].end - 0.05;
+        // Sound between them that no word accounts for (an "umm", a laugh, a breath) is neither
+        // sentence's: each ends at its own words, and a cut on either leaves the sound out.
+        if let Some((end, start)) = untranscribed_between(&toks[b], &toks[b + 1], regions, &gaps)
+            && end > lo
+            && start < hi
+        {
+            out[k].end = end;
+            out[k + 1].start = start;
+            continue;
+        }
         let w = window(&toks, b, seg_len[b]);
         let t = (out[k].end + out[k + 1].start) / 2.0;
         // The pause nearest the estimate, longer pauses winning ties within the window.
@@ -449,8 +542,6 @@ pub fn split(segs: &[SegIn], regions: &[SpeechRegion]) -> Vec<SentenceOut> {
             let solid = |t: &Tok| t.timed && t.end - t.start <= MAX_WORD_S;
             let crosses = (solid(last) && gb > last.start && gb < last.end - WORD_SIDE_S)
                 || (solid(next) && ga < next.end && ga > next.start + WORD_SIDE_S);
-            let lo = out[k].start + 0.05;
-            let hi = out[k + 1].end - 0.05;
             if !crosses && ga > lo && gb < hi {
                 out[k].end = ga;
                 out[k + 1].start = gb;
@@ -519,12 +610,11 @@ pub fn split(segs: &[SegIn], regions: &[SpeechRegion]) -> Vec<SentenceOut> {
 }
 
 /// The segments of a video as the splitter reads them, with their word timings. The speaker is the
-/// person, else the voice (negated, so the two never collide); off-mic speech counts as a voice of
-/// its own, so a question asked from across the room is never one sentence with its answer.
+/// person, else the voice (negated, so the two never collide); `off_mic` is tracked separately so
+/// a change between on-mic and off-mic always splits a sentence even when `speaker` is unknown.
 fn load_segments(db: &Db, video_id: i64) -> Result<Vec<SegIn>, Error> {
     let mut st = db.conn.prepare(
-        "SELECT id, start_s, end_s, text,
-                CASE WHEN COALESCE(off_mic, 0) = 1 THEN -1000000000 ELSE COALESCE(person_id, -speaker) END
+        "SELECT id, start_s, end_s, text, COALESCE(person_id, -speaker), COALESCE(off_mic, 0) = 1
            FROM transcript_segments
           WHERE video_id = ?1 AND TRIM(text) <> '' ORDER BY start_s, id",
     )?;
@@ -532,7 +622,14 @@ fn load_segments(db: &Db, video_id: i64) -> Result<Vec<SegIn>, Error> {
         .query_map([video_id], |r| {
             Ok((
                 r.get(0)?,
-                SegIn { start: r.get(1)?, end: r.get(2)?, text: r.get(3)?, speaker: r.get(4)?, words: Vec::new() },
+                SegIn {
+                    start: r.get(1)?,
+                    end: r.get(2)?,
+                    text: r.get(3)?,
+                    speaker: r.get(4)?,
+                    off_mic: r.get(5)?,
+                    words: Vec::new(),
+                },
             ))
         })?
         .collect::<Result<_, _>>()?;
@@ -576,7 +673,7 @@ pub fn rebuild(db: &Db, video_id: i64) -> Result<(), Error> {
         let mut st = db.conn.prepare("SELECT id, start_s, end_s FROM transcript_sentences WHERE video_id = ?1")?;
         st.query_map([video_id], |r| Ok((r.get(0)?, (r.get(1)?, r.get(2)?))))?.collect::<Result<_, _>>()?
     };
-    let mut chapters = crate::chapters::load(db, video_id).unwrap_or_default();
+    let mut chapters = crate::chapters::load(db, video_id)?;
     let tx = db.conn.unchecked_transaction()?;
     tx.execute("DELETE FROM chapters WHERE video_id = ?1", [video_id])?;
     tx.execute("DELETE FROM transcript_sentences WHERE video_id = ?1", [video_id])?;
@@ -592,13 +689,14 @@ pub fn rebuild(db: &Db, video_id: i64) -> Result<(), Error> {
         }
     }
     tx.execute("UPDATE videos SET sentence_split = ?2 WHERE id = ?1", params![video_id, SPLIT_VERSION])?;
-    tx.commit()?;
     if !chapters.is_empty() && !new.is_empty() {
         // The new sentence at `t`: the one holding it, else the nearest.
         let at = |t: f64| {
             new.iter()
                 .min_by(|a, b| {
-                    let d = |s: &(i64, f64, f64)| if s.1 <= t && t <= s.2 { 0.0 } else { (s.1 - t).abs().min((s.2 - t).abs()) };
+                    let d = |s: &(i64, f64, f64)| {
+                        if s.1 <= t && t <= s.2 { 0.0 } else { (s.1 - t).abs().min((s.2 - t).abs()) }
+                    };
                     d(a).total_cmp(&d(b))
                 })
                 .map(|s| s.0)
@@ -612,13 +710,17 @@ pub fn rebuild(db: &Db, video_id: i64) -> Result<(), Error> {
             standout.dedup();
             c.standout = standout;
         }
-        crate::chapters::store(db, video_id, &chapters)?;
+        crate::chapters::insert_all(&tx, video_id, &chapters)?;
     }
+    tx.commit()?;
     Ok(())
 }
 
 /// Every sentence of a video as (start, end), in order: the edges a cut may land on. Built first
 /// when the video has none yet.
+///
+/// Mic changes already split sentences when [`split`] builds `transcript_sentences`, and every
+/// off-mic mutation invalidates them so [`ensure`] rebuilds them cleanly.
 pub fn edges(db: &Db, video_id: i64) -> Vec<(f64, f64)> {
     if ensure(db, video_id).is_err() {
         return Vec::new();
@@ -627,6 +729,15 @@ pub fn edges(db: &Db, video_id: i64) -> Vec<(f64, f64)> {
         .prepare_cached("SELECT start_s, end_s FROM transcript_sentences WHERE video_id = ?1 ORDER BY start_s")
         .and_then(|mut st| st.query_map([video_id], |r| Ok((r.get(0)?, r.get(1)?)))?.collect())
         .unwrap_or_default()
+}
+
+/// How much of a sentence a range has to play before stopping in it counts as cutting into it (s).
+/// Below this it is the deliberate overrun past the last word, not an interruption.
+pub const CUT_INTO_SENTENCE_S: f64 = 0.6;
+
+/// Whether a range ending at `out_s` stops inside a sentence rather than at the end of one.
+pub fn cuts_into_a_sentence(edges: &[(f64, f64)], out_s: f64) -> bool {
+    edges.iter().any(|&(start, end)| end > out_s + 0.25 && start < out_s - CUT_INTO_SENTENCE_S)
 }
 
 /// Forget a video's sentences (its transcript or measured speech changed); they are built again on
@@ -641,8 +752,74 @@ pub fn invalidate(conn: &rusqlite::Connection, video_id: i64) -> Result<(), Erro
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_sentence_running_from_the_subject_into_the_interviewer_is_two_edges() {
+        let a = seg(0.0, 6.0, "the subject is speaking here");
+        let mut b = seg(6.3, 10.0, "okay, perfect");
+        b.off_mic = true;
+        let c = seg(11.0, 14.0, "back to the subject again.");
+        // On-mic -> off-mic -> on-mic splits even when every speaker is None.
+        let out = split(&[a.clone(), b.clone(), c.clone()], &[]);
+        assert_eq!(
+            out.iter().map(|s| (s.start, s.end)).collect::<Vec<_>>(),
+            vec![(0.0, 6.0), (6.3, 10.0), (11.0, 14.0)]
+        );
+        // All on the microphone: joined into one unpunctuated thought until the final stop.
+        b.off_mic = false;
+        assert_eq!(split(&[a, b, c], &[]).len(), 1);
+
+        // And through DB ensure()/edges() with speaker = NULL:
+        let db = Db::open_in_memory().unwrap();
+        db.conn.execute("INSERT INTO videos(id, content_hash, size, duration_s) VALUES (1, 'h', 1, 20.0)", []).unwrap();
+        db.conn
+            .execute_batch(
+                "INSERT INTO transcript_segments(video_id, start_s, end_s, text, off_mic) VALUES
+                 (1, 0.0, 6.0, 'the subject is speaking here', 0),
+                 (1, 6.3, 10.0, 'okay, perfect', 1),
+                 (1, 11.0, 14.0, 'back to the subject again.', 0);",
+            )
+            .unwrap();
+        assert_eq!(edges(&db, 1), vec![(0.0, 6.0), (6.3, 10.0), (11.0, 14.0)]);
+    }
+
     fn seg(start: f64, end: f64, text: &str) -> SegIn {
-        SegIn { start, end, text: text.into(), speaker: None, words: Vec::new() }
+        SegIn { start, end, text: text.into(), speaker: None, off_mic: false, words: Vec::new() }
+    }
+
+    fn mic(start: f64, end: f64, text: &str, off_mic: bool) -> SegIn {
+        SegIn { off_mic, ..seg(start, end, text) }
+    }
+
+    /// A word or two that finish the speaker's sentence at the head of the interviewer's segment
+    /// go back to the speaker; a capitalised line of the interviewer's own does not, and neither
+    /// does a head after a sentence that had already ended.
+    #[test]
+    fn the_end_of_a_sentence_across_a_mic_change_goes_back_to_its_speaker() {
+        let segs = vec![
+            mic(73.68, 81.47, "People are nice and the southern hospitality, that's a real", false),
+            mic(81.47, 87.3, "thing. So this event there are a lot of business owners, why is it", true),
+        ];
+        let out = split(&segs, &[]);
+        assert!(
+            texts(&out).contains(&"People are nice and the southern hospitality, that's a real thing."),
+            "{:?}",
+            texts(&out)
+        );
+        let moved = carry_tails(&segs);
+        assert!(moved[1].text.starts_with("So this event"), "{:?}", moved[1].text);
+        assert!(moved[0].end > 81.6 && moved[0].end < 82.5 && moved[1].start == moved[0].end, "{moved:?}");
+
+        // The interviewer's own short line, and a head after a finished sentence, stay.
+        for segs in [
+            vec![
+                mic(0.0, 4.0, "and that is how we met", false),
+                mic(4.0, 6.0, "Okay. And what about the venue?", true),
+            ],
+            vec![mic(0.0, 4.0, "That is how we met.", false), mic(4.0, 6.0, "right. And the venue?", true)],
+            vec![mic(0.0, 4.0, "and that is how we", false), mic(4.0, 6.0, "met at the event in August.", true)],
+        ] {
+            assert!(matches!(carry_tails(&segs), std::borrow::Cow::Borrowed(_)), "{segs:?}");
+        }
     }
 
     fn texts(out: &[SentenceOut]) -> Vec<&str> {
@@ -699,6 +876,26 @@ mod tests {
         let out = split(&segs, &regions);
         assert_eq!(texts(&out), ["pero si yo como que esto es muy ladilla", "entonces this is not the way y te digo"]);
         assert_eq!((out[0].end, out[1].start), (3.7, 4.6));
+    }
+
+    #[test]
+    fn an_umm_the_transcript_does_not_write_belongs_to_neither_sentence() {
+        // Mary Ellen: "...for our growth." ends at 58.08, then 0.8 s of "uh-mm" Whisper left out,
+        // then "It's just a great community." from 59.3. The pause nearest the estimate is the one
+        // after the "umm", which made it the first sentence's last sound and every cut on it end
+        // there.
+        let segs = [
+            seg(48.81, 58.08, "We share the same goals for our children and for our growth."),
+            seg(59.3, 61.18, "It's just a great community to live in."),
+        ];
+        let regions = [
+            SpeechRegion::new(48.9, 58.03),
+            SpeechRegion::new(58.12, 58.92),
+            SpeechRegion::new(59.45, 61.17),
+        ];
+        let out = split(&segs, &regions);
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert_eq!((out[0].end, out[1].start), (58.03, 59.45));
     }
 
     #[test]
@@ -939,6 +1136,71 @@ mod tests {
         assert_eq!(count(&db), 0);
         // A video with no transcript has nothing to build.
         ensure(&db, 2).unwrap();
+    }
+
+    #[test]
+    fn rebuild_preserves_chapters_on_load_or_store_failure() {
+        let db = Db::open_in_memory().unwrap();
+        db.conn.execute("INSERT INTO videos(id, content_hash, size, duration_s) VALUES (1, 'h', 1, 30.0)", []).unwrap();
+        for (a, b, t) in [(0.0, 2.0, "Hola a todos."), (2.0, 6.0, "Bienvenidos al programa de hoy.")] {
+            db.conn
+                .execute(
+                    "INSERT INTO transcript_segments(video_id, start_s, end_s, text) VALUES (1, ?1, ?2, ?3)",
+                    params![a, b, t],
+                )
+                .unwrap();
+        }
+        rebuild(&db, 1).unwrap();
+        let old_ids: Vec<i64> = {
+            let mut st =
+                db.conn.prepare("SELECT id FROM transcript_sentences WHERE video_id = 1 ORDER BY start_s").unwrap();
+            st.query_map([], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap()
+        };
+        assert_eq!(old_ids.len(), 2);
+
+        let chapter = crate::chapters::Chapter {
+            video_id: 1,
+            idx: 0,
+            start_s: 0.0,
+            end_s: 6.0,
+            first_sentence_id: old_ids[0],
+            last_sentence_id: old_ids[1],
+            title: "Model Title".into(),
+            summary: "Model Summary".into(),
+            standout: vec![old_ids[0]],
+            titled: true,
+        };
+        crate::chapters::store(&db, 1, &[chapter]).unwrap();
+
+        // 1. A failure while storing remapped chapters rolls back the whole rebuild.
+        db.conn
+            .execute(
+                "CREATE TRIGGER fail_chapter_insert BEFORE INSERT ON chapters BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+                [],
+            )
+            .unwrap();
+        assert!(rebuild(&db, 1).is_err());
+        let after_abort = crate::chapters::load(&db, 1).unwrap();
+        assert_eq!(after_abort.len(), 1);
+        assert_eq!(after_abort[0].title, "Model Title");
+        assert!(after_abort[0].titled);
+        assert_eq!(after_abort[0].first_sentence_id, old_ids[0]);
+        db.conn.execute("DROP TRIGGER fail_chapter_insert", []).unwrap();
+
+        // 2. A successful rebuild remaps the chapter onto the new sentence ids inside the transaction.
+        rebuild(&db, 1).unwrap();
+        let remapped = crate::chapters::load(&db, 1).unwrap();
+        assert_eq!(remapped.len(), 1);
+        assert_eq!(remapped[0].title, "Model Title");
+        assert!(remapped[0].titled);
+        assert_ne!(remapped[0].first_sentence_id, old_ids[0]);
+        assert_eq!(remapped[0].standout, vec![remapped[0].first_sentence_id]);
+
+        // 3. A failure loading chapters propagates instead of deleting chapters.
+        db.conn.execute("ALTER TABLE chapters RENAME TO chapters_bak", []).unwrap();
+        assert!(rebuild(&db, 1).is_err());
+        db.conn.execute("ALTER TABLE chapters_bak RENAME TO chapters", []).unwrap();
+        assert_eq!(crate::chapters::load(&db, 1).unwrap().len(), 1);
     }
 }
 

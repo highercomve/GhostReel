@@ -811,6 +811,10 @@ export interface ScriptClip {
   to?: string;
   /** How the clip is cropped to the cut's shape; absent = the script's framing. */
   framing?: Framing;
+  /** Keep these bounds exactly: the save path's repairs leave the clip alone. */
+  exact?: boolean;
+  /** The clip's own sound louder or softer in dB (−24…+24; absent = as recorded). */
+  gain_db?: number;
 }
 
 /** How a stretch is framed: follow the speaker, speaker over listener, a still crop, screen over
@@ -1268,6 +1272,10 @@ export const getScript = (scriptId: number) =>
 
 export const saveScript = (projectId: number, script: Script, sessionId: number | null) =>
   call<SaveScriptView>("save_script", { projectId, script, sessionId });
+
+/** Bring back a stored version as the newest version of its cut, exactly as stored (nothing re-finished). */
+export const restoreScriptVersion = (scriptId: number) =>
+  call<SaveScriptView>("restore_script_version", { scriptId });
 
 /** Check an (unsaved) script against the index as it is now. */
 export const checkScript = (projectId: number, script: Script) =>

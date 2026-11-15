@@ -131,21 +131,61 @@ fn cache() -> &'static Cache {
 /// The changes of picture within [`RADIUS_S`] of `t` in a video, measured from its file (empty when
 /// the file or ffmpeg is not there). Remembered per tenth of a second.
 pub fn around(db: &Db, video_id: i64, t: f64) -> Vec<Transition> {
+    match crate::framing::source_path(db, video_id).ok().flatten() {
+        Some(path) => around_file(video_id, &path, t),
+        None => Vec::new(),
+    }
+}
+
+/// [`around`] for a file already looked up: needs no database, so many edges can be measured on
+/// threads at once.
+pub fn around_file(video_id: i64, video: &Path, t: f64) -> Vec<Transition> {
     let key = (video_id, (t * 10.0).round() as i64);
     if let Some(hit) = cache().lock().ok().and_then(|c| c.get(&key).cloned()) {
         return hit;
     }
     let found = (|| {
         let ffmpeg = crate::doctor::locate("ffmpeg")?;
-        let video = crate::framing::source_path(db, video_id).ok().flatten().filter(|p| p.is_file())?;
+        if !video.is_file() {
+            return None;
+        }
         let from = (t - RADIUS_S).max(0.0);
-        Some(find(&measure(&ffmpeg, &video, from, t + RADIUS_S)?, from))
+        Some(find(&measure(&ffmpeg, video, from, t + RADIUS_S)?, from))
     })()
     .unwrap_or_default();
     if let Ok(mut c) = cache().lock() {
         c.insert(key, found.clone());
     }
     found
+}
+
+/// The changes of picture around many `(video_id, t)` moments, measured a few at a time in
+/// parallel (decoding is the cost: a 4K source takes about a second per moment).
+pub fn around_many(db: &Db, moments: &[(i64, f64)]) -> HashMap<(i64, i64), Vec<Transition>> {
+    let mut paths: HashMap<i64, Option<std::path::PathBuf>> = HashMap::new();
+    for &(id, _) in moments {
+        paths.entry(id).or_insert_with(|| crate::framing::source_path(db, id).ok().flatten());
+    }
+    let jobs: Vec<(i64, f64, std::path::PathBuf)> =
+        moments.iter().filter_map(|&(id, t)| Some((id, t, paths.get(&id)?.clone()?))).collect();
+    let out = Mutex::new(HashMap::new());
+    let workers = std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(1, 6);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..workers.min(jobs.len()) {
+            scope.spawn(|| {
+                loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some((id, t, path)) = jobs.get(i) else { break };
+                    let found = around_file(*id, path, *t);
+                    if let Ok(mut o) = out.lock() {
+                        o.insert((*id, (*t * 10.0).round() as i64), found);
+                    }
+                }
+            });
+        }
+    });
+    out.into_inner().unwrap_or_default()
 }
 
 /// How a clip edge sits against the changes of picture near it, when it is in trouble: an edge

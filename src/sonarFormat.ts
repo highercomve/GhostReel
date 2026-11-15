@@ -47,28 +47,42 @@ function videoIdOf(call: { args: unknown }): number | null {
   return Number.isFinite(n) ? n : null;
 }
 
-/** One sentence for a whole research pass: "Looked through 9 clips and ran 2 searches". */
+/** One sentence for a whole research pass: "Ran 6 tool calls · looked through 2 clips, read 3 manifests". */
 export function describeResearch(calls: ToolCallRecord[]): string {
   const clips = new Set<number | string>();
   const transcripts = new Set<number | string>();
+  const manifests = new Set<number | string>();
   let searches = 0;
-  let listed = false;
+  let outlines = 0;
+  let frames = 0;
+  let checks = 0;
+  let edits = 0;
   let other = 0;
   calls.forEach((c, i) => {
     const id = videoIdOf(c) ?? `?${i}`;
     if (c.tool === "get_video") clips.add(id);
     else if (c.tool === "get_transcript") transcripts.add(id);
+    else if (c.tool === "get_manifest") manifests.add(id);
+    else if (c.tool === "get_outline" || c.tool === "list_videos") outlines++;
+    else if (c.tool === "get_frames") frames++;
+    else if (c.tool === "read_cut" || c.tool === "check_clips" || c.tool === "preview_crop") checks++;
+    else if (c.tool === "save_script" || c.tool === "apply_fix" || c.tool === "draft_script") edits++;
     else if (c.tool.startsWith("search")) searches++;
-    else if (c.tool === "list_videos") listed = true;
     else other++;
   });
   const parts: string[] = [];
-  if (clips.size) parts.push(`looked through ${plural(clips.size, "clip")}`);
-  if (transcripts.size) parts.push(`read ${plural(transcripts.size, "transcript")}`);
+  if (outlines) parts.push("checked project outline");
   if (searches) parts.push(`ran ${plural(searches, "search", "searches")}`);
-  if (listed) parts.push("checked the library");
-  if (other) parts.push(plural(other, "other step"));
-  return sentence(joinList(parts)) || "Researched the footage";
+  if (manifests.size) parts.push(`read ${plural(manifests.size, "manifest")}`);
+  if (transcripts.size) parts.push(`read ${plural(transcripts.size, "transcript")}`);
+  if (clips.size) parts.push(`looked through ${plural(clips.size, "clip")}`);
+  if (frames) parts.push(`checked ${plural(frames, "frame set")}`);
+  if (checks) parts.push(`ran ${plural(checks, "check")}`);
+  if (edits) parts.push(`saved ${plural(edits, "edit")}`);
+  if (other) parts.push(plural(other, "other call"));
+  const header = `Ran ${plural(calls.length, "call")}`;
+  const detail = sentence(joinList(parts));
+  return detail ? `${header} · ${detail.charAt(0).toLowerCase()}${detail.slice(1)}` : header;
 }
 
 /** One line per tool call, for the expanded research list. */
@@ -81,8 +95,14 @@ export function describeCall(
   const name = id != null ? (names.get(id) ?? `video #${id}`) : "a video";
   const detail = call.summary && !call.summary.startsWith("error") ? call.summary : call.summary ? "failed" : undefined;
   switch (call.tool) {
+    case "get_outline":
+      return { text: "Checked project outline", detail };
     case "get_video":
       return { text: `Looked at ${name}`, detail };
+    case "get_manifest":
+      return { text: `Read manifest for ${name}`, detail };
+    case "get_frames":
+      return { text: `Inspected frames for ${name}`, detail };
     case "get_transcript": {
       const s = Number(args.start_s);
       const e = Number(args.end_s);
@@ -90,7 +110,17 @@ export function describeCall(
       return { text: `Read ${name}${range}`, detail };
     }
     case "list_videos":
-      return { text: "Checked the library", detail };
+      return { text: "Listed project videos", detail };
+    case "read_cut":
+      return { text: "Checked cut playback & pacing", detail };
+    case "save_script":
+      return { text: "Saved cut version", detail };
+    case "apply_fix":
+      return { text: "Applied fix to cut", detail };
+    case "check_clips":
+      return { text: "Verified clip boundaries", detail };
+    case "preview_crop":
+      return { text: `Previewed crop for ${name}`, detail };
     default:
       if (call.tool.startsWith("search")) {
         const q = typeof args.query === "string" ? args.query : "";
@@ -105,9 +135,17 @@ export function describeLiveStep(tool: string, args: unknown, names: Map<number,
   const call = { tool, args };
   const id = videoIdOf(call);
   const name = id != null ? (names.get(id) ?? "a clip") : "a clip";
+  if (tool === "get_outline") return "Reading project outline";
   if (tool === "get_video") return `Looking at ${name}`;
+  if (tool === "get_manifest") return `Reading manifest for ${name}`;
+  if (tool === "get_frames") return `Inspecting frames for ${name}`;
   if (tool === "get_transcript") return `Reading ${name}`;
-  if (tool === "list_videos") return "Checking the library";
+  if (tool === "list_videos") return "Listing project videos";
+  if (tool === "read_cut") return "Checking cut playback";
+  if (tool === "save_script") return "Saving cut";
+  if (tool === "apply_fix") return "Applying fix";
+  if (tool === "check_clips") return "Verifying clip boundaries";
+  if (tool === "preview_crop") return `Previewing crop for ${name}`;
   if (tool.startsWith("search")) {
     const q = argsOf(call).query;
     return typeof q === "string" && q ? `Searching for “${q}”` : "Searching the footage";
@@ -178,11 +216,14 @@ function formatRepairNote(note: string): string {
   return note.replace(/\b([\d.]+)\s*s of quiet\b/gi, (_, seconds: string) => `${Math.round(Number(seconds))} s of quiet`);
 }
 
-/** A new-cut brief starts with `[Draft "Title" — Target: 30s]`; show it as a chip, not text. */
-export function parseDraftHeader(text: string): { title: string; target_s: number; rest: string } | null {
-  const m = text.match(/^\[Draft "(.+?)" — Target: (\d+)s\]\s*\n?/);
+/** A new-cut brief starts with `[Draft "Title" — Target: 30s — Format: 9:16]` (the format is
+ * optional); show it as a chip, not text. */
+export function parseDraftHeader(
+  text: string,
+): { title: string; target_s: number; format: string | null; rest: string } | null {
+  const m = text.match(/^\[Draft "(.+?)" — Target: (\d+)s(?: — Format: ([^\]\s]+))?\]\s*\n?/);
   if (!m) return null;
-  return { title: m[1], target_s: Number(m[2]), rest: text.slice(m[0].length) };
+  return { title: m[1], target_s: Number(m[2]), format: m[3] ?? null, rest: text.slice(m[0].length) };
 }
 
 /** Editorial duration, shared with the cut and timeline. */

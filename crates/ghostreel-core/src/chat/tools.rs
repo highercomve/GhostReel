@@ -52,12 +52,12 @@ mod tests {
     fn the_descriptions_state_what_the_pipeline_will_do() {
         let prose = tools_prose(CHAT(Detail::Full));
         for claim in [
-            "list_videos makes nothing legal",     // Grounding::record_tool_call
-            "trimmed to its first seconds",        // trimmed_clip_s
-            "moved to the nearest steady stretch", // shaky repair
-            "retimed to where someone answers",    // off-mic repair
-            "pulled out to the sentence's edge",   // end_on_sentences
-            "cannot carry source audio",           // mute_silent_clips
+            "list_videos makes nothing legal",   // Grounding::record_tool_call
+            "trimmed to its first seconds",      // trimmed_clip_s
+            "trimmed to its steady part",        // shaky repair
+            "retimed to where someone answers",  // off-mic repair
+            "pulled out to the sentence's edge", // end_on_sentences
+            "cannot carry source audio",         // mute_silent_clips
         ] {
             assert!(prose.contains(claim), "the tools no longer say: {claim}");
         }

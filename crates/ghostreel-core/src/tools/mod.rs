@@ -35,12 +35,44 @@ mod util;
 use futures_util::future::BoxFuture;
 use serde_json::Value;
 
+pub(crate) use agent_loop::TempTrailFile;
 pub use agent_loop::{ToolAccess, ToolTrail, run_agent_json};
 pub use instructions::INSTRUCTIONS;
 pub use ctx::{Args, Grounding, Origin, ToolCtx, ToolError, ToolImage, ToolOutput, ToolResult};
-pub use render::{RenderOpts, TOOL_CONTRACT, action_branches, render_mcp, render_openai, tools_prose};
+pub use render::{
+    RenderOpts, TOOL_CONTRACT, action_branches, render_mcp, render_mcp_for, render_mcp_with, render_openai,
+    tools_prose,
+};
 pub use session::{CallGuard, Called, ToolBudget, ToolMemo, ToolSession};
 pub use spec::{Detail, Effect, ParamType, ToolParam, ToolSpec, params_schema};
+
+/// Which subset of the registry a surface exposes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ToolProfile {
+    /// The full registry (Sonar script chat, standard MCP server).
+    #[default]
+    All,
+    /// Read-only footage, person, and clip-verification tools for clip runs.
+    ClipRun,
+}
+
+/// The read-only tools offered to clip workers and orchestrators inside a clip run.
+pub const CLIP_RUN_TOOLS: &[&str] = &[
+    "get_outline",
+    "list_videos",
+    "search",
+    "get_transcript",
+    "get_manifest",
+    "get_video",
+    "get_frames",
+    "get_steadiness",
+    "get_faces",
+    "get_scenes",
+    "get_people",
+    "get_speakers",
+    "preview_crop",
+    "check_clips",
+];
 
 /// A handler: runs one tool. Async, because search, indexing and the model runs are.
 pub type Handler = for<'a, 'b> fn(&'a mut ToolCtx<'b>, Args<'a>) -> BoxFuture<'a, ToolResult>;
@@ -82,6 +114,28 @@ pub fn all() -> impl Iterator<Item = &'static Tool> {
     .flatten()
 }
 
+/// Tools included in `profile`, in registry order.
+pub fn for_profile(profile: ToolProfile) -> Vec<&'static Tool> {
+    match profile {
+        ToolProfile::All => all().collect(),
+        ToolProfile::ClipRun => all().filter(|t| CLIP_RUN_TOOLS.contains(&t.spec.name)).collect(),
+    }
+}
+
+/// Tool names included in `profile`, in listing order.
+pub fn profile_names(profile: ToolProfile) -> Vec<&'static str> {
+    for_profile(profile).into_iter().map(|t| t.spec.name).collect()
+}
+
+/// Whether `name` (or its canonical alias) is permitted under `profile`.
+pub fn allows(profile: ToolProfile, name: &str) -> bool {
+    let name = canonical_name(name);
+    match profile {
+        ToolProfile::All => lookup(name).is_some(),
+        ToolProfile::ClipRun => CLIP_RUN_TOOLS.contains(&name),
+    }
+}
+
 pub fn lookup(name: &str) -> Option<&'static Tool> {
     let name = canonical_name(name);
     all().find(|t| t.spec.name == name)
@@ -98,8 +152,13 @@ pub async fn call(ctx: &mut ToolCtx<'_>, name: &str, args: &Value) -> ToolResult
     // An argument the tool does not take is an error, not something to drop: a model that passes
     // `from`/`to` to a tool without them otherwise gets the whole video back and never learns why.
     if let Some(obj) = args.as_object() {
-        let unknown: Vec<&str> =
-            obj.keys().map(String::as_str).filter(|k| !tool.spec.params.iter().any(|p| p.name == *k)).collect();
+        // `project` is the one exception: every editor is told it may pass it to any tool, and a tool
+        // that works from a video id simply has no use for it — refusing it costs the model a round.
+        let unknown: Vec<&str> = obj
+            .keys()
+            .map(String::as_str)
+            .filter(|k| *k != "project" && !tool.spec.params.iter().any(|p| p.name == *k))
+            .collect();
         if !unknown.is_empty() {
             let takes: Vec<&str> = tool.spec.params.iter().map(|p| p.name).collect();
             return Err(ToolError::Invalid(format!(

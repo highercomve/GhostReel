@@ -263,6 +263,8 @@ pub struct SpeakersReport {
     pub speakers: Vec<SpeakerInfo>,
     pub people: PeopleReport,
     pub links: Vec<VideoLink>,
+    /// People named from their own introduction in this run: (person, name).
+    pub named: Vec<(i64, String)>,
     pub timings: Timings,
 }
 
@@ -564,6 +566,10 @@ pub fn analyse_project(
                 voice.entry(p).or_default().extend(idx);
             }
         }
+        // With the voices linked to faces, the interviewer's louder lines can be told apart too.
+        if let Err(e) = crate::interviewer::mark_by_voice(db, v.id) {
+            tracing::warn!(video_id = v.id, "interviewer::mark_by_voice failed: {e}");
+        }
         if !track_people.is_empty() {
             on_step(Step::Done { video_id: v.id });
         }
@@ -576,6 +582,8 @@ pub fn analyse_project(
         db.conn.execute("UPDATE people SET voice_embedding = ?2 WHERE id = ?1", params![p.id, blob])?;
     }
     report.timings.link_s = t3.elapsed().as_secs_f64();
+    // 5. Names people say about themselves ("my name is …"), where nobody named them yet.
+    report.named = db.name_people_from_introductions(project_id)?;
 
     db.conn.execute(
         "INSERT INTO meta (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",

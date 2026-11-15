@@ -284,7 +284,7 @@ impl<'a> ToolCtx<'a> {
 
     /// The project a call is about: its `project` argument (a name, or an id), else the current one.
     pub fn project_for(&self, args: Args<'_>) -> Result<Project, ToolError> {
-        match args.get("project") {
+        let requested = match args.get("project") {
             Some(Value::String(name)) if !name.trim().is_empty() => Ok(self.db.require_project(name)?),
             Some(v) if v.is_number() => {
                 let id = v.as_i64().ok_or_else(|| ToolError::invalid("project must be a name or a whole number id"))?;
@@ -294,14 +294,23 @@ impl<'a> ToolCtx<'a> {
                 .project
                 .clone()
                 .ok_or_else(|| ToolError::invalid("missing argument 'project' (the project's name)")),
+        }?;
+        if let Some(current) = &self.project
+            && requested.id != current.id
+        {
+            return Err(ToolError::invalid(format!(
+                "project '{}' is outside the current project scope ('{}')",
+                requested.name, current.name
+            )));
         }
+        Ok(requested)
     }
 
     /// Refuse a video outside the current project, when there is one. A caller without a current
     /// project (MCP) may read any video of the library.
     pub fn check_video(&self, video_id: i64) -> Result<(), ToolError> {
         if let Some(p) = &self.project
-            && !crate::chat::is_video_in_project(self.db, p.id, video_id)
+            && !self.db.is_video_in_project(p.id, video_id)
         {
             return Err(ToolError::invalid(format!("video #{video_id} not in project")));
         }
@@ -414,5 +423,55 @@ impl<'a> Args<'a> {
             Value::String(s) => s.trim().parse().ok(),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod membership_tests {
+    use super::*;
+
+    #[test]
+    fn tool_scope_rejects_other_projects_and_excluded_footage() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::in_dir(tmp.path());
+        let config = Config::default();
+        let mut db = Db::open_in_memory().unwrap();
+        let p = db.create_project(&crate::projects::NewProject::named("P")).unwrap();
+        let other = db.create_project(&crate::projects::NewProject::named("Other")).unwrap();
+        let folder = db.add_folder(p.id, tmp.path(), true).unwrap();
+        let other_path = tmp.path().join("other");
+        std::fs::create_dir(&other_path).unwrap();
+        let other_folder = db.add_folder(other.id, &other_path, true).unwrap();
+        for (v, folder_id) in [(1, folder.id), (2, folder.id), (3, folder.id), (4, other_folder.id)] {
+            db.conn
+                .execute(
+                    "INSERT INTO videos(id, content_hash, size, duration_s) VALUES (?1, ?2, 1, 30.0)",
+                    rusqlite::params![v, format!("h{v}")],
+                )
+                .unwrap();
+            db.conn.execute(
+                "INSERT INTO video_files(video_id, folder_id, path, size, mtime, last_seen) VALUES (?1, ?2, ?3, 1, 0, 0)",
+                rusqlite::params![v, folder_id, format!("{v}.mp4")],
+            ).unwrap();
+        }
+        db.exclude_video(p.id, 2, "reference").unwrap();
+        db.exclude_video(p.id, 3, "removed").unwrap();
+        let mut embedder = None;
+        let mut ctx = ToolCtx::new(&paths, &config, &mut db, &mut embedder, Origin::External).with_project(p);
+        assert!(
+            ctx.project_for(Args(&serde_json::json!({"project":"Other"}))).unwrap_err().to_string().contains("scope")
+        );
+        assert!(
+            ctx.project_for(Args(&serde_json::json!({"project":other.id}))).unwrap_err().to_string().contains("scope")
+        );
+        assert_eq!(ctx.project_for(Args(&serde_json::json!({}))).unwrap().id, ctx.project.as_ref().unwrap().id);
+        assert!(ctx.check_video(1).is_ok());
+        for v in [2, 3, 4, 99] {
+            assert!(ctx.check_video(v).is_err(), "video {v} escaped project scope");
+        }
+        ctx.db.include_video(ctx.project.as_ref().unwrap().id, 2).unwrap();
+        assert!(ctx.check_video(2).is_ok());
+        ctx.project = None;
+        assert!(ctx.check_video(4).is_ok(), "an unscoped external caller may read other projects");
     }
 }

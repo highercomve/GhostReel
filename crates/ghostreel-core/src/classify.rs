@@ -19,6 +19,50 @@ pub const CAT_DRONE: &str = "drone";
 pub const CAT_AUDIO: &str = "audio";
 pub const CAT_OTHER: &str = "other";
 
+/// Measured speech an interview has at least (s). A party clip has people talking in it — the
+/// recogniser even writes "sentences" out of the noise — but nobody speaks for long into a
+/// microphone; the interviews of an event run a minute or more.
+const INTERVIEW_MIN_VOICE_S: f64 = 30.0;
+/// A short interview (a quick testimonial) still needs this much measured speech (s), filling most
+/// of the clip, with most frames showing someone speaking to the camera or into a microphone.
+const SHORT_INTERVIEW_MIN_VOICE_S: f64 = 8.0;
+
+/// Whether a clip can be an interview, from its measured speech (`voice_s`, `None` when speech was
+/// not measured: the transcript is all there is to go by then) and how many of its described frames
+/// show someone addressing the camera or a microphone (`addressing` of `described`).
+fn can_be_interview(voice_s: Option<f64>, dur: f64, addressing: usize, described: usize) -> bool {
+    let Some(voice) = voice_s else { return true };
+    voice >= INTERVIEW_MIN_VOICE_S
+        || (voice >= SHORT_INTERVIEW_MIN_VOICE_S
+            && dur > 0.0
+            && voice / dur >= 0.5
+            && described > 0
+            && addressing * 2 >= described)
+}
+
+/// Whether a video of `category` is pictures whose sound is ambience: b-roll and aerials. People may
+/// talk in it, and the recogniser may write "sentences" out of the crowd, but nobody in it is saying
+/// a line a cut quotes; what a writer takes from it is the picture.
+///
+/// Only a video that was classified (`confidence` above 0, or set by hand): `videos.category`
+/// starts as `broll` before classification runs, and a video nobody has looked at yet is not known
+/// to be pictures.
+pub fn plays_ambience(category: &str, confidence: f64, source: &str) -> bool {
+    matches!(category.to_ascii_lowercase().as_str(), CAT_BROLL | CAT_DRONE) && (confidence > 0.0 || source == "manual")
+}
+
+/// [`plays_ambience`] for a stored video (false when it cannot be read).
+pub fn video_plays_ambience(db: &Db, video_id: i64) -> bool {
+    db.conn
+        .query_row(
+            "SELECT COALESCE(category, ''), COALESCE(category_confidence, 0), COALESCE(category_source, 'auto')
+               FROM videos WHERE id = ?1",
+            [video_id],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?, r.get::<_, String>(2)?)),
+        )
+        .is_ok_and(|(c, conf, src)| plays_ambience(&c, conf, &src))
+}
+
 /// Standard directory name on the filesystem for a given category.
 pub fn folder_for_category(category: &str) -> String {
     match category.to_ascii_lowercase().as_str() {
@@ -107,7 +151,24 @@ pub fn classify_video(db: &Db, video_id: i64) -> Result<ClassificationResult, Er
         .query_map([video_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
         .collect::<Result<_, _>>()?;
 
-    let speech_seconds: f64 = segs.iter().map(|(s, e, _, _)| (e - s).max(0.0)).sum();
+    // Measured speech when the speech stage ran: the transcript's spans are no measure of it, since
+    // on crowd noise the recogniser writes one segment over the whole clip.
+    let measured: bool = db.conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM speech_regions WHERE video_id = ?1)
+             OR EXISTS (SELECT 1 FROM jobs WHERE video_id = ?1 AND stage = 'speech' AND state = 'done')",
+        [video_id],
+        |r| r.get(0),
+    )?;
+    let voice_s: Option<f64> = if measured {
+        Some(db.conn.query_row(
+            "SELECT COALESCE(SUM(end_s - start_s), 0) FROM speech_regions WHERE video_id = ?1",
+            [video_id],
+            |r| r.get(0),
+        )?)
+    } else {
+        None
+    };
+    let speech_seconds: f64 = voice_s.unwrap_or_else(|| segs.iter().map(|(s, e, _, _)| (e - s).max(0.0)).sum());
     let speech_ratio = if dur > 0.5 { (speech_seconds / dur).clamp(0.0, 1.0) } else { 0.0 };
     let off_mic_count = segs.iter().filter(|(_, _, _, off)| *off != 0).count();
     let total_words: usize = segs.iter().map(|(_, _, t, _)| t.split_whitespace().count()).sum();
@@ -121,6 +182,8 @@ pub fn classify_video(db: &Db, video_id: i64) -> Result<ClassificationResult, Er
     let mut shot_counts: HashMap<String, usize> = HashMap::new();
     let mut tag_counts: HashMap<String, usize> = HashMap::new();
     let mut total_described_frames = 0usize;
+    // Frames showing someone speaking to the camera or into a microphone.
+    let mut addressing_frames = 0usize;
 
     for dj in &desc_jsons {
         if let Ok(desc) = serde_json::from_str::<FrameDescription>(dj) {
@@ -134,6 +197,9 @@ pub fn classify_video(db: &Db, video_id: i64) -> Result<ClassificationResult, Er
             }
             // Check description text for key indicator words
             let text_lower = desc.description.to_ascii_lowercase();
+            if ["to the camera", "to camera", "microphone", "interview"].iter().any(|k| text_lower.contains(k)) {
+                addressing_frames += 1;
+            }
             if text_lower.contains("screen recording")
                 || text_lower.contains("source code")
                 || text_lower.contains("computer screen")
@@ -364,6 +430,13 @@ pub fn classify_video(db: &Db, video_id: i64) -> Result<ClassificationResult, Er
         broll_score += 20.0;
     }
 
+    // People talking at a party are b-roll, however many "sentences" the recogniser heard in the
+    // noise: an interview is someone speaking at length, to the camera or a microphone.
+    if !can_be_interview(voice_s, dur, addressing_frames, total_described_frames) {
+        interview_score = 0.0;
+        broll_score += 30.0;
+    }
+
     // 6. Select winner
     scores.insert(CAT_INTERVIEW.to_string(), interview_score.max(0.0));
     scores.insert(CAT_BROLL.to_string(), broll_score.max(0.0));
@@ -401,6 +474,35 @@ pub fn classify_video(db: &Db, video_id: i64) -> Result<ClassificationResult, Er
     })
 }
 
+/// Classify the videos of `project_id` (every video when `None`) that have no category set by hand,
+/// logging what fails instead of stopping indexing.
+pub fn classify_videos(db: &Db, project_id: Option<i64>) {
+    if let Some(pid) = project_id {
+        if let Err(error) = classify_project_videos(db, pid) {
+            tracing::warn!(%error, "automatic classification failed");
+        }
+        return;
+    }
+    let vids: Vec<i64> = match db
+        .conn
+        .prepare("SELECT id FROM videos WHERE COALESCE(category_source, 'auto') <> 'manual'")
+        .and_then(|mut st| st.query_map([], |r| r.get::<_, i64>(0))?.collect())
+    {
+        Ok(v) => v,
+        Err(error) => {
+            tracing::warn!(%error, "automatic classification failed");
+            return;
+        }
+    };
+    for vid in vids {
+        if let Ok(res) = classify_video(db, vid)
+            && let Err(error) = db.set_video_category(vid, &res.category, res.confidence, "auto", res.tag.as_deref())
+        {
+            tracing::warn!(%error, video_id = vid, "automatic classification update failed");
+        }
+    }
+}
+
 /// Classify all videos in a project that don't have manual overrides, and update their records in the database.
 pub fn classify_project_videos(db: &Db, project_id: i64) -> Result<usize, Error> {
     let mut st = db.conn.prepare(
@@ -434,6 +536,65 @@ mod tests {
         assert_eq!(folder_for_category("audio"), "Music & Audio");
         assert_eq!(folder_for_category("other"), "Other");
         assert_eq!(folder_for_category("timelapse"), "Timelapse");
+    }
+
+    /// GreetMag v136 (481_2619): people talking at the party. The recogniser wrote one segment over
+    /// the whole 15 s ("I'm like, this was all my phosphorobiolens…"), noise was flagged off-mic, and
+    /// the frames show people "talking" in medium shots — all interview points — so the clip was an
+    /// interview, and a writer cut "sound" from it. Measured, 1.5 s of it is speech: b-roll. An
+    /// interview next to it, someone speaking to the camera for a minute, stays an interview.
+    #[test]
+    fn a_party_clip_full_of_talking_is_broll_once_speech_is_measured() {
+        let db = Db::open_in_memory().unwrap();
+        let frame = |vid: i64, t: f64, text: &str| {
+            db.conn
+                .execute(
+                    "INSERT INTO frames(video_id, t_s, description_json) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![
+                        vid,
+                        t,
+                        serde_json::json!({ "description": text, "shot": "medium", "tags": ["people talking", "speaking"],
+                                            "objects": [], "setting": "patio", "visible_text": [] })
+                        .to_string()
+                    ],
+                )
+                .unwrap();
+        };
+        for (id, dur) in [(1, 15.3), (2, 117.8)] {
+            db.conn
+                .execute(
+                    "INSERT INTO videos(id, content_hash, size, duration_s, vcodec, has_audio) VALUES (?1, ?2, 1, ?3, 'h264', 1)",
+                    rusqlite::params![id, format!("h{id}"), dur],
+                )
+                .unwrap();
+        }
+        db.conn
+            .execute(
+                "INSERT INTO transcript_segments(video_id, start_s, end_s, text, off_mic) VALUES
+                 (1, 0.0, 15.3, 'I am like, this was all my phosphorobiolens, called Pyroviolens. Yeah. Okay. So basically about the white news, which is, you know, traveling for a week', 1),
+                 (2, 1.0, 60.0, 'What I love about Westlake is the community. We are tight-knit, we are supportive, we share the same goals and aspirations for our children and for our growth.', 0)",
+                [],
+            )
+            .unwrap();
+        for t in [2.0, 7.0, 12.0] {
+            frame(1, t, "Two bald men in suits are talking at a social gathering, guests mingling behind them.");
+            frame(2, t, "A woman stands in the foreground speaking to the camera, a small microphone on her jacket.");
+        }
+        // Before the speech is measured, the transcript is all there is: the old reading stands.
+        assert_eq!(classify_video(&db, 1).unwrap().category, CAT_INTERVIEW);
+        db.conn
+            .execute(
+                "INSERT INTO speech_regions(video_id, start_s, end_s) VALUES (1, 3.0, 4.5), (2, 1.0, 40.0), (2, 41.0, 78.0)",
+                [],
+            )
+            .unwrap();
+        let party = classify_video(&db, 1).unwrap();
+        assert_eq!(party.category, CAT_BROLL, "{:?}", party.scores);
+        assert_eq!(classify_video(&db, 2).unwrap().category, CAT_INTERVIEW);
+        // A short testimonial: most of the clip speech, said to the camera.
+        assert!(can_be_interview(Some(12.0), 15.0, 3, 4));
+        // The same speech over a crowd shot is not one.
+        assert!(!can_be_interview(Some(17.9), 32.5, 2, 9));
     }
 
     #[test]

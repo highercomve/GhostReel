@@ -4870,6 +4870,15 @@ button.ghost.nle-sonar-icon-btn:hover:not(:disabled) { color: var(--text); backg
 .composer-advanced > summary .muted { margin-left: auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 400; }
 .composer-advanced[open] > summary { margin-bottom: 8px; }
 .composer-engine-hint { margin: 0; }
+.composer-engine-hint .link-btn {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--accent);
+  font: inherit;
+  cursor: pointer;
+}
+.composer-engine-hint .link-btn:hover { text-decoration: underline; }
 
 /* New cut dialog: how to start, then (for Sonar) a preset, name, length and the brief. */
 .nle-modal-content.nle-new-cut { max-width: 580px; max-height: calc(100vh - 40px); overflow: auto; padding: 20px 22px; gap: 0; }

@@ -33,6 +33,7 @@ import {
   StepForward,
   Type,
 } from "lucide-react";
+import { setLiveGain } from "./liveGain";
 import { audible, autoTrack, loadAudioTracks, trackProxyUrl, type TrackMonitor } from "./audioTracks";
 import { fpsValue, frameClock } from "./timecode";
 import { beatTimes, cardBackground, cardSeconds } from "./cards";
@@ -59,6 +60,8 @@ export interface LiveSegment {
   muted: boolean;
   /** Source tracks chosen for it (when not muted); undefined = the picture's own audio. */
   tracks?: number[];
+  /** Its sound louder or softer, in dB (the clip's `gain_db`). */
+  gainDb?: number;
 }
 
 export interface LiveBeatSpan {
@@ -114,6 +117,7 @@ export function layoutScript(script: Script): LiveLayout {
         end: t + dur,
         muted: c.audio === "mute" || hasBed,
         tracks: c.audio === "mute" || hasBed ? undefined : c.tracks,
+        gainDb: c.audio === "mute" || hasBed ? undefined : c.gain_db,
       });
       t += dur;
     });
@@ -202,7 +206,7 @@ interface LivePlayerProps {
 }
 
 /** Where chosen tracks play from at some moment of the cut. */
-type TrackSource = { videoId: number; srcTime: number; tracks: number[] };
+type TrackSource = { videoId: number; srcTime: number; tracks: number[]; gainDb?: number };
 type TrackEl = { el: HTMLAudioElement; url: string; pending: number | null };
 
 type Slot = 0 | 1;
@@ -425,6 +429,7 @@ export default function LivePlayer({
       return true;
     }
     v.muted = pictureMuted(seg);
+    setLiveGain(v, seg.gainDb ?? 0, pictureMuted(seg));
     const url = urlsRef.current[seg.videoId];
     if (!url) {
       ensureUrl(seg.videoId);
@@ -502,7 +507,7 @@ export default function LivePlayer({
     }
     const seg = layoutRef.current.segments[segAt(t)];
     if (!seg || t < seg.start || t > seg.end || !usesTracks(seg.videoId, seg.tracks)) return null;
-    return { videoId: seg.videoId, srcTime: seg.inS + (t - seg.start), tracks: seg.tracks };
+    return { videoId: seg.videoId, srcTime: seg.inS + (t - seg.start), tracks: seg.tracks, gainDb: seg.gainDb };
   };
 
   /** Keeps the chosen tracks in step with the cut clock, the same way the bed is kept. */
@@ -520,6 +525,7 @@ export default function LivePlayer({
       let te = trackEls.current.get(k);
       if (!te) {
         const el = new Audio();
+        el.crossOrigin = "anonymous";
         el.preload = "auto";
         const entry: TrackEl = { el, url, pending: want!.srcTime };
         el.addEventListener("loadedmetadata", () => {
@@ -535,6 +541,7 @@ export default function LivePlayer({
       }
       const { el } = te;
       el.muted = !audible(track, monitorRef.current);
+      setLiveGain(el, want!.gainDb ?? 0, el.muted);
       if (el.readyState >= 1) {
         if (Math.abs(el.currentTime - want!.srcTime) > (hard ? 0.05 : 0.15)) el.currentTime = want!.srcTime;
       } else {
@@ -658,6 +665,7 @@ export default function LivePlayer({
       idxRef.current = next;
       setCurIdx(next);
       v.muted = pictureMuted(ns);
+      setLiveGain(v, ns.gainDb ?? 0, pictureMuted(ns));
       slotSeg.current[active] = next;
       timeRef.current = ns.start;
       if (next + 1 < segments.length) prime(other, next + 1, 0);
@@ -667,6 +675,7 @@ export default function LivePlayer({
     }
     if (o && slotSeg.current[other] === next && slotUrl.current[other] && pending.current[other] == null && o.readyState >= 2) {
       o.muted = pictureMuted(ns);
+      setLiveGain(o, ns.gainDb ?? 0, pictureMuted(ns));
       applyRate(o);
       o.play().catch(() => {});
       v?.pause();
@@ -869,6 +878,7 @@ export default function LivePlayer({
     const seg = layoutRef.current.segments[idxRef.current];
     const v = vid(activeRef.current);
     if (seg && v) v.muted = pictureMuted(seg);
+    setLiveGain(v, seg.gainDb ?? 0, pictureMuted(seg));
     syncAudio(timeRef.current, false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [trackTick, trackMonitor]);
@@ -1129,9 +1139,9 @@ export default function LivePlayer({
         >
           <canvas ref={blurRef} className="lp-fit-blur" aria-hidden="true" />
           <div className="lp-vwrap" ref={wrapRef} data-stacked="0">
-            <video ref={vidA} className="lp-video" data-on="1" preload="auto" playsInline
+            <video ref={vidA} className="lp-video" data-on="1" preload="auto" playsInline crossOrigin="anonymous"
               onLoadedMetadata={() => onMeta(0)} onEnded={() => activeRef.current === 0 && playingRef.current && advance()} />
-            <video ref={vidB} className="lp-video" data-on="0" preload="auto" playsInline
+            <video ref={vidB} className="lp-video" data-on="0" preload="auto" playsInline crossOrigin="anonymous"
               onLoadedMetadata={() => onMeta(1)} onEnded={() => activeRef.current === 1 && playingRef.current && advance()} />
           </div>
           <canvas ref={stackRef} className="lp-stack-bottom" aria-hidden="true" />
@@ -1154,7 +1164,7 @@ export default function LivePlayer({
             />
           )}
         </div>
-        <audio ref={bedRef} preload="auto" onLoadedMetadata={onBedMeta} />
+        <audio ref={bedRef} preload="auto" crossOrigin="anonymous" onLoadedMetadata={onBedMeta} />
 
         {empty ? (
           <div className="nle-viewer-empty lp-overlay-center">

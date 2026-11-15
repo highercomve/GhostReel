@@ -4,6 +4,7 @@
 
 use serde_json::{Value, json};
 
+use super::ToolProfile;
 use super::spec::{Detail, Effect, ToolSpec};
 
 /// The rules that apply to every tool, stated once.
@@ -19,17 +20,24 @@ pub struct RenderOpts {
     pub detail: Detail,
     /// The reader works on one project already: `project` is optional in every schema.
     pub project_default: bool,
+    /// Which subset of tools is exposed.
+    pub profile: ToolProfile,
 }
 
 impl RenderOpts {
     pub fn new(detail: Detail, project_default: bool) -> Self {
-        Self { detail, project_default }
+        Self { detail, project_default, profile: ToolProfile::All }
+    }
+
+    pub fn with_profile(mut self, profile: ToolProfile) -> Self {
+        self.profile = profile;
+        self
     }
 }
 
 impl Default for RenderOpts {
     fn default() -> Self {
-        Self { detail: Detail::Full, project_default: false }
+        Self { detail: Detail::Full, project_default: false, profile: ToolProfile::All }
     }
 }
 
@@ -39,16 +47,27 @@ fn input_schema(spec: &ToolSpec, opts: RenderOpts, docs: bool) -> Value {
     spec.input_schema(opts.project_default, docs)
 }
 
-/// The MCP `tools/list` result entries: name, description, input schema, and annotations taken
-/// from what the tool does (`readOnlyHint`, `destructiveHint`).
+/// The MCP `tools/list` result entries for the full registry.
 pub fn render_mcp() -> Vec<Value> {
-    super::all()
+    render_mcp_for(ToolProfile::All)
+}
+
+/// The MCP `tools/list` result entries for `profile`: name, description, input schema, and
+/// annotations taken from what the tool does (`readOnlyHint`, `destructiveHint`).
+pub fn render_mcp_for(profile: ToolProfile) -> Vec<Value> {
+    render_mcp_with(RenderOpts::new(Detail::Full, false).with_profile(profile))
+}
+
+/// The MCP `tools/list` result entries configured by `opts`.
+pub fn render_mcp_with(opts: RenderOpts) -> Vec<Value> {
+    super::for_profile(opts.profile)
+        .into_iter()
         .map(|t| {
             let s = t.spec;
             json!({
                 "name": s.name,
-                "description": s.describe(Detail::Full),
-                "inputSchema": s.input_schema(false, true),
+                "description": s.describe(opts.detail),
+                "inputSchema": s.input_schema(opts.project_default, opts.detail == Detail::Full),
                 "annotations": {
                     "readOnlyHint": s.effect == Effect::Read,
                     "destructiveHint": s.effect == Effect::Destructive,
@@ -61,7 +80,8 @@ pub fn render_mcp() -> Vec<Value> {
 /// The OpenAI `tools` array a server backend is sent.
 pub fn render_openai(opts: RenderOpts) -> Value {
     Value::Array(
-        super::all()
+        super::for_profile(opts.profile)
+            .into_iter()
             .map(|t| {
                 json!({
                     "type": "function",
@@ -81,7 +101,8 @@ pub fn render_openai(opts: RenderOpts) -> Value {
 /// cannot be a filename and a research round is not wasted on one. Without the parameters' docs,
 /// which a grammar ignores and the prompt already carries.
 pub fn action_branches(opts: RenderOpts) -> Vec<Value> {
-    super::all()
+    super::for_profile(opts.profile)
+        .into_iter()
         .map(|t| {
             json!({
                 "type": "object",
@@ -97,14 +118,14 @@ pub fn action_branches(opts: RenderOpts) -> Vec<Value> {
         .collect()
 }
 
-/// The TOOLS block of a prompt, for the loops that read prose rather than a schema. Every tool is
-/// listed at every detail level: `Short` drops the prose around a tool and the parameters' docs,
-/// not the tool.
+/// The TOOLS block of a prompt, for the loops that read prose rather than a schema. Every tool
+/// in `opts.profile` is listed at every detail level: `Short` drops the prose around a tool and
+/// the parameters' docs, not the tool.
 pub fn tools_prose(opts: RenderOpts) -> String {
     let mut out = String::from("\n\nTOOLS\n");
     out.push_str(TOOL_CONTRACT);
     out.push('\n');
-    for t in super::all() {
+    for t in super::for_profile(opts.profile) {
         let spec = t.spec;
         let args: Vec<String> = spec
             .params

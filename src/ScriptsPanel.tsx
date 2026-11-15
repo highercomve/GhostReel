@@ -6,6 +6,7 @@ import ChatAnswerStats from "./ChatAnswerStats";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useMemo } from "react";
 import {
+  restoreScriptVersion,
   getAiSettings,
   setAiSettings,
   modelsStatus,
@@ -45,6 +46,7 @@ import {
   type ToolCallRecord,
   type TrashItem,
   type VisionSettingsPatch,
+  saveAgents,
 } from "./api";
 import { onEvent } from "./events";
 import ChatLogModal from "./ChatLogModal";
@@ -55,7 +57,8 @@ import ScriptEditor, { type ScriptEditorHandle } from "./ScriptEditor";
 import TaskCard from "./TaskCard";
 import Modal from "./ui/Modal";
 import AgentPicker, { agentSelectionProblem } from "./agents/AgentPicker";
-import { useAgents, useResolvedAgents } from "./agents/useAgents";
+import { announceAgentsChanged, useAgents, useResolvedAgents } from "./agents/useAgents";
+import { navigate } from "./navigate";
 import RunLog from "./runs/RunLog";
 import PreflightList, { usePreflight } from "./runs/PreflightList";
 import { useProjectRuns } from "./runs/useRuns";
@@ -176,12 +179,17 @@ const NEW_CHAT_EXAMPLES = [
 
 type CutPreset = "social_30s" | "interview_3m" | "doc_15m";
 
-const CUT_PRESETS: { id: CutPreset; label: string; title: string; target: number; prompt: string }[] = [
+/** A new cut's shape: Auto lets the brief decide ("an instagram reel" is vertical); any other
+ * choice wins over what the model drafts. */
+type CutFormat = "auto" | ClipFormat;
+
+const CUT_PRESETS: { id: CutPreset; label: string; title: string; target: number; format: CutFormat; prompt: string }[] = [
   {
     id: "social_30s",
     label: "Social reel",
     title: "Social Reel (30s)",
     target: 30,
+    format: "auto",
     prompt:
       "Create an upbeat 30-second video for social media from this footage. Fast pacing, strong speech hook, energetic B-roll montage.",
   },
@@ -190,6 +198,7 @@ const CUT_PRESETS: { id: CutPreset; label: string; title: string; target: number
     label: "Highlights",
     title: "Highlights (3m)",
     target: 180,
+    format: "auto",
     prompt: "Create a 3-minute cut highlighting the best insights, keynote soundbites, and audience takeaways.",
   },
   {
@@ -197,6 +206,7 @@ const CUT_PRESETS: { id: CutPreset; label: string; title: string; target: number
     label: "Documentary",
     title: "Documentary (15m)",
     target: 900,
+    format: "auto",
     prompt:
       "Create a 15-minute documentary-style feature. Build a thoughtful narrative arc with deep speaker quotes, context, and rich natural sound.",
   },
@@ -311,6 +321,7 @@ function UserText({ text }: { text: string }) {
     <>
       <div className="bubble-draft-chip">
         New cut · {draft.title} · {clock(draft.target_s)} target
+        {draft.format && draft.format !== "auto" ? ` · ${draft.format === "original" ? "original shape" : draft.format}` : ""}
       </div>
       {draft.rest.trim() && <div className="bubble-text">{draft.rest.trim()}</div>}
     </>
@@ -389,6 +400,7 @@ export default function ScriptsPanel({
   const [newCutTargetS, setNewCutTargetS] = useState(CUT_PRESETS[0].target);
   const [newCutType, setNewCutType] = useState<"ai" | "blank" | "branch" | "clips">("ai");
   const [newCutPrompt, setNewCutPrompt] = useState(CUT_PRESETS[0].prompt);
+  const [newCutFormat, setNewCutFormat] = useState<CutFormat>(CUT_PRESETS[0].format);
 
   const applyPreset = (preset: CutPreset) => {
     const p = CUT_PRESETS.find((x) => x.id === preset) ?? CUT_PRESETS[0];
@@ -396,6 +408,7 @@ export default function ScriptsPanel({
     setNewCutType("ai");
     setNewCutTitle(p.title);
     setNewCutTargetS(p.target);
+    setNewCutFormat(p.format);
     setNewCutPrompt(p.prompt);
   };
 
@@ -1103,6 +1116,23 @@ export default function ScriptsPanel({
   const chatAgent = agentsView?.agents.find((a) => a.spec.id === cutResolved?.chat) ?? null;
   // The app's chat model answers unless the cut (or the app default) picked another agent.
   const chatIsAppModel = !chatAgent || chatAgent.spec.source === "chat_model";
+  // Agents that can write a cut: script chat goes to the app's orchestrator when it can chat.
+  const chatCapable = (agentsView?.agents ?? []).filter(
+    (a) => a.spec.enabled && a.spec.roles.includes("chat") && a.spec.roles.includes("orchestrator"),
+  );
+  /** Make `id` the app's writer: the default orchestrator (which also picks clips in a clip run). */
+  const handleChatAgent = async (id: string) => {
+    if (!agentsView || !id) return;
+    try {
+      const next = await saveAgents(
+        agentsView.agents.map((a) => a.spec),
+        { ...agentsView.app_selection, orchestrator: id, pick_by_score: null },
+      );
+      void announceAgentsChanged(next);
+    } catch (e) {
+      setTurnError(String(e));
+    }
+  };
   const chatEngineLabel = (ai: AiSettings) =>
     chatIsAppModel || !chatAgent
       ? brainSummary(ai.chat_model)
@@ -1316,7 +1346,7 @@ export default function ScriptsPanel({
       setSonarOpen(true);
       setSonarTab("chat");
       const promptToUse = newCutPrompt.trim() || `Create an edit titled "${title}" targeting ${newCutTargetS} seconds.`;
-      setInputMessage(`[Draft "${title}" — Target: ${newCutTargetS}s]\n${promptToUse}`);
+      setInputMessage(`[Draft "${title}" — Target: ${newCutTargetS}s — Format: ${newCutFormat}]\n${promptToUse}`);
       // The brief is ready to send; put the caret there so Enter starts the draft.
       window.setTimeout(() => composerRef.current?.focus(), 50);
     }
@@ -1415,7 +1445,8 @@ export default function ScriptsPanel({
         if (!(await guardUnsaved())) return;
         try {
           const { stored } = await getScript(id);
-          const saved = await saveScript(projectId, { ...stored.script, title: stored.title }, stored.session_id);
+          // A restore brings the version back as it was stored, not re-finished like an edit.
+          const saved = await restoreScriptVersion(id);
           setScripts(await listScripts(projectId));
           await selectScript(saved.script_id, stored.session_id, true);
         } catch (error) { setTurnError(String(error)); }
@@ -2110,13 +2141,38 @@ export default function ScriptsPanel({
                             <span>Advanced: engine</span>
                             <span className="muted">{chatEngineLabel(aiSettings)}</span>
                           </summary>
-                          {!chatIsAppModel && chatAgent && (
+                          {agentsView && (
+                            <label className="composer-field">Writes with
+                              <select
+                                className="composer-model-select"
+                                value={chatAgent?.spec.id ?? ""}
+                                disabled={isTurnRunning || cutAgents?.orchestrator != null}
+                                onChange={(e) => void handleChatAgent(e.target.value)}
+                              >
+                                {chatCapable.map((a) => (
+                                  <option key={a.spec.id} value={a.spec.id}>
+                                    {a.spec.name || a.spec.id}{a.spec.source === "chat_model" ? "" : ` · ${a.summary}`}
+                                  </option>
+                                ))}
+                              </select>
+                            </label>
+                          )}
+                          {cutAgents?.orchestrator != null && (
                             <p className="composer-engine-hint small muted">
-                              This cut writes with the agent “{chatAgent.spec.name || chatAgent.spec.id}” ({chatAgent.summary}),
-                              chosen in the cut&apos;s Inspector › Agents{cutAgents ? "" : " or Models › Agents"}. The engine
-                              below is the app&apos;s script chat model.
+                              This cut has its own agent, set in its Inspector › Agents.
                             </p>
                           )}
+                          {!chatIsAppModel && chatAgent && (
+                            <p className="composer-engine-hint small muted">
+                              {chatAgent.spec.name || chatAgent.spec.id} also picks the clips in a clip run. Its tool and
+                              model are set in{" "}
+                              <button type="button" className="link-btn" onClick={() => navigate("models", "agents")}>
+                                Models › Agents
+                              </button>
+                              .
+                            </p>
+                          )}
+                          {chatIsAppModel && (
                           <div className="composer-model-bar">
                             <div className="composer-backend-pills" role="radiogroup" aria-label="Where the AI runs">
                               {(["auto", "local", "server", "cli"] as const).map((b) => (
@@ -2243,6 +2299,7 @@ export default function ScriptsPanel({
                               </label>
                             </div>
                           </div>
+                          )}
                         </details>
                       )}
                     </div>
@@ -2369,6 +2426,20 @@ export default function ScriptsPanel({
                       onClick={(e) => { e.currentTarget.focus(); applyPreset(p.id); }}
                     >
                       {p.label}
+                    </button>
+                  ))}
+                </div>
+                <div className="nle-field-label" id="new-cut-format">Format</div>
+                <div className="nle-preset-row" role="group" aria-labelledby="new-cut-format">
+                  {([{ id: "auto", label: "Auto" }, ...CLIP_FORMATS] as { id: CutFormat; label: string }[]).map((f) => (
+                    <button
+                      key={f.id}
+                      type="button"
+                      className={`nle-preset-chip${newCutFormat === f.id ? " on" : ""}`}
+                      aria-pressed={newCutFormat === f.id}
+                      onClick={(e) => { e.currentTarget.focus(); setNewCutFormat(f.id); }}
+                    >
+                      {f.label}
                     </button>
                   ))}
                 </div>

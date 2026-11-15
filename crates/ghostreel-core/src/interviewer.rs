@@ -20,7 +20,7 @@
 //! This only ever *adds* off-mic flags. The acoustic test is evidence too, and a segment it
 //! already caught is not re-litigated.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use rusqlite::params;
 use serde_json::json;
@@ -168,17 +168,79 @@ pub async fn find(db: &Db, project_id: i64, cfg: &JevConfig) -> Result<Vec<Verdi
 /// Only ever sets the flag. The acoustic test in `audio.rs` is evidence as well, and a segment it
 /// already caught is left alone — two different ways of being the wrong voice, one column.
 pub fn apply(db: &Db, verdicts: &[Verdict], cfg: &JevConfig) -> Result<usize, Error> {
+    let tx = db.conn.unchecked_transaction()?;
     let mut n = 0;
+    let mut changed = BTreeSet::new();
     for v in verdicts.iter().filter(|v| v.is_interviewer(cfg)) {
         // 'speech' with the probability that produced it, so this can be reviewed, re-judged at a
         // different threshold, or undone — none of which is possible from one bit. The `off_mic`
         // guard keeps an acoustic flag's own provenance intact.
-        n += db.conn.execute(
+        let updated = tx.execute(
             "UPDATE transcript_segments SET off_mic = 1, off_mic_source = 'speech', off_mic_p = ?3
              WHERE video_id = ?1 AND ABS(start_s - ?2) < 0.001 AND COALESCE(off_mic, 0) = 0",
             params![v.video_id, v.start_s, v.p],
         )?;
+        if updated > 0 {
+            n += updated;
+            changed.insert(v.video_id);
+        }
     }
+    for video_id in changed {
+        crate::sentence_split::invalidate(&tx, video_id)?;
+    }
+    tx.commit()?;
+    Ok(n)
+}
+
+/// A voice never on camera that is off the microphone most of the time is off it all of the time:
+/// the interviewer, whose louder lines ("So tell me, what do you like about Westlake?") pass the
+/// acoustic test and then sit inside the answers a cut is made of. Measured, not read: the speaker
+/// labels, the people linked to them and the acoustic flags, so it needs no model.
+///
+/// Recorded as 'voice', and re-runnable: it clears its own earlier marks first and never touches
+/// the acoustic ('level') or the read ('speech') ones. Returns how many lines it marked.
+pub fn mark_by_voice(db: &Db, video_id: i64) -> Result<usize, Error> {
+    /// The share of a voice's lines the acoustic test already caught.
+    const OFF_MIC_SHARE: f64 = 0.5;
+    /// The fewest lines that make a pattern rather than a coincidence.
+    const MIN_LINES: i64 = 3;
+    let off_mic_ids = |conn: &rusqlite::Connection| -> Result<Vec<i64>, Error> {
+        let mut st = conn.prepare(
+            "SELECT id FROM transcript_segments WHERE video_id = ?1 AND COALESCE(off_mic, 0) = 1 ORDER BY id",
+        )?;
+        Ok(st.query_map([video_id], |r| r.get(0))?.collect::<Result<_, _>>()?)
+    };
+    let tx = db.conn.unchecked_transaction()?;
+    let before = off_mic_ids(&tx)?;
+    tx.execute(
+        "UPDATE transcript_segments SET off_mic = 0, off_mic_source = NULL WHERE video_id = ?1 AND off_mic_source = 'voice'",
+        [video_id],
+    )?;
+    let voices: Vec<(i64, i64, i64)> = {
+        let mut st = tx.prepare(
+            "SELECT speaker, COUNT(*), SUM(CASE WHEN off_mic = 1 AND off_mic_source = 'level' THEN 1 ELSE 0 END)
+               FROM transcript_segments
+              WHERE video_id = ?1 AND speaker IS NOT NULL
+              GROUP BY speaker
+             HAVING MAX(person_id) IS NULL",
+        )?;
+        st.query_map([video_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<_, _>>()?
+    };
+    let mut n = 0;
+    for (speaker, lines, flagged) in voices {
+        if lines >= MIN_LINES && flagged as f64 >= lines as f64 * OFF_MIC_SHARE {
+            n += tx.execute(
+                "UPDATE transcript_segments SET off_mic = 1, off_mic_source = 'voice'
+                  WHERE video_id = ?1 AND speaker = ?2 AND COALESCE(off_mic, 0) = 0",
+                params![video_id, speaker],
+            )?;
+        }
+    }
+    let after = off_mic_ids(&tx)?;
+    if before != after {
+        crate::sentence_split::invalidate(&tx, video_id)?;
+    }
+    tx.commit()?;
     Ok(n)
 }
 
@@ -187,7 +249,19 @@ pub fn apply(db: &Db, verdicts: &[Verdict], cfg: &JevConfig) -> Result<usize, Er
 /// The point of recording the source: a threshold changed on evidence should be re-runnable, and
 /// an editor who disagrees with a call should not have to re-measure every video's levels.
 pub fn undo(db: &Db, project_id: i64) -> Result<usize, Error> {
-    Ok(db.conn.execute(
+    let tx = db.conn.unchecked_transaction()?;
+    let videos: Vec<i64> = {
+        let mut st = tx.prepare(
+            "SELECT DISTINCT ts.video_id
+               FROM transcript_segments ts
+               JOIN video_files vf ON vf.video_id = ts.video_id
+               JOIN folders f ON f.id = vf.folder_id
+               JOIN project_folders pf ON pf.folder_id = f.id
+              WHERE pf.project_id = ?1 AND ts.off_mic_source = 'speech'",
+        )?;
+        st.query_map(params![project_id], |r| r.get(0))?.collect::<Result<_, _>>()?
+    };
+    let n = tx.execute(
         "UPDATE transcript_segments SET off_mic = 0, off_mic_source = NULL, off_mic_p = NULL
          WHERE off_mic_source = 'speech' AND video_id IN (
              SELECT vf.video_id FROM video_files vf
@@ -195,12 +269,59 @@ pub fn undo(db: &Db, project_id: i64) -> Result<usize, Error> {
              JOIN project_folders pf ON pf.folder_id = f.id
              WHERE pf.project_id = ?1)",
         params![project_id],
-    )?)
+    )?;
+    if n > 0 {
+        for video_id in videos {
+            crate::sentence_split::invalidate(&tx, video_id)?;
+        }
+    }
+    tx.commit()?;
+    Ok(n)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_voice_never_on_camera_and_mostly_off_mic_is_off_mic_throughout() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        db.conn.execute("INSERT INTO videos(id, content_hash, size, duration_s) VALUES (1, 'h', 1, 60.0)", []).unwrap();
+        // Speaker 3 asks; two of its four lines were quiet enough for the acoustic test, two were
+        // not. Speaker 2 answers and is linked to the face on screen; one of its lines was flagged.
+        let rows: [(f64, &str, i64, Option<i64>, bool); 7] = [
+            (0.0, "Are you comfortable with that?", 3, None, true),
+            (3.0, "Yeah.", 2, Some(4), false),
+            (5.0, "So tell me, what do you like about Westlake?", 3, None, false),
+            (8.0, "What I like about Westlake is the people.", 2, Some(4), false),
+            (12.0, "Okay.", 3, None, true),
+            (14.0, "And the schools are great.", 2, Some(4), true),
+            (18.0, "And how did you hear about the magazine?", 3, None, false),
+        ];
+        for (s, text, speaker, person, off) in rows {
+            db.conn
+                .execute(
+                    "INSERT INTO transcript_segments(video_id, start_s, end_s, text, speaker, person_id, off_mic, off_mic_source)
+                     VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, CASE WHEN ?6 THEN 'level' END)",
+                    params![s, s + 2.0, text, speaker, person, off],
+                )
+                .unwrap();
+        }
+        assert_eq!(mark_by_voice(&db, 1).unwrap(), 2);
+        let off: Vec<String> = db
+            .conn
+            .prepare("SELECT text FROM transcript_segments WHERE off_mic = 1 ORDER BY start_s")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(off.contains(&"So tell me, what do you like about Westlake?".to_string()), "{off:?}");
+        // The person on camera keeps their own lines, even the one the acoustic test caught.
+        assert!(!off.contains(&"What I like about Westlake is the people.".to_string()));
+        // Re-running finds the same, not more.
+        assert_eq!(mark_by_voice(&db, 1).unwrap(), 2);
+    }
     use crate::projects::NewProject;
 
     fn project_with_an_interview() -> (Db, i64) {
@@ -348,5 +469,69 @@ mod tests {
             .collect::<Result<_, _>>()
             .unwrap();
         assert_eq!(still_off, vec!["Perfect."]);
+    }
+
+    #[test]
+    fn mark_by_voice_invalidates_sentences_so_moments_drop_the_interviewer() {
+        let db = Db::open_in_memory().unwrap();
+        db.conn
+            .execute_batch(
+                "INSERT INTO videos(id, content_hash, size, duration_s) VALUES(1,'h',1,60);
+                 INSERT INTO transcript_segments(video_id,start_s,end_s,text,speaker,off_mic,off_mic_source) VALUES
+                  (1,0,8,'We build strong and lasting relationships with all of our many wonderful neighbors every single day',1,0,NULL),
+                  (1,8,10,'Okay perfect',2,0,NULL),
+                  (1,12,14,'Question one',2,1,'level'),
+                  (1,16,18,'Question two',2,1,'level');",
+            )
+            .unwrap();
+        crate::sentence_split::ensure(&db, 1).unwrap();
+        db.conn
+            .execute_batch(
+                "DELETE FROM transcript_sentences WHERE video_id=1;
+                 INSERT INTO transcript_sentences(video_id,start_s,end_s,text)
+                 VALUES(1,0,10,'We build strong and lasting relationships with all of our many wonderful neighbors every single day. Okay perfect.');",
+            )
+            .unwrap();
+        assert_eq!(mark_by_voice(&db, 1).unwrap(), 1);
+        let survey = crate::clips::VideoSurvey::load(&db, 1).unwrap();
+        let opts = crate::clips::ClipOptions { min_s: 4.0, max_s: 15.0, ..Default::default() };
+        let cs = crate::clips::candidates(&survey, &crate::config::ScriptConfig::default(), &opts);
+        assert!(!cs.is_empty());
+        assert!(!cs.iter().any(|c| c.text.contains("Okay perfect")), "moment still holds interviewer line: {cs:?}");
+    }
+
+    #[test]
+    fn apply_and_undo_invalidate_sentences_at_mic_changes() {
+        let (db, project_id) = project_with_an_interview();
+        // Two unpunctuated segments separated by a 0.2 s breath (below PAUSE_BREAK_S), with speaker = NULL.
+        db.conn.execute("DELETE FROM transcript_segments WHERE video_id = 1", []).unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO transcript_segments(video_id, start_s, end_s, text, off_mic) VALUES
+                 (1, 0.0, 6.0, 'I own a small coffee shop north of campus', 0),
+                 (1, 6.2, 8.0, 'Okay perfect', 0)",
+                [],
+            )
+            .unwrap();
+        db.set_speech_regions(
+            1,
+            &[crate::speech::SpeechRegion::new(0.0, 6.0), crate::speech::SpeechRegion::new(6.2, 8.0)],
+        )
+        .unwrap();
+        crate::sentence_split::ensure(&db, 1).unwrap();
+        assert_eq!(crate::index::transcript(&db, 1).unwrap().len(), 1);
+
+        let cfg = JevConfig::default();
+        let verdicts = vec![Verdict { video_id: 1, start_s: 6.2, text: "Okay perfect".into(), p: 0.95 }];
+        assert_eq!(apply(&db, &verdicts, &cfg).unwrap(), 1);
+
+        let after_apply = crate::index::transcript(&db, 1).unwrap();
+        assert_eq!(after_apply.len(), 2, "apply must invalidate and split at the mic change: {after_apply:?}");
+        assert!(!after_apply[0].off_mic && after_apply[1].off_mic);
+
+        assert_eq!(undo(&db, project_id).unwrap(), 1);
+        let after_undo = crate::index::transcript(&db, 1).unwrap();
+        assert_eq!(after_undo.len(), 1, "undo must invalidate and merge back: {after_undo:?}");
+        assert!(!after_undo[0].off_mic);
     }
 }

@@ -12,6 +12,8 @@
 //! The reading is typed ([`CutReading`], serialisable for `format: json`) and renders to a compact
 //! text ([`CutReading::render`]), which is what `read_cut` returns by default.
 
+use crate::lexicon::{CONNECTIVES, REPLIES};
+
 use std::collections::HashMap;
 
 use serde::Serialize;
@@ -193,8 +195,11 @@ pub fn read_cut(
         for (i, clip) in beat.clips.iter().enumerate() {
             let duration = (clip.out_s - clip.in_s).max(0.0);
             let hears = clip.audio == Audio::Source && !clip.tracks.as_ref().is_some_and(Vec::is_empty);
-            let heard =
-                if hears { heard(db, clip.video_id, clip.in_s, clip.out_s, clip.sentences.as_ref()) } else { Vec::new() };
+            let heard = if hears {
+                heard(db, clip.video_id, clip.in_s, clip.out_s, clip.sentences.as_ref())
+            } else {
+                Vec::new()
+            };
             let mut speakers: Vec<String> = Vec::new();
             for h in &heard {
                 if let Some(s) = &h.speaker
@@ -369,13 +374,7 @@ fn story_as_written(db: &Db, clip: &crate::script::ScriptClip) -> Vec<String> {
 /// An edge written on a word (`asked`, "s206@9") opens or closes on exactly that word: the cut was
 /// placed on the sound in front of it, and the word's estimated times can sit a hundredth of a
 /// second the wrong side of the cut — "… hay manera" for a clip that plays "No hay manera".
-fn heard(
-    db: &Db,
-    video_id: i64,
-    in_s: f64,
-    out_s: f64,
-    asked: Option<&crate::script::SentenceRange>,
-) -> Vec<Heard> {
+fn heard(db: &Db, video_id: i64, in_s: f64, out_s: f64, asked: Option<&crate::script::SentenceRange>) -> Vec<Heard> {
     let start_word = named_word(asked.map(|s| s.from.as_str()));
     let end_word = named_word(asked.map(|s| s.to.as_str()));
     let sentences: Vec<index::TranscriptSegment> = index::transcript(db, video_id)
@@ -442,32 +441,6 @@ const WORD_SLACK_S: f64 = 0.3;
 /// A range that starts or ends this far inside a sentence cuts the thought (s).
 const MID_SENTENCE_S: f64 = 0.4;
 
-/// First words that answer someone: a clip that opens on one answers a line we never hear.
-const REPLIES: &[&str] = &[
-    "exacto",
-    "exactamente",
-    "claro",
-    "sí",
-    "totalmente",
-    "correcto",
-    "efectivamente",
-    "obvio",
-    "obviamente",
-    "exactly",
-    "right",
-    "yeah",
-    "yes",
-    "sure",
-    "absolutely",
-    "totally",
-    "true",
-];
-/// First words that lean on what came before.
-const CONNECTIVES: &[&str] = &[
-    "pero", "entonces", "porque", "además", "también", "aunque", "sino", "pues", "and", "but", "so", "because", "also",
-    "which", "although",
-];
-
 /// The first `n` words of `text`, with an ellipsis when there are more.
 fn opening(text: &str, n: usize) -> String {
     let words: Vec<&str> = text.split_whitespace().collect();
@@ -484,6 +457,27 @@ fn closing(text: &str, n: usize) -> String {
     words[words.len().saturating_sub(n)..].join(" ")
 }
 
+/// A pause shorter than this after a sentence, before the same speaker's next one, is no pause:
+/// they ran on, and the thought was not finished there (s).
+const RUN_ON_S: f64 = 0.25;
+
+/// Whether the measured speech runs from a sentence ending at `end_s` into the next one starting at
+/// `next_s` with no pause of [`RUN_ON_S`] between them. The transcript's own times butt sentences
+/// together whatever the voice did, so only the sound can say; unmeasured, nothing is claimed.
+fn runs_on(db: &Db, video_id: i64, end_s: f64, next_s: f64) -> bool {
+    let Ok(regions) = crate::speech::speech_regions(db, video_id, end_s - 2.0, next_s + 2.0) else { return false };
+    if regions.is_empty() {
+        return false;
+    }
+    let (lo, hi) = (end_s - 0.1, next_s + 0.3);
+    let paused = regions.windows(2).any(|w| {
+        let (a, b) = (w[0].end_s, w[1].start_s);
+        b - a >= RUN_ON_S && b > lo && a < hi
+    // Or no voice is measured from the next sentence on: whatever the transcript says, it is quiet.
+    }) || regions.last().is_some_and(|r| r.end_s <= next_s);
+    !paused
+}
+
 /// Whether `in_s..out_s` holds whole thoughts, as notes for the editor (see [`ClipReading::story`]).
 pub(crate) fn story(db: &Db, video_id: i64, in_s: f64, out_s: f64) -> Vec<String> {
     let all = index::transcript(db, video_id).unwrap_or_default();
@@ -492,8 +486,13 @@ pub(crate) fn story(db: &Db, video_id: i64, in_s: f64, out_s: f64) -> Vec<String
     let (Some(&first), Some(&last)) = (inside.first(), inside.last()) else { return Vec::new() };
     let mut notes = Vec::new();
     let (a, z) = (&all[first], &all[last]);
-    let starts_inside = in_s > a.start + MID_SENTENCE_S && a.end - a.start > MID_SENTENCE_S * 2.0;
-    if starts_inside {
+    // A start just after a "yeah so" said on its own breath is where the thought begins: placement
+    // drops those words (`cuts::after_opening_filler`), and that is not cutting into the sentence.
+    let after_filler = crate::cuts::after_opening_filler(db, video_id, a.start)
+        .is_some_and(|t| in_s > a.start + 0.05 && in_s >= t - 0.4 && in_s <= t + 0.1);
+    let starts_inside = !after_filler && in_s > a.start + MID_SENTENCE_S && a.end - a.start > MID_SENTENCE_S * 2.0;
+    if after_filler {
+    } else if starts_inside {
         notes.push(format!(
             "starts mid-sentence: {} began {:.1} s earlier (\"{}\"); start at {} or later",
             format_id(a.id),
@@ -507,7 +506,7 @@ pub(crate) fn story(db: &Db, video_id: i64, in_s: f64, out_s: f64) -> Vec<String
         let before = first.checked_sub(1).map(|i| &all[i]).filter(|p| a.start - p.end < 3.0);
         let quoted = opening(&a.text, 4);
         if let Some(p) = first.checked_sub(1).map(|i| &all[i]).filter(|p| {
-            a.start - p.end < 1.5 && p.speaker == a.speaker && crate::sentence_split::opens_as_continuation(&a.text)
+            a.start - p.end < 1.5 && p.speaker == a.speaker && crate::lexicon::opens_as_continuation(&a.text)
         }) {
             // "En API de Opus, lo cual…": the clip never says what it is about.
             notes.push(format!(
@@ -542,6 +541,20 @@ pub(crate) fn story(db: &Db, video_id: i64, in_s: f64, out_s: f64) -> Vec<String
             format_id(z.id),
             z.end - out_s
         ));
+    } else if let Some(next) = all
+        .get(last + 1)
+        .filter(|n| n.start - z.end < RUN_ON_S && !n.off_mic && !z.off_mic && n.speaker == z.speaker)
+        .filter(|n| runs_on(db, video_id, z.end, n.start))
+    {
+        // "…super common. Like, we go to networking events…": a full stop in the transcript, but
+        // no breath in the voice. The speaker was not done; an end there sounds cut off.
+        notes.push(format!(
+            "ends where the speaker runs straight on: {} (\"{}\") follows {:.2} s later, with no pause; end on a \
+             sentence followed by a pause, or take it in",
+            format_id(next.id),
+            opening(&next.text, 6),
+            (next.start - z.end).max(0.0)
+        ));
     } else if z.text.trim_end().ends_with('?')
         && !crate::sentence_split::ends_on_tag(&z.text)
         && let Some(next) = all.get(last + 1).filter(|n| n.start - z.end < 3.0 && n.speaker != z.speaker)
@@ -551,6 +564,17 @@ pub(crate) fn story(db: &Db, video_id: i64, in_s: f64, out_s: f64) -> Vec<String
             format_id(next.id),
             next.speaker.as_deref().map(|s| format!(", {s}")).unwrap_or_default()
         ));
+    }
+    // An off-mic line (an interviewer's question, a "perfect" from behind the camera) inside a clip
+    // whose own voice is on the mic: it plays, quieter, and the viewer hears someone they never see.
+    if inside.iter().any(|&i| !all[i].off_mic) {
+        for &i in inside.iter().filter(|&&i| all[i].off_mic) {
+            notes.push(format!(
+                "plays an off-mic line: {} (\"{}\"), someone away from the microphone; end before it or start after it",
+                format_id(all[i].id),
+                opening(&all[i].text, 8)
+            ));
+        }
     }
     notes
 }
@@ -850,7 +874,18 @@ mod tests {
     }
 
     fn clip(in_s: f64, out_s: f64, audio: Audio) -> ScriptClip {
-        ScriptClip { exact: false, sentences: None, video_id: 104, in_s, out_s, audio, why: None, tracks: None, framing: None }
+        ScriptClip {
+            exact: false,
+            gain_db: None,
+            sentences: None,
+            video_id: 104,
+            in_s,
+            out_s,
+            audio,
+            why: None,
+            tracks: None,
+            framing: None,
+        }
     }
 
     fn script(clips: Vec<ScriptClip>) -> Script {
@@ -878,6 +913,52 @@ mod tests {
             agents: None,
             card_style: None,
         }
+    }
+
+    /// "…super common. Like, we go to networking events…": a full stop in the transcript, no breath
+    /// in the voice. Judged on the measured speech, never on the transcript's butted times.
+    #[test]
+    fn a_clip_ending_where_the_speaker_runs_straight_on_is_a_story_note() {
+        let db = Db::open_in_memory().unwrap();
+        db.conn
+            .execute("INSERT INTO videos(id, content_hash, size, duration_s) VALUES (104, 'h', 1, 300.0)", [])
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO transcript_segments(id, video_id, start_s, end_s, text) VALUES
+                 (1, 104, 1.0, 4.0, 'Every event we have come to was worth it.'),
+                 (2, 104, 4.6, 6.0, 'I do not think that is common.'),
+                 (3, 104, 6.0, 9.0, 'Like we go to networking events all the time.')",
+                [],
+            )
+            .unwrap();
+        db.set_speech_regions(104, &[SpeechRegion::new(1.0, 4.0), SpeechRegion::new(4.6, 6.0), SpeechRegion::new(6.09, 9.0)])
+            .unwrap();
+        crate::sentence_split::mirror_segments(&db, 104);
+        let runs_on = |out_s| story(&db, 104, 0.9, out_s).iter().any(|n| n.starts_with("ends where the speaker runs"));
+        assert!(runs_on(6.0), "a 0.09 s breath is no pause");
+        assert!(!runs_on(4.0), "0.6 s of quiet after it is an end");
+    }
+
+    #[test]
+    fn an_off_mic_question_inside_a_clip_is_a_story_note() {
+        let db = Db::open_in_memory().unwrap();
+        db.conn
+            .execute("INSERT INTO videos(id, content_hash, size, duration_s) VALUES (104, 'h', 1, 300.0)", [])
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO transcript_segments(id, video_id, start_s, end_s, text, off_mic) VALUES
+                 (1, 104, 1.0, 4.0, 'These events are always great for networking.', 0),
+                 (2, 104, 4.2, 6.0, 'What made you want to sponsor the bar?', 1),
+                 (3, 104, 7.0, 9.0, 'We wanted the visibility.', 0)",
+                [],
+            )
+            .unwrap();
+        crate::sentence_split::mirror_segments(&db, 104);
+        let notes = story(&db, 104, 0.9, 6.2);
+        assert!(notes.iter().any(|n| n.starts_with("plays an off-mic line: s2")), "{notes:?}");
+        assert!(story(&db, 104, 0.9, 4.1).iter().all(|n| !n.contains("off-mic")));
     }
 
     #[test]
@@ -952,8 +1033,7 @@ mod tests {
         // A clip written to open on a word ("s413@4") opens on that word, even where its estimated
         // times end a hundredth past the cut placed on the sound in front of it.
         let mut on_word = clip(15.19, 16.6, Audio::Source);
-        on_word.sentences =
-            Some(crate::script::SentenceRange { from: "s413@4".into(), to: "s413".into() });
+        on_word.sentences = Some(crate::script::SentenceRange { from: "s413@4".into(), to: "s413".into() });
         let r = read_cut(&db, pid, &script(vec![on_word]), &ScriptConfig::default(), Vec::new()).unwrap();
         let c = &r.beats[0].clips[0];
         assert_eq!(c.heard[0].text, "… ‹Corres› o Te Encaramas");

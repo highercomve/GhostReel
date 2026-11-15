@@ -8,7 +8,22 @@ use crate::faces::{cosine_similarity, l2_normalize};
 /// Builds the full dendrogram with the nearest-neighbour chain algorithm (O(n²) time and memory)
 /// and cuts it at `threshold`. Average linkage has no inversions, so this gives the same clusters
 /// as greedily merging the most similar pair until none is above the threshold.
+/// The similarity given to a pair that must stay apart: low enough that no average containing it
+/// reaches any threshold, whatever the other members are.
+const APART: f32 = -1.0e4;
+
 pub fn cluster_average_linkage(embeddings: &[&[f32]], threshold: f32) -> Vec<Vec<usize>> {
+    cluster_average_linkage_apart(embeddings, threshold, |_, _| false)
+}
+
+/// [`cluster_average_linkage`], where `apart(i, j)` says two items can never be together (two
+/// faces on screen at the same moment are two people): any cluster holding such a pair averages
+/// so low it is never formed.
+pub fn cluster_average_linkage_apart(
+    embeddings: &[&[f32]],
+    threshold: f32,
+    apart: impl Fn(usize, usize) -> bool,
+) -> Vec<Vec<usize>> {
     let n = embeddings.len();
     if n == 0 {
         return Vec::new();
@@ -19,7 +34,7 @@ pub fn cluster_average_linkage(embeddings: &[&[f32]], threshold: f32) -> Vec<Vec
     let mut sim = vec![0.0f32; n * n];
     for i in 0..n {
         for j in (i + 1)..n {
-            let s = cosine_similarity(embeddings[i], embeddings[j]);
+            let s = if apart(i, j) { APART } else { cosine_similarity(embeddings[i], embeddings[j]) };
             sim[i * n + j] = s;
             sim[j * n + i] = s;
         }

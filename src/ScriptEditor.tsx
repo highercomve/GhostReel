@@ -920,6 +920,41 @@ const ScriptEditor = forwardRef<ScriptEditorHandle, ScriptEditorProps>(function 
                   <span className={`insp-switch-state ${soundOn ? "" : "off"}`}>{soundOn ? "On" : "Muted"}</span>
                 </div>
                 <div className="small muted">{beat.bed ? "The beat’s sound bed plays instead of clip sound." : soundOn ? "Plays the selected source tracks." : "Muted: source tracks are off."}</div>
+                {soundOn && !beat.bed && (
+                  <div className="insp-volume-row">
+                    <label className="insp-volume-label" htmlFor="clip-volume">
+                      Volume
+                    </label>
+                    <input
+                      id="clip-volume"
+                      type="range"
+                      min={-24}
+                      max={24}
+                      step={1}
+                      value={clip.gain_db ?? 0}
+                      disabled={isAiWorking}
+                      onChange={(e) => {
+                        const v = Number(e.target.value);
+                        updateClip(selBeat, selClip, { gain_db: v === 0 ? undefined : v });
+                      }}
+                      title="Make this clip's sound louder or softer. Exports level every clip first; this is applied on top."
+                    />
+                    <span className="insp-volume-value">
+                      {(clip.gain_db ?? 0) > 0 ? "+" : ""}
+                      {clip.gain_db ?? 0} dB
+                    </span>
+                    {(clip.gain_db ?? 0) !== 0 && (
+                      <button
+                        type="button"
+                        className="insp-volume-reset"
+                        disabled={isAiWorking}
+                        onClick={() => updateClip(selBeat, selClip, { gain_db: undefined })}
+                      >
+                        Reset
+                      </button>
+                    )}
+                  </div>
+                )}
                 <div className="nle-insp-subtitle">Audio tracks</div>
                 <AudioTracksSection
                   videoId={clip.video_id}

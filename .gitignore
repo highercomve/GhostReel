@@ -29,3 +29,4 @@ site-public/
 .playwright-mcp/
 .agents/design-council/
 .agents/bench/
+.agents/code-council/

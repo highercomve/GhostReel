@@ -5,7 +5,27 @@ versions follow [SemVer](https://semver.org/) while the project is 0.x (minor = 
 
 ## [Unreleased]
 
+## [0.16.0] — 2026-11-15
+
 ### Added
+
+- **One finish chain** (`finish/`): every saved cut — a chat turn, an MCP `save_script`, `apply_fix`
+  or `read_cut`, a clip run, `script import` — goes through the same deterministic passes in the
+  same order (sentence edges, speech breaths, audio beds and faces first, cut placement, fit to the
+  target, closing hold). Callers differ only in a profile, never in the passes, and a finished cut
+  finished again comes out unchanged. Edges an editor pinned (an `exact` clip, an edge on a word)
+  are never moved.
+- **A breath after a voice under b-roll**: when a beat's voice runs as a bed under b-roll and the
+  beat ends on b-roll, that shot runs on muted for `broll_breath_s` (default 2 s, 0 turns it off)
+  before the next beat speaks, so two voices don't land on each other. Never after a face (someone
+  seen talking with no sound) and never on the closing beat, which has its own hold.
+- Clip and bed ranges take seconds as well as sentence ids (`"15.75"`, `"412s"`, a number), and a
+  clip whose sentence ids belong to another video is moved to that video (or, muted, keeps its
+  pictures) with a note instead of refusing the whole draft.
+- The inspector has a **Volume** slider per clip (-24 to +24 dB, applied on top of the export's
+  levelling), and the live viewer plays it.
+- A new cut can choose its shape (Auto, 9:16, 1:1, original) next to the presets, and the Scripts
+  panel can switch the writing agent.
 
 - **Manifest** (`get_manifest` tool): everything the index measured about a video on one clock —
   chapters with summaries, each sentence with its speaker and the measured silence before and after
@@ -86,6 +106,26 @@ versions follow [SemVer](https://semver.org/) while the project is 0.x (minor = 
   point) and the cost rule (text before pictures).
 
 ### Fixed
+
+- The MCP server no longer runs out of saves: it kept one tool session for its whole life, so its
+  per-turn limits (20 saves, 60 reads of a tool) locked a long external session out of
+  `save_script` until restart. Its session has no turn quotas now, and a save clears remembered
+  read answers, so `list_scripts` after a save shows the new version.
+- A session scoped to a project refuses a `project` argument naming another project.
+- Long chat turns that make room in the context replace old tool results with a stub instead of
+  deleting them (an answered tool call without its result is refused by OpenAI-compatible
+  servers), and the empty-search hint no longer lands between a tool call and its results.
+- A draft the finish passes empty is no longer saved as an empty cut; the earlier cut stands.
+- An audio bed inferred from a speaking clip keeps the clip's chosen audio track, and a clip
+  deliberately silenced (no tracks) neither becomes a bed nor hushes narration as if it spoke.
+- Pinned pictures count as fixed length when a cut is fitted to its target, so the others are
+  trimmed enough; pinned clips under 1 s survive the clamp to the footage.
+- The closing picture is never taken from a video excluded from the project.
+- A clip run keeps its checked picks when checking the orchestrator's repair fails, and a stopped
+  run stops the orchestrator's turns at once instead of waiting out their timeout.
+- Rebuilding a video's sentences can no longer lose its model-titled chapters.
+- The chat log writes images as a size placeholder instead of their base64 data on every round.
+- MCP tool errors are no longer wrapped in a second `{"error": …}`.
 
 - A tag question talked straight through ("…10 dólares episodio, ¿ok? En API de Opus…") no longer
   splits the thought into two sentences, so a clip cannot open on its second half. `read_cut` and the

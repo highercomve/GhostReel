@@ -19,17 +19,17 @@ const FORMAT: T = T::Enum(&["original", "9:16", "1:1"]);
 static FIND_CLIP_CANDIDATES: ToolSpec = ToolSpec {
     name: "find_clip_candidates",
     effect: Effect::Read,
-    summary: "Sentence-bounded windows in the length range that could be clips, found by code from the stored \
-              transcripts (no model): never starting off-mic, never across a transcript hole, not on shaky stretches.",
-    when: "To orchestrate your own clip picking (e.g. with subagents), or to see what generate_clips would choose \
-           from. Needs transcripts.",
-    returns: "{total, candidates}: each candidate has an id, video_id, in_s/out_s, text, a visual label (faces / \
-              screen / mixed, from keyframe descriptions), face numbers from face tracking, speakers when known, \
-              and a code prescore. Best prescore first, at most `limit`.",
+    summary: "Moments: the spoken pieces a cut or a clip is made of, found by code (no model): whole sentences in \
+              the length range, nobody off the microphone in them, never across a transcript hole or a shaky stretch.",
+    when: "Choosing what a cut's voices say (min_s/max_s: one spoken beat, about 4-15 s for a 60 s cut), or a clip \
+           run (20-60 s). Needs transcripts.",
+    returns: "{total, candidates}: each has an id, video_id, from/to sentence ids, in_s/out_s, text, a visual label \
+              (faces / screen / mixed), face numbers, speakers when known, and a code prescore. Best first.",
     misuse: &[
-        "A candidate is where speech is clean, not a judgement that it is good: read its transcript before saving it.",
+        "A moment is clean speech, not a good line: read its words and pictures (get_manifest) before choosing it. \
+         Its id is per call; a cut uses its video_id and from/to.",
     ],
-    chains_with: &["get_manifest around the ones you like, then check_clips, then save_clips."],
+    chains_with: &["get_manifest, then save_script clips {video_id, from, to}; or check_clips, then save_clips."],
     params: &[
         PROJECT,
         ToolParam::new("min_s", T::Number, false, "default 20."),
@@ -70,12 +70,51 @@ fn clip_options(a: Args<'_>) -> Result<crate::clips::ClipOptions, ToolError> {
 fn clip_picks(a: Args<'_>) -> Result<Vec<crate::clips::Pick>, ToolError> {
     let raw = a.get("clips").ok_or_else(|| ToolError::invalid("missing 'clips' array"))?;
     let picks: Vec<crate::clips::Pick> = serde_json::from_value(raw.clone()).map_err(|e| {
-        ToolError::Invalid(format!("clips must be [{{video_id, in_s, out_s, title?, hook?, ...}}]: {e}"))
+        ToolError::Invalid(format!(
+            "clips must be [{{video_id, from?, to?, in_s?, out_s?, title?, hook?, ...}}]: {e}"
+        ))
     })?;
     if picks.is_empty() {
         return Err(ToolError::invalid("no clips given"));
     }
     Ok(picks)
+}
+
+fn resolve_picks(db: &crate::db::Db, picks: &mut [crate::clips::Pick]) -> Result<(), ToolError> {
+    let mut surveys: std::collections::HashMap<i64, crate::clips::VideoSurvey> = std::collections::HashMap::new();
+    for pk in picks {
+        pk.from = pk.from.take().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        pk.to = pk.to.take().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        match (&pk.from, &pk.to) {
+            (Some(from), Some(to)) => {
+                let (in_s, out_s) = crate::sentences::resolve_range(db, pk.video_id, from, to)?;
+                pk.in_s = (in_s * 100.0).round() / 100.0;
+                pk.out_s = (out_s * 100.0).round() / 100.0;
+            }
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(ToolError::invalid(
+                    "clip needs both 'from' and 'to' sentence ids (or 'in_s' and 'out_s' in seconds)",
+                ));
+            }
+            (None, None) if pk.out_s <= pk.in_s => {
+                return Err(ToolError::invalid(
+                    "clip needs either 'from'/'to' sentence ids or 'in_s'/'out_s' with out_s > in_s",
+                ));
+            }
+            (None, None) => {}
+        }
+        let survey = match surveys.entry(pk.video_id) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(crate::clips::VideoSurvey::load(db, pk.video_id)?)
+            }
+        };
+        pk.visual = survey.visual(pk.in_s, pk.out_s);
+        if pk.speakers.is_empty() {
+            pk.speakers = survey.speakers(pk.in_s, pk.out_s);
+        }
+    }
+    Ok(())
 }
 
 async fn find_clip_candidates(ctx: &mut ToolCtx<'_>, a: Args<'_>) -> ToolResult {
@@ -98,20 +137,15 @@ async fn find_clip_candidates(ctx: &mut ToolCtx<'_>, a: Args<'_>) -> ToolResult 
 static CHECK_CLIPS: ToolSpec = ToolSpec {
     name: "check_clips",
     effect: Effect::Read,
-    summary: "Dry run of save_clips: builds each clip's script, runs the same repair passes `script import` uses \
-              (snap to segments, whole sentences, closing hold) and the script checker, plus overlaps between clips.",
-    when: "Before save_clips, on the picks you intend to keep. Saves nothing.",
-    returns: "{clips: [{video_id, in_s, out_s, visual, notes, issues, errors}]}: the repaired bounds and the issues.",
+    summary: "Dry run of save_clips: resolves `from`/`to` sentence ids (`sX`, `sX@word`), runs repair passes \
+              (sentences, closing hold, speech cuts) and checks story, framing, edges, duration and overlaps.",
+    when: "Before save_clips (or before finishing a clip run), on picks you plan to keep. Saves nothing.",
+    returns: "{clips: [{video_id, from?, to?, in_s, out_s, duration_s, visual, story, crop?, start?, end?, notes, issues}]}.",
     misuse: &[],
-    chains_with: &["save_clips with the same list once errors is 0."],
+    chains_with: &["save_clips with the same list once errors and warnings are addressed."],
     params: &[
         PROJECT,
-        ToolParam::new(
-            "clips",
-            T::List(&T::Object),
-            true,
-            "[{video_id, in_s, out_s, title?, hook?, quote?, why?, score?}]",
-        ),
+        ToolParam::new("clips", T::List(&T::Object), true, "[{video_id, from?, to?, in_s?, out_s?, title?, hook?, ...}]"),
         ToolParam::new("format", FORMAT, false, ""),
         ToolParam::new("min_s", T::Number, false, ""),
         ToolParam::new("max_s", T::Number, false, ""),
@@ -122,37 +156,101 @@ async fn check_clips(ctx: &mut ToolCtx<'_>, a: Args<'_>) -> ToolResult {
     let p = ctx.project_for(a)?;
     let opts = clip_options(a)?;
     let mut picks = clip_picks(a)?;
-    for pk in &mut picks {
-        pk.visual = crate::clips::VideoSurvey::load(ctx.db, pk.video_id)?.visual(pk.in_s, pk.out_s);
-    }
+    resolve_picks(ctx.db, &mut picks)?;
     let checked = crate::clips::check_clips(ctx.db, &p, &ctx.config.script, &picks, &opts)?;
-    let errors: usize =
-        checked.iter().map(|c| c.issues.iter().filter(|i| i.severity == script::IssueSeverity::Error).count()).sum();
-    Ok(ToolOutput::json(json!({ "clips": checked.iter().map(|c| json!({
-        "video_id": c.pick.video_id, "in_s": c.pick.in_s, "out_s": c.pick.out_s,
-        "visual": c.pick.visual, "notes": c.notes, "issues": c.issues,
-        "errors": c.issues.iter().filter(|i| i.severity == script::IssueSeverity::Error).count(),
-    })).collect::<Vec<_>>() }))
-    .summary(format!("{} clips, {errors} errors", checked.len())))
+    let mut total_errors = 0usize;
+    let mut total_warnings = 0usize;
+    let mut clips_json = Vec::with_capacity(checked.len());
+    let mut lines = String::new();
+    for (i, c) in checked.iter().enumerate() {
+        let reading = crate::readcut::read_cut(ctx.db, p.id, &c.script, &ctx.config.script, c.issues.clone())?;
+        let cr = reading.beats.first().and_then(|b| b.clips.first());
+        let story = cr.map(|x| x.story.clone()).unwrap_or_default();
+        let crop = cr.and_then(|x| x.crop.clone());
+        let start_detail = cr.and_then(|x| x.start.as_ref().map(|s| s.detail()));
+        let end_detail = cr.and_then(|x| x.end.as_ref().map(|e| e.detail()));
+        let errors = c.issues.iter().filter(|i| i.severity == script::IssueSeverity::Error).count();
+        let warnings = c.issues.iter().filter(|i| i.severity == script::IssueSeverity::Warning).count();
+        total_errors += errors;
+        total_warnings += warnings;
+        clips_json.push(json!({
+            "video_id": c.pick.video_id,
+            "from": c.pick.from,
+            "to": c.pick.to,
+            "in_s": c.pick.in_s,
+            "out_s": c.pick.out_s,
+            "duration_s": (c.pick.duration_s() * 100.0).round() / 100.0,
+            "visual": c.pick.visual,
+            "story": story,
+            "crop": crop,
+            "start": cr.and_then(|x| x.start),
+            "end": cr.and_then(|x| x.end),
+            "notes": c.notes,
+            "issues": c.issues,
+            "warnings": warnings,
+            "errors": errors,
+        }));
+        let span = match (&c.pick.from, &c.pick.to) {
+            (Some(f), Some(t)) => format!(" {f}–{t}"),
+            _ => String::new(),
+        };
+        lines.push_str(&format!(
+            "{}. v{}{} {}-{} ({:.1} s) · {} · {errors} errors, {warnings} warnings\n",
+            i + 1,
+            c.pick.video_id,
+            span,
+            crate::sentences::clock(c.pick.in_s),
+            crate::sentences::clock(c.pick.out_s),
+            c.pick.duration_s(),
+            c.pick.visual.summary(),
+        ));
+        if let (Some(s), Some(e)) = (&start_detail, &end_detail) {
+            lines.push_str(&format!("   edges: in {s} · out {e}\n"));
+        }
+        if !story.is_empty() {
+            lines.push_str(&format!("   story: {}\n", story.join(" · ")));
+        }
+        if let Some(cr_text) = &crop
+            && (cr_text.contains("face lost") || cr_text.contains("cut off") || cr_text.contains("letterboxed"))
+        {
+            lines.push_str(&format!("   crop: {cr_text}\n"));
+        }
+        if !c.notes.is_empty() {
+            lines.push_str(&format!("   repaired: {}\n", c.notes.join("; ")));
+        }
+        if !c.issues.is_empty() {
+            let iss: Vec<String> = c
+                .issues
+                .iter()
+                .map(|iss| {
+                    let sev = match iss.severity {
+                        script::IssueSeverity::Error => "error",
+                        script::IssueSeverity::Warning => "warning",
+                        script::IssueSeverity::Info => "info",
+                    };
+                    format!("[{sev}] {}", iss.message)
+                })
+                .collect();
+            lines.push_str(&format!("   issues: {}\n", iss.join("; ")));
+        }
+    }
+    Ok(ToolOutput::json(json!({ "clips": clips_json }))
+        .text(lines.trim_end().to_string())
+        .summary(format!("{} clips, {total_errors} errors, {total_warnings} warnings", checked.len())))
 }
 
 static SAVE_CLIPS: ToolSpec = ToolSpec {
     name: "save_clips",
     effect: Effect::Write,
-    summary: "Save clips you picked as a new clip set (one-clip scripts, kind 'clip', speech captions on, hook as \
-              the on-screen title, chosen frame size).",
-    when: "After check_clips. Same checks as check_clips; clips with errors are skipped.",
-    returns: "{set_id, saved, clips: [{script_id, title, in_s, out_s, issues}]}.",
+    summary: "Save picks as a new clip set (one-clip scripts, kind 'clip', captions on, hook title). \
+              Takes `from`/`to` sentence ids or `in_s`/`out_s`.",
+    when: "After check_clips; clips with errors are skipped. Refused in a clip run.",
+    returns: "{set_id, saved, clips: [{script_id, title, from?, to?, in_s, out_s, issues}]}.",
     misuse: &["Every call makes a new set: saving the same picks twice gives two sets."],
     chains_with: &["list_clip_sets to see the set with its live checks."],
     params: &[
         PROJECT,
-        ToolParam::new(
-            "clips",
-            T::List(&T::Object),
-            true,
-            "[{video_id, in_s, out_s, title, hook, quote?, why?, score?}]",
-        ),
+        ToolParam::new("clips", T::List(&T::Object), true, "[{video_id, from?, to?, in_s?, out_s?, title, hook, ...}]"),
         ToolParam::new("brief", T::String, false, ""),
         ToolParam::new("format", FORMAT, false, ""),
         ToolParam::new("min_s", T::Number, false, ""),
@@ -161,12 +259,15 @@ static SAVE_CLIPS: ToolSpec = ToolSpec {
 };
 
 async fn save_clips(ctx: &mut ToolCtx<'_>, a: Args<'_>) -> ToolResult {
+    if ctx.origin == super::Origin::ClipRun {
+        return Err(ToolError::invalid(
+            "save_clips cannot be called from inside a clip run: return your chosen clips as your final JSON answer instead",
+        ));
+    }
     let p = ctx.project_for(a)?;
     let opts = clip_options(a)?;
     let mut picks = clip_picks(a)?;
-    for pk in &mut picks {
-        pk.visual = crate::clips::VideoSurvey::load(ctx.db, pk.video_id)?.visual(pk.in_s, pk.out_s);
-    }
+    resolve_picks(ctx.db, &mut picks)?;
     let source = match ctx.origin {
         super::Origin::External => "mcp save_clips",
         super::Origin::ScriptChat => "script chat save_clips",
@@ -178,7 +279,12 @@ async fn save_clips(ctx: &mut ToolCtx<'_>, a: Args<'_>) -> ToolResult {
         "set_id": set.id,
         "saved": set.items.len(),
         "clips": checked.iter().map(|c| json!({
-            "script_id": c.script_id, "title": c.script.title, "in_s": c.pick.in_s, "out_s": c.pick.out_s,
+            "script_id": c.script_id,
+            "title": c.script.title,
+            "from": c.pick.from,
+            "to": c.pick.to,
+            "in_s": c.pick.in_s,
+            "out_s": c.pick.out_s,
             "issues": c.issues,
         })).collect::<Vec<_>>(),
     }))
@@ -188,15 +294,12 @@ async fn save_clips(ctx: &mut ToolCtx<'_>, a: Args<'_>) -> ToolResult {
 static GENERATE_CLIPS: ToolSpec = ToolSpec {
     name: "generate_clips",
     effect: Effect::Write,
-    summary: "Whole clip run: mine sentence-bounded candidates from the project's videos, score them with the worker \
-              agents in parallel (spread over every selected agent's free slots), let the orchestrator agent choose N \
-              and write hooks, check, and save a clip set of one-clip scripts (speech captions on, hook as the \
-              on-screen title).",
-    when: "When GhostReel's own models should do the picking. Slow: minutes. Agents default to the app's choice (see \
-           list_agents). Not available from inside a clip run or a script chat, which are model runs already.",
-    returns: "The set, each clip's script id and issues, and the run log with timings and which agent ran each job.",
+    summary: "Whole clip run: mine sentence-bounded candidates, score with worker agents in parallel, let the \
+              orchestrator pick N and write hooks, check, and save a clip set (captions on, hook title).",
+    when: "When GhostReel's models should pick. Slow (minutes). Refused inside a clip run or script chat.",
+    returns: "The set, each clip's script id and issues, and the run log with timings.",
     misuse: &[
-        "Called from inside a clip run or a script chat it is refused: pick with find_clip_candidates and save_clips.",
+        "Refused inside a clip run or script chat: pick with find_clip_candidates and save_clips.",
     ],
     chains_with: &["list_clip_sets for the saved set."],
     params: &[

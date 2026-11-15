@@ -293,10 +293,19 @@ pub fn build(db: &Db, video_id: i64, opts: &Options) -> Result<Manifest, Error> 
     // Each change of picture measured from the pixels — for a reading of a stretch, not a whole
     // video, where it would mean decoding a few seconds around every one of hundreds of changes.
     let measure_changes = spans.len() <= MEASURED_CHANGES;
+    let moments: Vec<(i64, f64)> = if measure_changes {
+        spans.iter().filter(|s| s.start > from + 0.05).map(|s| (video_id, s.start)).collect()
+    } else {
+        Vec::new()
+    };
+    let measured = crate::transitions::around_many(db, &moments);
     for s in &spans {
         let change = (measure_changes && s.start > from + 0.05)
             .then(|| {
-                crate::transitions::around(db, video_id, s.start)
+                measured
+                    .get(&(video_id, (s.start * 10.0).round() as i64))
+                    .cloned()
+                    .unwrap_or_default()
                     .into_iter()
                     .filter(|t| !t.is_cut())
                     .min_by(|a, b| ((a.start + a.end) / 2.0 - s.start).abs().total_cmp(&((b.start + b.end) / 2.0 - s.start).abs()))

@@ -410,6 +410,9 @@ pub async fn run_pipeline(
             if let Err(e) = run_speech_jobs(db, rt, opts, false, &mut tracker, &mut sink).await {
                 failed("speech", e, &mut sink);
             }
+            // The categories again, now on measured speech: what tells a party clip, full of
+            // talking, from an interview (`classify::can_be_interview`).
+            crate::classify::classify_videos(db, opts.project_id);
         }
         // After the embeddings it reads and the speakers its titles may name.
         if enabled("chapters") {
@@ -580,6 +583,11 @@ async fn run_jobs(
         let (done, failed) = run_transcribe_jobs(db, rt, opts, &mut tracker, &mut on_event).await?;
         summary.jobs_done += done;
         summary.jobs_failed += failed;
+        if !opts.cancelled() {
+            let (done, failed) = run_word_timings(db, rt, opts, &mut tracker, &mut on_event).await?;
+            summary.jobs_done += done;
+            summary.jobs_failed += failed;
+        }
     }
 
     if stage_active("frames") {
@@ -613,23 +621,7 @@ async fn run_jobs(
     }
 
     // Auto-classify indexed videos that do not have manual category overrides.
-    if let Some(pid) = opts.project_id {
-        if let Err(error) = crate::classify::classify_project_videos(db, pid) {
-            tracing::warn!(%error, "automatic classification failed");
-        }
-    } else if let Ok(mut st) =
-        db.conn.prepare("SELECT id FROM videos WHERE COALESCE(category_source, 'auto') <> 'manual'")
-        && let Ok(vids) = st.query_map([], |r| r.get::<_, i64>(0)).map(|m| m.filter_map(Result::ok).collect::<Vec<_>>())
-    {
-        for vid in vids {
-            if let Ok(res) = crate::classify::classify_video(db, vid)
-                && let Err(error) =
-                    db.set_video_category(vid, &res.category, res.confidence, "auto", res.tag.as_deref())
-            {
-                tracing::warn!(%error, video_id = vid, "automatic classification update failed");
-            }
-        }
-    }
+    crate::classify::classify_videos(db, opts.project_id);
 
     tracker.finish();
     tracker.save_rates(db)?;
@@ -1360,6 +1352,126 @@ async fn run_transcribe_jobs(
                     on_event(Event::StageUnavailable { stage: STAGE.into(), reason: e.to_string() });
                     break;
                 }
+            }
+        }
+        if duration > credited {
+            tracker.advance(phase, (duration - credited).round() as u64);
+        }
+        on_event(Event::Progress(tracker.snapshot(Some(path))));
+    }
+    transcriber.shutdown().await;
+    Ok((done, failed))
+}
+
+/// The meta key that records a video's transcript was given word timings ([`run_word_timings`]),
+/// or that the engine had none to give: either way it is not tried again.
+fn words_tried_key(video_id: i64) -> String {
+    format!("word_timings:{video_id}")
+}
+
+/// Videos transcribed before word timings were kept: a transcript in the index, no timed word,
+/// and not tried yet. `(video_id, path)`.
+fn untimed_transcripts(db: &Db, opts: &Options) -> Result<Vec<(i64, PathBuf)>, Error> {
+    let sql = "
+        SELECT v.id, (SELECT vf.path FROM video_files vf
+                       JOIN project_folders pf ON pf.folder_id = vf.folder_id
+                      WHERE vf.video_id = v.id AND (?1 IS NULL OR pf.project_id = ?1)
+                        AND NOT EXISTS (SELECT 1 FROM project_exclusions x WHERE x.project_id = pf.project_id AND x.video_id = vf.video_id AND x.role = 'removed')
+                      ORDER BY vf.id LIMIT 1) AS path
+          FROM videos v
+         WHERE COALESCE(v.has_audio, 1) = 1
+           AND EXISTS (SELECT 1 FROM jobs j WHERE j.video_id = v.id AND j.stage = 'transcribe' AND j.state = 'done')
+           AND EXISTS (SELECT 1 FROM transcript_segments s WHERE s.video_id = v.id)
+           AND NOT EXISTS (SELECT 1 FROM transcript_words w JOIN transcript_segments s ON s.id = w.segment_id
+                            WHERE s.video_id = v.id)
+           AND NOT EXISTS (SELECT 1 FROM meta m WHERE m.key = 'word_timings:' || v.id)
+         ORDER BY v.id";
+    let mut st = db.conn.prepare(sql)?;
+    let rows = st.query_map(params![opts.project_id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?)))?;
+    Ok(rows.filter_map(Result::ok).filter_map(|(id, path)| path.map(|p| (id, PathBuf::from(p)))).collect())
+}
+
+/// Give word timings to transcripts made before they were kept. Without them every sentence edge
+/// inside a Whisper segment is a guess by letters, and a guess that lands on the pause after an
+/// unwritten "uh, the, uh" ends the sentence there: the cut ends on the filler. The audio is heard
+/// again for its words only; the transcript's text and segments stay as they are (the words are
+/// matched to them, [`crate::sentence_split::align`]) and the sentences are split again, keeping
+/// their chapters. Once per video, with [`Runtime::word_stt`].
+async fn run_word_timings(
+    db: &mut Db,
+    rt: &Runtime,
+    opts: &Options,
+    tracker: &mut Tracker,
+    on_event: &mut impl FnMut(Event),
+) -> Result<(usize, usize), Error> {
+    const STAGE: &str = "transcribe";
+    let Some(engine) = &rt.word_stt else { return Ok((0, 0)) };
+    let jobs = untimed_transcripts(db, opts)?;
+    if jobs.is_empty() {
+        return Ok((0, 0));
+    }
+    let phase = "transcribe_local";
+    let durations: HashMap<i64, f64> = {
+        let mut st = db.conn.prepare("SELECT id, COALESCE(duration_s, 0) FROM videos")?;
+        st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?
+    };
+    let total: f64 = jobs.iter().map(|(id, _)| durations.get(id).copied().unwrap_or(0.0)).sum();
+    tracker.set_total(phase, total.ceil() as u64);
+    tracker.start(phase);
+    on_event(Event::Progress(tracker.snapshot(None)));
+
+    let (mut done, mut failed) = (0, 0);
+    let mut transcriber = stt::Transcriber::new(engine);
+    for (video_id, path) in jobs {
+        if opts.cancelled() {
+            break;
+        }
+        let duration = durations.get(&video_id).copied().unwrap_or(0.0);
+        on_event(Event::JobStarted { video_id, stage: STAGE.into(), path: path.clone() });
+        let prompt = db.glossary_for_video(video_id).unwrap_or_default().whisper_prompt();
+        let mut credited = 0.0f64;
+        let result = crate::cancel::race(
+            opts.cancel.as_ref(),
+            transcriber.transcribe(
+                &rt.ffmpeg,
+                &path,
+                duration,
+                |secs| {
+                    let secs = secs.min(duration);
+                    if secs > credited {
+                        tracker.advance(phase, (secs - credited).round() as u64);
+                        credited = secs.round();
+                    }
+                    if tracker.should_emit() {
+                        on_event(Event::Progress(tracker.snapshot(Some(path.clone()))));
+                    }
+                },
+                prompt.as_deref(),
+            ),
+        )
+        .await;
+        let Ok(result) = result else { break };
+        match result {
+            Ok(t) => {
+                let segments: Vec<(i64, f64, f64)> = db
+                    .conn
+                    .prepare("SELECT id, start_s, end_s FROM transcript_segments WHERE video_id = ?1 ORDER BY start_s, id")?
+                    .query_map([video_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                    .collect::<Result<_, _>>()?;
+                let stored = crate::sentences::store_words(db, &segments, &t.words)?;
+                db.conn.execute(
+                    "INSERT OR REPLACE INTO meta(key, value) VALUES (?1, ?2)",
+                    params![words_tried_key(video_id), stored.to_string()],
+                )?;
+                if stored > 0 {
+                    crate::sentence_split::rebuild(db, video_id)?;
+                }
+                on_event(Event::JobDone { video_id, stage: STAGE.into() });
+                done += 1;
+            }
+            Err(e) => {
+                on_event(Event::JobFailed { video_id, stage: STAGE.into(), error: format!("word timings: {e}") });
+                failed += 1;
             }
         }
         if duration > credited {
@@ -3630,6 +3742,7 @@ echo '{"streams":[{"codec_type":"video","codec_name":"h264","width":1920,"height
             describe_concurrency: 1,
             ffprobe: ffprobe.to_path_buf(),
             stt: SttSetup::Unavailable("not configured in this test".into()),
+            word_stt: None,
             data_dir: std::env::temp_dir(),
             frames: None,
             vision: VisionSetup::Unavailable("not configured in this test".into()),
@@ -4366,6 +4479,7 @@ echo '{"streams":[{"codec_type":"video","codec_name":"h264","width":1920,"height
             ffmpeg: "ffmpeg".into(),
             ffprobe: "ffprobe".into(),
             stt: SttSetup::Unavailable("GhostPen down".into()),
+            word_stt: None,
             data_dir: tmp.path().join("data"),
             frames: None,
             vision: VisionSetup::Unavailable("not configured in this test".into()),
@@ -4386,6 +4500,7 @@ echo '{"streams":[{"codec_type":"video","codec_name":"h264","width":1920,"height
         std::fs::write(&model, b"m").unwrap();
         let local = Runtime {
             stt: SttSetup::Ready(Engine::Local { asr_bin: asr, model, language: "auto".into() }),
+            word_stt: None,
             frames: Some(crate::frames::FrameOptions::default()),
             ..unavailable
         };

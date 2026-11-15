@@ -83,7 +83,7 @@ pub struct SentenceRef {
 }
 
 impl SentenceRef {
-    /// `s412`, `S412` or `412`, each optionally followed by `@3`.
+    /// `s412` or `S412`, optionally followed by `@3`.
     pub fn parse(text: &str) -> Result<Self, SentenceError> {
         let malformed = || SentenceError::Malformed { text: text.to_string() };
         let t = text.trim();
@@ -91,7 +91,7 @@ impl SentenceRef {
             Some((a, b)) => (a, Some(b)),
             None => (t, None),
         };
-        let digits = id_part.strip_prefix(['s', 'S']).unwrap_or(id_part);
+        let digits = id_part.strip_prefix(['s', 'S']).ok_or_else(malformed)?;
         let sentence_id: i64 = digits.parse().map_err(|_| malformed())?;
         let word = match word_part {
             None => None,
@@ -117,6 +117,79 @@ impl std::fmt::Display for SentenceRef {
             Some(w) => write!(f, "s{}@{w}", self.sentence_id),
             None => write!(f, "s{}", self.sentence_id),
         }
+    }
+}
+
+/// One end of a transcript or manifest range (`from`/`to`): either a sentence id (`s412`,
+/// `S412@3`) or an explicit time in seconds (`15.75`, `412s`, or a JSON number). Bare integer
+/// strings like `"412"` are rejected as ambiguous because the caller could mean sentence `s412` or
+/// `412` seconds.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum EdgeRef {
+    Sentence(SentenceRef),
+    Seconds(f64),
+}
+
+impl EdgeRef {
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let t = text.trim();
+        if t.is_empty() {
+            return Err("empty range edge: write a sentence id like 's412', or seconds like '412s' or '412.0'".into());
+        }
+        if t.starts_with(['s', 'S']) {
+            return SentenceRef::parse(t).map(EdgeRef::Sentence).map_err(|e| e.to_string());
+        }
+        if let Some(rest) = t.strip_suffix(['s', 'S']) {
+            let secs: f64 = rest
+                .trim()
+                .parse()
+                .map_err(|_| format!("'{t}' is not a valid time in seconds: write e.g. 's412', '412s', or '412.0'"))?;
+            if !secs.is_finite() || secs < 0.0 {
+                return Err(format!(
+                    "'{t}' is not a finite non-negative time in seconds: write e.g. 's412', '412s', or '412.0'"
+                ));
+            }
+            return Ok(EdgeRef::Seconds(secs));
+        }
+        if !t.contains('.') {
+            if let Ok(n) = t.parse::<i64>() {
+                if n >= 0 {
+                    return Err(format!(
+                        "'{t}' is ambiguous: write 's{n}' for a sentence id, or '{n}s' / '{n}.0' for seconds"
+                    ));
+                }
+                return Err(format!(
+                    "'{t}' is not a valid sentence id or non-negative time: write 's412' for a sentence id, or '412s' / '412.0' for seconds"
+                ));
+            }
+            return Err(format!(
+                "'{t}' is neither a sentence id nor seconds: write 's412' for a sentence id, or '412s' / '412.0' for seconds"
+            ));
+        }
+        let secs: f64 = t.parse().map_err(|_| {
+            format!(
+                "'{t}' is not a valid time in seconds: write 's412' for a sentence id, or '412s' / '412.0' for seconds"
+            )
+        })?;
+        if !secs.is_finite() || secs < 0.0 {
+            return Err(format!(
+                "'{t}' is not a finite non-negative time in seconds: write e.g. 's412', '412s', or '412.0'"
+            ));
+        }
+        Ok(EdgeRef::Seconds(secs))
+    }
+
+    pub fn parse_value(v: &serde_json::Value) -> Result<Self, String> {
+        if let Some(secs) = v.as_f64() {
+            if !secs.is_finite() || secs < 0.0 {
+                return Err(format!("{secs} is not a finite non-negative time in seconds"));
+            }
+            return Ok(EdgeRef::Seconds(secs));
+        }
+        if let Some(s) = v.as_str() {
+            return Self::parse(s);
+        }
+        Err(format!("invalid range edge {v}: write a sentence id like 's412' or seconds like 15.75"))
     }
 }
 
@@ -285,10 +358,130 @@ pub fn resolve_range(db: &Db, video_id: i64, from: &str, to: &str) -> Result<(f6
     Ok((start, end))
 }
 
+/// A clip's or bed's `from`/`to`, each a sentence id or seconds ([`EdgeRef`]): the seconds they
+/// cover, and whether either was written in seconds. Every tool that reads a range takes seconds
+/// there ("0.41", "412s", 15.75); a script's clips do too, so a writer that copied times from a
+/// manifest gets its cut instead of a round spent on "not a sentence id".
+fn resolve_edges(db: &Db, video_id: i64, from: &str, to: &str) -> Result<(f64, f64, bool), SentenceError> {
+    match (EdgeRef::parse(from), EdgeRef::parse(to)) {
+        (Ok(EdgeRef::Sentence(_)), Ok(EdgeRef::Sentence(_))) => {
+            resolve_range(db, video_id, from, to).map(|(a, b)| (a, b, false))
+        }
+        (Ok(a), Ok(b)) => {
+            let _ = crate::sentence_split::ensure(db, video_id);
+            let at = |e: EdgeRef, edge: Edge| match e {
+                EdgeRef::Seconds(s) => Ok(s),
+                EdgeRef::Sentence(r) => seconds(db, video_id, &r, edge),
+            };
+            let (start, end) = (at(a, Edge::Start)?, at(b, Edge::End)?);
+            if start >= end {
+                return Err(SentenceError::Reversed { from: from.to_string(), to: to.to_string() });
+            }
+            Ok((start, end, true))
+        }
+        // Neither a sentence nor seconds: the sentence parser says how to write it.
+        _ => resolve_range(db, video_id, from, to).map(|(a, b)| (a, b, false)),
+    }
+}
+
 /// Resolve every clip and bed of `script` that was written with sentences to seconds, keeping the
 /// range on the item. Items written with seconds are left as they are. Returns how many were
 /// resolved; the first failure names the beat and clip.
+/// The video and bounds `(video_id, start_s, end_s)` of a sentence id (ids are unique across the library).
+fn sentence_info(db: &Db, text: &str) -> Option<(i64, f64, f64)> {
+    let r = SentenceRef::parse(text).ok()?;
+    db.conn
+        .query_row("SELECT video_id, start_s, end_s FROM transcript_sentences WHERE id = ?1", [r.sentence_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .ok()
+}
+
+/// How far beyond the sentence's own bounds a resolved clip's trimmed/padded seconds may sit and
+/// still clearly belong to that sentence span rather than another video's timeline (s).
+const SPAN_TOL_S: f64 = 0.5;
+
+fn outside_span(in_s: f64, out_s: f64, span_start: f64, span_end: f64) -> bool {
+    in_s < span_start - SPAN_TOL_S || out_s > span_end + SPAN_TOL_S
+}
+
+/// Clips and beds whose sentences belong to another video than the one they name. A sentence id is
+/// unique across the library, so the video it is in is not in doubt: a clip with sound takes that
+/// video (re-resolved from its sentences); a muted clip with its own seconds keeps its pictures and
+/// loses the stray range (it was b-roll, labelled with the line it plays under). An already-resolved
+/// clip or bed whose seconds already sit inside the resolved sentence span is left alone so an old
+/// saved script is never silently hijacked if an upstream id changes. Returns a note for each, so
+/// the editor learns what was meant — a small model mixed these up in two drafts in a row, and each
+/// time the whole draft was refused for one clip.
+pub fn correct_sentence_videos(db: &Db, script: &mut Script) -> Vec<String> {
+    let mut notes = Vec::new();
+    let owner_and_span = |r: &SentenceRange| match (sentence_info(db, &r.from), sentence_info(db, &r.to)) {
+        (Some((va, sa, ea)), Some((vb, sb, eb))) if va == vb => Some((va, sa.min(sb), ea.max(eb))),
+        _ => None,
+    };
+    for beat in &mut script.beats {
+        for (i, clip) in beat.clips.iter_mut().enumerate() {
+            let Some((v, span_start, span_end)) =
+                clip.sentences.as_ref().and_then(owner_and_span).filter(|(v, _, _)| *v != clip.video_id)
+            else {
+                continue;
+            };
+            if !clip.is_unresolved() && !outside_span(clip.in_s, clip.out_s, span_start, span_end) {
+                continue;
+            }
+            let range = clip.sentences.as_ref().map(|r| format!("{}..{}", r.from, r.to)).unwrap_or_default();
+            if clip.audio == crate::script::Audio::Mute && clip.out_s > clip.in_s {
+                notes.push(format!(
+                    "beat {} clip {}: muted, so kept its pictures of video #{} {:.1}-{:.1} s and dropped the sentences \
+                     {range}, which are in video #{v}",
+                    beat.id,
+                    i + 1,
+                    clip.video_id,
+                    clip.in_s,
+                    clip.out_s
+                ));
+                clip.sentences = None;
+            } else {
+                notes.push(format!(
+                    "beat {} clip {}: sentences {range} are in video #{v}, not #{}: the clip now plays video #{v}",
+                    beat.id,
+                    i + 1,
+                    clip.video_id
+                ));
+                clip.video_id = v;
+                // Seconds written for the other video mean nothing here: the sentences decide.
+                clip.in_s = 0.0;
+                clip.out_s = 0.0;
+            }
+        }
+        if let Some(bed) = beat.bed.as_mut()
+            && let Some((v, span_start, span_end)) =
+                bed.sentences.as_ref().and_then(owner_and_span).filter(|(v, _, _)| *v != bed.video_id)
+            && (bed.is_unresolved() || outside_span(bed.in_s, bed.out_s, span_start, span_end))
+        {
+            notes.push(format!(
+                "beat {} bed: its sentences are in video #{v}, not #{}: it now plays video #{v}",
+                beat.id, bed.video_id
+            ));
+            bed.video_id = v;
+            bed.in_s = 0.0;
+            bed.out_s = 0.0;
+        }
+    }
+    notes
+}
+
+/// Resolve every clip and bed written with sentence ids to seconds, after correcting the ones that
+/// name another video than their sentences ([`correct_sentence_videos`]). Returns how many were
+/// resolved; [`resolve_script_noting`] also returns what the correction did.
 pub fn resolve_script(db: &Db, script: &mut Script) -> Result<usize, SentenceError> {
+    resolve_script_noting(db, script).map(|(resolved, _)| resolved)
+}
+
+/// [`resolve_script`], with a note for each clip or bed whose video was corrected, so a caller can
+/// tell the editor what was meant instead of changing its cut silently.
+pub fn resolve_script_noting(db: &Db, script: &mut Script) -> Result<(usize, Vec<String>), SentenceError> {
+    let mut notes = correct_sentence_videos(db, script);
     let mut resolved = 0;
     for beat in &mut script.beats {
         for (i, clip) in beat.clips.iter_mut().enumerate() {
@@ -296,24 +489,41 @@ pub fn resolve_script(db: &Db, script: &mut Script) -> Result<usize, SentenceErr
                 continue;
             }
             let range: &SentenceRange = clip.sentences.as_ref().expect("unresolved clips have a range");
-            let (a, b) = resolve_range(db, clip.video_id, &range.from, &range.to).map_err(|e| SentenceError::At {
-                place: format!("beat {} clip {}", beat.id, i + 1),
-                error: Box::new(e),
+            let (a, b, in_seconds) = resolve_edges(db, clip.video_id, &range.from, &range.to).map_err(|e| {
+                SentenceError::At { place: format!("beat {} clip {}", beat.id, i + 1), error: Box::new(e) }
             })?;
             clip.in_s = a;
             clip.out_s = b;
+            if in_seconds {
+                notes.push(seconds_note(&format!("beat {} clip {}", beat.id, i + 1), range, a, b));
+                // Seconds are a range like any in_s/out_s: the finish puts it on the sentences.
+                clip.sentences = None;
+            }
             resolved += 1;
         }
         if let Some(bed) = beat.bed.as_mut().filter(|b| b.is_unresolved()) {
             let range: &SentenceRange = bed.sentences.as_ref().expect("unresolved beds have a range");
-            let (a, b) = resolve_range(db, bed.video_id, &range.from, &range.to)
+            let (a, b, in_seconds) = resolve_edges(db, bed.video_id, &range.from, &range.to)
                 .map_err(|e| SentenceError::At { place: format!("beat {} bed", beat.id), error: Box::new(e) })?;
             bed.in_s = a;
             bed.out_s = b;
+            if in_seconds {
+                notes.push(seconds_note(&format!("beat {} bed", beat.id), range, a, b));
+                bed.sentences = None;
+            }
             resolved += 1;
         }
     }
-    Ok(resolved)
+    Ok((resolved, notes))
+}
+
+/// What a range written in seconds was taken as, for the editor.
+fn seconds_note(place: &str, range: &SentenceRange, a: f64, b: f64) -> String {
+    format!(
+        "{place}: from/to \"{}\"–\"{}\" were read as seconds ({a:.2}–{b:.2} s); sentence ids (s412) cut on whole \
+         sentences",
+        range.from, range.to
+    )
 }
 
 /// Parse script JSON the way [`Script::parse_for_project`] does, then resolve its sentence ranges
@@ -369,6 +579,85 @@ pub fn store_words(db: &Db, segments: &[(i64, f64, f64)], words: &[Word]) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_clip_naming_the_wrong_video_takes_its_sentences_video_unless_it_is_muted_b_roll() {
+        let db = Db::open_in_memory().unwrap();
+        for v in [1, 2] {
+            db.conn
+                .execute(
+                    "INSERT INTO videos(id, content_hash, size, duration_s) VALUES (?1, ?2, 1, 60.0)",
+                    rusqlite::params![v, format!("h{v}")],
+                )
+                .unwrap();
+        }
+        db.conn
+            .execute(
+                "INSERT INTO transcript_segments(id, video_id, start_s, end_s, text) VALUES
+                 (100, 1, 2.0, 6.0, 'What I love about Westlake is the community.')",
+                [],
+            )
+            .unwrap();
+        crate::sentence_split::mirror_segments(&db, 1);
+        let mut s: Script = serde_json::from_value(serde_json::json!({
+            "title": "t",
+            "beats": [{ "id": "b1", "purpose": "p", "clips": [
+                { "video_id": 2, "from": "s100", "to": "s100", "audio": "source" },
+                { "video_id": 2, "from": "s100", "to": "s100", "audio": "mute", "in_s": 0.0, "out_s": 6.6 }
+            ] }]
+        }))
+        .unwrap();
+        let notes = correct_sentence_videos(&db, &mut s);
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        let (spoken, broll) = (&s.beats[0].clips[0], &s.beats[0].clips[1]);
+        assert_eq!(spoken.video_id, 1, "the line is Mary Ellen's: her video plays");
+        assert_eq!(
+            (broll.video_id, broll.sentences.is_none(), broll.out_s),
+            (2, true, 6.6),
+            "the b-roll keeps its pictures"
+        );
+        // And it resolves now instead of refusing the whole script.
+        resolve_script(&db, &mut s).unwrap();
+        assert!(s.beats[0].clips[0].in_s >= 1.9 && s.beats[0].clips[0].out_s <= 6.1, "{:?}", s.beats[0].clips[0]);
+    }
+
+    /// Resolving is where a chat answer's sentences are turned into seconds, so the correction's
+    /// notes have to come out of it: they used to be dropped there, and the editor never learned
+    /// that its clip now plays another video.
+    #[test]
+    fn resolving_reports_the_video_corrections_it_made() {
+        let db = Db::open_in_memory().unwrap();
+        for v in [1, 2] {
+            db.conn
+                .execute(
+                    "INSERT INTO videos(id, content_hash, size, duration_s) VALUES (?1, ?2, 1, 60.0)",
+                    rusqlite::params![v, format!("h{v}")],
+                )
+                .unwrap();
+        }
+        db.conn
+            .execute(
+                "INSERT INTO transcript_segments(id, video_id, start_s, end_s, text) VALUES
+                 (100, 1, 2.0, 6.0, 'What I love about Westlake is the community.')",
+                [],
+            )
+            .unwrap();
+        crate::sentence_split::mirror_segments(&db, 1);
+        let mut s: Script = serde_json::from_value(serde_json::json!({
+            "title": "t",
+            "beats": [{ "id": "b1", "purpose": "p", "clips": [
+                { "video_id": 2, "from": "s100", "to": "s100", "audio": "source" }
+            ] }]
+        }))
+        .unwrap();
+        let (resolved, notes) = resolve_script_noting(&db, &mut s).unwrap();
+        assert_eq!(resolved, 1);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("video #1"), "{notes:?}");
+        assert_eq!(s.beats[0].clips[0].video_id, 1);
+        // A second pass finds nothing left to correct, and says nothing.
+        assert_eq!(resolve_script_noting(&db, &mut s).unwrap(), (0, Vec::new()));
+    }
     use crate::speech::SpeechRegion;
 
     fn db_with_two_videos() -> Db {
@@ -401,9 +690,7 @@ mod tests {
                 .unwrap();
         }
         // Built by the current splitting rules, so nothing splits them again under the test.
-        db.conn
-            .execute("UPDATE videos SET sentence_split = ?1", [crate::sentence_split::SPLIT_VERSION])
-            .unwrap();
+        db.conn.execute("UPDATE videos SET sentence_split = ?1", [crate::sentence_split::SPLIT_VERSION]).unwrap();
         db
     }
 
@@ -411,8 +698,7 @@ mod tests {
     fn ids_parse_in_every_spelling_and_say_what_is_wrong_otherwise() {
         assert_eq!(SentenceRef::parse("s412").unwrap(), SentenceRef { sentence_id: 412, word: None });
         assert_eq!(SentenceRef::parse(" S412@3 ").unwrap(), SentenceRef { sentence_id: 412, word: Some(3) });
-        assert_eq!(SentenceRef::parse("412").unwrap().sentence_id, 412);
-        for bad in ["", "s", "sx1", "s0", "s-4", "s412@0", "s412@x", "412.5"] {
+        for bad in ["", "s", "sx1", "s0", "s-4", "s412@0", "s412@x", "412", "412.5"] {
             assert!(matches!(SentenceRef::parse(bad), Err(SentenceError::Malformed { .. })), "{bad}");
         }
         assert_eq!(format_id(412), "s412");
@@ -543,12 +829,106 @@ mod tests {
             "title": "t",
             "beats": [{"id": "hook", "purpose": "p", "clips": [
                 {"video_id": 1, "from": "s412", "to": "s413"},
-                {"video_id": 1, "from": "s500", "to": "s500"}
+                {"video_id": 1, "from": "s99999", "to": "s99999"}
             ]}]
         }))
         .unwrap();
         let err = resolve_script(&db, &mut script).unwrap_err();
         let text = err.to_string();
-        assert!(text.starts_with("beat hook clip 2:") && text.contains("video #2"), "{text}");
+        assert!(text.starts_with("beat hook clip 2:") && text.contains("s99999"), "{text}");
+    }
+
+    /// The 9B wrote every clip's from/to as seconds copied from a manifest ("0.41", "8.16"): the
+    /// whole answer came back "'0.41' is not a sentence id" and a review round was spent on it.
+    /// Seconds are taken as seconds, with a note; a sentence on one edge still resolves; and a bare
+    /// integer stays ambiguous.
+    #[test]
+    fn a_clip_written_in_seconds_resolves_to_those_seconds() {
+        let db = db_with_two_videos();
+        let mut script: Script = serde_json::from_value(serde_json::json!({
+            "title": "t",
+            "beats": [{"id": "b0", "purpose": "p", "clips": [
+                {"video_id": 1, "from": "12.41", "to": "17.9"},
+                {"video_id": 1, "from": "s412", "to": "20s"}
+            ], "bed": {"video_id": 1, "from": "30.0", "to": "33.5"}}]
+        }))
+        .unwrap();
+        let (resolved, notes) = resolve_script_noting(&db, &mut script).unwrap();
+        assert_eq!(resolved, 3);
+        let clips = &script.beats[0].clips;
+        assert_eq!((clips[0].in_s, clips[0].out_s), (12.41, 17.9));
+        assert!(clips[0].sentences.is_none(), "a seconds range is a plain range");
+        assert_eq!((clips[1].in_s, clips[1].out_s), (12.0, 20.0));
+        let bed = script.beats[0].bed.as_ref().unwrap();
+        assert_eq!((bed.in_s, bed.out_s), (30.0, 33.5));
+        assert_eq!(notes.len(), 3, "{notes:?}");
+        assert!(notes[0].contains("read as seconds"), "{notes:?}");
+
+        let mut ambiguous: Script = serde_json::from_value(serde_json::json!({
+            "title": "t", "beats": [{"id": "b0", "purpose": "p", "clips": [{"video_id": 1, "from": "412", "to": "413"}]}]
+        }))
+        .unwrap();
+        assert!(resolve_script(&db, &mut ambiguous).is_err());
+    }
+
+    #[test]
+    fn correct_sentence_videos_leaves_resolved_clips_inside_span_alone() {
+        let db = Db::open_in_memory().unwrap();
+        for v in [1, 2] {
+            db.conn
+                .execute(
+                    "INSERT INTO videos(id, content_hash, size, duration_s) VALUES (?1, ?2, 1, 60.0)",
+                    params![v, format!("h{v}")],
+                )
+                .unwrap();
+        }
+        db.conn
+            .execute(
+                "INSERT INTO transcript_segments(id, video_id, start_s, end_s, text) VALUES
+                 (100, 1, 2.0, 6.0, 'Inside span.')",
+                [],
+            )
+            .unwrap();
+        crate::sentence_split::mirror_segments(&db, 1);
+        let mut s: Script = serde_json::from_value(serde_json::json!({
+            "title": "t",
+            "beats": [{ "id": "b1", "purpose": "p", "clips": [
+                // Resolved and inside s100's span (2.0..6.0): must NOT be rewritten to video 1.
+                { "video_id": 2, "in_s": 2.0, "out_s": 6.0, "from": "s100", "to": "s100", "audio": "source" },
+                // Resolved but outside s100's span (20.0..25.0): corrected to video 1.
+                { "video_id": 2, "in_s": 20.0, "out_s": 25.0, "from": "s100", "to": "s100", "audio": "source" },
+                // Unresolved: corrected to video 1.
+                { "video_id": 2, "from": "s100", "to": "s100", "audio": "source" }
+            ] }]
+        }))
+        .unwrap();
+        let notes = correct_sentence_videos(&db, &mut s);
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        assert_eq!(s.beats[0].clips[0].video_id, 2);
+        assert_eq!((s.beats[0].clips[0].in_s, s.beats[0].clips[0].out_s), (2.0, 6.0));
+        assert_eq!(s.beats[0].clips[1].video_id, 1);
+        assert_eq!(s.beats[0].clips[2].video_id, 1);
+    }
+
+    #[test]
+    fn sentence_ref_rejects_bare_integers() {
+        assert!(matches!(SentenceRef::parse("412"), Err(SentenceError::Malformed { .. })));
+    }
+
+    #[test]
+    fn edge_ref_parses_sentences_and_seconds_and_rejects_ambiguous_or_non_finite() {
+        assert_eq!(EdgeRef::parse("s412").unwrap(), EdgeRef::Sentence(SentenceRef { sentence_id: 412, word: None }));
+        assert_eq!(
+            EdgeRef::parse("S412@3").unwrap(),
+            EdgeRef::Sentence(SentenceRef { sentence_id: 412, word: Some(3) })
+        );
+        assert_eq!(EdgeRef::parse("412s").unwrap(), EdgeRef::Seconds(412.0));
+        assert_eq!(EdgeRef::parse("15.75").unwrap(), EdgeRef::Seconds(15.75));
+        assert_eq!(EdgeRef::parse_value(&serde_json::json!(412)).unwrap(), EdgeRef::Seconds(412.0));
+        let ambig = EdgeRef::parse("412").unwrap_err();
+        assert!(ambig.contains("s412") && ambig.contains("412s") && ambig.contains("412.0"), "{ambig}");
+        for bad in ["", "-5", "-5.0", "-5s", "NaN", "inf", "-inf", "NaNs", "infs", "1e309.0"] {
+            assert!(EdgeRef::parse(bad).is_err(), "{bad}");
+        }
     }
 }

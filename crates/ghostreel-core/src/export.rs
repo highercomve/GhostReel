@@ -174,7 +174,7 @@ mod tests {
                 narration: Some("Hello".into()),
                 on_screen_text: Some("Title".into()),
                 title_layout: None,
-                clips: vec![script::ScriptClip { exact: false,
+                clips: vec![script::ScriptClip { exact: false, gain_db: None,
                     sentences: None,
                     framing: None,
                     video_id: 1,

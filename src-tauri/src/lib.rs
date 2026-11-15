@@ -1793,18 +1793,37 @@ async fn save_script(
 ) -> CmdResult<SaveScriptView> {
     agents::check_selection(script.agents.as_ref())?;
     let db = open_db()?;
-    // A clip the editor wrote with sentence ids has no seconds yet.
-    ghostreel_core::sentences::resolve_script(&db, &mut script).map_err(|e| e.to_string())?;
-    let _ = ghostreel_core::script::snap_to_segments(&db, &mut script).map_err(err)?;
-    // The deterministic framing work (a vertical clip off a screen share, the closing hold on a
-    // face), the same pass clip runs and imports get; what it did comes back as notes.
-    let cfg = paths().map(|p| Config::load(&p.config_file).unwrap_or_default().script).unwrap_or_default();
-    let min = ghostreel_core::clips::length_range(&db, project_id, &script.title).map(|r| r.0);
-    let notes = ghostreel_core::script_fix::repair_framing(&db, &mut script, cfg.speech_overrun_s, min);
+    let notes = prepare_app_save(&db, &mut script)?;
     let mut issues = live_issues(&db, project_id, &script)?;
     queue_needed_stages(&app, &queue, project_id, &mut issues).await;
     let script_id = ghostreel_core::script::save_version(&db, project_id, &script, session_id).map_err(err)?;
     Ok(SaveScriptView { script_id, issues, notes, script })
+}
+
+/// The app's own save: a person's edit, kept exactly as they made it. Sentence ids are resolved to
+/// seconds (with a note for each clip whose video they correct), and nothing else: no edge they set
+/// moves and no clip is dropped or joined. The finishing chain (`finish::run`) is for a model's
+/// draft; what it would change here comes back from the check as issues with their fixes, for the
+/// person to apply (`apply_script_fix`).
+fn prepare_app_save(db: &Db, script: &mut ghostreel_core::script::Script) -> CmdResult<Vec<String>> {
+    let (_, notes) = ghostreel_core::sentences::resolve_script_noting(db, script).map_err(|e| e.to_string())?;
+    Ok(notes)
+}
+
+/// Bring back a stored version as the newest version of its cut, exactly as it was stored: a restore
+/// is not an edit, so nothing is resolved or finished again. Returns it with today's check.
+#[tauri::command]
+async fn restore_script_version(
+    app: AppHandle,
+    queue: State<'_, queue::Queue>,
+    script_id: i64,
+) -> CmdResult<SaveScriptView> {
+    let db = open_db()?;
+    let new_id = ghostreel_core::script::restore_version(&db, script_id).map_err(err)?;
+    let stored = ghostreel_core::script::load(&db, new_id).map_err(err)?;
+    let mut issues = live_issues(&db, stored.project_id, &stored.script)?;
+    queue_needed_stages(&app, &queue, stored.project_id, &mut issues).await;
+    Ok(SaveScriptView { script_id: new_id, issues, notes: Vec::new(), script: stored.script })
 }
 
 /// Move one script version to the trash (restorable; recorded as a run).
@@ -2106,6 +2125,7 @@ pub fn run() {
             check_script,
             apply_script_fix,
             save_script,
+            restore_script_version,
             delete_script,
             delete_script_cut,
             script_captions,
@@ -2129,4 +2149,82 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running GhostReel");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One video with two sentences on the microphone, in project `P`.
+    fn library() -> (Db, i64) {
+        let db = Db::open_in_memory().unwrap();
+        let project = db.create_project(&NewProject::named("P")).unwrap();
+        db.conn.execute("INSERT INTO videos(id, content_hash, size, duration_s) VALUES (1, 'h', 1, 60.0)", []).unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO transcript_segments(video_id, start_s, end_s, text, off_mic) VALUES
+                 (1, 1.0, 6.0, 'Every event we have come to, we walked away with a new friend.', 0),
+                 (1, 7.0, 12.0, 'We love this hotel and the people who come here every month.', 0)",
+                [],
+            )
+            .unwrap();
+        ghostreel_core::sentence_split::ensure(&db, 1).unwrap();
+        (db, project.id)
+    }
+
+    /// The editor's Save is a person's edit: an out point dragged to the middle of a sentence and
+    /// the same footage used twice on purpose are kept as they are. It used to go through the
+    /// finishing chain for a model's draft, which moved the edge back out to the sentence's end and
+    /// dropped the repeat. Sentence ids are still resolved, with the note.
+    #[test]
+    fn the_apps_save_keeps_a_hand_edit_exactly() {
+        let (db, _) = library();
+        let first: i64 = db
+            .conn
+            .query_row("SELECT id FROM transcript_sentences WHERE video_id = 1 ORDER BY start_s LIMIT 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let mut script: ghostreel_core::script::Script = serde_json::from_value(serde_json::json!({
+            "title": "t",
+            "beats": [
+                { "id": "b1", "purpose": "p", "narration": "",
+                  "clips": [{ "video_id": 1, "in_s": 1.0, "out_s": 3.2, "audio": "source" }] },
+                { "id": "b2", "purpose": "p", "narration": "",
+                  "clips": [{ "video_id": 1, "in_s": 1.0, "out_s": 3.2, "audio": "source" }] },
+                { "id": "b3", "purpose": "p", "narration": "",
+                  "clips": [{ "video_id": 1, "from": format!("s{first}"), "to": format!("s{first}"), "audio": "source" }] }
+            ]
+        }))
+        .unwrap();
+        let before = script.clone();
+        prepare_app_save(&db, &mut script).unwrap();
+        assert_eq!(script.beats[..2], before.beats[..2], "the hand edits are kept exactly");
+        let resolved = &script.beats[2].clips[0];
+        assert_eq!((resolved.in_s, resolved.out_s), (1.0, 6.0), "sentence ids become seconds: {resolved:?}");
+        assert!(resolved.sentences.is_some(), "and keep the range");
+    }
+
+    /// Restoring a version brings it back exactly as stored, byte for byte, as the newest version.
+    #[test]
+    fn restoring_a_version_copies_it_as_stored() {
+        let (db, project_id) = library();
+        let script: ghostreel_core::script::Script = serde_json::from_value(serde_json::json!({
+            "title": "t",
+            "beats": [{ "id": "b1", "purpose": "p", "narration": "",
+                        "clips": [{ "video_id": 1, "in_s": 1.0, "out_s": 3.2, "audio": "source" },
+                                  { "video_id": 1, "in_s": 1.0, "out_s": 3.2, "audio": "source" }] }]
+        }))
+        .unwrap();
+        let old = ghostreel_core::script::save_version(&db, project_id, &script, None).unwrap();
+        let restored = ghostreel_core::script::restore_version(&db, old).unwrap();
+        assert_ne!(restored, old);
+        let json = |id: i64| -> String {
+            db.conn.query_row("SELECT script_json FROM scripts WHERE id = ?1", [id], |r| r.get(0)).unwrap()
+        };
+        assert_eq!(json(restored), json(old));
+        let stored = ghostreel_core::script::load(&db, restored).unwrap();
+        assert_eq!(stored.version, 2);
+        assert_eq!(stored.script, script);
+    }
 }

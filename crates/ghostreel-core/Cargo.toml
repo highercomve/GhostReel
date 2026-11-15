@@ -18,6 +18,7 @@ rustfft = "6.4.1"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+serde_path_to_error = "0.1.20"
 quick-xml = "0.42"
 sqlite-vec = "0.1.9"
 thiserror = "2.0.20"

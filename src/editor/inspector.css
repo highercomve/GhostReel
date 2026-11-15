@@ -251,3 +251,10 @@ kbd.keycap {
 .insp-card-remove { margin-left: auto; }
 .insp-field-card .insp-field-label > svg { color: var(--accent); }
 .nle-inspector .insp-field-card input { border-left: 3px solid var(--accent); font-family: inherit; }
+
+/* A clip's volume: a slider with its value in dB. */
+.insp-volume-row { display: flex; align-items: center; gap: 8px; margin: 6px 0 2px; }
+.insp-volume-label { font-size: 12px; color: var(--muted); min-width: 48px; }
+.insp-volume-row input[type="range"] { flex: 1; accent-color: var(--accent); }
+.insp-volume-value { font-variant-numeric: tabular-nums; font-size: 12px; min-width: 44px; text-align: right; }
+.insp-volume-reset { padding: 2px 8px; font-size: 11px; }

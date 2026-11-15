@@ -136,6 +136,30 @@ pub struct SentenceRange {
     pub to: String,
 }
 
+impl SentenceRange {
+    /// Whether the range starts on a word inside its sentence (`s412@3`) rather than on the sentence.
+    pub fn starts_on_word(&self) -> bool {
+        self.from.contains('@')
+    }
+
+    /// Whether the range ends on a word inside its sentence rather than on the sentence's end.
+    pub fn ends_on_word(&self) -> bool {
+        self.to.contains('@')
+    }
+}
+
+/// Whether an optional range starts (`start`) or ends on a word: an edge code must leave where it was asked for.
+pub fn on_word(range: Option<&SentenceRange>, start: bool) -> bool {
+    range.is_some_and(|r| if start { r.starts_on_word() } else { r.ends_on_word() })
+}
+
+/// What `hold_the_last_picture` writes in a cutaway's `why`, and what `drop_closing_picture`
+/// finds it by. A repair must be able to tell the pictures it added from the ones the model
+/// chose: `drop_beats_to_target` will not cut below half the clips the model wrote, and an extra
+/// picture in that count let it drop one more beat on the second repair than on the first — a
+/// draft walked 84.5 s → 43.1 s on a pass that should have found nothing to do.
+pub const CLOSING_PICTURE: &str = "the image the piece closes on";
+
 /// A clip used in a script beat.
 ///
 /// Written either with seconds (`in_s`, `out_s`) or with sentences (`from`, `to`; see
@@ -163,10 +187,14 @@ pub struct ScriptClip {
     /// The sentences the clip was asked for, when it was written that way.
     #[serde(flatten, skip_serializing_if = "Option::is_none")]
     pub sentences: Option<SentenceRange>,
-    /// Keep this clip's bounds exactly as written: the save path's repairs (cuts placed on the
-    /// sound, framing trims) leave it alone while they still work on the other clips.
+    /// Keep this clip's bounds exactly as written: no finishing pass moves either edge (see
+    /// [`ScriptClip::movable`]) while they still work on the other clips.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub exact: bool,
+    /// The clip's own sound made louder or softer, in dB (0/absent = as recorded). Applied after a
+    /// render levels each clip, and in the live viewer, so a speaker far from the mic can be heard.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gain_db: Option<f64>,
 }
 
 /// A clip as it is written: seconds, or sentences, or both (then the seconds win).
@@ -191,6 +219,8 @@ struct ScriptClipWire {
     framing: Option<crate::framing::Framing>,
     #[serde(default)]
     exact: bool,
+    #[serde(default)]
+    gain_db: Option<f64>,
 }
 
 /// The range a clip or a bed was written with, and the seconds to start from.
@@ -228,6 +258,7 @@ impl TryFrom<ScriptClipWire> for ScriptClip {
         let (in_s, out_s, sentences) = wire_range("a clip", w.in_s, w.out_s, w.from, w.to)?;
         Ok(ScriptClip {
             exact: w.exact,
+            gain_db: w.gain_db.map(|g| g.clamp(-24.0, 24.0)).filter(|g| g.abs() > 0.05),
             video_id: w.video_id,
             in_s,
             out_s,
@@ -240,10 +271,34 @@ impl TryFrom<ScriptClipWire> for ScriptClip {
     }
 }
 
+/// One end of a clip or a bed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Side {
+    In,
+    Out,
+}
+
 impl ScriptClip {
     /// Written with sentences and not yet resolved to seconds.
     pub fn is_unresolved(&self) -> bool {
         self.sentences.is_some() && self.in_s == 0.0 && self.out_s == 0.0
+    }
+
+    /// Whether code may move this edge of the clip: the one answer every pass that moves an edge
+    /// asks (snapping, trimming what is off the microphone, padding, turn and sentence ends, the
+    /// fit, the hold, framing, a shaky stretch, cut placement).
+    ///
+    /// An `exact` clip keeps both edges, and an edge written on a word (`s412@3`) keeps that edge:
+    /// both are an editor's instruction, not a draft to tidy. The one thing still done to a word
+    /// edge is to settle it on the quiet between that word and its neighbour in the sound
+    /// ([`crate::cuts::place_cuts`]), never past the middle of that gap: it stays on its word.
+    pub fn movable(&self, side: Side) -> bool {
+        !self.exact && !on_word(self.sentences.as_ref(), side == Side::In)
+    }
+
+    /// Whether neither edge may move ([`Self::movable`]).
+    pub fn pinned(&self) -> bool {
+        !self.movable(Side::In) && !self.movable(Side::Out)
     }
 }
 
@@ -313,6 +368,12 @@ impl AudioBed {
     /// Written with sentences and not yet resolved to seconds.
     pub fn is_unresolved(&self) -> bool {
         self.sentences.is_some() && self.in_s == 0.0 && self.out_s == 0.0
+    }
+
+    /// Whether code may move this edge of the bed: an edge written on a word stays, as a clip's
+    /// does ([`ScriptClip::movable`]).
+    pub fn movable(&self, side: Side) -> bool {
+        !on_word(self.sentences.as_ref(), side == Side::In)
     }
 
     pub fn duration_s(&self) -> f64 {
@@ -901,75 +962,8 @@ pub fn validate(db: &Db, project_id: i64, script: &Script) -> Result<Vec<Issue>,
     Ok(issues)
 }
 
-/// How far a clip edge may travel to land on a sentence edge (s).
-const SNAP_REACH_S: f64 = 0.75;
-
-/// Snap each clip's `in_s` to the nearest sentence START and its `out_s` to the nearest sentence
-/// END ([`crate::sentence_split`]), within 0.75 s. Returns the count of clips that were changed.
-///
-/// An edge only ever snaps to the kind of boundary it is: a clip opens where somebody starts
-/// speaking and closes where somebody stops. Snapping to the nearest boundary of either kind sent
-/// an out point to the NEXT speaker's first word (12.86 s, a handover from 12.02 s) and an in
-/// point to the end of the PREVIOUS speaker's line, so the cut opened on, or closed with, the
-/// wrong voice. Muted clips are left alone: they carry no voice, and the speech of the video a
-/// cutaway was taken from is not where it should start or end.
-pub fn snap_to_segments(db: &Db, script: &mut Script) -> Result<usize, Error> {
-    let mut clips_changed = 0;
-
-    for beat in &mut script.beats {
-        for clip in &mut beat.clips {
-            // A muted picture (a cutaway, the quiet image a cut closes on) has no speech to land
-            // on; the speech of the video it was taken from is not its edges.
-            if clip.audio == Audio::Mute {
-                continue;
-            }
-            let duration_s: Option<f64> = db
-                .conn
-                .query_row("SELECT duration_s FROM videos WHERE id = ?1", [clip.video_id], |r| r.get(0))
-                .optional()?;
-            let max_dur = duration_s.unwrap_or(f64::MAX);
-
-            let (starts, ends): (Vec<f64>, Vec<f64>) =
-                crate::sentence_split::edges(db, clip.video_id).into_iter().unzip();
-
-            if starts.is_empty() {
-                continue;
-            }
-
-            let best_in = nearest_within(&starts, clip.in_s, SNAP_REACH_S).map_or(clip.in_s, |b| b.clamp(0.0, max_dur));
-            let best_out =
-                nearest_within(&ends, clip.out_s, SNAP_REACH_S).map_or(clip.out_s, |b| b.clamp(0.0, max_dur));
-
-            // Never produce in >= out; skip snap if it would
-            if best_in >= best_out {
-                continue;
-            }
-
-            let changed = (best_in - clip.in_s).abs() > 1e-4 || (best_out - clip.out_s).abs() > 1e-4;
-            if changed {
-                clip.in_s = best_in;
-                clip.out_s = best_out;
-                clips_changed += 1;
-            }
-        }
-    }
-
-    Ok(clips_changed)
-}
-
-/// The edge closest to `t` within `reach` (the later one on a tie), if any.
-fn nearest_within(edges: &[f64], t: f64, reach: f64) -> Option<f64> {
-    let mut best = None;
-    let mut best_diff = reach;
-    for &b in edges {
-        let diff = (b - t).abs();
-        if diff <= best_diff {
-            best_diff = diff;
-            best = Some(b);
-        }
-    }
-    best
-}
+/// Snapping clip edges to sentences is a finishing pass; it lives with the others.
+pub use crate::finish::snap_to_sentences;
 
 /// Save a new version of the script. Versions are numbered past trashed ones too, so a restore
 /// never collides with what was saved meanwhile. A new version of a clip stays in its clip set
@@ -978,11 +972,32 @@ fn nearest_within(edges: &[f64], t: f64, reach: f64) -> Option<f64> {
 /// write transaction, so the app and the CLI cannot take the same number.
 pub fn save_version(db: &Db, project_id: i64, script: &Script, session_id: Option<i64>) -> Result<i64, Error> {
     let script_json = serde_json::to_string_pretty(script).map_err(|e| Error::Invalid(e.to_string()))?;
+    save_json(db, project_id, &script.title, &script_json, session_id)
+}
+
+/// Bring back a stored version as the newest version of its cut, exactly as it was stored: the same
+/// JSON, nothing resolved, finished or checked again (a restore is not an edit). Returns the new
+/// version's id.
+pub fn restore_version(db: &Db, script_id: i64) -> Result<i64, Error> {
+    let (project_id, session_id, title, script_json): (i64, Option<i64>, String, String) = db
+        .conn
+        .query_row(
+            "SELECT project_id, session_id, title, script_json FROM scripts WHERE id = ?1 AND trash_id IS NULL",
+            [script_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()?
+        .ok_or_else(|| Error::NotFound(format!("script #{script_id}")))?;
+    save_json(db, project_id, &title, &script_json, session_id)
+}
+
+/// Insert `script_json` as the next version of the cut `title` ([`save_version`]).
+fn save_json(db: &Db, project_id: i64, title: &str, script_json: &str, session_id: Option<i64>) -> Result<i64, Error> {
     let now = crate::projects::now();
     let tx = rusqlite::Transaction::new_unchecked(&db.conn, rusqlite::TransactionBehavior::Immediate)?;
     let next_version: i64 = tx.query_row(
         "SELECT COALESCE(MAX(version), 0) + 1 FROM scripts WHERE project_id = ?1 AND title = ?2",
-        params![project_id, &script.title],
+        params![project_id, title],
         |r| r.get(0),
     )?;
     let (set_id, kind): (Option<String>, Option<String>) = tx
@@ -991,7 +1006,7 @@ pub fn save_version(db: &Db, project_id: i64, script: &Script, session_id: Optio
              WHERE s.project_id = ?1 AND s.title = ?2 AND s.trash_id IS NULL
                AND (s.set_id IS NULL OR c.trash_id IS NULL)
              ORDER BY s.version DESC LIMIT 1",
-            params![project_id, &script.title],
+            params![project_id, title],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?
@@ -999,7 +1014,7 @@ pub fn save_version(db: &Db, project_id: i64, script: &Script, session_id: Optio
     tx.execute(
         "INSERT INTO scripts(project_id, session_id, title, version, script_json, created_at, set_id, kind)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        params![project_id, session_id, &script.title, next_version, script_json, now, set_id, kind],
+        params![project_id, session_id, title, next_version, script_json, now, set_id, kind],
     )?;
     let id = tx.last_insert_rowid();
     tx.commit()?;
@@ -1099,6 +1114,18 @@ pub fn delete_cut(db: &Db, project_id: i64, title: &str, source: &str) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_clip_s_volume_is_kept_within_24_db_and_zero_means_none() {
+        let clip = |g: f64| -> ScriptClip {
+            serde_json::from_value(serde_json::json!({"video_id": 1, "in_s": 0.0, "out_s": 2.0, "gain_db": g})).unwrap()
+        };
+        assert_eq!(clip(6.0).gain_db, Some(6.0));
+        assert_eq!(clip(40.0).gain_db, Some(24.0));
+        assert_eq!(clip(0.0).gain_db, None);
+        let json = serde_json::to_value(clip(0.0)).unwrap();
+        assert!(json.get("gain_db").is_none(), "not written when unset");
+    }
     use crate::projects::NewProject;
 
     /// Old scripts have no `tracks`: they load as None and save without the key; a choice,
@@ -1209,11 +1236,13 @@ mod tests {
         assert_eq!(script.width, Some(1920));
         assert_eq!(script.height, Some(1080));
 
-        // Snap to segments: 0.3 is within 0.75 of 0.0 (snaps to 0.0), 5.4 is within 0.75 of 5.2 (snaps to 5.2)
-        let changed = snap_to_segments(&db, &mut script).unwrap();
+        // Snap to segments: 0.3 is within 0.75 of 0.0 (snaps to 0.0); 5.4 is 0.2 s after the end at
+        // 5.2, inside that sentence's tail (`finish::edges::out_owner`), so it has finished the
+        // sentence already and stays.
+        let changed = snap_to_sentences(&db, &mut script, &crate::config::ScriptConfig::default()).unwrap();
         assert_eq!(changed, 1);
         assert!((script.beats[0].clips[0].in_s - 0.0).abs() < 1e-4);
-        assert!((script.beats[0].clips[0].out_s - 5.2).abs() < 1e-4);
+        assert!((script.beats[0].clips[0].out_s - 5.4).abs() < 1e-4);
 
         // Validate
         let issues = validate(&db, project.id, &script).unwrap();
@@ -1298,7 +1327,9 @@ mod tests {
                     on_screen_text: None,
                     title_layout: None,
                     clips: vec![
-                        ScriptClip { exact: false,
+                        ScriptClip {
+                            exact: false,
+                            gain_db: None,
                             sentences: None,
                             framing: None,
                             video_id: 1,
@@ -1308,7 +1339,9 @@ mod tests {
                             why: None,
                             tracks: None,
                         },
-                        ScriptClip { exact: false,
+                        ScriptClip {
+                            exact: false,
+                            gain_db: None,
                             sentences: None,
                             framing: None,
                             video_id: 999, // not found: Error
@@ -1329,7 +1362,9 @@ mod tests {
                     narration: None,
                     on_screen_text: None,
                     title_layout: None,
-                    clips: vec![ScriptClip { exact: false,
+                    clips: vec![ScriptClip {
+                        exact: false,
+                        gain_db: None,
                         sentences: None,
                         framing: None,
                         video_id: 1,
@@ -1529,7 +1564,9 @@ mod tests {
     }
 
     fn snap_clip(in_s: f64, out_s: f64) -> ScriptClip {
-        ScriptClip { exact: false,
+        ScriptClip {
+            exact: false,
+            gain_db: None,
             sentences: None,
             video_id: 104,
             in_s,
@@ -1586,7 +1623,7 @@ mod tests {
             agents: None,
             card_style: None,
         };
-        assert_eq!(snap_to_segments(&db, &mut script).unwrap(), 2);
+        assert_eq!(snap_to_sentences(&db, &mut script, &crate::config::ScriptConfig::default()).unwrap(), 2);
         let clips = &script.beats[0].clips;
         assert!((clips[0].in_s - 0.0).abs() < 1e-9 && (clips[0].out_s - 12.02).abs() < 1e-9, "{:?}", clips[0]);
         assert!((clips[1].in_s - 12.86).abs() < 1e-9 && (clips[1].out_s - 16.46).abs() < 1e-9, "{:?}", clips[1]);
@@ -1594,7 +1631,7 @@ mod tests {
         // in point would land on it: the snap would give in >= out, so the clip is left as it was.
         let mut far = script.clone();
         far.beats[0].clips = vec![snap_clip(12.3, 12.86)];
-        assert_eq!(snap_to_segments(&db, &mut far).unwrap(), 0);
+        assert_eq!(snap_to_sentences(&db, &mut far, &crate::config::ScriptConfig::default()).unwrap(), 0);
         assert_eq!((far.beats[0].clips[0].in_s, far.beats[0].clips[0].out_s), (12.3, 12.86));
     }
 

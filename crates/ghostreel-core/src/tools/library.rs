@@ -350,8 +350,7 @@ static GET_TRANSCRIPT: ToolSpec = ToolSpec {
     effect: Effect::Read,
     summary: "The words spoken in one or more videos, one line per sentence with an id you can cut on, optionally \
               limited to a range.",
-    when: "To read what people said, after get_outline has told you which chapters matter (pass the chapter's \
-           start_s/end_s).",
+    when: "To find a line by its words. To choose a clip, read get_manifest: it has the pictures too.",
     returns: "format text (default): a '=== video N (file, length)' header, then one line per sentence: \
               's412 [12:03.4 Freddy] Esto es O Corres o Te Encaramas.' — the sentence id, its start as minutes:seconds, \
               who says it when known, 'off-mic' when it is someone away from the microphone (an interviewer's \
@@ -439,12 +438,13 @@ fn transcript_text(videos: &[(i64, String, f64, Vec<index::TranscriptSegment>)],
 
 async fn get_transcript(ctx: &mut ToolCtx<'_>, a: Args<'_>) -> ToolResult {
     let ids = transcript_ids(a)?;
-    let (start, end) = match a.opt_str("from") {
+    let (start, end) = match edge_arg(a, "from")? {
         Some(from) => {
             let [id] = ids[..] else {
                 return Err(ToolError::invalid("from/to name sentences of one video: give a single video_id"));
             };
-            sentence_span(ctx.db, id, from, a.opt_str("to").unwrap_or(from))?
+            let to = edge_arg(a, "to")?.unwrap_or(from);
+            sentence_span(ctx.db, id, from, to)?
         }
         None => (a.opt_f64("start_s").unwrap_or(0.0), a.opt_f64("end_s").unwrap_or(f64::MAX)),
     };
@@ -499,7 +499,10 @@ async fn get_transcript(ctx: &mut ToolCtx<'_>, a: Args<'_>) -> ToolResult {
     };
     let mut out = ToolOutput::json(value).summary(format!("{total} sentences"));
     if as_text {
-        out = out.text(transcript_text(&videos, cut));
+        // Words alone: a model that chooses clips from them has never seen the picture under them.
+        let mut text = transcript_text(&videos, cut);
+        text.push_str("(words only: what is on screen under these lines, the faces and the frames, is in get_manifest)\n");
+        out = out.text(text);
     }
     Ok(out)
 }
@@ -511,8 +514,8 @@ static GET_MANIFEST: ToolSpec = ToolSpec {
               around them, each change of picture with every face on screen, keyframe descriptions and on-screen \
               text, camera shake.",
     when: "To choose moments knowing what is said, by whom, over what picture and with how much room to cut, in \
-           one read instead of get_transcript + get_scenes + get_faces + get_video. Read one chapter at a time \
-           (get_outline gives their start_s/end_s).",
+           one read instead of get_transcript + get_scenes + get_faces + get_video. A chapter at a time (start_s/ \
+           end_s from get_outline), or several short videos at once (video_ids).",
     returns: "One line per fact, in time order: '## ch4 15:21.5–18:08.6 title' + summary; '[picture a–b two faces: \
               Freddy x0.24 y0.20 h0.46 · person 1 x0.74 …]' (face centre and height as fractions of the frame; \
               ranges when it moves or resizes, 'on N%' when it comes and goes, 'cut off N%' at the frame's edge); \
@@ -522,7 +525,8 @@ static GET_MANIFEST: ToolSpec = ToolSpec {
     misuse: &[],
     chains_with: &["save_script with clips {video_id, from: \"s412\", to: \"s418\"}; read_cut to check the result."],
     params: &[
-        ToolParam::new("video_id", T::Integer, true, "From list_videos or get_outline."),
+        ToolParam::new("video_id", T::Integer, false, "From list_videos or get_outline."),
+        ToolParam::new("video_ids", T::List(&T::Integer), false, "Several (short) videos at once, instead of video_id."),
         ToolParam::new("start_s", T::Number, false, "Seconds; omit for the start."),
         ToolParam::new("end_s", T::Number, false, "Seconds; omit for the end."),
         ToolParam::new(
@@ -550,24 +554,48 @@ static GET_MANIFEST: ToolSpec = ToolSpec {
 };
 
 /// The span of sentences `from` through `to` of a video (whole sentences; a word suffix is ignored).
-fn sentence_span(db: &crate::db::Db, video_id: i64, from: &str, to: &str) -> Result<(f64, f64), ToolError> {
-    let edge = |text: &str, col: &str| -> Result<f64, ToolError> {
-        let r = crate::sentences::SentenceRef::parse(text).map_err(|e| ToolError::invalid(e.to_string()))?;
-        db.conn
-            .query_row(
-                &format!("SELECT {col} FROM transcript_sentences WHERE id = ?1 AND video_id = ?2"),
-                rusqlite::params![r.sentence_id, video_id],
-                |row| row.get::<_, f64>(0),
-            )
-            .map_err(|_| ToolError::invalid(format!("{text} is not a sentence of video #{video_id}")))
+/// `from`/`to` as given: a sentence id (`"s412"`), or an explicit time in seconds (`"15.75"`,
+/// `"412s"`, or a JSON number). Bare integer strings like `"412"` are rejected as ambiguous.
+fn edge_arg(a: Args<'_>, key: &str) -> Result<Option<crate::sentences::EdgeRef>, ToolError> {
+    let Some(v) = a.get(key) else {
+        return Ok(None);
+    };
+    if v.is_null() {
+        return Ok(None);
+    }
+    crate::sentences::EdgeRef::parse_value(v).map(Some).map_err(ToolError::invalid)
+}
+
+fn sentence_span(
+    db: &crate::db::Db,
+    video_id: i64,
+    from: crate::sentences::EdgeRef,
+    to: crate::sentences::EdgeRef,
+) -> Result<(f64, f64), ToolError> {
+    let edge = |edge: crate::sentences::EdgeRef, col: &str| -> Result<f64, ToolError> {
+        match edge {
+            crate::sentences::EdgeRef::Seconds(seconds) => Ok(seconds),
+            crate::sentences::EdgeRef::Sentence(r) => db
+                .conn
+                .query_row(
+                    &format!("SELECT {col} FROM transcript_sentences WHERE id = ?1 AND video_id = ?2"),
+                    rusqlite::params![r.sentence_id, video_id],
+                    |row| row.get::<_, f64>(0),
+                )
+                .map_err(|_| ToolError::invalid(format!("{r} is not a sentence of video #{video_id}"))),
+        }
     };
     // A little either side, so the pauses around the sentences are in the reading too.
     Ok(((edge(from, "start_s")? - 0.05).max(0.0), edge(to, "end_s")? + 0.05))
 }
 
 /// A range read backwards is an error to say, not an empty result: "0 sentences" for start_s 2750,
-/// end_s 284.6 reads as "nothing was said there", and a model asks again.
+/// end_s 284.6 reads as "nothing was said there", and a model asks again. Non-finite bounds are
+/// rejected for the same reason.
 fn check_range(start: f64, end: f64) -> Result<(), ToolError> {
+    if !start.is_finite() || !end.is_finite() {
+        return Err(ToolError::invalid("range bounds must be finite numbers in seconds"));
+    }
     if end <= start {
         return Err(ToolError::invalid(format!(
             "end_s {end} is not after start_s {start}: give the range in order (start_s < end_s)"
@@ -577,49 +605,61 @@ fn check_range(start: f64, end: f64) -> Result<(), ToolError> {
 }
 
 async fn get_manifest(ctx: &mut ToolCtx<'_>, a: Args<'_>) -> ToolResult {
-    let id = a.opt_i64("video_id").ok_or_else(|| ToolError::invalid("give video_id"))?;
-    ctx.check_video(id)?;
-    let (start_s, end_s) = match a.opt_str("from") {
-        Some(from) => sentence_span(ctx.db, id, from, a.opt_str("to").unwrap_or(from))?,
+    let ids = transcript_ids(a)?;
+    let frames = match a.opt_str("frames") {
+        Some("all") => crate::manifest::Frames::All,
+        Some("none") => crate::manifest::Frames::None,
+        _ => crate::manifest::Frames::Changes,
+    };
+    let words = a.bool_or("words", false);
+    let (start_s, end_s) = match edge_arg(a, "from")? {
+        Some(from) => {
+            let [id] = ids[..] else {
+                return Err(ToolError::invalid("from/to name sentences of one video: give a single video_id"));
+            };
+            let to = edge_arg(a, "to")?.unwrap_or(from);
+            sentence_span(ctx.db, id, from, to)?
+        }
         None => (a.opt_f64("start_s").unwrap_or(0.0), a.opt_f64("end_s").unwrap_or(f64::MAX)),
     };
-    let opts = crate::manifest::Options {
-        start_s,
-        end_s,
-        frames: match a.opt_str("frames") {
-            Some("all") => crate::manifest::Frames::All,
-            Some("none") => crate::manifest::Frames::None,
-            _ => crate::manifest::Frames::Changes,
-        },
-        words: a.bool_or("words", false),
-    };
-    check_range(opts.start_s, opts.end_s)?;
-    ctx.ground(id, opts.start_s, opts.end_s);
-    let mut m = crate::manifest::build(ctx.db, id, &opts)?;
-    let total = m.events.len();
-    let sentences = m.events.iter().filter(|e| matches!(e, crate::manifest::Event::Sentence { .. })).count();
-    // Cut to the room the caller has, from the end, so what is returned is a whole stretch.
-    let room = ctx.room(0);
-    let mut text = m.render();
-    while text.len() > room && m.events.len() > 1 {
-        let n = (m.events.len() / 10).max(1);
-        m.events.truncate(m.events.len() - n);
-        text = m.render();
+    check_range(start_s, end_s)?;
+    // Several videos share the room the caller has, each cut from its own end.
+    let room = ctx.room(0) / ids.len().max(1);
+    let (mut texts, mut values, mut sentences, mut lines) = (Vec::new(), serde_json::Map::new(), 0, 0);
+    for &id in &ids {
+        ctx.check_video(id)?;
+        ctx.ground(id, start_s, end_s);
+        let opts = crate::manifest::Options { start_s, end_s, frames, words };
+        let mut m = crate::manifest::build(ctx.db, id, &opts)?;
+        let total = m.events.len();
+        sentences += m.events.iter().filter(|e| matches!(e, crate::manifest::Event::Sentence { .. })).count();
+        lines += total;
+        // Cut to the room, from the end, so what is returned is a whole stretch.
+        let mut text = m.render();
+        while text.len() > room && m.events.len() > 1 {
+            let n = (m.events.len() / 10).max(1);
+            m.events.truncate(m.events.len() - n);
+            text = m.render();
+        }
+        let cut = total - m.events.len();
+        if cut > 0 {
+            let until = m.events.last().map(|e| match e {
+                crate::manifest::Event::Sentence { end_s, .. } => *end_s,
+                _ => 0.0,
+            });
+            text.push_str(&format!(
+                "… ({cut} more lines left out to fit{}; ask for a narrower range)\n",
+                until.filter(|t| *t > 0.0).map(|t| format!(", from {}", clock(t))).unwrap_or_default()
+            ));
+        }
+        texts.push(text);
+        values.insert(id.to_string(), serde_json::to_value(&m)?);
     }
-    let cut = total - m.events.len();
-    if cut > 0 {
-        let until = m.events.last().map(|e| match e {
-            crate::manifest::Event::Sentence { end_s, .. } => *end_s,
-            _ => 0.0,
-        });
-        text.push_str(&format!(
-            "… ({cut} more lines left out to fit{}; ask for a narrower range)\n",
-            until.filter(|t| *t > 0.0).map(|t| format!(", from {}", clock(t))).unwrap_or_default()
-        ));
-    }
-    let mut out = ToolOutput::json(serde_json::to_value(&m)?).summary(format!("{sentences} sentences, {total} lines"));
+    let value = if ids.len() == 1 { values.into_iter().next().map(|(_, v)| v).unwrap_or_default() } else { Value::Object(values) };
+    let videos = if ids.len() > 1 { format!("{} videos, ", ids.len()) } else { String::new() };
+    let mut out = ToolOutput::json(value).summary(format!("{videos}{sentences} sentences, {lines} lines"));
     if a.opt_str("format").unwrap_or("text") == "text" {
-        out = out.text(text);
+        out = out.text(texts.join("\n"));
     }
     Ok(out)
 }
@@ -638,8 +678,8 @@ static GET_VIDEO: ToolSpec = ToolSpec {
     misuse: &[
         "A clip whose pictures you have not seen is a guess: if nothing was described or spoken near it, the \
          clip is dropped and your beat loses its picture.",
-        "Cutting from a range listed in shaky_at puts visible camera shake in the finished piece; the clip is \
-         moved to the nearest steady stretch of the same shot, or dropped when the shot has none.",
+        "Cutting from a range listed in shaky_at puts visible camera shake in the finished piece; a speaking clip is \
+         trimmed to its steady part, a picture moved to the nearest steady stretch of the same shot, or dropped.",
     ],
     chains_with: &[
         "Opening a video this way makes the whole of it legal to cut, not only the range you asked for.",

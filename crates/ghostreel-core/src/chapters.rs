@@ -386,28 +386,33 @@ pub fn points(db: &Db, video_id: i64) -> Result<Vec<Point>, Error> {
 pub fn store(db: &Db, video_id: i64, chapters: &[Chapter]) -> Result<(), Error> {
     let tx = db.conn.unchecked_transaction()?;
     tx.execute("DELETE FROM chapters WHERE video_id = ?1", [video_id])?;
-    {
-        let mut insert = tx.prepare(
-            "INSERT INTO chapters(video_id, idx, start_s, end_s, first_sentence_id, last_sentence_id, title, summary,
-                                  standout_json, titled)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-        )?;
-        for c in chapters {
-            insert.execute(params![
-                video_id,
-                c.idx as i64,
-                c.start_s,
-                c.end_s,
-                c.first_sentence_id,
-                c.last_sentence_id,
-                c.title,
-                c.summary,
-                serde_json::to_string(&c.standout).unwrap_or_else(|_| "[]".into()),
-                c.titled,
-            ])?;
-        }
-    }
+    insert_all(&tx, video_id, chapters)?;
     tx.commit()?;
+    Ok(())
+}
+
+/// Insert `chapters` for a video on `conn` (a transaction the caller owns and commits), without
+/// deleting what is there: the caller has cleared the video's chapters first.
+pub(crate) fn insert_all(conn: &rusqlite::Connection, video_id: i64, chapters: &[Chapter]) -> Result<(), Error> {
+    let mut insert = conn.prepare(
+        "INSERT INTO chapters(video_id, idx, start_s, end_s, first_sentence_id, last_sentence_id, title, summary,
+                              standout_json, titled)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+    )?;
+    for c in chapters {
+        insert.execute(params![
+            video_id,
+            c.idx as i64,
+            c.start_s,
+            c.end_s,
+            c.first_sentence_id,
+            c.last_sentence_id,
+            c.title,
+            c.summary,
+            serde_json::to_string(&c.standout).unwrap_or_else(|_| "[]".into()),
+            c.titled,
+        ])?;
+    }
     Ok(())
 }
 

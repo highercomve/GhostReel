@@ -34,7 +34,7 @@ pub struct PlannedSegment {
     /// How the picture is cut to the cut's shape (the clip's framing, else the script's).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub framing: Option<crate::framing::Framing>,
-    /// The quiet picture a cut closes on (`chat::CLOSING_PICTURE`), outside any bed: it plays the
+    /// The quiet picture a cut closes on (`script::CLOSING_PICTURE`), outside any bed: it plays the
     /// room's own sound when no one is speaking in it, not digital silence.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub hold: bool,
@@ -43,6 +43,9 @@ pub struct PlannedSegment {
     /// empty, `in_s` is 0 and `out_s` the card's length.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub card: Option<String>,
+    /// The clip's own sound louder or softer (dB), after levelling (`ScriptClip::gain_db`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gain_db: Option<f64>,
 }
 
 impl PlannedSegment {
@@ -136,14 +139,15 @@ pub struct PreviewOptions {
 }
 
 impl PreviewOptions {
-    /// What a finished MP4 is rendered with: the cut's own size, titles and speech captions burnt
-    /// in where the script has them, every clip at the same loudness. The one definition behind a
-    /// clip set's export and `export_script` with `format: mp4`.
+    /// What a finished MP4 is rendered with: the cut's own size, titles burnt in where the script
+    /// has them, every clip at the same loudness. Speech captions only for a cut that carries a
+    /// caption style (clips do) or when the caller asks. The one definition behind a clip set's
+    /// export, `export_script` with `format: mp4` and `ghostreel script export`.
     pub fn deliverable(cfg: &crate::config::ScriptConfig, out: PathBuf, cancel: Option<Arc<AtomicBool>>) -> Self {
         Self {
             burn_titles: true,
             burn_narration: false,
-            burn_captions: true,
+            burn_captions: false,
             normalize_audio: true,
             audio_fade_s: cfg.audio_fade_s,
             speech_overrun_s: cfg.speech_overrun_s,
@@ -359,6 +363,7 @@ pub fn plan_segments(script: &Script, media: &HashMap<i64, ResolvedMedia>) -> Re
                 framing: None,
                 hold: false,
                 card: Some(script.card_background(beat)),
+                gain_db: None,
             });
             timeline_start_s += dur;
         }
@@ -389,8 +394,9 @@ pub fn plan_segments(script: &Script, media: &HashMap<i64, ResolvedMedia>) -> Re
                 framing: crate::framing::effective(script, clip).cloned(),
                 hold: clip.audio == Audio::Mute
                     && beat.bed.is_none()
-                    && clip.why.as_deref() == Some(crate::chat::CLOSING_PICTURE),
+                    && clip.why.as_deref() == Some(crate::script::CLOSING_PICTURE),
                 card: None,
+                gain_db: clip.gain_db,
             });
 
             timeline_start_s += dur;
@@ -926,6 +932,9 @@ pub fn render_preview(
         if let Some(p) = &plan {
             p_name = p_name.replace(".mp4", &format!("_f{}.mp4", p.digest()));
         }
+        if let Some(g) = seg.gain_db.filter(|_| !silent) {
+            p_name = p_name.replace(".mp4", &format!("_g{}.mp4", (g * 10.0).round() as i64));
+        }
         let p_path = proxies_dir.join(p_name);
 
         let exists_and_non_empty = p_path.is_file() && std::fs::metadata(&p_path).map(|m| m.len() > 0).unwrap_or(false);
@@ -938,58 +947,73 @@ pub fn render_preview(
             let dur_str = format!("{:.3}", seg_dur);
             let tmp_path = p_path.with_extension(format!("tmp.{}.mp4", std::process::id()));
 
-            let mut cmd = crate::proc::std_command(ffmpeg);
-            cmd.arg("-y").arg("-ss").arg(&in_str).arg("-t").arg(&dur_str).arg("-i").arg(&seg.path);
+            let mut build = |encoder: &Encoder| {
+                let mut cmd = crate::proc::std_command(ffmpeg);
+                cmd.arg("-y").arg("-ss").arg(&in_str).arg("-t").arg(&dur_str).arg("-i").arg(&seg.path);
 
-            // Levelling happens per clip, before they are joined: loudnorm needs a whole clip
-            // to measure, and the point is that clips match each other.
-            // Fade each clip in and out: segments are joined end to end, and a cut taken in the
-            // middle of a breath stops dead without one. The fade out is the end of the clip, and
-            // never starts before the last voiced sound in it (see `audio_fades`).
-            let af = if opts.normalize_audio {
-                format!("{fades}loudnorm=I=-16:TP=-1.5:LRA=11,apad")
-            } else {
-                format!("{fades}apad")
+                // Levelling happens per clip, before they are joined: loudnorm needs a whole clip
+                // to measure, and the point is that clips match each other.
+                // Fade each clip in and out: segments are joined end to end, and a cut taken in the
+                // middle of a breath stops dead without one. The fade out is the end of the clip, and
+                // never starts before the last voiced sound in it (see `audio_fades`).
+                // The editor's own volume for the clip comes after levelling, so it is a change from
+                // where every clip sits, not something loudnorm undoes.
+                let gain = seg.gain_db.map(|g| format!("volume={g:.1}dB,")).unwrap_or_default();
+                let af = if opts.normalize_audio {
+                    format!("{fades}loudnorm=I=-16:TP=-1.5:LRA=11,{gain}apad")
+                } else {
+                    format!("{fades}{gain}apad")
+                };
+                let chosen = if silent || !seg.has_audio {
+                    Vec::new()
+                } else {
+                    let count = if seg.tracks.is_some() { stream_count(seg.video_id, &seg.path) } else { None };
+                    effective_tracks(seg.tracks.as_deref(), seg.audio_track, count)
+                };
+                if !chosen.is_empty() {
+                    cmd.args(["-map", "0:v:0"]);
+                    cmd.args(audio_map_args(&chosen, &af));
+                } else {
+                    let null_audio = "anullsrc=r=48000:cl=stereo";
+                    cmd.args(["-f", "lavfi", "-t", &dur_str, "-i", null_audio]);
+                    cmd.args(["-map", "0:v:0", "-map", "1:a:0", "-af", "apad"]);
+                }
+
+                cmd.args(["-vf", &vf]);
+                cmd.args(["-g", &g_val.to_string()]);
+                for arg in &encoder.args {
+                    cmd.arg(arg);
+                }
+                cmd.args([
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    "128k",
+                    "-ar",
+                    "48000",
+                    "-ac",
+                    "2",
+                    "-t",
+                    &dur_str,
+                    "-shortest",
+                    "-movflags",
+                    "+faststart",
+                ]);
+                cmd.arg(&tmp_path);
+                cmd
             };
-            let chosen = if silent || !seg.has_audio {
-                Vec::new()
-            } else {
-                let count = if seg.tracks.is_some() { stream_count(seg.video_id, &seg.path) } else { None };
-                effective_tracks(seg.tracks.as_deref(), seg.audio_track, count)
-            };
-            if !chosen.is_empty() {
-                cmd.args(["-map", "0:v:0"]);
-                cmd.args(audio_map_args(&chosen, &af));
-            } else {
-                let null_audio = "anullsrc=r=48000:cl=stereo";
-                cmd.args(["-f", "lavfi", "-t", &dur_str, "-i", null_audio]);
-                cmd.args(["-map", "0:v:0", "-map", "1:a:0", "-af", "apad"]);
-            }
-
-            cmd.args(["-vf", &vf]);
-            cmd.args(["-g", &g_val.to_string()]);
-            for arg in &encoder.args {
-                cmd.arg(arg);
-            }
-            cmd.args([
-                "-c:a",
-                "aac",
-                "-b:a",
-                "128k",
-                "-ar",
-                "48000",
-                "-ac",
-                "2",
-                "-t",
-                &dur_str,
-                "-shortest",
-                "-movflags",
-                "+faststart",
-            ]);
-            cmd.arg(&tmp_path);
-
-            let out = crate::cancel::output(&mut cmd, opts.cancel.as_ref())
+            let mut cmd = build(&encoder);
+            let mut out = crate::cancel::output(&mut cmd, opts.cancel.as_ref())
                 .map_err(ffmpeg_err("failed to run ffmpeg for proxy"))?;
+            // The GPU encoder cannot open when the card's memory is taken (a model server holding
+            // most of it): the render falls back to the CPU encoder instead of failing.
+            if !out.status.success() && encoder.name != Encoder::libx264().name {
+                let _ = std::fs::remove_file(&tmp_path);
+                tracing::warn!("{} failed for a proxy; retrying with libx264", encoder.name);
+                let mut cmd = build(&Encoder::libx264());
+                out = crate::cancel::output(&mut cmd, opts.cancel.as_ref())
+                    .map_err(ffmpeg_err("failed to run ffmpeg for proxy"))?;
+            }
             if !out.status.success() {
                 let stderr = String::from_utf8_lossy(&out.stderr);
                 let tail =
@@ -1194,15 +1218,20 @@ pub fn render_preview(
             }
             graph.push_str(&format!("subtitles={ov}"));
         }
-        let burn = |graph: String| {
+        let burn = |graph: &str, encoder: &Encoder| {
             let mut cmd = crate::proc::std_command(ffmpeg);
-            cmd.args(["-y", "-i"]).arg(&burn_input).args(["-vf", &graph]);
+            cmd.args(["-y", "-i"]).arg(&burn_input).args(["-vf", graph]);
             cmd.args(&encoder.args);
             cmd.args(["-c:a", "copy", "-movflags", "+faststart"]).arg(&out_path);
             crate::cancel::output(&mut cmd, opts.cancel.as_ref())
         };
 
-        let burn_res = burn(graph);
+        let mut burn_res = burn(&graph, &encoder);
+        // As for the proxies: a GPU encoder that cannot open falls back to the CPU one.
+        if burn_res.as_ref().is_ok_and(|o| !o.status.success()) && encoder.name != Encoder::libx264().name {
+            tracing::warn!("{} failed for the burn pass; retrying with libx264", encoder.name);
+            burn_res = burn(&graph, &Encoder::libx264());
+        }
         for tmp in &temp_files_to_remove {
             let _ = std::fs::remove_file(tmp);
         }
@@ -1524,7 +1553,9 @@ mod tests {
                     on_screen_text: Some("Title 1".into()),
                     title_layout: None,
                     clips: vec![
-                        script::ScriptClip { exact: false,
+                        script::ScriptClip {
+                            exact: false,
+                            gain_db: None,
                             sentences: None,
                             framing: None,
                             video_id: 1,
@@ -1534,7 +1565,9 @@ mod tests {
                             why: None,
                             tracks: None,
                         },
-                        script::ScriptClip { exact: false,
+                        script::ScriptClip {
+                            exact: false,
+                            gain_db: None,
                             sentences: None,
                             framing: None,
                             video_id: 2,
@@ -1555,7 +1588,9 @@ mod tests {
                     narration: Some("Voice 2".into()),
                     on_screen_text: None,
                     title_layout: None,
-                    clips: vec![script::ScriptClip { exact: false,
+                    clips: vec![script::ScriptClip {
+                        exact: false,
+                        gain_db: None,
                         sentences: None,
                         framing: None,
                         video_id: 1,
@@ -1916,7 +1951,9 @@ mod tests {
                     narration: Some("Narration for Beat 1".into()),
                     on_screen_text: Some("Preview Title".into()),
                     title_layout: None,
-                    clips: vec![script::ScriptClip { exact: false,
+                    clips: vec![script::ScriptClip {
+                        exact: false,
+                        gain_db: None,
                         sentences: None,
                         framing: None,
                         video_id: 1,
@@ -1936,7 +1973,9 @@ mod tests {
                     narration: None,
                     on_screen_text: None,
                     title_layout: None,
-                    clips: vec![script::ScriptClip { exact: false,
+                    clips: vec![script::ScriptClip {
+                        exact: false,
+                        gain_db: None,
                         sentences: None,
                         framing: None,
                         video_id: 2,
@@ -2355,7 +2394,9 @@ mod tests {
                     narration: None,
                     on_screen_text: None,
                     title_layout: None,
-                    clips: vec![script::ScriptClip { exact: false,
+                    clips: vec![script::ScriptClip {
+                        exact: false,
+                        gain_db: None,
                         sentences: None,
                         video_id: 1,
                         in_s: 0.0,
@@ -2400,9 +2441,9 @@ mod tests {
             )]);
             plan_segments(&s, &media).unwrap().remove(0)
         };
-        assert!(seg(Some(crate::chat::CLOSING_PICTURE), Audio::Mute, false).hold);
-        assert!(!seg(Some(crate::chat::CLOSING_PICTURE), Audio::Mute, true).hold, "a bed carries the sound");
-        assert!(!seg(Some(crate::chat::CLOSING_PICTURE), Audio::Source, false).hold);
+        assert!(seg(Some(crate::script::CLOSING_PICTURE), Audio::Mute, false).hold);
+        assert!(!seg(Some(crate::script::CLOSING_PICTURE), Audio::Mute, true).hold, "a bed carries the sound");
+        assert!(!seg(Some(crate::script::CLOSING_PICTURE), Audio::Source, false).hold);
         assert!(!seg(None, Audio::Mute, false).hold);
     }
 }

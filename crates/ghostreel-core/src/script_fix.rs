@@ -13,7 +13,7 @@
 use crate::Error;
 use crate::db::Db;
 use crate::framing::{self, Framing, Layout};
-use crate::script::{Audio, Fix, FixAction, Script, ScriptClip};
+use crate::script::{Audio, CLOSING_PICTURE, Fix, FixAction, Script, ScriptClip, Side};
 
 /// An edge stretch shorter than this is left alone: the segmentation folds anything shorter than
 /// a shot into its neighbour anyway.
@@ -123,7 +123,7 @@ pub fn closing_hold(script: &Script) -> Option<(usize, usize)> {
     let hold = &beat.clips[ci];
     let prev = beat.clips.get(ci.checked_sub(1)?)?;
     (hold.audio == Audio::Mute
-        && hold.why.as_deref() == Some(crate::chat::CLOSING_PICTURE)
+        && hold.why.as_deref() == Some(CLOSING_PICTURE)
         && hold.video_id == prev.video_id
         && (hold.in_s - prev.out_s).abs() < 0.05)
         .then_some((bi, ci))
@@ -133,8 +133,13 @@ pub fn closing_hold(script: &Script) -> Option<(usize, usize)> {
 fn set_bounds(script: &mut Script, bi: usize, ci: usize, in_s: f64, out_s: f64) {
     let hold = closing_hold(script).filter(|&(hb, hc)| hb == bi && hc == ci + 1);
     let clip = &mut script.beats[bi].clips[ci];
-    clip.in_s = round3(in_s);
-    clip.out_s = round3(out_s);
+    let new_in = round3(in_s);
+    let new_out = round3(out_s);
+    if (new_in - clip.in_s).abs() > 0.05 || (new_out - clip.out_s).abs() > 0.05 {
+        clip.sentences = None;
+    }
+    clip.in_s = new_in;
+    clip.out_s = new_out;
     if let Some((hb, hc)) = hold {
         let h = &mut script.beats[hb].clips[hc];
         let len = h.out_s - h.in_s;
@@ -176,7 +181,7 @@ pub fn framing_trim(
     let f = framed(script, clip)?;
     let spans = people_spans(db, &f.framing, clip.video_id, clip.in_s, clip.out_s, f.out_w, f.out_h)?;
     let (g0, g1) = (spans.first()?.0, spans.last()?.1);
-    let edges = crate::chat::sentence_edges(db, clip.video_id);
+    let edges = crate::finish::sentence_edges(db, clip.video_id);
     let len = clip.out_s - clip.in_s;
     let min_len = min_clip_s.unwrap_or_else(|| default_min_len(len)).min(len);
     edge_trim(&edges, clip.in_s, clip.out_s, g0, g1, min_len, overrun)
@@ -216,15 +221,29 @@ pub fn repair_framing(db: &Db, script: &mut Script, overrun: f64, min_clip_s: Op
     }
     for bi in 0..script.beats.len() {
         for ci in 0..script.beats[bi].clips.len() {
-            if script.beats[bi].clips[ci].exact {
+            if script.beats[bi].clips[ci].pinned() {
                 continue;
             }
             let Some((a, b)) = framing_trim(db, script, bi, ci, min_clip_s, overrun) else { continue };
             let c = &script.beats[bi].clips[ci];
+            // An edge code may not move (written on a word) stays: a trim that needs it is not made.
+            if (!c.movable(Side::In) && (a - c.in_s).abs() > 1e-6)
+                || (!c.movable(Side::Out) && (b - c.out_s).abs() > 1e-6)
+            {
+                continue;
+            }
             let (old_in, old_out, video) = (c.in_s, c.out_s, c.video_id);
+            // A target that was the clip's own length (a cut of one clip, a social clip) follows it.
+            // A cut of several was fitted to its target before this runs: that stays.
+            let one_clip = script
+                .beats
+                .iter()
+                .flat_map(|b| &b.clips)
+                .filter(|c| c.why.as_deref() != Some(CLOSING_PICTURE))
+                .count()
+                == 1;
             set_bounds(script, bi, ci, a, b);
-            // A target that was the clip's own length follows it.
-            if let Some(t) = script.target_duration_s.as_mut() {
+            if one_clip && let Some(t) = script.target_duration_s.as_mut() {
                 *t = round3((*t - ((a - old_in) + (old_out - b))).max(1.0));
             }
             notes.push(trim_note(video, old_in, old_out, a, b));
@@ -375,6 +394,82 @@ mod tests {
         assert!(edge_trim(&[(0.0, 29.0)], 0.0, 29.35, 12.8, 29.35, 10.0, 0.35).is_none());
         // Short bad edges are left alone.
         assert!(edge_trim(&edges, 0.0, 47.35, 0.6, 47.0, 10.0, 0.35).is_none());
+    }
+
+    /// Video 1 as a podcast: two hosts side by side 0–40 s, then a screen share with their tiles
+    /// in a corner 40–60 s, a sentence every few seconds.
+    fn podcast() -> Db {
+        let db = Db::open_in_memory().unwrap();
+        db.conn
+            .execute("INSERT INTO videos(id, content_hash, size, duration_s, width, height) VALUES (1, 'h', 1, 300.0, 1920, 1080)", [])
+            .unwrap();
+        for (id, a, b, cx, cy, h) in [
+            (1, 0.0, 40.0, 0.25, 0.42, 0.45),
+            (2, 0.0, 40.0, 0.75, 0.42, 0.45),
+            (3, 40.0, 60.0, 0.72, 0.88, 0.076),
+            (4, 40.0, 60.0, 0.90, 0.88, 0.07),
+        ] {
+            db.conn
+                .execute(
+                    "INSERT INTO face_tracks(id, video_id, start_s, end_s, n_faces, mean_embedding, avg_box_h)
+                     VALUES (?1, 1, ?2, ?3, 0, x'', ?4)",
+                    rusqlite::params![id, a, b, h],
+                )
+                .unwrap();
+            let w = h * 0.56;
+            for i in 0..((b - a) * 5.0f64).round() as i64 {
+                db.conn
+                    .execute(
+                        "INSERT INTO face_boxes(track_id, t_s, x, y, w, h, score, landmarks_json, sharpness, cut_off)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0.9, '[]', 100.0, 0)",
+                        rusqlite::params![id, a + i as f64 * 0.2, cx - w / 2.0, cy - h / 2.0, w, h],
+                    )
+                    .unwrap();
+            }
+        }
+        db.conn
+            .execute("INSERT INTO speaker_turns(video_id, start_s, end_s, speaker) VALUES (1, 0.0, 60.0, 0)", [])
+            .unwrap();
+        for (a, b) in [(2.0, 10.0), (10.0, 20.0), (20.0, 30.0), (30.0, 38.5), (38.6, 46.0), (46.0, 55.0)] {
+            db.conn
+                .execute(
+                    "INSERT INTO transcript_segments(video_id, start_s, end_s, text) VALUES (1, ?1, ?2, 'una frase.')",
+                    [a, b],
+                )
+                .unwrap();
+        }
+        db
+    }
+
+    fn vertical(target: f64, clips: &[(f64, f64)]) -> Script {
+        let beats: Vec<serde_json::Value> = clips
+            .iter()
+            .enumerate()
+            .map(|(i, (a, b))| {
+                serde_json::json!({ "id": format!("b{i}"), "purpose": "p", "narration": "",
+                "clips": [{ "video_id": 1, "in_s": a, "out_s": b, "audio": "source" }] })
+            })
+            .collect();
+        serde_json::from_value(serde_json::json!({ "title": "t", "target_duration_s": target, "width": 1080,
+            "height": 1920, "framing": {}, "beats": beats }))
+        .unwrap()
+    }
+
+    /// The framing repair runs after the fit, and the target is what the fit fitted to: trimming a
+    /// screen share off one clip of several must not lower the cut's target. Only a cut that is one
+    /// clip, whose target is that clip's length, follows it.
+    #[test]
+    fn a_framing_trim_keeps_the_target_of_a_cut_of_several_clips() {
+        let db = podcast();
+        let mut s = vertical(80.0, &[(2.0, 55.35), (2.0, 20.35)]);
+        let notes = repair_framing(&db, &mut s, 0.35, Some(20.0));
+        assert!(notes.iter().any(|n| n.starts_with("trimmed video #1")), "{notes:?}");
+        assert_eq!(s.target_duration_s, Some(80.0), "{notes:?}");
+
+        let mut one = vertical(53.35, &[(2.0, 55.35)]);
+        repair_framing(&db, &mut one, 0.35, Some(20.0));
+        let c = &one.beats[0].clips[0];
+        assert!((one.target_duration_s.unwrap() - (c.out_s - c.in_s)).abs() < 1e-6, "{one:?}");
     }
 
     #[test]

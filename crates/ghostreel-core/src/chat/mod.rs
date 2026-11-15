@@ -18,6 +18,8 @@ pub mod metrics;
 pub mod refine;
 pub mod repair;
 mod research;
+#[cfg(test)]
+mod review_tests;
 pub use enforce_grounding_and_pacing as repair_draft;
 pub mod tools;
 pub mod workers;
@@ -29,8 +31,9 @@ pub use tools::{Detail, tools_definition};
 use crate::Error;
 use crate::db::Db;
 use crate::embed::Embedder;
+use crate::finish::{MIN_CLIP_WORDS, clip_has_speech, clip_speech};
 use crate::projects::{Project, now};
-use crate::script::{ChatStyle, Issue, IssueSeverity, Script, ScriptClip, save_version, snap_to_segments};
+use crate::script::{ChatStyle, Issue, IssueSeverity, Script, ScriptClip};
 use crate::tools::{Origin, RenderOpts, ToolCtx, ToolSession};
 
 /// Events emitted during agent execution.
@@ -385,172 +388,28 @@ pub fn pacing_issues(script: &Script, enforce_target: bool, cfg: &crate::config:
     issues
 }
 
-/// Drop ungrounded/foreign clips and trim over-long ones; with `enforce_target`, also squeeze the
-/// total toward the target. Revisions don't enforce it: the user's feedback ("slower", "longer")
-/// must be able to change the length. Returns the issues describing the changes.
+/// What a chat turn holds its editor's draft to that needs the turn's own context, before the
+/// finishing chain every cut goes through ([`crate::finish::run`], which keeps the project's
+/// footage, a steady camera, the clip length, the sound and the narration for every model's cut):
+/// tidy beat ids, a montage's sound, footage the model never opened that nothing is indexed for,
+/// and with `enforce_target` a squeeze toward the target so the model hears about a cut far too long
+/// while it can still choose differently. Revisions don't enforce the target: the user's feedback
+/// ("slower", "longer") must be able to change the length. Returns the issues describing the changes.
 pub fn enforce_grounding_and_pacing(
     db: &Db,
-    project_id: i64,
+    _project_id: i64,
     s: &mut Script,
     grounding: &Grounding,
     enforce_target: bool,
     cfg: &crate::config::ScriptConfig,
 ) -> Vec<Issue> {
     let mut issues = tidy_beat_ids(s);
-    // A clip on a stretch the camera shakes through is moved to the nearest steady stretch of
-    // the same shot, or dropped when there is none. Telling the model was not enough: the same
-    // stretch of a clip measured at eleven times the sway limit was cut into four scripts.
-    for beat in &mut s.beats {
-        let mut kept = Vec::with_capacity(beat.clips.len());
-        for mut c in beat.clips.drain(..) {
-            let windows = db.motion_windows(c.video_id).unwrap_or_default();
-            if windows.is_empty() || cfg.max_shake_jerk <= 0.0 {
-                kept.push(c);
-                continue;
-            }
-            let limit = crate::steadiness::shake_limit(&windows, cfg.max_shake_jerk, cfg.shake_relative);
-            let spans = crate::steadiness::shaky_spans_with_sway(&windows, c.in_s, c.out_s, limit, cfg.max_sway);
-            let len = c.out_s - c.in_s;
-            let shaky_s: f64 = spans.iter().map(|(a, b)| (b.min(c.out_s) - a.max(c.in_s)).max(0.0)).sum();
-            if len <= 0.0 || shaky_s <= len * 0.5 {
-                kept.push(c);
-                continue;
-            }
-            match crate::steadiness::steady_stretch_near(&windows, c.in_s, len, limit, cfg.max_sway) {
-                Some(start) => {
-                    issues.push(Issue {
-                        fixes: Vec::new(),
-                        severity: IssueSeverity::Info,
-                        beat_id: Some(beat.id.clone()),
-                        clip_index: None,
-                        message: format!(
-                            "moved clip off a shaky stretch: video #{} {:.1}–{:.1} s → {:.1}–{:.1} s",
-                            c.video_id,
-                            c.in_s,
-                            c.out_s,
-                            start,
-                            start + len
-                        ),
-                    });
-                    c.in_s = start;
-                    c.out_s = start + len;
-                    kept.push(c);
-                }
-                None => issues.push(Issue {
-                    fixes: Vec::new(),
-                    severity: IssueSeverity::Warning,
-                    beat_id: Some(beat.id.clone()),
-                    clip_index: None,
-                    message: format!(
-                        "dropped clip: the camera shakes through video #{} {:.1}–{:.1} s and nothing steady \
-                         of that length exists in it",
-                        c.video_id, c.in_s, c.out_s
-                    ),
-                }),
-            }
-        }
-        beat.clips = kept;
-    }
-    // A clip playing its own audio must start on someone close to the microphone: left alone it
-    // opens on the interviewer's question or the slate, which is what "the sound is awful" meant.
-    let mut retimed = 0usize;
-    for beat in &mut s.beats {
-        for c in &mut beat.clips {
-            // A montage's clips play ambience, not answers: moving one onto the microphone would
-            // put the very speech it avoids into it.
-            if cfg.style.broll
-                || c.audio != crate::script::Audio::Source
-                || db.opens_on_mic(c.video_id, c.in_s, c.out_s)
-            {
-                continue;
-            }
-            // It opens on the interviewer: move to the first on-mic segment, keeping the length.
-            let next: Option<f64> = db
-                .conn
-                .query_row(
-                    "SELECT start_s FROM transcript_segments WHERE video_id = ?1 AND start_s >= ?2 \
-                     AND COALESCE(off_mic, 0) = 0 ORDER BY start_s LIMIT 1",
-                    params![c.video_id, c.in_s],
-                    |r| r.get(0),
-                )
-                .ok();
-            if let Some(start) = next {
-                let len = c.out_s - c.in_s;
-                c.in_s = start;
-                c.out_s = start + len;
-                retimed += 1;
-            }
-        }
-    }
-    if retimed > 0 {
-        issues.push(Issue {
-            fixes: Vec::new(),
-            severity: IssueSeverity::Info,
-            beat_id: None,
-            clip_index: None,
-            message: format!("moved {retimed} clip(s) off the interviewer's questions to where someone answers"),
-        });
-    }
-    // A clip with no transcript in its range cannot carry source audio, whatever the model said.
-    // Left alone, a scenery shot marked "source" reads as "someone speaks here", which is exactly
-    // the case the editing rules tell the model to leave narration empty for — so a whole script
-    // of b-roll ends up silent.
     if cfg.style.broll {
         issues.extend(settle_broll_audio(db, s, cfg.style));
-    }
-    let mut unmuted = 0usize;
-    for beat in s.beats.iter_mut().filter(|_| !cfg.style.broll) {
-        for c in &mut beat.clips {
-            if c.audio == crate::script::Audio::Source && !clip_has_speech(db, c.video_id, c.in_s, c.out_s) {
-                c.audio = crate::script::Audio::Mute;
-                unmuted += 1;
-            }
-        }
-    }
-    let mut hushed = 0usize;
-    for beat in &mut s.beats {
-        let speaks = beat.clips.iter().any(|c| c.audio == crate::script::Audio::Source);
-        let narrated = beat.narration.as_deref().map(str::trim).is_some_and(|n| !n.is_empty());
-        if speaks && narrated {
-            beat.narration = Some(String::new());
-            hushed += 1;
-        }
-    }
-    if hushed > 0 {
-        issues.push(Issue {
-            fixes: Vec::new(),
-            severity: IssueSeverity::Info,
-            beat_id: None,
-            clip_index: None,
-            message: format!("dropped narration from {hushed} beat(s) that play the speaker's own audio"),
-        });
-    }
-    if unmuted > 0 {
-        issues.push(Issue {
-            fixes: Vec::new(),
-            severity: IssueSeverity::Info,
-            beat_id: None,
-            clip_index: None,
-            message: format!("muted {unmuted} clip(s) with no speech in range"),
-        });
-    }
-    // Now that it is settled who speaks, let their voice carry the pictures that follow.
-    if !cfg.style.broll {
-        issues.extend(lay_audio_beds(db, s, cfg));
     }
     for beat in &mut s.beats {
         let mut kept = Vec::with_capacity(beat.clips.len());
         for c in beat.clips.drain(..) {
-            if !is_video_in_project(db, project_id, c.video_id) {
-                issues.push(Issue {
-                    fixes: Vec::new(),
-                    severity: IssueSeverity::Warning,
-                    beat_id: Some(beat.id.clone()),
-                    clip_index: None,
-                    message: format!("dropped clip from video #{} — not in this project", c.video_id),
-                });
-                continue;
-            }
             if !grounding.is_grounded(c.video_id, c.in_s, c.out_s, cfg.grounding_slack_s) {
                 // The model reached for footage it never opened. That used to be fatal for the
                 // clip, and with enough ungrounded picks a whole script collapsed to nothing —
@@ -588,67 +447,13 @@ pub fn enforce_grounding_and_pacing(
             }
             kept.push(c);
         }
-        for (i, c) in kept.iter_mut().enumerate() {
-            if c.out_s - c.in_s > cfg.max_clip_s {
-                issues.push(Issue {
-                    fixes: Vec::new(),
-                    severity: IssueSeverity::Info,
-                    beat_id: Some(beat.id.clone()),
-                    clip_index: Some(i),
-                    message: format!(
-                        "trimmed {:.1} s clip to {:.0} s (video #{} from {:.1} s)",
-                        c.out_s - c.in_s,
-                        cfg.trimmed_clip_s,
-                        c.video_id,
-                        c.in_s
-                    ),
-                });
-                c.out_s = c.in_s + cfg.trimmed_clip_s;
-            }
-        }
         beat.clips = kept;
     }
     s.beats.retain(|b| !b.clips.is_empty());
-    clamp_to_duration(db, s);
-    let repeats = drop_repeated_footage(s);
-    if repeats > 0 {
-        issues.push(Issue {
-            fixes: Vec::new(),
-            severity: IssueSeverity::Warning,
-            beat_id: None,
-            clip_index: None,
-            message: format!("dropped {repeats} clip(s) that repeated footage already used earlier"),
-        });
-    }
-    let merged = merge_contiguous_clips(s, cfg);
-    if merged > 0 {
-        issues.push(Issue {
-            fixes: Vec::new(),
-            severity: IssueSeverity::Info,
-            beat_id: None,
-            clip_index: None,
-            message: format!("joined {merged} back-to-back cut(s) of the same shot into continuous clips"),
-        });
-    }
-    // Pad before trimming, so the target is met with the people's pauses already in.
-    if !cfg.style.broll {
-        pad_speech(db, s, cfg);
-    }
-    // Padding can grow two clips of the same video into each other: check again.
-    let overlapped = drop_repeated_footage(s);
-    if overlapped > 0 {
-        issues.push(Issue {
-            fixes: Vec::new(),
-            severity: IssueSeverity::Info,
-            beat_id: None,
-            clip_index: None,
-            message: format!("dropped {overlapped} clip(s) that overlapped another once padded"),
-        });
-    }
     let before = s.total_duration_s();
     // In a montage nothing is speech, so every clip may be trimmed.
     let speaking = |c: &ScriptClip| !cfg.style.broll && clip_has_speech(db, c.video_id, c.in_s, c.out_s);
-    if enforce_target && trim_to_target_with(s, speaking, cfg) {
+    if enforce_target && crate::finish::fit::trim_to_target_with(s, speaking, cfg) {
         issues.push(Issue {
             fixes: Vec::new(),
             severity: IssueSeverity::Info,
@@ -888,9 +693,14 @@ fn approx_tokens(messages: &[Value]) -> usize {
 /// Every round re-sends the whole conversation, so a model that keeps looking eventually fills the
 /// window — Bonsai 2 made 199 tool calls and the turn died on a raw "exceeds the available context
 /// size" from the server, with nothing drafted. The oldest results are the ones it has already
-/// used or discarded; dropping them keeps the research going. Returns false when there is nothing
-/// left to drop, which means it is time to draft with what we have.
-pub(crate) fn make_room(messages: &mut Vec<Value>, budget_tokens: usize) -> bool {
+/// used or discarded; forgetting them keeps the research going. Returns false when there is
+/// nothing left to shrink, which means it is time to draft with what we have.
+///
+/// The response is stubbed, not removed: an assistant message carrying `tool_calls` whose
+/// responses are gone is protocol-invalid and OpenAI-compatible servers reject it outright (400),
+/// which would kill the turn exactly when this exists to prevent.
+const DROPPED_RESULT: &str = "[result dropped to save room]";
+pub(crate) fn make_room(messages: &mut [Value], budget_tokens: usize) -> bool {
     if approx_tokens(messages) <= budget_tokens {
         return true;
     }
@@ -901,11 +711,14 @@ pub(crate) fn make_room(messages: &mut Vec<Value>, budget_tokens: usize) -> bool
             .iter()
             .enumerate()
             .skip(2)
-            .find(|(_, m)| m.get("role").and_then(Value::as_str) == Some("tool"))
+            .find(|(_, m)| {
+                m.get("role").and_then(Value::as_str) == Some("tool")
+                    && m.get("content").and_then(Value::as_str) != Some(DROPPED_RESULT)
+            })
             .map(|(i, _)| i);
         match victim {
             Some(i) => {
-                messages.remove(i);
+                messages[i]["content"] = json!(DROPPED_RESULT);
             }
             None => return false,
         }
@@ -1052,17 +865,7 @@ build the script from what they actually show.";
 
 /// Check whether a video belongs to a project.
 pub fn is_video_in_project(db: &Db, project_id: i64, video_id: i64) -> bool {
-    let res: Result<i64, _> = db.conn.query_row(
-        "SELECT 1 FROM video_files vf
-         JOIN folders f ON f.id = vf.folder_id
-         JOIN project_folders pf ON pf.folder_id = f.id
-         WHERE pf.project_id = ?1 AND vf.video_id = ?2
-           AND NOT EXISTS (SELECT 1 FROM project_exclusions x WHERE x.project_id = pf.project_id AND x.video_id = vf.video_id)
-         LIMIT 1",
-        params![project_id, video_id],
-        |r| r.get(0),
-    );
-    res.is_ok()
+    db.is_video_in_project(project_id, video_id)
 }
 
 /// Tool results for the local helper (8k context) stay small.
@@ -1106,598 +909,6 @@ pub fn check_grounding(
     issues
 }
 
-/// Last resort when the model ignores the target: shorten every clip proportionally (keeping its
-/// in point, never below `script.min_trimmed_clip_s`). Returns whether anything changed.
-pub fn trim_to_target(script: &mut Script, cfg: &crate::config::ScriptConfig) -> bool {
-    trim_to_target_with(script, |_| false, cfg)
-}
-
-/// Cut the pictures back to the voice carrying them, so a cutaway is not a pause.
-///
-/// A beat that ends its bed before its last picture leaves the cutaway hanging in silence — the
-/// b-roll stops being something you see *while* someone talks and becomes a gap between
-/// interviews, which is exactly what it should not be. Two of four beats in an agy cut ran on for
-/// 2.6 s and 4.4 s after the speaker had finished.
-///
-/// The trailing pictures give way, last first, and a clip trimmed below `min_trimmed_clip_s`
-/// goes rather than becoming a flash. The clip that opens the beat is never dropped: it is the
-/// face, and the beat exists to show it.
-pub fn trim_pictures_to_bed(script: &mut Script, cfg: &crate::config::ScriptConfig) -> usize {
-    let mut trimmed = 0usize;
-    for beat in &mut script.beats {
-        // Narration covers the whole beat, so pictures may outlast a bed when there is some.
-        if beat.narration.as_deref().map(str::trim).is_some_and(|n| !n.is_empty()) {
-            continue;
-        }
-        let Some(bed) = &beat.bed else { continue };
-        let bed_len = bed.duration_s();
-        if bed_len <= 0.0 {
-            continue;
-        }
-
-        let beat_len = beat.clips.iter().map(|c| (c.out_s - c.in_s).max(0.0)).sum::<f64>();
-        let mut excess = beat_len - bed_len;
-        if excess <= 0.1 {
-            continue;
-        }
-        // This trims a tail, not a piece. When the voice covers less than half the beat the
-        // model has built something else — pictures that needed narration, or a second speaker —
-        // and cutting to the bed would throw most of the cut away: a Qwen draft collapsed from
-        // 53.6 s to 8.0 s. Leave it, and let the silent picture show in the score.
-        if excess > beat_len * 0.5 {
-            continue;
-        }
-        let mut touched = false;
-
-        // Take it from wherever there is room, in proportion: holding the face a shade less is
-        // better than losing the cutaway, which is the picture the beat cut away to show.
-        let room = |c: &crate::script::ScriptClip| ((c.out_s - c.in_s) - cfg.min_trimmed_clip_s).max(0.0);
-        let total_room: f64 = beat.clips.iter().map(room).sum();
-        if total_room >= excess {
-            let share = excess / total_room;
-            for c in beat.clips.iter_mut() {
-                let give = room(c) * share;
-                if give > 0.01 {
-                    c.out_s -= give;
-                    touched = true;
-                }
-            }
-        } else {
-            // Not enough give: the trailing pictures go, last first, rather than becoming
-            // flashes. The clip that opens the beat stays — it is the face the beat is for.
-            while excess > 0.1 && beat.clips.len() > 1 {
-                let last = beat.clips.len() - 1;
-                let len = (beat.clips[last].out_s - beat.clips[last].in_s).max(0.0);
-                excess -= len;
-                beat.clips.remove(last);
-                touched = true;
-            }
-            if excess > 0.1
-                && let Some(first) = beat.clips.first_mut()
-            {
-                let give = ((first.out_s - first.in_s) - cfg.min_trimmed_clip_s).max(0.0).min(excess);
-                if give > 0.01 {
-                    first.out_s -= give;
-                    touched = true;
-                }
-            }
-        }
-
-        if touched {
-            trimmed += 1;
-        }
-    }
-    trimmed
-}
-
-/// Let the last picture run on after the last word, in silence, so the piece ends instead of
-/// stopping.
-///
-/// Every brain tested cuts on the final syllable. An editor holds the closing image for a moment
-/// and lets it go quiet — it is what tells a viewer the thing is over. The hold comes out of
-/// footage already chosen and already grounded: the last shot simply plays a little longer, and
-/// the bed is deliberately not extended with it, because the silence is the point.
-/// What `hold_the_last_picture` writes in a cutaway's `why`, and what `drop_closing_picture`
-/// finds it by. A repair must be able to tell the pictures it added from the ones the model
-/// chose: `drop_beats_to_target` will not cut below half the clips the model wrote, and an extra
-/// picture in that count let it drop one more beat on the second repair than on the first — a
-/// draft walked 84.5 s → 43.1 s on a pass that should have found nothing to do.
-pub(crate) const CLOSING_PICTURE: &str = "the image the piece closes on";
-
-/// Take back the closing picture a previous repair added, so the fit sees the model's own cut.
-pub fn drop_closing_picture(script: &mut Script) -> bool {
-    let Some(beat) = script.beats.last_mut() else { return false };
-    if beat.clips.last().and_then(|c| c.why.as_deref()) == Some(CLOSING_PICTURE) {
-        beat.clips.pop();
-        return true;
-    }
-    false
-}
-
-pub fn hold_the_last_picture(db: &Db, project_id: i64, script: &mut Script, cfg: &crate::config::ScriptConfig) -> f64 {
-    if cfg.closing_hold_s <= 0.0 {
-        return 0.0;
-    }
-    let Some(beat) = script.beats.last_mut() else { return 0.0 };
-    // Narration read to the end is already an ending; a hold under it would be dead air.
-    if beat.narration.as_deref().map(str::trim).is_some_and(|n| !n.is_empty()) {
-        return 0.0;
-    }
-    // Already held? A hold leaves the last picture outlasting the sound under it, and doing it
-    // again on every repair would add two seconds each time.
-    let pictures: f64 = beat.clips.iter().map(|c| (c.out_s - c.in_s).max(0.0)).sum();
-    match &beat.bed {
-        Some(bed) if pictures > bed.duration_s() + 0.2 => return 0.0,
-        // Without a bed the voice is the last clip's own, so a silent last picture is a held one.
-        None if beat.clips.last().is_some_and(|c| c.audio == crate::script::Audio::Mute) => return 0.0,
-        _ => {}
-    }
-
-    let Some(last) = beat.clips.last() else { return 0.0 };
-    let (last_video, last_out) = (last.video_id, last.out_s);
-
-    // Closing on the speaker means closing on a talking head with the sound already finished —
-    // two seconds of somebody moving their hands in silence, which the editor described as the
-    // cut ending "without an image that represents what we were talking about". When the last
-    // picture is a face we have been listening to, the hold becomes a cutaway instead.
-    //
-    // Only under a bed. Without one the closing voice is that picture's own audio, and the hold
-    // below mutes the clip it extends — so cutting away there would be swapping the sound out as
-    // well as the image, and it changes what the fit is allowed to trim: a draft whose last beat
-    // has no bed walked 84.5 s → 52.5 s across two repairs on the strength of that one difference.
-    let bedded = beat_has_bed(script);
-    if bedded && voices(script).contains(&last_video) {
-        let heard = closing_words(db, script);
-        if let Some(shot) = closing_shot(db, project_id, script, &heard, cfg.closing_hold_s) {
-            let beat = script.beats.last_mut().expect("checked above");
-            beat.clips.push(ScriptClip { exact: false,
-                sentences: None,
-                framing: None,
-                video_id: shot.video_id,
-                in_s: shot.t_s,
-                out_s: shot.t_s + cfg.closing_hold_s,
-                audio: crate::script::Audio::Mute,
-                why: Some(CLOSING_PICTURE.into()),
-                tracks: None,
-            });
-            return cfg.closing_hold_s;
-        }
-    }
-
-    let Some(beat) = script.beats.last_mut() else { return 0.0 };
-    let Some(last) = beat.clips.last_mut() else { return 0.0 };
-    let duration = video_duration(db, last.video_id).unwrap_or(f64::MAX);
-    let room = (duration - last_out).max(0.0);
-    let held = cfg.closing_hold_s.min(room);
-    if held < 0.2 {
-        return 0.0;
-    }
-    if last.audio == crate::script::Audio::Source {
-        // Whatever was being heard stops where it stopped: this is the quiet at the end. Audio is
-        // on or off for a whole clip, so the quiet is its own clip continuing the same shot.
-        // Muting the extended clip instead silenced everything said in it: a one-clip cut (a
-        // social clip) of someone talking came out with no sound at all.
-        let hold = ScriptClip { exact: false,
-            sentences: None,
-            framing: None,
-            video_id: last.video_id,
-            in_s: last.out_s,
-            out_s: last.out_s + held,
-            audio: crate::script::Audio::Mute,
-            why: Some(CLOSING_PICTURE.into()),
-            tracks: None,
-        };
-        beat.clips.push(hold);
-    } else {
-        last.out_s += held;
-    }
-    held
-}
-
-/// Whether the last beat carries its sound on a bed rather than in the pictures themselves.
-fn beat_has_bed(script: &Script) -> bool {
-    script.beats.last().is_some_and(|b| b.bed.is_some())
-}
-
-/// Every video whose voice is heard anywhere in the cut.
-fn voices(script: &Script) -> std::collections::HashSet<i64> {
-    let mut v = std::collections::HashSet::new();
-    for beat in &script.beats {
-        if let Some(bed) = &beat.bed {
-            v.insert(bed.video_id);
-        }
-        for c in &beat.clips {
-            if c.audio == crate::script::Audio::Source {
-                v.insert(c.video_id);
-            }
-        }
-    }
-    v
-}
-
-/// The last thing said in the cut, which is what the closing image should be about.
-fn closing_words(db: &Db, script: &Script) -> String {
-    let Some(beat) = script.beats.last() else { return String::new() };
-    if let Some(bed) = &beat.bed {
-        return clip_speech(db, bed.video_id, bed.in_s, bed.out_s);
-    }
-    match beat.clips.iter().rev().find(|c| c.audio == crate::script::Audio::Source) {
-        Some(c) => clip_speech(db, c.video_id, c.in_s, c.out_s),
-        None => String::new(),
-    }
-}
-
-/// A described shot to close on: nobody talking in it, nothing already used, and of everything
-/// left, whatever shares the most with the closing line.
-///
-/// "Nobody talking" is the part that matters and it is stricter than the rule `chat/build.rs`
-/// picks cutaways by. Excluding only the voices *heard in this cut* still closed one on a frame
-/// of a different interviewee, lav mic on his collar, mid-sentence — a talking head is a talking
-/// head whether or not this piece happens to use his voice. A shot with any speech under it is
-/// somebody being interviewed; the closing image wants the place, not a person answering a
-/// question. Word overlap and not embeddings, deliberately: this is a tie-break over a handful of
-/// eligible shots, not a search.
-fn closing_shot(
-    db: &Db,
-    project_id: i64,
-    script: &Script,
-    heard: &str,
-    need_s: f64,
-) -> Option<crate::chat::build::Shot> {
-    let voices = voices(script);
-    let used: std::collections::HashSet<i64> =
-        script.beats.iter().flat_map(|b| b.clips.iter().map(|c| c.video_id)).collect();
-    let wanted = crate::chat::build::content_words(heard);
-
-    let rows: Vec<(i64, f64, String)> = db
-        .conn
-        .prepare_cached(
-            "SELECT f.video_id, f.t_s, f.description_json, v.duration_s
-               FROM frames f
-               JOIN videos v ON v.id = f.video_id
-               JOIN video_files vf ON vf.video_id = f.video_id
-               JOIN folders fo ON fo.id = vf.folder_id
-               JOIN project_folders pf ON pf.folder_id = fo.id
-              WHERE pf.project_id = ?1 AND f.description_json IS NOT NULL
-              GROUP BY f.video_id, f.t_s",
-        )
-        .ok()?
-        .query_map(params![project_id], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?, r.get::<_, String>(2)?, r.get::<_, f64>(3)?))
-        })
-        .ok()?
-        .flatten()
-        // Room to play the whole hold, not a voice we have been listening to, and not somebody
-        // talking on camera.
-        .filter(|(vid, t_s, _, dur)| {
-            !voices.contains(vid)
-                && !used.contains(vid)
-                && dur - t_s >= need_s
-                && !clip_has_speech(db, *vid, *t_s, t_s + need_s)
-        })
-        .filter_map(|(vid, t_s, json, _)| {
-            let text = serde_json::from_str::<Value>(&json).ok()?["description"].as_str()?.to_string();
-            Some((vid, t_s, text))
-        })
-        .collect();
-
-    rows.into_iter()
-        .max_by_key(|(_, _, text)| crate::chat::build::relevance(&wanted, text))
-        .map(|(video_id, t_s, text)| crate::chat::build::Shot { video_id, t_s, text })
-}
-
-/// Keep every bed inside the beat it plays under.
-///
-/// Beds are laid before the cut is fitted to its target, and fitting trims the pictures. A bed
-/// left at its old length then outlives them: it plays on over the next beat's pictures, and the
-/// export puts overlapping clips on A1. Whatever moved the clips, this puts the sound back inside
-/// its beat.
-pub fn clamp_beds_to_beats(db: &Db, script: &mut Script, cfg: &crate::config::ScriptConfig) {
-    for beat in &mut script.beats {
-        let beat_len: f64 = beat.clips.iter().map(|c| (c.out_s - c.in_s).max(0.0)).sum();
-        let Some(bed) = &beat.bed else { continue };
-        if beat_len <= 0.0 {
-            beat.bed = None;
-            continue;
-        }
-        if bed.duration_s() <= beat_len {
-            continue;
-        }
-
-        // This is the last thing that touches a bed, and it is where a speaker gets cut off:
-        // `end_on_sentences` puts the voice on a sentence, then `trim_pictures_to_bed` and the
-        // closing hold move the pictures, and trimming the bed to fit them lands mid-word.
-        //
-        // The pictures give way to the voice, so when cutting the bed here would land inside a
-        // sentence, the beat's last shot is held for the seconds the voice still needs instead.
-        // Bounded by the budget a clip gets for the same job; past that, the trim stands and the
-        // score reports the cut.
-        let wanted = bed.duration_s();
-        let short_by = wanted - beat_len;
-        let segs = sentence_edges(db, bed.video_id);
-        if short_by <= cfg.max_speech_extend_s && cuts_into_a_sentence(&segs, bed.in_s + beat_len) {
-            if let Some(last) = beat.clips.last_mut() {
-                let room = (video_duration(db, last.video_id).unwrap_or(f64::MAX) - last.out_s).max(0.0);
-                last.out_s += short_by.min(room);
-            }
-            let beat_len: f64 = beat.clips.iter().map(|c| (c.out_s - c.in_s).max(0.0)).sum();
-            if let Some(bed) = &mut beat.bed
-                && bed.duration_s() > beat_len
-            {
-                bed.out_s = bed.in_s + beat_len;
-            }
-            continue;
-        }
-        if let Some(bed) = &mut beat.bed {
-            bed.out_s = bed.in_s + beat_len;
-        }
-    }
-}
-
-/// [`trim_to_target`] that leaves `keep` clips (people speaking) whole and shortens the others.
-/// Fit a cut to its target in one pass.
-///
-/// Three mechanisms used to shorten a script independently — speech capped to a share of the
-/// target, b-roll trimmed proportionally, and a final pass doing both again — each measuring from
-/// its own view of the total. Together they overshot badly: a cut sitting at 58.6 s against a 60 s
-/// target came out at 29.5 s. One pass, measuring once, cannot do that.
-///
-/// Over target, the pictures give way first and the speaking clips only if that was not enough;
-/// under it, the pictures are held longer. Speech is never stretched: a sentence is as long as it
-/// is, and the rest is dead air.
-fn fit_to_target(db: &Db, script: &mut Script, cfg: &crate::config::ScriptConfig) -> bool {
-    let Some(target) = script.target_duration_s.filter(|t| *t > 0.0) else { return false };
-    let total = script.total_duration_s();
-    let slack = target * (cfg.final_target_tolerance - 1.0);
-    if (total - target).abs() <= slack {
-        return false;
-    }
-    if total < target {
-        let grew = grow_to_target(db, script, cfg);
-        clamp_beds_to_beats(db, script, cfg);
-        return grew;
-    }
-
-    // In a montage nothing is speech: every shot may be trimmed.
-    let speaking: Vec<bool> = script
-        .beats
-        .iter()
-        .flat_map(|b| &b.clips)
-        .map(|c| !cfg.style.broll && clip_has_speech(db, c.video_id, c.in_s, c.out_s))
-        .collect();
-    let spoken: f64 = script
-        .beats
-        .iter()
-        .flat_map(|b| &b.clips)
-        .zip(&speaking)
-        .filter(|(_, s)| **s)
-        .map(|(c, _)| c.out_s - c.in_s)
-        .sum();
-    let pictures = total - spoken;
-
-    // What the pictures must come down to, never below the floor for each shot.
-    let picture_floor: f64 = speaking.iter().filter(|s| !**s).count() as f64 * cfg.min_trimmed_clip_s;
-    let want_pictures = (target - spoken).max(picture_floor).min(pictures);
-    let picture_factor = if pictures > 0.0 { want_pictures / pictures } else { 1.0 };
-
-    // Speech is never scaled. Scaling it cut people off mid-sentence to hit a number: three
-    // interview clips in a row ended inside a word. A sentence is the unit here, and a cut that
-    // runs a few seconds long is worth more than one that lands exactly and sounds broken.
-    let speech_factor = 1.0;
-
-    let mut changed = false;
-    let mut i = 0;
-    for beat in &mut script.beats {
-        for c in &mut beat.clips {
-            let factor = if speaking[i] { speech_factor } else { picture_factor };
-            i += 1;
-            if factor >= 1.0 {
-                continue;
-            }
-            let len = c.out_s - c.in_s;
-            let new_len = (len * factor).max(cfg.min_trimmed_clip_s).min(len);
-            if (new_len - len).abs() > 0.05 {
-                c.out_s = c.in_s + new_len;
-                changed = true;
-            }
-        }
-    }
-    clamp_beds_to_beats(db, script, cfg);
-
-    // Pictures alone cannot save a cut made of speech. A model that chose seven quotes of
-    // twenty-five seconds is 349% over and there is nothing to scale: the rule that speech is
-    // never scaled is what stops it, and rightly. What it can lose is a whole quote — that ends
-    // on a sentence by construction, so dropping one breaks nothing.
-    //
-    // The opening and the closing stay: they are the two positions a viewer notices, and a piece
-    // that keeps its hook and its ending and loses a middle is still the piece. Middles go from
-    // the back, so what survives is what was set up earliest.
-    changed |= drop_beats_to_target(db, script, cfg);
-    changed
-}
-
-/// Drop whole beats, from the middle and the back, until the cut is near its target.
-///
-/// Returns whether anything was dropped. Never leaves fewer than two beats: below that it is no
-/// longer the script the model wrote, and the score reports the overrun instead.
-fn drop_beats_to_target(db: &Db, script: &mut Script, cfg: &crate::config::ScriptConfig) -> bool {
-    let Some(target) = script.target_duration_s.filter(|t| *t > 0.0) else { return false };
-    let ceiling = target * cfg.target_overshoot;
-    if script.total_duration_s() <= ceiling || script.beats.len() <= 2 {
-        return false;
-    }
-
-    // Dropping has to stop before the cut stops being the model's. Half the clips is the line the
-    // replay eval draws — "a cut assembled from a third of what the model chose is not the cut it
-    // wrote" — and a wall of eleven talking heads hit it immediately.
-    //
-    // Decided up front, not greedily, because a greedy loop that stops at the floor leaves the
-    // cut still over the ceiling, and the next pass recomputes a lower floor and drops again:
-    // repairing an already-repaired script took it from 53.0 s to 43.4 s. Either the target is
-    // reachable while keeping half the clips, or nothing is dropped and the score reports the
-    // overrun.
-    let floor = script.clip_count().div_ceil(2);
-    let mut plan: Vec<usize> = Vec::new();
-    let mut length = script.total_duration_s();
-    let mut clips = script.clip_count();
-    let mut beats = script.beats.len();
-    // Walk the middles from the back, as `remove` would.
-    for i in (1..script.beats.len() - 1).rev() {
-        if length <= ceiling || beats <= 2 {
-            break;
-        }
-        let beat = &script.beats[i];
-        if clips - beat.clips.len() < floor {
-            break;
-        }
-        length -= beat.clips.iter().map(|c| (c.out_s - c.in_s).max(0.0)).sum::<f64>();
-        clips -= beat.clips.len();
-        beats -= 1;
-        plan.push(i);
-    }
-    if length > ceiling {
-        return false; // cannot get there without gutting it
-    }
-
-    let mut dropped = false;
-    for i in plan {
-        script.beats.remove(i);
-        dropped = true;
-    }
-    if dropped {
-        clamp_beds_to_beats(db, script, cfg);
-    }
-    dropped
-}
-
-/// Hold the b-roll longer when the cut came in short.
-///
-/// Two independent mechanisms shorten a script — speech is capped at a share of the target, and
-/// b-roll is trimmed proportionally — so together they undershoot, and a 60 s teaser lands at 49 s
-/// with no way back. Speaking clips are left alone: they are as long as the sentence is. Scenery
-/// can simply be held, up to what the footage actually has.
-fn grow_to_target(db: &Db, script: &mut Script, cfg: &crate::config::ScriptConfig) -> bool {
-    let Some(target) = script.target_duration_s.filter(|t| *t > 0.0) else { return false };
-    let total = script.total_duration_s();
-    if total >= target * 0.97 {
-        return false;
-    }
-    let mut room: Vec<(usize, usize, f64)> = Vec::new();
-    for (bi, beat) in script.beats.iter().enumerate() {
-        // A narrated beat can only be held as long as its voice-over lasts, or the picture runs
-        // on in silence after the last word — the very gap content_issues complains about.
-        let mut beat_room = f64::MAX;
-        let words = beat.narration.as_deref().map(|n| n.split_whitespace().count()).unwrap_or(0);
-        if words > 0 {
-            let spoken_s = words as f64 / cfg.narration_words_per_s;
-            let beat_s: f64 = beat.clips.iter().map(|c| c.out_s - c.in_s).sum();
-            beat_room = (spoken_s - beat_s).max(0.0);
-        }
-        if beat_room <= 0.1 {
-            continue;
-        }
-        let mut left = beat_room;
-        for (ci, c) in beat.clips.iter().enumerate() {
-            if left <= 0.1 {
-                break;
-            }
-            if clip_has_speech(db, c.video_id, c.in_s, c.out_s) {
-                continue;
-            }
-            let duration: Option<f64> = db
-                .conn
-                .query_row("SELECT duration_s FROM videos WHERE id = ?1", [c.video_id], |r| r.get(0))
-                .ok()
-                .flatten();
-            let ceiling = duration.unwrap_or(c.out_s).min(c.in_s + cfg.max_clip_s);
-            let spare = (ceiling - c.out_s).min(left);
-            if spare > 0.1 {
-                room.push((bi, ci, spare));
-                left -= spare;
-            }
-        }
-    }
-    let spare_total: f64 = room.iter().map(|(_, _, s)| s).sum();
-    if spare_total <= 0.0 {
-        return false;
-    }
-    let needed = target - total;
-    let share = (needed / spare_total).min(1.0);
-    let mut changed = false;
-    for (bi, ci, spare) in room {
-        let add = spare * share;
-        if add > 0.1 {
-            script.beats[bi].clips[ci].out_s += add;
-            changed = true;
-        }
-    }
-    changed
-}
-
-fn trim_to_target_with(
-    script: &mut Script,
-    keep: impl Fn(&ScriptClip) -> bool,
-    cfg: &crate::config::ScriptConfig,
-) -> bool {
-    trim_to_target_within(script, keep, cfg.target_overshoot, cfg)
-}
-
-/// `trim_to_target_with` with an explicit tolerance. The draft stage is loose — the model may yet
-/// redraft — but the last pass before saving has no such luxury: whatever it leaves is the length
-/// the user gets, and a cut left 18% long is one the report then complains about.
-fn trim_to_target_within(
-    script: &mut Script,
-    keep: impl Fn(&ScriptClip) -> bool,
-    tolerance: f64,
-    cfg: &crate::config::ScriptConfig,
-) -> bool {
-    let Some(target) = script.target_duration_s.filter(|t| *t > 0.0) else { return false };
-    let total = script.total_duration_s();
-    if total <= target * tolerance {
-        return false;
-    }
-    let kept: f64 = script.beats.iter().flat_map(|b| &b.clips).filter(|c| keep(c)).map(|c| c.out_s - c.in_s).sum();
-    let flexible = total - kept;
-    if flexible <= 0.0 {
-        return false;
-    }
-    let factor = ((target - kept) / flexible).clamp(0.0, 1.0);
-    let mut changed = false;
-    for clip in script.beats.iter_mut().flat_map(|b| b.clips.iter_mut()) {
-        if keep(clip) {
-            continue;
-        }
-        let len = clip.out_s - clip.in_s;
-        let new_len = (len * factor).max(cfg.min_trimmed_clip_s).min(len);
-        if new_len < len {
-            clip.out_s = clip.in_s + new_len;
-            changed = true;
-        }
-    }
-    changed
-}
-
-fn video_duration(db: &Db, video_id: i64) -> Option<f64> {
-    db.conn
-        .query_row("SELECT duration_s FROM videos WHERE id = ?1", [video_id], |r| r.get::<_, Option<f64>>(0))
-        .ok()
-        .flatten()
-}
-
-/// Keep clips inside their video; drop the ones that start past its end.
-fn clamp_to_duration(db: &Db, script: &mut Script) {
-    for beat in &mut script.beats {
-        beat.clips.retain_mut(|c| {
-            if let Some(d) = video_duration(db, c.video_id) {
-                c.out_s = c.out_s.min(d);
-                c.in_s = c.in_s.max(0.0);
-            }
-            c.out_s - c.in_s >= 1.0
-        });
-    }
-    script.beats.retain(|b| !b.clips.is_empty());
-}
-
 /// A video length stated in the user's message: "60 second", "90s", "1.5 minutes", "2 minutos".
 pub fn requested_duration_s(message: &str) -> Option<f64> {
     let lower = message.to_lowercase();
@@ -1724,55 +935,91 @@ pub fn requested_duration_s(message: &str) -> Option<f64> {
     None
 }
 
-/// A later clip overlapping footage an earlier clip already showed (by more than 1 s) is dropped.
-fn drop_repeated_footage(script: &mut Script) -> usize {
-    let mut used: Vec<(i64, f64, f64)> = Vec::new();
-    let mut dropped = 0;
-    for beat in &mut script.beats {
-        beat.clips.retain(|c| {
-            let repeat = used.iter().any(|&(v, a, b)| v == c.video_id && c.out_s.min(b) - c.in_s.max(a) > 1.0);
-            if repeat {
-                dropped += 1;
-            } else {
-                used.push((c.video_id, c.in_s, c.out_s));
-            }
-            !repeat
-        });
-    }
-    script.beats.retain(|b| !b.clips.is_empty());
-    dropped
+/// The project's videos a text names by file name ("use only 481_2635.mp4 and 481_2636.mp4").
+pub fn named_videos(db: &Db, project_id: i64, text: &str) -> Vec<i64> {
+    let lower = text.to_lowercase();
+    let Ok(videos) = crate::index::videos(db, Some(project_id)) else { return Vec::new() };
+    let mut ids: Vec<i64> = videos
+        .iter()
+        .filter(|v| {
+            std::path::Path::new(&v.path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.len() > 4 && lower.contains(&n.to_lowercase()))
+        })
+        .map(|v| v.id)
+        .collect();
+    ids.dedup();
+    ids
 }
 
-/// Back-to-back clips of the same video in one beat (`0-6`, `6-16`, `16-23`) are jump cuts inside a
-/// single continuous take: join them. Returns how many cuts were removed.
-fn merge_contiguous_clips(script: &mut Script, cfg: &crate::config::ScriptConfig) -> usize {
-    let mut merged = 0;
-    for beat in &mut script.beats {
-        let mut out: Vec<ScriptClip> = Vec::with_capacity(beat.clips.len());
-        for c in beat.clips.drain(..) {
-            if let Some(prev) = out.last_mut()
-                && prev.video_id == c.video_id
-                && (c.in_s - prev.out_s).abs() <= 0.5
-                && c.out_s - prev.in_s <= cfg.max_clip_s
-            {
-                prev.out_s = prev.out_s.max(c.out_s);
-                if c.audio == crate::script::Audio::Source {
-                    prev.audio = crate::script::Audio::Source;
-                }
-                merged += 1;
-                continue;
-            }
-            out.push(c);
-        }
-        beat.clips = out;
+/// The shape a new-cut brief asks for, from its header: `[Draft "Title" — Target: 30s — Format: 9:16]`.
+/// `None` when the message has no such header or names no format (the project's shape).
+pub fn requested_format(message: &str) -> Option<crate::clips::ClipFormat> {
+    let header = message.lines().next()?.trim();
+    if !header.starts_with("[Draft") {
+        return None;
     }
-    merged
+    let rest = header[header.find("Format:")? + "Format:".len()..].trim_start();
+    let token: String = rest.chars().take_while(|c| !c.is_whitespace() && *c != ']').collect();
+    crate::clips::ClipFormat::parse(&token).ok()
+}
+
+/// The shape a turn's cut must have, `(width, height, crop)` where `crop` means the footage is cut
+/// to that shape and its framing follows the speaker:
+/// - the format the new-cut brief chose (Original = the project's own size) wins over the model;
+/// - else the cut keeps the shape it already has (a revision does not change it);
+/// - else, a first draft on Auto, the shape the model drafted, from the brief ("an instagram
+///   video" is vertical), with the framing a crop needs; the project's own when it set none.
+fn turn_shape(
+    project: &crate::projects::Project,
+    requested: Option<crate::clips::ClipFormat>,
+    baseline: Option<&Script>,
+    drafted: &Script,
+) -> Option<(i64, i64, bool)> {
+    if project.width <= 0 || project.height <= 0 {
+        return None;
+    }
+    let own = (project.width, project.height, false);
+    let crops =
+        |w: i64, h: i64| crate::framing::needs_crop(project.width as f64, project.height as f64, w as f64, h as f64);
+    Some(match requested {
+        Some(fmt) => fmt.size().map_or(own, |(w, h)| (w, h, true)),
+        None => match baseline.and_then(|b| Some((b.width?, b.height?))) {
+            Some((w, h)) => (w, h, crops(w, h)),
+            None => match (drafted.width, drafted.height) {
+                (Some(w), Some(h)) if w > 0 && h > 0 => (w, h, crops(w, h)),
+                _ => own,
+            },
+        },
+    })
+}
+
+/// Give a cut its shape (see [`turn_shape`]), then the framing repair a save would do. True when
+/// anything changed.
+fn apply_shape(db: &Db, s: &mut Script, (w, h, crop): (i64, i64, bool), cfg: &crate::config::ScriptConfig) -> bool {
+    let framed = !crop || s.framing.is_some();
+    if s.width == Some(w) && s.height == Some(h) && framed {
+        return false;
+    }
+    s.width = Some(w);
+    s.height = Some(h);
+    if crop && s.framing.is_none() {
+        s.framing = Some(crate::framing::Framing::default());
+    }
+    if !crop {
+        // The footage's own shape: no crop to plan, and no follow-the-speaker framing left over.
+        s.framing = None;
+    }
+    crate::script_fix::repair_framing(db, s, cfg.speech_overrun_s, None);
+    true
 }
 
 /// What the script chat adds to the harness instructions ([`crate::tools::INSTRUCTIONS`], the same
 /// ones an MCP client reads): only how a chat turn ends. Every model the chat drives, local or not,
 /// gets these same words and the same tools; `{project}`, `{fps}`, `{width}` and `{height}` are filled in.
-pub const CHAT_TURN_PROMPT: &str = "You are the editor on GhostReel project \"{project}\" ({fps} fps, {width}x{height}). \
+pub const CHAT_TURN_PROMPT: &str =
+    "You are the editor on GhostReel project \"{project}\" ({fps} fps, {width}x{height}). \
 The project is set, so `project` is optional in every tool. The instructions below are the ones every editor \
 working with GhostReel follows, with the same tools.
 
@@ -2105,29 +1352,6 @@ fn broll_issues(db: &Db, script: &Script) -> Vec<Issue> {
     issues
 }
 
-/// The on-mic words a clip actually carries, as one line.
-fn clip_speech(db: &Db, video_id: i64, in_s: f64, out_s: f64) -> String {
-    let Ok(mut st) = db.conn.prepare(
-        "SELECT text FROM transcript_segments
-          WHERE video_id = ?1 AND end_s > ?2 AND start_s < ?3 AND COALESCE(off_mic, 0) = 0
-          ORDER BY start_s",
-    ) else {
-        return String::new();
-    };
-    st.query_map(params![video_id, in_s, out_s], |r| r.get::<_, String>(0))
-        .map(|rows| rows.flatten().collect::<Vec<_>>().join(" "))
-        .unwrap_or_default()
-}
-
-/// Words below which a clip's speech is an acknowledgement rather than something said.
-///
-/// The repair passes check length, sentence boundaries and grounding; none of them ever asked
-/// whether the words were worth hearing. A cut came back at 39.9 s against a 40 s target — a
-/// perfect duration score — with three of its eight clips being five seconds each of "Thank you."
-/// and "Okay.", a third of the piece. `chat/build.rs` has held this rule since it was written;
-/// a model writing the script was never told it.
-const MIN_CLIP_WORDS: usize = 4;
-
 /// Clips whose audible speech says nothing: "Okay.", "Thank you.", "Yeah."
 ///
 /// Reported rather than dropped. The words may be the point — somebody thanking a neighbour is a
@@ -2166,16 +1390,6 @@ fn empty_speech_issues(db: &Db, script: &Script) -> Vec<Issue> {
         }
     }
     issues
-}
-
-fn clip_has_speech(db: &Db, video_id: i64, in_s: f64, out_s: f64) -> bool {
-    db.conn
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM transcript_segments WHERE video_id = ?1 AND end_s > ?2 AND start_s < ?3)",
-            params![video_id, in_s, out_s],
-            |r| r.get::<_, bool>(0),
-        )
-        .unwrap_or(false)
 }
 
 /// What is actually at a clip's range, when the model never opened it: a short description of the
@@ -2223,335 +1437,6 @@ fn clip_has_described_frame(db: &Db, video_id: i64, in_s: f64, out_s: f64) -> bo
             |r| r.get::<_, bool>(0),
         )
         .unwrap_or(false)
-}
-
-/// Acknowledgements in a row, which is where one person stops talking and another starts.
-///
-/// Nothing in the index says who is speaking. Diarisation would, and `interviewer.rs` catches the
-/// lines that give the interviewer away by their words, but neither reaches the ordinary case: a
-/// subject finishes a thought, both people say "Yeah", and the interviewer starts a story of their
-/// own. Measured on the Greet Mag tape, the beat meant to end on
-///
-/// > "And we love the deer running around too." … "So, yeah, it's beautiful."
-///
-/// ran three segments further, through "Yeah." "Yeah." into "I used to live up on like Spicewood
-/// Springs road." — the interviewer, indistinguishable from the subject as text (Jev scores it
-/// 0.20) and impossible to catch by word count, since it is a full ten-word sentence. What gives
-/// it away is the pair of acknowledgements in front of it.
-const TURN_BREAK_ACKS: usize = 2;
-
-/// How close to the end of a range the handover has to be to count as one.
-///
-/// Without this the pass is not idempotent, which the replay eval caught: having trimmed at one
-/// run of acknowledgements it finds an earlier one on the next pass and trims again, and a
-/// recorded draft walked from 52.5 s to 43.4 s on a repair that should have found nothing to do.
-/// Anchoring the handover to the end of the range fixes that by construction — once the range
-/// stops where the speaker stopped, the acknowledgements are outside it and there is nothing left
-/// to find.
-const TURN_TAIL_S: f64 = 4.0;
-
-/// Whether a transcript line is an acknowledgement rather than something said.
-fn is_acknowledgement(text: &str) -> bool {
-    let n = text.split_whitespace().count();
-    n > 0 && n < MIN_CLIP_WORDS
-}
-
-/// End a speech range before somebody else takes over.
-///
-/// A run of `TURN_BREAK_ACKS` acknowledgements splits the range, and the range keeps the longer
-/// side. That last part is what makes this safe: two "Yeah"s in the middle of somebody's own
-/// answer are them thinking, and the answer continues for longer than its opening — trimming
-/// there would throw the answer away to keep its first sentence. When the acknowledgements are a
-/// handover instead, what follows them is a scrap: Adrienne speaks for eight seconds, both say
-/// "Yeah", and one second of the interviewer follows.
-///
-/// This runs before `end_on_sentences`, which puts the new edge back on a sentence boundary, and
-/// like every pass that moves a clip it must be followed by `clamp_beds_to_beats`.
-pub fn end_on_turns(db: &Db, script: &mut Script, cfg: &crate::config::ScriptConfig) -> usize {
-    let mut fixed = 0usize;
-    for beat in &mut script.beats {
-        let trim = |video_id: i64, in_s: f64, out_s: &mut f64| {
-            let Some(end) = turn_end(db, video_id, in_s, *out_s, cfg) else { return false };
-            if end < *out_s - 0.05 {
-                *out_s = end;
-                return true;
-            }
-            false
-        };
-        for c in beat.clips.iter_mut() {
-            if c.audio == crate::script::Audio::Source && trim(c.video_id, c.in_s, &mut c.out_s) {
-                fixed += 1;
-            }
-        }
-        if let Some(bed) = &mut beat.bed {
-            let (v, i) = (bed.video_id, bed.in_s);
-            if trim(v, i, &mut bed.out_s) {
-                fixed += 1;
-            }
-        }
-    }
-    fixed
-}
-
-/// Where the turn inside `[in_s, out_s]` ends, if somebody else takes over before `out_s`.
-fn turn_end(db: &Db, video_id: i64, in_s: f64, out_s: f64, cfg: &crate::config::ScriptConfig) -> Option<f64> {
-    let segs: Vec<(f64, f64, String)> = db
-        .conn
-        .prepare_cached(
-            "SELECT start_s, end_s, text FROM transcript_segments
-             WHERE video_id = ?1 AND end_s > ?2 + 0.05 AND start_s < ?3 - 0.05 ORDER BY start_s",
-        )
-        .ok()?
-        .query_map(params![video_id, in_s, out_s], |r| {
-            Ok((r.get::<_, f64>(0)?, r.get::<_, f64>(1)?, r.get::<_, String>(2)?))
-        })
-        .ok()?
-        .flatten()
-        .collect();
-    if segs.len() < TURN_BREAK_ACKS + 2 {
-        return None;
-    }
-    // Walk back from the end looking for the last run of acknowledgements, and keep whatever was
-    // said before it. Starting from the end rather than the start is what makes this the *tail*:
-    // the first such run in a long answer is a pause, the last one is the handover.
-    let mut i = segs.len();
-    while i > 0 {
-        i -= 1;
-        if !is_acknowledgement(&segs[i].2) {
-            continue;
-        }
-        let run_end = i + 1;
-        while i > 0 && is_acknowledgement(&segs[i - 1].2) {
-            i -= 1;
-        }
-        if run_end - i < TURN_BREAK_ACKS || i == 0 {
-            continue;
-        }
-        // The handover is at the end of the range or it is not a handover.
-        if out_s - segs[i].0 > TURN_TAIL_S {
-            return None;
-        }
-        // Something is said after the run, or the run is simply trailing filler that
-        // `end_on_sentences` will tidy on its own.
-        if !segs[run_end..].iter().any(|s| !is_acknowledgement(&s.2)) {
-            continue;
-        }
-        let end = segs[i - 1].1;
-        // Keep the longer side. Everything after the acknowledgements has to be the scrap for
-        // this to be a handover rather than a pause the speaker took in their own answer.
-        if out_s - segs[run_end].0 >= end - in_s {
-            continue;
-        }
-        // Never trim a speech range below what a clip is allowed to be.
-        if end - in_s < cfg.min_clip_s {
-            return None;
-        }
-        return Some(end);
-    }
-    None
-}
-
-/// Make every clip that carries someone's voice begin and end on a whole sentence.
-///
-/// Snapping only reaches 0.75 s and the fit that runs last can trim far more than that, so a clip
-/// ended wherever the arithmetic landed: four in one run stopped between 0.27 s and 2.65 s before
-/// the speaker finished, one of them mid-word. The length is a target; a sentence is not.
-///
-/// An edge moves out to the sentence boundary when that is within `max_speech_extend_s`, and back
-/// to the previous one when it is further, so a clip is never left in the middle of a thought.
-pub fn end_on_sentences(db: &Db, script: &mut Script, cfg: &crate::config::ScriptConfig) -> usize {
-    let mut fixed = 0usize;
-    for beat in &mut script.beats {
-        let beat_len: f64 = beat.clips.iter().map(|c| (c.out_s - c.in_s).max(0.0)).sum();
-
-        for c in beat.clips.iter_mut() {
-            if c.audio != crate::script::Audio::Source {
-                continue;
-            }
-            let segs = sentence_edges(db, c.video_id);
-            let duration = video_duration(db, c.video_id).unwrap_or(f64::MAX);
-            let (in_s, out_s) = snap_range(&segs, duration, c.in_s, c.out_s, None, cfg);
-            if (in_s - c.in_s).abs() > 0.05 || (out_s - c.out_s).abs() > 0.05 {
-                c.in_s = in_s;
-                c.out_s = out_s;
-                fixed += 1;
-            }
-        }
-
-        // A bed is where most of the speech lives once one is laid, and it was never covered
-        // here: three clips in a Bonsai 2 cut and one in agy's stopped mid-sentence because of
-        // it. Its end may not pass the pictures it plays under, or `clamp_beds_to_beats` would
-        // cut it back to exactly the place this pass exists to avoid.
-        if let Some(bed) = &mut beat.bed {
-            let segs = sentence_edges(db, bed.video_id);
-            let duration = video_duration(db, bed.video_id).unwrap_or(f64::MAX);
-            let cap = if beat_len > 0.0 { Some(bed.in_s + beat_len) } else { None };
-            let (in_s, out_s) = snap_range(&segs, duration, bed.in_s, bed.out_s, cap, cfg);
-            if (in_s - bed.in_s).abs() > 0.05 || (out_s - bed.out_s).abs() > 0.05 {
-                bed.in_s = in_s;
-                bed.out_s = out_s;
-                fixed += 1;
-            }
-        }
-    }
-    fixed
-}
-
-/// Whether a range ending at `out_s` stops inside a sentence rather than at the end of one.
-/// The same rule `metrics::ends_mid_sentence` measures, asked of the edges already in hand.
-fn cuts_into_a_sentence(segs: &[(f64, f64)], out_s: f64) -> bool {
-    segs.iter().any(|&(start, end)| end > out_s + 0.25 && start < out_s - CUT_INTO_SENTENCE_S)
-}
-
-/// How much of a sentence a range has to play before stopping in it counts as cutting into it.
-/// Below this it is the deliberate overrun past the last word, not an interruption.
-const CUT_INTO_SENTENCE_S: f64 = 0.6;
-
-/// Every sentence boundary in a video, as (start, end) pairs in order.
-pub(crate) fn sentence_edges(db: &Db, video_id: i64) -> Vec<(f64, f64)> {
-    crate::sentence_split::edges(db, video_id)
-}
-
-/// Pull one range onto whole sentences.
-///
-/// `cap_out` is the furthest the end may travel — a bed may not outlast the pictures above it.
-/// When finishing the sentence would pass it, the range falls back to where an earlier sentence
-/// ended rather than stopping in the middle of this one.
-fn snap_range(
-    segs: &[(f64, f64)],
-    duration: f64,
-    in_s: f64,
-    out_s: f64,
-    cap_out: Option<f64>,
-    cfg: &crate::config::ScriptConfig,
-) -> (f64, f64) {
-    let overlapping: Vec<usize> =
-        (0..segs.len()).filter(|&i| segs[i].1 > in_s + 0.05 && segs[i].0 < out_s - 0.05).collect();
-    let (Some(&first), Some(&_last)) = (overlapping.first(), overlapping.last()) else { return (in_s, out_s) };
-    let (mut in_s, mut out_s) = (in_s, out_s);
-    let ceiling = cap_out.unwrap_or(f64::MAX).min(duration);
-
-    // The end. The sentence to finish is one the range is genuinely inside — a range that ends on
-    // a boundary still reaches a little past it on purpose, and treating that as "inside the next
-    // sentence" makes every pass swallow one more: a cut grew 126 s to 154 s being repaired twice.
-    let cut_into = overlapping.iter().rev().find(|&&i| segs[i].0 < out_s - CUT_INTO_SENTENCE_S).copied();
-    let sentence_end = cut_into.map(|i| segs[i].1).unwrap_or(out_s);
-
-    // A range that stops exactly on a boundary still clips the last word. Whisper's times are
-    // approximate and often quantised — Adrienne's segments land on whole seconds — so "the
-    // sentence ends at 79.00" means the speech ends somewhere near it, and cutting at 79.00 takes
-    // the tail of "running around too" with it. Give every speaking range the overrun; the render
-    // fades across it, so the word decays instead of stopping.
-    if let Some(last_end) = overlapping.iter().rev().map(|&i| segs[i].1).find(|&e| e <= out_s + 0.05)
-        && out_s < last_end + cfg.speech_overrun_s - 0.02
-    {
-        out_s = (last_end + cfg.speech_overrun_s).min(ceiling).min(duration);
-    }
-
-    if sentence_end > out_s + 0.05 {
-        let wanted = (sentence_end + cfg.speech_overrun_s).min(duration);
-        if wanted - out_s <= cfg.max_speech_extend_s && wanted <= ceiling {
-            out_s = wanted;
-        } else {
-            let back = overlapping
-                .iter()
-                .rev()
-                .map(|&i| segs[i].1)
-                .find(|&e| e <= out_s + 0.05 && e - in_s >= cfg.min_trimmed_clip_s);
-            match back {
-                Some(end) => out_s = (end + cfg.speech_overrun_s).min(ceiling),
-                // Nothing to fall back to: a whole sentence long is better than half of one.
-                None => out_s = wanted.min(ceiling.max(wanted.min(duration))),
-            }
-        }
-    }
-
-    // The start. Never open in the middle of a sentence.
-    let sentence_start = segs[first].0;
-    if sentence_start < in_s - 0.05 {
-        if in_s - sentence_start <= cfg.max_speech_extend_s {
-            in_s = (sentence_start - cfg.speech_lead_s).max(0.0);
-        } else if let Some(&next) = overlapping.iter().find(|&&i| segs[i].0 >= in_s)
-            && out_s - segs[next].0 >= cfg.min_trimmed_clip_s
-        {
-            in_s = (segs[next].0 - cfg.speech_lead_s).max(0.0);
-        }
-    }
-    (in_s, out_s)
-}
-
-/// Let speaking clips breathe: finish the sentence the clip is in, then hold ~1.5 s of the person
-/// before cutting (without running into their next sentence), and start slightly before the first
-/// words. Runs after [`snap_to_segments`], which lands cuts exactly on segment boundaries.
-fn pad_speech(db: &Db, script: &mut Script, cfg: &crate::config::ScriptConfig) -> usize {
-    let mut changed = 0;
-    for c in script.beats.iter_mut().flat_map(|b| b.clips.iter_mut()) {
-        // A muted clip has no voice to protect. Padding one to finish a sentence nobody can hear
-        // is not a repair, it is a two-second cutaway turning into twenty: b-roll taken from a
-        // video that happens to contain speech was held until that speech finished, and a 40 s
-        // cut came out at 77 s. `end_on_sentences` always skipped these; this did not.
-        if c.audio != crate::script::Audio::Source {
-            continue;
-        }
-        let segs = crate::sentence_split::edges(db, c.video_id);
-        let overlapping: Vec<usize> =
-            (0..segs.len()).filter(|&i| segs[i].1 > c.in_s + 0.05 && segs[i].0 < c.out_s - 0.05).collect();
-        let (Some(&first), Some(&last)) = (overlapping.first(), overlapping.last()) else { continue };
-        let duration = video_duration(db, c.video_id).unwrap_or(f64::MAX);
-        let (old_in, old_out) = (c.in_s, c.out_s);
-
-        // The sentence to hold after is the last one the clip really contains — not one its own
-        // padding reached into. Without that distinction each pass swallows another sentence:
-        // repairing an already-repaired script grew a cut from 152.9 s to 178.7 s, and every
-        // `script import` of a saved script inflated it a little more.
-        let speech_end =
-            overlapping.iter().rev().map(|&i| segs[i].1).find(|&e| e <= c.out_s + 0.05).unwrap_or(segs[last].1);
-        let last = overlapping.iter().rev().find(|&&i| segs[i].1 <= c.out_s + 0.05).copied().unwrap_or(last);
-        let mut out = speech_end + cfg.speech_tail_s;
-        if let Some(next) = segs.get(last + 1) {
-            // Stop short of the next sentence — but when the speaker runs straight on there is
-            // no pause to stop in, and clipping at the final sample cuts the last word's decay.
-            // A little overrun is the difference between a clean end and a chopped one.
-            let room = (next.0 - 0.3).max(speech_end + cfg.speech_overrun_s);
-            out = out.min(room);
-        }
-        let out = out.min(old_out + cfg.max_speech_extend_s).min(duration);
-        if out > c.out_s {
-            c.out_s = out;
-        }
-
-        let speech_start = segs[first].0;
-        let mut lead = (speech_start - cfg.speech_lead_s).max(0.0);
-        if first > 0 {
-            lead = lead.max(segs[first - 1].1);
-        }
-        // Also pulls a clip that starts mid-sentence back to the start of that sentence.
-        if c.in_s > lead {
-            c.in_s = lead.max(old_in - cfg.max_speech_extend_s);
-        }
-        if (c.in_s, c.out_s) != (old_in, old_out) {
-            changed += 1;
-        }
-    }
-    changed
-}
-
-/// Mute clips nobody speaks in when their beat has narration: ambient wind and handling noise
-/// shouldn't play under the voice-over.
-fn mute_silent_clips(db: &Db, script: &mut Script) -> usize {
-    let mut muted = 0;
-    for beat in &mut script.beats {
-        if beat.narration.as_deref().is_none_or(|n| n.trim().is_empty()) {
-            continue;
-        }
-        for c in &mut beat.clips {
-            if c.audio == crate::script::Audio::Source && !clip_has_speech(db, c.video_id, c.in_s, c.out_s) {
-                c.audio = crate::script::Audio::Mute;
-                muted += 1;
-            }
-        }
-    }
-    muted
 }
 
 /// Create a new chat session in the database.
@@ -2944,6 +1829,9 @@ async fn run_turn_inner(
     };
     // Every repair pass reads the chat's style from here.
     ctx.script.style = session_style(&ctx.db, session_id);
+    // The footage the brief named by file, if it did: the bounds of what a repair may add.
+    let brief_text = session_brief(&ctx.db, session_id).unwrap_or_else(|| message.to_string());
+    ctx.script.footage = named_videos(&ctx.db, project_id, &brief_text);
     let style = ctx.script.style;
     // The registry's tools read the whole config; the chat's own `[script]` settings win in it.
     let tool_cfg = {
@@ -2965,14 +1853,32 @@ async fn run_turn_inner(
     // where an editor over MCP starts, with get_outline, and reads only what its story needs.
     // A length the user states ("60 second promo", "2 minutos") wins over whatever the model sets.
     let requested_s = requested_duration_s(message);
+    let requested_fmt = requested_format(message);
 
     // Only a first draft (or an explicit length) is squeezed to its target; revisions follow feedback.
     let enforce_target = latest_script_json.is_none() || requested_s.is_some();
 
     let mut tool_records = Vec::new();
     let mut raw_reply = String::new();
-    let mut parsed_script: Option<Script> = None;
     let mut pre_issues: Vec<Issue> = Vec::new();
+    // What the editor delivered, reviewed the same way whichever backend it is (`repair::deliver`).
+    let mut delivered = repair::Delivered::default();
+    // What the turn asked for, which every draft it reviews is held to. A macro, not a value: the
+    // research loops borrow the grounding mutably until the editor delivers.
+    macro_rules! rules {
+        () => {
+            repair::Rules {
+                project: &project,
+                grounding: &grounding,
+                cfg: &ctx.script,
+                enforce_target,
+                requested_s,
+                requested_fmt,
+                baseline: baseline_script.as_ref(),
+                read: repair::read_back,
+            }
+        };
+    }
 
     match &mut ctx.backend {
         ChatBackend::Server { url, model, api_key, ctx_tokens } => {
@@ -3115,11 +2021,6 @@ async fn run_turn_inner(
 
                 req_messages.push(msg_obj.clone());
 
-                if empty_searches >= EMPTY_SEARCHES_BEFORE_HINT && !hinted {
-                    hinted = true;
-                    req_messages.push(json!({ "role": "user", "content": EMPTY_SEARCH_HINT }));
-                }
-
                 for tc in tool_calls.unwrap() {
                     let call_id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("");
                     let func = tc.get("function").cloned().unwrap_or(Value::Null);
@@ -3166,6 +2067,13 @@ async fn run_turn_inner(
                         "content": called.model_text,
                     }));
                 }
+                // The hint goes after the tool responses: between the assistant `tool_calls`
+                // message and its responses even a `user` hint is protocol-invalid on strict
+                // servers (400), and the model hears it on the next round either way.
+                if empty_searches >= EMPTY_SEARCHES_BEFORE_HINT && !hinted {
+                    hinted = true;
+                    req_messages.push(json!({ "role": "user", "content": EMPTY_SEARCH_HINT }));
+                }
                 if stuck {
                     // It will not stop repeating itself: write the script with what it has.
                     break;
@@ -3174,173 +2082,148 @@ async fn run_turn_inner(
 
             // A model that saved its edit with save_script has delivered it, the way an MCP session
             // does: only one that never saved is asked for the script here.
-            if session.saved_script.is_none() {
-            // Drafting final script call
-            on_event(ChatEvent::Drafting);
-
-            req_messages.push(json!({
-                "role": "user",
-                "content": format!(
-                    "Now produce the final complete Script JSON using only the footage returned by the tools. \
-                     Follow the pacing rules, and apply this request from the user: {message}"
-                )
-            }));
-
-            let mut final_body = json!({
-                "messages": req_messages,
-                "temperature": 0.3,
-                // Deliberately generous: a long script must never be cut off. The cap only stops
-                // a model that will not stop at all, so the turn fails as itself rather than as a
-                // dead socket — Bonsai-27B at 1 bit produced 11 347 tokens of one draft that way.
-                "max_tokens": ctx.script.max_answer_tokens,
-                "chat_template_kwargs": { "enable_thinking": false },
-                "response_format": {
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": "script",
-                        "strict": true,
-                        "schema": script_json_schema()
-                    }
-                }
-            });
-            if !model.is_empty() {
-                final_body["model"] = json!(model);
-            }
-            final_body["options"] = json!({ "num_ctx": *ctx_tokens });
-
-            crate::llmlog::push("prompt", final_body.to_string());
-            let mut req = client.post(format!("{}/v1/chat/completions", url.trim_end_matches('/'))).json(&final_body);
-            if !api_key.is_empty() {
-                req = req.bearer_auth(api_key.as_str());
-            }
-            let request_started = std::time::Instant::now();
-            let resp = req.send().await.map_err(|e| Error::Agent(crate::agents::error_from_request(url, &e)))?;
-            if !resp.status().is_success() {
-                return Err(Error::Agent(crate::agents::error_from_response(url, model, resp).await));
-            }
-            let v: Value = resp.json().await.map_err(|e| Error::Invalid(format!("bad final JSON: {e}")))?;
-            let logged_message = &v["choices"][0]["message"];
-            if let Some(thinking) = logged_message["reasoning_content"].as_str() {
-                crate::llmlog::push("thinking", thinking);
-            }
-            crate::llmlog::push("answer", logged_message.to_string());
-            inference.push(crate::inference::InferenceCall::from_response(
-                &v,
-                "server",
-                if model.is_empty() { "Server model not reported" } else { model },
-                request_started.elapsed().as_secs_f64(),
-            ));
-            let content = v["choices"][0]["message"]["content"].as_str().unwrap_or_default();
-
-            // Set when a redraft came back worse and was thrown away, so the turn can say so.
-            let mut kept_first_draft: Option<(f64, f64)> = None;
-            let mut script_res = crate::sentences::parse_for_project(&ctx.db, content, &project);
-            if let (Ok(s), Some(t)) = (&mut script_res, requested_s) {
-                s.target_duration_s = Some(t);
-            }
-
-            // Grounding + pacing check, redraft once on the server backend
-            on_event(ChatEvent::Validating);
-
-            let redraft_reasons = match &script_res {
-                Ok(s) => {
-                    let mut i = check_grounding(&ctx.db, project_id, s, &grounding, &ctx.script);
-                    i.extend(pacing_issues(s, enforce_target, &ctx.script));
-                    i.extend(content_issues(&ctx.db, s, &ctx.script));
-                    i
-                }
-                Err(_) => Vec::new(),
-            };
-
-            for issue in &redraft_reasons {
-                crate::llmlog::push("info", format!("Validation: {}", issue.message));
-            }
-            if !redraft_reasons.is_empty() && script_res.is_ok() {
-                // Retry once
+            let first = if let Some(id) = session.saved_script {
+                on_event(ChatEvent::Validating);
+                repair::Answer::Saved(id)
+            } else {
                 on_event(ChatEvent::Drafting);
-                let issue_text: Vec<String> = redraft_reasons.iter().map(|i| i.message.clone()).collect();
-                req_messages.push(json!({ "role": "assistant", "content": content }));
                 req_messages.push(json!({
                     "role": "user",
                     "content": format!(
-                        "Fix these problems and return the complete corrected Script JSON:\n{}\n\
-                         Every clip must lie inside a range returned by the tools and follow the pacing rules. \
-                         Keep applying the user's request: {message}",
-                        issue_text.join("\n")
+                        "Now produce the final complete Script JSON using only the footage returned by the tools. \
+                         Follow the pacing rules, and apply this request from the user: {message}"
                     )
                 }));
-                final_body["messages"] = json!(req_messages);
-
+                let final_body = server_script_request(&req_messages, model, *ctx_tokens, ctx.script.max_answer_tokens);
                 crate::llmlog::push("prompt", final_body.to_string());
-                let mut retry_req =
+                let mut req =
                     client.post(format!("{}/v1/chat/completions", url.trim_end_matches('/'))).json(&final_body);
                 if !api_key.is_empty() {
-                    retry_req = retry_req.bearer_auth(api_key.as_str());
+                    req = req.bearer_auth(api_key.as_str());
                 }
-                let retry_started = std::time::Instant::now();
-                let retry_response = async { retry_req.send().await?.json::<Value>().await }.await;
-                if let Err(error) = &retry_response {
-                    crate::llmlog::push("error", format!("Optional redraft: {error}"));
+                let request_started = std::time::Instant::now();
+                let resp = req.send().await.map_err(|e| Error::Agent(crate::agents::error_from_request(url, &e)))?;
+                if !resp.status().is_success() {
+                    return Err(Error::Agent(crate::agents::error_from_response(url, model, resp).await));
                 }
-                if let Ok(rv) = retry_response {
-                    let logged_message = &rv["choices"][0]["message"];
-                    if let Some(thinking) = logged_message["reasoning_content"].as_str() {
-                        crate::llmlog::push("thinking", thinking);
-                    }
-                    crate::llmlog::push("answer", logged_message.to_string());
-                    inference.push(crate::inference::InferenceCall::from_response(
-                        &rv,
-                        "server",
-                        if model.is_empty() { "Server model not reported" } else { model },
-                        retry_started.elapsed().as_secs_f64(),
-                    ));
-                    let retry_content = rv["choices"][0]["message"]["content"].as_str().unwrap_or_default();
-                    if let Ok(mut rescript) = crate::sentences::parse_for_project(&ctx.db, retry_content, &project) {
-                        if let Some(t) = requested_s {
-                            rescript.target_duration_s = Some(t);
-                        }
-                        // The redraft used to be accepted whatever it was, so a model that
-                        // answered one complaint by breaking something else quietly won. Keep it
-                        // only when it is better by the same measure the eval uses.
-                        let after_issues = {
-                            let mut i = check_grounding(&ctx.db, project_id, &rescript, &grounding, &ctx.script);
-                            i.extend(pacing_issues(&rescript, enforce_target, &ctx.script));
-                            i.extend(content_issues(&ctx.db, &rescript, &ctx.script));
-                            i
-                        };
-                        let after = score(&measure(&ctx.db, None, &rescript, &after_issues)).total;
-                        let before = match &script_res {
-                            Ok(first) => score(&measure(&ctx.db, None, first, &redraft_reasons)).total,
-                            Err(_) => f64::MIN,
-                        };
-                        if after >= before {
-                            script_res = Ok(rescript);
-                        } else {
-                            kept_first_draft = Some((before, after));
-                        }
-                    }
-                }
-            }
+                let v: Value = resp.json().await.map_err(|e| Error::Invalid(format!("bad final JSON: {e}")))?;
+                log_server_answer(&v);
+                inference.push(crate::inference::InferenceCall::from_response(
+                    &v,
+                    "server",
+                    if model.is_empty() { "Server model not reported" } else { model },
+                    request_started.elapsed().as_secs_f64(),
+                ));
+                let content = v["choices"][0]["message"]["content"].as_str().unwrap_or_default().to_string();
+                let first = repair::normalise(&ctx.db, &rules!(), repair::Answer::Text(content.clone()));
 
-            if let Ok(mut s) = script_res {
-                if requested_s.is_some() {
-                    s.target_duration_s = requested_s;
+                // Grounding + pacing check, redraft once on the server backend
+                on_event(ChatEvent::Validating);
+                let redraft_reasons = match &first {
+                    repair::Ready::Draft(d) => {
+                        let mut i = check_grounding(&ctx.db, project_id, &d.script, &grounding, &ctx.script);
+                        i.extend(pacing_issues(&d.script, enforce_target, &ctx.script));
+                        i.extend(content_issues(&ctx.db, &d.script, &ctx.script));
+                        i
+                    }
+                    _ => Vec::new(),
+                };
+                for issue in &redraft_reasons {
+                    crate::llmlog::push("info", format!("Validation: {}", issue.message));
                 }
-                pre_issues =
-                    enforce_grounding_and_pacing(&ctx.db, project_id, &mut s, &grounding, enforce_target, &ctx.script);
-                if let Some((before, after)) = kept_first_draft {
-                    pre_issues.push(Issue {
-                        fixes: Vec::new(),
-                        severity: IssueSeverity::Info,
-                        beat_id: None,
-                        clip_index: None,
-                        message: format!("kept the first draft: the redraft scored {after:.0} against {before:.0}"),
-                    });
+                let mut first = first;
+                if !redraft_reasons.is_empty() {
+                    // Retry once
+                    on_event(ChatEvent::Drafting);
+                    let issue_text: Vec<String> = redraft_reasons.iter().map(|i| i.message.clone()).collect();
+                    req_messages.push(json!({ "role": "assistant", "content": content }));
+                    req_messages.push(json!({
+                        "role": "user",
+                        "content": format!(
+                            "Fix these problems and return the complete corrected Script JSON:\n{}\n\
+                             Every clip must lie inside a range returned by the tools and follow the pacing rules. \
+                             Keep applying the user's request: {message}",
+                            issue_text.join("\n")
+                        )
+                    }));
+                    let retry_body =
+                        server_script_request(&req_messages, model, *ctx_tokens, ctx.script.max_answer_tokens);
+                    crate::llmlog::push("prompt", retry_body.to_string());
+                    let mut retry_req =
+                        client.post(format!("{}/v1/chat/completions", url.trim_end_matches('/'))).json(&retry_body);
+                    if !api_key.is_empty() {
+                        retry_req = retry_req.bearer_auth(api_key.as_str());
+                    }
+                    let retry_started = std::time::Instant::now();
+                    let retry_response = async { retry_req.send().await?.json::<Value>().await }.await;
+                    if let Err(error) = &retry_response {
+                        crate::llmlog::push("error", format!("Optional redraft: {error}"));
+                    }
+                    if let Ok(rv) = retry_response {
+                        log_server_answer(&rv);
+                        inference.push(crate::inference::InferenceCall::from_response(
+                            &rv,
+                            "server",
+                            if model.is_empty() { "Server model not reported" } else { model },
+                            retry_started.elapsed().as_secs_f64(),
+                        ));
+                        let retry_content =
+                            rv["choices"][0]["message"]["content"].as_str().unwrap_or_default().to_string();
+                        if let repair::Ready::Draft(redraft) =
+                            repair::normalise(&ctx.db, &rules!(), repair::Answer::Text(retry_content))
+                        {
+                            // The redraft used to be accepted whatever it was, so a model that
+                            // answered one complaint by breaking something else quietly won. Keep it
+                            // only when it is better by the same measure the eval uses.
+                            let after_issues = {
+                                let mut i =
+                                    check_grounding(&ctx.db, project_id, &redraft.script, &grounding, &ctx.script);
+                                i.extend(pacing_issues(&redraft.script, enforce_target, &ctx.script));
+                                i.extend(content_issues(&ctx.db, &redraft.script, &ctx.script));
+                                i
+                            };
+                            let after = score(&measure(&ctx.db, None, &redraft.script, &after_issues)).total;
+                            let before = match &first {
+                                repair::Ready::Draft(d) => {
+                                    score(&measure(&ctx.db, None, &d.script, &redraft_reasons)).total
+                                }
+                                _ => f64::MIN,
+                            };
+                            if after >= before {
+                                first = repair::Ready::Draft(redraft);
+                            } else {
+                                pre_issues.push(Issue {
+                                    fixes: Vec::new(),
+                                    severity: IssueSeverity::Info,
+                                    beat_id: None,
+                                    clip_index: None,
+                                    message: format!(
+                                        "kept the first draft: the redraft scored {after:.0} against {before:.0}"
+                                    ),
+                                });
+                            }
+                        }
+                    }
                 }
-                parsed_script = Some(s);
-            }
-            }
+                repair::Answer::Ready(first)
+            };
 
+            // Read back before it is saved, as every writer's cut is: what the finished cut still
+            // needs goes back to the model, which answers with the whole script.
+            let mut transport = ServerTransport {
+                client: &client,
+                url,
+                model,
+                api_key,
+                ctx_tokens: *ctx_tokens,
+                max_tokens: ctx.script.max_answer_tokens,
+                messages: &mut req_messages,
+                message,
+                inference: &mut inference,
+                on_event: &mut *on_event,
+                cancel: ctx.cancel.clone(),
+            };
+            delivered = repair::deliver(&mut ctx.db, &rules!(), &mut transport, first).await?;
             raw_reply = last_assistant_text;
         }
         ChatBackend::Local { helper, ctx_tokens, think } => {
@@ -3387,6 +2270,8 @@ async fn run_turn_inner(
             // nudge has already been spent.
             let mut tools_used = 0usize;
             let mut pushed_back = 0usize;
+            // The editor's answer, when it gave one: reviewed after the loop, like every backend's.
+            let mut delivered_answer: Option<repair::Answer> = None;
             while budget.can_research() {
                 if cancelled() {
                     // The generation runs inside the helper process; ending the turn means
@@ -3514,151 +2399,134 @@ async fn run_turn_inner(
                             break;
                         }
                     }
+                    // The script: delivered, and reviewed below like every backend's.
                     Ok(LocalAction::Final { script }) => {
-                        let mut s = script;
-                        s.fill_from_project(&project);
-                        crate::sentences::resolve_script(&ctx.db, &mut s).map_err(|e| Error::Invalid(e.to_string()))?;
-                        parsed_script = Some(s);
+                        delivered_answer = Some(repair::Answer::Script(script));
                         break;
                     }
-                    Err(e) => {
-                        return Err(Error::Invalid(format!("local helper output did not match action schema: {e}")));
+                    // Not an action: fed back below with the reason, like any unusable answer.
+                    Err(_) => {
+                        delivered_answer = Some(repair::Answer::Text(out_str));
+                        break;
                     }
                 }
             }
 
-            if parsed_script.is_none() && session.saved_script.is_none() {
-                if cancelled() {
-                    return Err(Error::Invalid(CANCELLED.into()));
-                }
-                on_event(ChatEvent::Drafting);
-                transcript.push_str(&format!(
-                    "<|im_start|>user\n{}Produce the final script action.<|im_end|>\n",
-                    allowed_clips_text(&grounding)
-                ));
-                fit_local_prompt(
-                    helper,
-                    &mut transcript,
-                    &user_turn_text,
-                    *ctx_tokens,
-                    script_token_budget,
-                    *think,
-                    None,
-                )
-                .await?;
-                let final_str = helper
-                    .complete_full(
-                        &transcript,
-                        Some(local_final_action_schema(tools_used == 0)),
-                        script_token_budget,
-                        *think,
-                    )
-                    .await?;
-                debug_dump("final-draft", &transcript, &final_str);
-                // Failing to parse here used to leave `parsed_script` as None, which surfaced as
-                // the bland "unable to assemble a script" reply with no hint of what went wrong —
-                // the same silence a mid-loop parse failure is loud about.
-                match serde_json::from_str::<LocalAction>(&final_str) {
-                    Ok(LocalAction::Final { mut script }) => {
-                        script.fill_from_project(&project);
-                        crate::sentences::resolve_script(&ctx.db, &mut script)
-                            .map_err(|e| Error::Invalid(e.to_string()))?;
-                        parsed_script = Some(script);
-                    }
-                    Ok(LocalAction::Reply { text }) => {
-                        raw_reply = text;
-                    }
-                    Ok(LocalAction::Tool { .. }) => {
-                        return Err(Error::Invalid(
-                            "the local model asked for another tool instead of drafting the script".into(),
+            // What the editor delivered: the script it answered with, else the version it saved
+            // itself, else (when it did not answer in words) the script asked for now.
+            let first = match delivered_answer {
+                Some(answer) => Some(answer),
+                None => match session.saved_script {
+                    Some(id) => Some(repair::Answer::Saved(id)),
+                    None if !raw_reply.is_empty() => None,
+                    None => {
+                        if cancelled() {
+                            return Err(Error::Invalid(CANCELLED.into()));
+                        }
+                        on_event(ChatEvent::Drafting);
+                        transcript.push_str(&format!(
+                            "<|im_start|>user\n{}Produce the final script action.<|im_end|>\n",
+                            allowed_clips_text(&grounding)
                         ));
-                    }
-                    Err(e) => {
-                        return Err(Error::Invalid(format!(
-                            "the local model's final script was not valid JSON: {e}: {}",
-                            final_str.chars().take(200).collect::<String>()
-                        )));
-                    }
-                }
-            }
-
-            on_event(ChatEvent::Validating);
-
-            // Redraft once against the same checks the server backend uses. Without this the
-            // local model's first answer is final, and its usual miss — beats with a purpose but
-            // no narration — reached the user as a finished script full of silent beats.
-            if let Some(s) = &parsed_script {
-                let mut reasons = check_grounding(&ctx.db, project_id, s, &grounding, &ctx.script);
-                reasons.extend(pacing_issues(s, enforce_target, &ctx.script));
-                reasons.extend(content_issues(&ctx.db, s, &ctx.script));
-                for issue in &reasons {
-                    crate::llmlog::push("info", format!("Validation: {}", issue.message));
-                }
-                if !reasons.is_empty() {
-                    on_event(ChatEvent::Drafting);
-                    let issue_text: Vec<String> = reasons.iter().map(|i| i.message.clone()).collect();
-                    transcript.push_str(&format!(
-                        "<|im_start|>assistant\n{}<|im_end|>\n",
-                        serde_json::to_string(&LocalAction::Final { script: s.clone() }).unwrap_or_default()
-                    ));
-                    transcript.push_str(&format!(
-                        "<|im_start|>user\nFix these problems and return the complete corrected script action:\n{}\n\
-                         {}Keep applying the user's request: {message}<|im_end|>\n",
-                        issue_text.join("\n"),
-                        allowed_clips_text(&grounding)
-                    ));
-                    let fits = fit_local_prompt(
-                        helper,
-                        &mut transcript,
-                        &user_turn_text,
-                        *ctx_tokens,
-                        script_token_budget,
-                        *think,
-                        saved_image_paths.first().map(|p| p.as_path()),
-                    )
-                    .await;
-                    if let Err(error) = &fits {
-                        crate::llmlog::push("info", format!("Skipped optional redraft: {error}"));
-                    }
-                    if fits.is_ok()
-                        && let Ok(retry_str) = helper
-                            .complete_full_with_image(
+                        fit_local_prompt(
+                            helper,
+                            &mut transcript,
+                            &user_turn_text,
+                            *ctx_tokens,
+                            script_token_budget,
+                            *think,
+                            None,
+                        )
+                        .await?;
+                        let final_str = helper
+                            .complete_full(
                                 &transcript,
-                                saved_image_paths.first().map(|p| p.as_path()),
-                                Some(local_final_action_schema(false)),
+                                Some(local_final_action_schema(tools_used == 0)),
                                 script_token_budget,
                                 *think,
                             )
-                            .await
-                        && let Ok(LocalAction::Final { mut script }) = serde_json::from_str::<LocalAction>(&retry_str)
-                    {
-                        script.fill_from_project(&project);
-                        crate::sentences::resolve_script(&ctx.db, &mut script)
-                            .map_err(|e| Error::Invalid(e.to_string()))?;
-                        parsed_script = Some(script);
+                            .await?;
+                        debug_dump("final-draft", &transcript, &final_str);
+                        Some(repair::Answer::Text(final_str))
+                    }
+                },
+            };
+
+            on_event(ChatEvent::Validating);
+
+            if let Some(first) = first {
+                let mut first = repair::normalise(&ctx.db, &rules!(), first);
+                // Redraft once against the same checks the server backend uses. Without this the
+                // local model's first answer is final, and its usual miss — beats with a purpose
+                // but no narration — reached the user as a finished script full of silent beats.
+                // A version the editor saved itself has been through its own save.
+                if let repair::Ready::Draft(d) = &first
+                    && d.saved.is_none()
+                {
+                    let mut reasons = check_grounding(&ctx.db, project_id, &d.script, &grounding, &ctx.script);
+                    reasons.extend(pacing_issues(&d.script, enforce_target, &ctx.script));
+                    reasons.extend(content_issues(&ctx.db, &d.script, &ctx.script));
+                    for issue in &reasons {
+                        crate::llmlog::push("info", format!("Validation: {}", issue.message));
+                    }
+                    if !reasons.is_empty() {
+                        on_event(ChatEvent::Drafting);
+                        let issue_text: Vec<String> = reasons.iter().map(|i| i.message.clone()).collect();
+                        transcript.push_str(&format!(
+                            "<|im_start|>assistant\n{}<|im_end|>\n",
+                            serde_json::to_string(&LocalAction::Final { script: d.script.clone() }).unwrap_or_default()
+                        ));
+                        transcript.push_str(&format!(
+                            "<|im_start|>user\nFix these problems and return the complete corrected script action:\n{}\n\
+                             {}Keep applying the user's request: {message}<|im_end|>\n",
+                            issue_text.join("\n"),
+                            allowed_clips_text(&grounding)
+                        ));
+                        let fits = fit_local_prompt(
+                            helper,
+                            &mut transcript,
+                            &user_turn_text,
+                            *ctx_tokens,
+                            script_token_budget,
+                            *think,
+                            saved_image_paths.first().map(|p| p.as_path()),
+                        )
+                        .await;
+                        if let Err(error) = &fits {
+                            crate::llmlog::push("info", format!("Skipped optional redraft: {error}"));
+                        }
+                        if fits.is_ok()
+                            && let Ok(retry_str) = helper
+                                .complete_full_with_image(
+                                    &transcript,
+                                    saved_image_paths.first().map(|p| p.as_path()),
+                                    Some(local_final_action_schema(false)),
+                                    script_token_budget,
+                                    *think,
+                                )
+                                .await
+                            && let Ok(LocalAction::Final { script }) = serde_json::from_str::<LocalAction>(&retry_str)
+                            && let redraft @ repair::Ready::Draft(_) =
+                                repair::normalise(&ctx.db, &rules!(), repair::Answer::Script(script))
+                        {
+                            first = redraft;
+                        }
                     }
                 }
-            }
-
-            if let Some(s) = &mut parsed_script {
-                if requested_s.is_some() {
-                    s.target_duration_s = requested_s;
-                }
-                pre_issues =
-                    enforce_grounding_and_pacing(&ctx.db, project_id, s, &grounding, enforce_target, &ctx.script);
-                // Muting happens above, so by now the beats that need a voice-over are known.
-                // A montage has no voice-over to write.
-                let jobs = if style.broll { Vec::new() } else { narration_jobs(&ctx.db, s, &ctx.script) };
-                let filled = fill_missing_narration(helper, s, jobs).await;
-                if filled > 0 {
-                    pre_issues.push(Issue {
-                        fixes: Vec::new(),
-                        severity: IssueSeverity::Info,
-                        beat_id: None,
-                        clip_index: None,
-                        message: format!("wrote narration for {filled} silent beat(s)"),
-                    });
-                }
+                let mut transport = LocalTransport {
+                    helper,
+                    transcript: &mut transcript,
+                    brief: &user_turn_text,
+                    ctx_tokens: *ctx_tokens,
+                    output: script_token_budget,
+                    think: *think,
+                    image: saved_image_paths.first().map(|p| p.as_path()),
+                    cfg: &ctx.script,
+                    on_event: &mut *on_event,
+                    cancel: ctx.cancel.clone(),
+                };
+                delivered =
+                    repair::deliver(&mut ctx.db, &rules!(), &mut transport, repair::Answer::Ready(first)).await?;
             }
         }
         ChatBackend::Cli(agent) => {
@@ -3698,9 +2566,25 @@ async fn run_turn_inner(
             let schema_json = serde_json::to_string(&local_action_schema()).unwrap_or_default();
             let final_schema_json = serde_json::to_string(&local_final_action_schema(true)).unwrap_or_default();
 
+            let events_file = crate::tools::TempTrailFile::create_named("chat-mcp-events");
+            let events_path = events_file.as_ref().map(|f| f.path().to_path_buf());
+            let mut seen_mcp_events = 0usize;
+            let project_id_str = project_id.to_string();
+            let events_path_str = events_path.as_ref().map(|p| p.to_string_lossy().into_owned());
+            let mut cli_env: Vec<(&str, &str)> = vec![
+                ("GHOSTREEL_MCP_ORIGIN", "script_chat"),
+                ("GHOSTREEL_MCP_PROJECT", &project_id_str),
+                ("GHOSTREEL_MCP_PROFILE", "all"),
+            ];
+            if let Some(p) = events_path_str.as_deref() {
+                cli_env.push(("GHOSTREEL_MCP_EVENTS_FILE", p));
+            }
+
             let mut tool_rounds = 0;
             let mut empty_searches = 0usize;
             let mut hinted = false;
+            // The editor's answer, when it gave one: reviewed after the loop, like every backend's.
+            let mut delivered_answer: Option<repair::Answer> = None;
             // What has happened since the tool last spoke: sent on its own when continuing.
             let mut new_since_last = String::new();
             while round_cap.is_none_or(|cap| tool_rounds < cap) {
@@ -3721,7 +2605,30 @@ async fn run_turn_inner(
                 } else {
                     format!("{new_since_last}\nReply ONLY with a JSON object matching the same schema.")
                 };
-                let out_str = agent.complete_continuing(&cli_prompt, !first).await?;
+                let answered = complete_cli_streaming_mcp(
+                    agent,
+                    &cli_prompt,
+                    !first,
+                    &cli_env,
+                    events_path.as_deref(),
+                    &mut seen_mcp_events,
+                    on_event,
+                    &mut tool_records,
+                    &log_tool_record,
+                    &mut session.saved_script,
+                )
+                .await;
+                // An answer with no JSON in it is an error from the CLI; after the editor saved a
+                // version itself it is the editor saying so in words, and the version is the answer.
+                let out_str = match (answered, session.saved_script) {
+                    (Ok(text), _) => text,
+                    (Err(e), Some(id)) => {
+                        crate::llmlog::push("error", format!("CLI answer after saving #{id}: {e}"));
+                        delivered_answer = Some(repair::Answer::Saved(id));
+                        break;
+                    }
+                    (Err(e), None) => return Err(e),
+                };
                 debug_dump(&format!("cli-round-{tool_rounds}"), &cli_prompt, &out_str);
                 new_since_last.clear();
                 let action: Result<LocalAction, _> = serde_json::from_str(&out_str);
@@ -3775,109 +2682,111 @@ async fn run_turn_inner(
                             break;
                         }
                     }
+                    // The script: delivered, and reviewed below like every backend's.
                     Ok(LocalAction::Final { script }) => {
-                        let mut s = script;
-                        s.fill_from_project(&project);
-                        crate::sentences::resolve_script(&ctx.db, &mut s).map_err(|e| Error::Invalid(e.to_string()))?;
-                        parsed_script = Some(s);
+                        delivered_answer = Some(repair::Answer::Script(script));
                         break;
                     }
+                    // Not an action: perhaps a script wrapped in prose, perhaps nothing usable. Either
+                    // way it is reviewed below (or its reason fed back); prose with no script in it
+                    // after the editor saved a version itself means the saved version.
                     Err(_) => {
-                        // A CLI may wrap the JSON in prose: pull the object out and retry once.
-                        if let Some(start) = out_str.find('{')
-                            && let Ok(LocalAction::Final { mut script }) =
-                                serde_json::from_str::<LocalAction>(&out_str[start..])
-                        {
-                            script.fill_from_project(&project);
-                            crate::sentences::resolve_script(&ctx.db, &mut script)
-                                .map_err(|e| Error::Invalid(e.to_string()))?;
-                            parsed_script = Some(script);
-                            break;
-                        }
-                        // Give up this round and ask for the final script.
+                        delivered_answer = Some(match session.saved_script {
+                            Some(id) if !repair::holds_script(&out_str) => repair::Answer::Saved(id),
+                            _ => repair::Answer::Text(out_str),
+                        });
                         break;
                     }
                 }
             }
 
-            if parsed_script.is_none() && session.saved_script.is_none() {
-                if cancelled() {
-                    return Err(Error::Invalid(CANCELLED.into()));
-                }
-                on_event(ChatEvent::Drafting);
-                let cli_final_prompt = if tool_rounds > 0 {
-                    format!(
-                        "{new_since_last}\nProduce the final script. Reply ONLY with a JSON object matching this \
-                         schema:\n{final_schema_json}"
-                    )
-                } else {
-                    format!(
-                        "{transcript}<|im_start|>assistant\n\
-                         Produce the final script. Reply ONLY with a JSON object matching this schema:\n{final_schema_json}\n<|im_end|>\n"
-                    )
-                };
-                let final_str = agent.complete_continuing(&cli_final_prompt, tool_rounds > 0).await?;
-                debug_dump("cli-final", &cli_final_prompt, &final_str);
-                if let Ok(LocalAction::Reply { text }) = serde_json::from_str::<LocalAction>(&final_str) {
-                    raw_reply = text;
-                } else if let Ok(LocalAction::Final { mut script }) = serde_json::from_str::<LocalAction>(&final_str) {
-                    script.fill_from_project(&project);
-                    crate::sentences::resolve_script(&ctx.db, &mut script)
-                        .map_err(|e| Error::Invalid(e.to_string()))?;
-                    parsed_script = Some(script);
-                }
-            }
+            // What the editor delivered: the script it answered with, else the version it saved
+            // itself, else (when it did not answer in words) the script asked for now.
+            let first = match delivered_answer {
+                Some(answer) => Some(answer),
+                None => match session.saved_script {
+                    Some(id) => Some(repair::Answer::Saved(id)),
+                    None if !raw_reply.is_empty() => None,
+                    None => {
+                        if cancelled() {
+                            return Err(Error::Invalid(CANCELLED.into()));
+                        }
+                        on_event(ChatEvent::Drafting);
+                        let cli_final_prompt = if tool_rounds > 0 {
+                            format!(
+                                "{new_since_last}\nProduce the final script. Reply ONLY with a JSON object matching \
+                                 this schema:\n{final_schema_json}"
+                            )
+                        } else {
+                            format!(
+                                "{transcript}<|im_start|>assistant\n\
+                                 Produce the final script. Reply ONLY with a JSON object matching this schema:\n{final_schema_json}\n<|im_end|>\n"
+                            )
+                        };
+                        let before = session.saved_script;
+                        let answered = complete_cli_streaming_mcp(
+                            agent,
+                            &cli_final_prompt,
+                            tool_rounds > 0,
+                            &cli_env,
+                            events_path.as_deref(),
+                            &mut seen_mcp_events,
+                            on_event,
+                            &mut tool_records,
+                            &log_tool_record,
+                            &mut session.saved_script,
+                        )
+                        .await;
+                        match (answered, session.saved_script) {
+                            (Ok(final_str), saved) => {
+                                debug_dump("cli-final", &cli_final_prompt, &final_str);
+                                Some(cli_answer(final_str, before, saved))
+                            }
+                            // Saved, then answered in words: the saved version.
+                            (Err(e), Some(id)) => {
+                                crate::llmlog::push("error", format!("CLI final answer after saving #{id}: {e}"));
+                                Some(repair::Answer::Saved(id))
+                            }
+                            (Err(e), None) => return Err(e),
+                        }
+                    }
+                },
+            };
 
             on_event(ChatEvent::Validating);
-            if let Some(s) = &mut parsed_script {
-                if requested_s.is_some() {
-                    s.target_duration_s = requested_s;
-                }
-                pre_issues =
-                    enforce_grounding_and_pacing(&ctx.db, project_id, s, &grounding, enforce_target, &ctx.script);
+            if let Some(first) = first {
+                let mut transport = CliTransport {
+                    agent,
+                    env: &cli_env,
+                    events_path: events_path.as_deref(),
+                    seen: &mut seen_mcp_events,
+                    on_event: &mut *on_event,
+                    tool_records: &mut tool_records,
+                    saved: &mut session.saved_script,
+                    final_schema: &final_schema_json,
+                    cancel: ctx.cancel.clone(),
+                };
+                delivered = repair::deliver(&mut ctx.db, &rules!(), &mut transport, first).await?;
             }
         }
     }
 
     let mut script_id = None;
+    let mut parsed_script: Option<Script> = None;
     let mut issues = pre_issues;
-
-    if let Some(mut s) = parsed_script {
-        match repair::finish_script(&ctx.db, project_id, &mut s, enforce_target, &ctx.script)? {
-            Some(more) => {
-                issues.extend(more);
-                // Pin cut title to baseline script title on revision to prevent AI from accidentally splitting cuts
-                if let Some(ref base) = baseline_script {
-                    s.title = base.title.clone();
-                    // The cut's agent choice is the cut's, not the model's to drop.
-                    if s.agents.is_none() {
-                        s.agents = base.agents.clone();
-                    }
-                }
-                let sid = save_version(&ctx.db, project_id, &s, Some(session_id))?;
-                script_id = Some(sid);
-                parsed_script = Some(s);
-            }
-            None => parsed_script = None,
-        }
-    }
-
-    // The edit the model saved itself (save_script, apply_fix), when it did not answer with one: it
-    // already went through the save path, so it is this turn's version as it stands.
-    if script_id.is_none()
-        && let Some(id) = session.saved_script
-        && let Ok(stored) = crate::script::load(&ctx.db, id)
+    issues.extend(delivered.issues);
+    if raw_reply.trim().is_empty()
+        && let Some(reply) = delivered.reply
     {
-        ctx.db.conn.execute("UPDATE scripts SET session_id = ?1 WHERE id = ?2", params![session_id, id])?;
-        issues.extend(crate::script_check::check(
-            &ctx.db,
-            project_id,
-            &stored.script,
-            &ctx.script,
-            &Default::default(),
-        )?);
-        script_id = Some(id);
-        parsed_script = Some(stored.script);
+        raw_reply = reply;
+    }
+    // Why the turn's script could not be used, when it could not: said in the reply instead of a
+    // bland "unable to assemble", so the user (and the next turn) know what to change.
+    let assembly_error = delivered.error;
+    // The cut exactly as it was reviewed: finished once, saved as read.
+    if let Some(s) = delivered.script {
+        script_id = Some(repair::save(&ctx.db, project_id, session_id, &s, delivered.saved)?);
+        parsed_script = Some(s);
     }
 
     // What the pipeline changed after the draft was written — beds laid, clips moved off shaky
@@ -3931,6 +2840,8 @@ async fn run_turn_inner(
             s.clip_count(),
             s.total_duration_s()
         )
+    } else if let Some(why) = &assembly_error {
+        format!("I could not assemble a script: {why}")
     } else {
         "I was unable to assemble a script from the available footage.".to_string()
     };
@@ -4007,6 +2918,322 @@ async fn run_turn_inner(
     Ok(TurnResult { session_id, reply, script_id, script: parsed_script, issues, tool_calls: tool_records, judgement })
 }
 
+/// The request that asks a server model for the whole script, constrained to the script schema.
+fn server_script_request(messages: &[Value], model: &str, ctx_tokens: u32, max_tokens: u32) -> Value {
+    let mut body = json!({
+        "messages": messages,
+        "temperature": 0.3,
+        // Deliberately generous: a long script must never be cut off. The cap only stops a model
+        // that will not stop at all, so the turn fails as itself rather than as a dead socket —
+        // Bonsai-27B at 1 bit produced 11 347 tokens of one draft that way.
+        "max_tokens": max_tokens,
+        "chat_template_kwargs": { "enable_thinking": false },
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": { "name": "script", "strict": true, "schema": script_json_schema() }
+        }
+    });
+    if !model.is_empty() {
+        body["model"] = json!(model);
+    }
+    body["options"] = json!({ "num_ctx": ctx_tokens });
+    body
+}
+
+/// Log a server model's answer (and its reasoning, when it shows it).
+fn log_server_answer(v: &Value) {
+    let message = &v["choices"][0]["message"];
+    if let Some(thinking) = message["reasoning_content"].as_str() {
+        crate::llmlog::push("thinking", thinking);
+    }
+    crate::llmlog::push("answer", message.to_string());
+}
+
+/// What a CLI's answer delivered: the version it saved itself through MCP during this call, when
+/// it saved one and did not answer with a script (in any form a script is read from); else its
+/// text, reviewed as any answer is.
+fn cli_answer(text: String, saved_before: Option<i64>, saved_now: Option<i64>) -> repair::Answer {
+    let answered_with_script = repair::holds_script(&text);
+    match saved_now {
+        Some(id) if saved_now != saved_before && !answered_with_script => repair::Answer::Saved(id),
+        _ => repair::Answer::Text(text),
+    }
+}
+
+fn is_cancelled(cancel: &Option<std::sync::Arc<std::sync::atomic::AtomicBool>>) -> bool {
+    cancel.as_ref().is_some_and(|c| c.load(std::sync::atomic::Ordering::SeqCst))
+}
+
+/// A review round on a server model: the note goes in as the next user message, after the script
+/// it is about, and the answer comes back constrained to the script schema.
+struct ServerTransport<'a, 'e> {
+    client: &'a reqwest::Client,
+    url: &'a str,
+    model: &'a str,
+    api_key: &'a str,
+    ctx_tokens: u32,
+    max_tokens: u32,
+    messages: &'a mut Vec<Value>,
+    /// The user's request, repeated with every note.
+    message: &'a str,
+    inference: &'a mut Vec<crate::inference::InferenceCall>,
+    on_event: &'a mut (dyn FnMut(ChatEvent) + Send + 'e),
+    cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+}
+
+impl repair::Transport for ServerTransport<'_, '_> {
+    async fn ask(&mut self, note: &str, replay: repair::Replay<'_>) -> repair::Answer {
+        if is_cancelled(&self.cancel) {
+            return repair::Answer::Cancelled;
+        }
+        (self.on_event)(ChatEvent::Drafting);
+        let replay = match replay {
+            repair::Replay::Script(s) => serde_json::to_string(s).unwrap_or_default(),
+            repair::Replay::Text(t) => t.to_string(),
+        };
+        self.messages.push(json!({ "role": "assistant", "content": replay }));
+        self.messages.push(json!({
+            "role": "user",
+            "content": format!(
+                "{note}\nReturn the complete corrected Script JSON. Keep applying the user's request: {}",
+                self.message
+            )
+        }));
+        let body = server_script_request(self.messages, self.model, self.ctx_tokens, self.max_tokens);
+        crate::llmlog::push("prompt", body.to_string());
+        let mut req = self.client.post(format!("{}/v1/chat/completions", self.url.trim_end_matches('/'))).json(&body);
+        if !self.api_key.is_empty() {
+            req = req.bearer_auth(self.api_key);
+        }
+        let started = std::time::Instant::now();
+        match async { req.send().await?.json::<Value>().await }.await {
+            Ok(rv) => {
+                log_server_answer(&rv);
+                self.inference.push(crate::inference::InferenceCall::from_response(
+                    &rv,
+                    "server",
+                    if self.model.is_empty() { "Server model not reported" } else { self.model },
+                    started.elapsed().as_secs_f64(),
+                ));
+                repair::Answer::Text(rv["choices"][0]["message"]["content"].as_str().unwrap_or_default().to_string())
+            }
+            Err(error) => {
+                // The cut under review is still a cut: keep it.
+                crate::llmlog::push("error", format!("Review round: {error}"));
+                repair::Answer::Nothing
+            }
+        }
+    }
+}
+
+/// A review round on a local model: the note goes into its transcript after the script it is
+/// about, and the answer comes back constrained to the final-script action. Each draft gets
+/// narration written for its silent beats before it is finished.
+struct LocalTransport<'a, 'e> {
+    helper: &'a mut crate::vision::LocalLlm,
+    transcript: &'a mut String,
+    /// The user's turn, kept when the transcript is trimmed to fit.
+    brief: &'a str,
+    ctx_tokens: u32,
+    output: usize,
+    think: bool,
+    image: Option<&'a Path>,
+    cfg: &'a crate::config::ScriptConfig,
+    on_event: &'a mut (dyn FnMut(ChatEvent) + Send + 'e),
+    cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+}
+
+impl repair::Transport for LocalTransport<'_, '_> {
+    async fn ask(&mut self, note: &str, replay: repair::Replay<'_>) -> repair::Answer {
+        if is_cancelled(&self.cancel) {
+            // The generation runs inside the helper process: ending the turn means ending it.
+            self.helper.kill().await;
+            return repair::Answer::Cancelled;
+        }
+        (self.on_event)(ChatEvent::Drafting);
+        let replay = match replay {
+            repair::Replay::Script(s) => {
+                serde_json::to_string(&LocalAction::Final { script: s.clone() }).unwrap_or_default()
+            }
+            repair::Replay::Text(t) => t.to_string(),
+        };
+        self.transcript
+            .push_str(&format!("<|im_start|>assistant\n{replay}\n<|im_end|>\n<|im_start|>user\n{note}<|im_end|>\n"));
+        if let Err(error) = fit_local_prompt(
+            self.helper,
+            self.transcript,
+            self.brief,
+            self.ctx_tokens,
+            self.output,
+            self.think,
+            self.image,
+        )
+        .await
+        {
+            crate::llmlog::push("error", format!("Review round: {error}"));
+            return repair::Answer::Nothing;
+        }
+        match self
+            .helper
+            .complete_full_with_image(
+                self.transcript,
+                self.image,
+                Some(local_final_action_schema(false)),
+                self.output,
+                self.think,
+            )
+            .await
+        {
+            Ok(answer) => {
+                debug_dump("local-review", self.transcript, &answer);
+                repair::Answer::Text(answer)
+            }
+            Err(error) => {
+                crate::llmlog::push("error", format!("Review round: {error}"));
+                repair::Answer::Nothing
+            }
+        }
+    }
+
+    async fn fill(&mut self, db: &mut Db, draft: &mut Script) -> Vec<Issue> {
+        // A montage has no voice-over to write.
+        if self.cfg.style.broll {
+            return Vec::new();
+        }
+        let jobs = narration_jobs(db, draft, self.cfg);
+        let filled = fill_missing_narration(self.helper, draft, jobs).await;
+        if filled == 0 {
+            return Vec::new();
+        }
+        vec![Issue {
+            fixes: Vec::new(),
+            severity: IssueSeverity::Info,
+            beat_id: None,
+            clip_index: None,
+            message: format!("wrote narration for {filled} silent beat(s)"),
+        }]
+    }
+}
+
+/// A review round on a coding-agent CLI: it continues its own conversation, so it hears only the
+/// note, and it may answer with the script or by saving a version through its MCP tools.
+struct CliTransport<'a, 'e> {
+    agent: &'a crate::cliagent::CliAgent,
+    env: &'a [(&'a str, &'a str)],
+    events_path: Option<&'a Path>,
+    seen: &'a mut usize,
+    on_event: &'a mut (dyn FnMut(ChatEvent) + Send + 'e),
+    tool_records: &'a mut Vec<ToolCallRecord>,
+    saved: &'a mut Option<i64>,
+    final_schema: &'a str,
+    cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+}
+
+impl repair::Transport for CliTransport<'_, '_> {
+    async fn ask(&mut self, note: &str, _replay: repair::Replay<'_>) -> repair::Answer {
+        if is_cancelled(&self.cancel) {
+            return repair::Answer::Cancelled;
+        }
+        (self.on_event)(ChatEvent::Drafting);
+        let prompt = format!("{note}\nReply ONLY with a JSON object matching this schema:\n{}", self.final_schema);
+        let before = *self.saved;
+        let answer = complete_cli_streaming_mcp(
+            self.agent,
+            &prompt,
+            true,
+            self.env,
+            self.events_path,
+            self.seen,
+            &mut *self.on_event,
+            self.tool_records,
+            &log_tool_record,
+            self.saved,
+        )
+        .await;
+        debug_dump("cli-review", &prompt, answer.as_deref().unwrap_or_default());
+        match answer {
+            Ok(text) => cli_answer(text, before, *self.saved),
+            Err(error) => {
+                crate::llmlog::push("error", format!("Review round: {error}"));
+                match *self.saved {
+                    Some(id) if *self.saved != before => repair::Answer::Saved(id),
+                    // The cut under review is still a cut: keep it.
+                    _ => repair::Answer::Nothing,
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn complete_cli_streaming_mcp(
+    agent: &crate::cliagent::CliAgent,
+    prompt: &str,
+    continued: bool,
+    env: &[(&str, &str)],
+    events_path: Option<&std::path::Path>,
+    seen_lines: &mut usize,
+    on_event: &mut (dyn FnMut(ChatEvent) + Send),
+    tool_records: &mut Vec<ToolCallRecord>,
+    log_tool_record: &(dyn Fn(&ToolCallRecord) + Sync),
+    saved_script: &mut Option<i64>,
+) -> Result<String, Error> {
+    let fut = agent.complete_continuing_with_env(prompt, continued, env);
+    let Some(path) = events_path else {
+        return fut.await;
+    };
+    tokio::pin!(fut);
+    let mut tick = tokio::time::interval(Duration::from_millis(150));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let result = loop {
+        tokio::select! {
+            res = &mut fut => break res,
+            _ = tick.tick() => {
+                drain_mcp_events(path, seen_lines, on_event, tool_records, log_tool_record, saved_script);
+            }
+        }
+    };
+    drain_mcp_events(path, seen_lines, on_event, tool_records, log_tool_record, saved_script);
+    result
+}
+
+fn drain_mcp_events(
+    path: &std::path::Path,
+    seen_lines: &mut usize,
+    on_event: &mut (dyn FnMut(ChatEvent) + Send),
+    tool_records: &mut Vec<ToolCallRecord>,
+    log_tool_record: &(dyn Fn(&ToolCallRecord) + Sync),
+    saved_script: &mut Option<i64>,
+) {
+    let Ok(content) = std::fs::read_to_string(path) else { return };
+    let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+    if lines.len() <= *seen_lines {
+        return;
+    }
+    for line in &lines[*seen_lines..] {
+        let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+        let tool = v.get("tool").and_then(Value::as_str).unwrap_or_default().to_string();
+        let args = v.get("args").cloned().unwrap_or_else(|| json!({}));
+        match v.get("kind").and_then(Value::as_str) {
+            Some("tool_started") if !tool.is_empty() => {
+                on_event(ChatEvent::ToolStarted { tool, args });
+            }
+            Some("tool_finished") if !tool.is_empty() => {
+                let summary = v.get("summary").and_then(Value::as_str).unwrap_or_default().to_string();
+                if let Some(id) = v.get("script_id").and_then(Value::as_i64) {
+                    *saved_script = Some(id);
+                }
+                on_event(ChatEvent::ToolFinished { tool: tool.clone(), summary: summary.clone() });
+                let record = ToolCallRecord { tool, args, summary };
+                log_tool_record(&record);
+                tool_records.push(record);
+            }
+            _ => {}
+        }
+    }
+    *seen_lines = lines.len();
+}
+
 /// What the pipeline changed after the draft was written — beds laid, clips moved off shaky
 /// stretches, ranges dropped — written for the model rather than the user.
 ///
@@ -4071,160 +3298,15 @@ fn tidy_beat_ids(script: &mut Script) -> Vec<Issue> {
     issues
 }
 
-/// How far a voice can keep going from `from_s` towards `wanted_end`: never into the interviewer's
-/// next question, and stopping on a whole sentence. Shared by the beds the editor asks for and the
-/// ones laid here, so both end the same way.
-fn speech_runs_until(db: &Db, video_id: i64, from_s: f64, wanted_end: f64, cfg: &crate::config::ScriptConfig) -> f64 {
-    let mut end = wanted_end;
-    let segs: Vec<(f64, f64, bool)> = db
-        .conn
-        .prepare(
-            "SELECT start_s, end_s, COALESCE(off_mic, 0) FROM transcript_segments
-             WHERE video_id = ?1 AND end_s > ?2 AND start_s < ?3 ORDER BY start_s",
-        )
-        .and_then(|mut st| {
-            st.query_map(params![video_id, from_s, end], |r| {
-                Ok((r.get::<_, f64>(0)?, r.get::<_, f64>(1)?, r.get::<_, i64>(2)? != 0))
-            })
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
-        })
-        .unwrap_or_default();
-    if let Some((off_start, _, _)) = segs.iter().find(|(_, _, off)| *off) {
-        end = end.min(*off_start);
-    }
-    match segs.iter().rev().find(|(_, e, off)| !*off && *e <= end + cfg.speech_overrun_s) {
-        // Stop where the sentence stops, the way a clip does.
-        Some((_, seg_end, _)) => (*seg_end + cfg.speech_overrun_s).min(wanted_end),
-        // Nobody speaks out here. Running the bed on would only add silence that has been faded
-        // out anyway, and would claim in the export that there is audio to hear.
-        None => from_s,
-    }
-}
-
-/// Let a speaker's voice run under the pictures that follow, instead of stopping at the cutaway.
-///
-/// A beat usually opens on the person talking and then cuts to what they are describing. Until
-/// beds existed the second half went silent, because sound belonged to whichever clip was on
-/// screen — so every teaser alternated a talking head with a mute postcard. Here the beat's
-/// speech is extended across the whole beat and the pictures play under it.
-///
-/// The bed is aligned so the face stays in sync: it starts as far *before* the speaking clip's
-/// own in-point as that clip sits into the beat, so when we reach the face, the audio is exactly
-/// where it would have been. It stops at a sentence end, before the interviewer's next question,
-/// and never runs further than `max_bed_extend_s` past the clip it came from.
-pub fn lay_audio_beds(db: &Db, s: &mut Script, cfg: &crate::config::ScriptConfig) -> Vec<Issue> {
-    let mut issues = Vec::new();
-    if !cfg.infer_audio_beds {
-        return issues;
-    }
-    let mut laid = 0usize;
-
-    for beat in &mut s.beats {
-        let beat_len: f64 = beat.clips.iter().map(|c| (c.out_s - c.in_s).max(0.0)).sum();
-
-        // A bed the editor asked for is checked, not trusted: it has to be speech, and it cannot
-        // outlast the pictures it plays under or it would run into the next beat.
-        if let Some(bed) = beat.bed.take() {
-            let mut bed = bed;
-            if bed.duration_s() > beat_len && beat_len > 0.0 {
-                bed.out_s = bed.in_s + beat_len;
-            } else if beat_len > bed.duration_s() + 0.05 {
-                // Written to the length of the speaker's own clip, not the beat's: the pictures
-                // after it would play silent, which is the thing a bed exists to prevent.
-                let wanted = (bed.in_s + beat_len).min(bed.out_s + cfg.max_bed_extend_s);
-                let grown = speech_runs_until(db, bed.video_id, bed.out_s, wanted, cfg);
-                if grown > bed.out_s + 0.05 {
-                    bed.out_s = grown;
-                }
-            }
-            if !clip_has_speech(db, bed.video_id, bed.in_s, bed.out_s) {
-                issues.push(Issue {
-                    fixes: Vec::new(),
-                    severity: IssueSeverity::Warning,
-                    beat_id: Some(beat.id.clone()),
-                    clip_index: None,
-                    message: format!(
-                        "dropped the audio bed: nobody speaks at video #{} {:.1}–{:.1} s",
-                        bed.video_id, bed.in_s, bed.out_s
-                    ),
-                });
-            } else {
-                for c in &mut beat.clips {
-                    c.audio = crate::script::Audio::Mute;
-                }
-                beat.bed = Some(bed);
-                continue;
-            }
-        }
-
-        if beat.clips.len() < 2 {
-            continue;
-        }
-        // Where does the voice come from, and how far into the beat does its picture sit?
-        let mut offset = 0.0f64;
-        let mut source: Option<(usize, f64)> = None;
-        for (i, c) in beat.clips.iter().enumerate() {
-            if c.audio == crate::script::Audio::Source && clip_has_speech(db, c.video_id, c.in_s, c.out_s) {
-                source = Some((i, offset));
-                break;
-            }
-            offset += (c.out_s - c.in_s).max(0.0);
-        }
-        let Some((idx, lead)) = source else { continue };
-
-        let beat_dur = beat_len;
-        let clip = &beat.clips[idx];
-        let clip_dur = (clip.out_s - clip.in_s).max(0.0);
-        // Only worth a bed when something other than this clip is on screen.
-        if beat_dur <= clip_dur + 0.05 {
-            continue;
-        }
-
-        let start = (clip.in_s - lead).max(0.0);
-        let wanted_end = start + beat_dur;
-        let cap = clip.out_s + cfg.max_bed_extend_s;
-        let capped = wanted_end.min(cap);
-
-        // Never run into the interviewer's next question, and stop on a whole sentence.
-        let end = speech_runs_until(db, clip.video_id, clip.out_s, capped, cfg);
-        // Worth a bed when the voice carries past its own picture, or begins under one before
-        // it — the two halves of a J-cut. When it does neither, the old behaviour is already right.
-        let trails = end > clip.out_s + 0.05;
-        let leads = start < clip.in_s - 0.05;
-        if !trails && !leads {
-            continue;
-        }
-
-        beat.bed = Some(crate::script::AudioBed {
-            sentences: None,
-            video_id: clip.video_id,
-            in_s: start,
-            out_s: end,
-            why: None,
-            inferred: true,
-            tracks: None,
-        });
-        for c in &mut beat.clips {
-            c.audio = crate::script::Audio::Mute;
-        }
-        laid += 1;
-    }
-
-    if laid > 0 {
-        issues.push(Issue {
-            fixes: Vec::new(),
-            severity: IssueSeverity::Info,
-            beat_id: None,
-            clip_index: None,
-            message: format!("let the speaker's voice run under the pictures in {laid} beat(s)"),
-        });
-    }
-    issues
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The finishing passes these tests drive, as a turn's finish runs them.
+    use crate::finish::fit::drop_beats_to_target;
+    use crate::finish::{
+        clamp_beds_to_beats, drop_closing_picture, end_on_sentences, end_on_turns, fit_to_target,
+        hold_the_last_picture, lay_audio_beds, mute_clips_without_speech, pad_speech, trim_pictures_to_bed,
+    };
 
     #[test]
     fn no_research_limit_means_no_cap_and_a_set_one_is_not_clamped() {
@@ -4269,7 +3351,9 @@ mod tests {
             narration: None,
             on_screen_text: None,
             title_layout: None,
-            clips: vec![ScriptClip { exact: false,
+            clips: vec![ScriptClip {
+                exact: false,
+                gain_db: None,
                 sentences: None,
                 framing: None,
                 video_id: 1,
@@ -4334,7 +3418,9 @@ mod tests {
                 on_screen_text: None,
                 title_layout: None,
                 // Muted pictures under somebody else's voice: what they say is irrelevant.
-                clips: vec![ScriptClip { exact: false,
+                clips: vec![ScriptClip {
+                    exact: false,
+                    gain_db: None,
                     sentences: None,
                     framing: None,
                     video_id: 1,
@@ -4397,7 +3483,9 @@ mod tests {
             narration: None,
             on_screen_text: None,
             title_layout: None,
-            clips: vec![ScriptClip { exact: false,
+            clips: vec![ScriptClip {
+                exact: false,
+                gain_db: None,
                 sentences: None,
                 framing: None,
                 video_id: 1,
@@ -4436,6 +3524,39 @@ mod tests {
         assert!(script.total_duration_s() <= 40.0 * cfg.target_overshoot);
     }
 
+    /// The 9B's six beats against 60 s (77.4 s, from cut #188): dropping stopped as soon as the cut
+    /// was under the 75 s ceiling, after the 3 s "Thank you", and left it at 74.4 s. The next
+    /// middle brings it to 61.8 s, nearer, so it goes too. A cut just over keeps its quotes.
+    #[test]
+    fn dropping_continues_while_it_brings_the_cut_nearer_its_target() {
+        use crate::script::Script;
+        let db = Db::open_in_memory().unwrap();
+        let cfg = crate::config::ScriptConfig::default();
+        let cut = |lens: &[f64], target: f64| -> Script {
+            let beats: Vec<_> = lens
+                .iter()
+                .enumerate()
+                .map(|(i, l)| {
+                    serde_json::json!({ "id": format!("b{i}"), "purpose": "p", "narration": "",
+                        "clips": [{ "video_id": 1, "in_s": 0.0, "out_s": l, "audio": "source" }] })
+                })
+                .collect();
+            serde_json::from_value(serde_json::json!({ "title": "t", "target_duration_s": target, "beats": beats }))
+                .unwrap()
+        };
+        let mut s = cut(&[8.2, 15.3, 29.6, 12.6, 3.0, 8.7], 60.0);
+        assert!(drop_beats_to_target(&db, &mut s, &cfg));
+        let ids: Vec<&str> = s.beats.iter().map(|b| b.id.as_str()).collect();
+        assert_eq!(ids, ["b0", "b1", "b2", "b5"], "{ids:?}");
+        assert!((s.total_duration_s() - 61.8).abs() < 0.01, "{}", s.total_duration_s());
+        // 1.5 s over a 60 s target: losing a 12 s quote lands further away.
+        let mut s = cut(&[20.0, 12.0, 20.0, 9.5], 60.0);
+        let before = s.total_duration_s();
+        assert!(before > 60.0 * cfg.final_target_tolerance, "{before}");
+        assert!(!drop_beats_to_target(&db, &mut s, &cfg));
+        assert_eq!(s.beats.len(), 4);
+    }
+
     #[test]
     fn dropping_stops_before_it_stops_being_the_script() {
         use crate::script::{Audio, Beat, ScriptClip};
@@ -4447,7 +3568,9 @@ mod tests {
             narration: None,
             on_screen_text: None,
             title_layout: None,
-            clips: vec![ScriptClip { exact: false,
+            clips: vec![ScriptClip {
+                exact: false,
+                gain_db: None,
                 sentences: None,
                 framing: None,
                 video_id: 1,
@@ -4515,7 +3638,9 @@ mod tests {
                 )
                 .unwrap();
         }
-        let clip = |in_s: f64, out_s: f64| ScriptClip { exact: false,
+        let clip = |in_s: f64, out_s: f64| ScriptClip {
+            exact: false,
+            gain_db: None,
             sentences: None,
             framing: None,
             video_id: 1,
@@ -4618,7 +3743,9 @@ mod tests {
                 on_screen_text: None,
                 title_layout: None,
                 notes: None,
-                clips: vec![ScriptClip { exact: false,
+                clips: vec![ScriptClip {
+                    exact: false,
+                    gain_db: None,
                     sentences: None,
                     framing: None,
                     video_id: 1,
@@ -4781,7 +3908,9 @@ mod tests {
                 on_screen_text: None,
                 title_layout: None,
                 notes: None,
-                clips: vec![ScriptClip { exact: false,
+                clips: vec![ScriptClip {
+                    exact: false,
+                    gain_db: None,
                     sentences: None,
                     framing: None,
                     video_id: 7,
@@ -4823,7 +3952,9 @@ mod tests {
             on_screen_text: None,
             title_layout: None,
             notes: None,
-            clips: vec![ScriptClip { exact: false,
+            clips: vec![ScriptClip {
+                exact: false,
+                gain_db: None,
                 sentences: None,
                 framing: None,
                 video_id: 1,
@@ -4905,6 +4036,65 @@ mod tests {
         // Nothing left to forget: the caller is told to stop looking and draft.
         let mut only_prompt = vec![msg("system", &"rules ".repeat(500)), msg("user", "hello")];
         assert!(!make_room(&mut only_prompt, 10));
+    }
+
+    /// Trimming must not break the tool protocol: an assistant message with `tool_calls` whose
+    /// responses are gone is rejected outright (400) by OpenAI-compatible servers — which would
+    /// kill the turn exactly when `make_room` exists to prevent. Before, it removed the tool
+    /// messages; now their content is stubbed and every tool_call keeps a response.
+    #[test]
+    fn making_room_stubs_tool_results_and_keeps_every_tool_call_answered() {
+        let mut messages = vec![
+            json!({ "role": "system", "content": "rules rules rules" }),
+            json!({ "role": "user", "content": "make me a teaser" }),
+        ];
+        for i in 0..4 {
+            messages.push(json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{ "id": format!("call_{i}"), "type": "function",
+                    "function": { "name": "search", "arguments": "{}" } }]
+            }));
+            messages.push(json!({
+                "role": "tool", "tool_call_id": format!("call_{i}"),
+                "content": format!("result {i} {}", "keyframe description ".repeat(50))
+            }));
+        }
+        let before = approx_tokens(&messages);
+        assert!(make_room(&mut messages, before / 2), "room was made");
+        assert!(approx_tokens(&messages) <= before / 2);
+        // Every assistant tool_call still has its response: the pairing survives.
+        let answered: std::collections::HashSet<String> = messages
+            .iter()
+            .filter(|m| m["role"] == "tool")
+            .filter_map(|m| m["tool_call_id"].as_str().map(str::to_string))
+            .collect();
+        for m in messages.iter().filter(|m| m["role"] == "assistant") {
+            for tc in m["tool_calls"].as_array().cloned().unwrap_or_default() {
+                let id = tc["id"].as_str().expect("tool_call id");
+                assert!(answered.contains(id), "tool_call {id} lost its response");
+            }
+        }
+        // The oldest results are the stubs; the newest kept its text.
+        let stubbed = messages.iter().filter(|m| m["content"].as_str() == Some(DROPPED_RESULT)).count();
+        assert!(stubbed >= 1, "oldest were stubbed: {stubbed}");
+        assert!(
+            messages.iter().any(|m| m["content"].as_str().is_some_and(|c| c.starts_with("result 3"))),
+            "the newest result kept its text"
+        );
+        // Everything already stubbed and still over budget: nothing more to shrink.
+        assert!(!make_room(&mut messages, 1), "nothing left to shrink");
+        // And an already-stubbed result is not stubbed twice.
+        let mut already = vec![
+            json!({ "role": "system", "content": "rules" }),
+            json!({ "role": "user", "content": "go" }),
+            json!({ "role": "assistant", "content": "", "tool_calls": [{ "id": "c", "type": "function",
+                "function": { "name": "search", "arguments": "{}" } }] }),
+            json!({ "role": "tool", "tool_call_id": "c", "content": DROPPED_RESULT }),
+        ];
+        let snapshot = already.clone();
+        assert!(!make_room(&mut already, 1), "nothing left to shrink");
+        assert_eq!(already, snapshot, "an already-stubbed result is left alone");
     }
 
     /// The model never hears about a repair in the turn that caused it, so the note rides on the
@@ -4997,7 +4187,9 @@ mod tests {
                 on_screen_text: None,
                 title_layout: None,
                 notes: None,
-                clips: vec![ScriptClip { exact: false,
+                clips: vec![ScriptClip {
+                    exact: false,
+                    gain_db: None,
                     sentences: None,
                     framing: None,
                     video_id: 1,
@@ -5106,7 +4298,9 @@ mod tests {
                 notes: None,
                 // Her face for 4 s, then two pictures of what she is describing.
                 clips: vec![
-                    ScriptClip { exact: false,
+                    ScriptClip {
+                        exact: false,
+                        gain_db: None,
                         sentences: None,
                         framing: None,
                         video_id: 1,
@@ -5116,7 +4310,9 @@ mod tests {
                         why: None,
                         tracks: None,
                     },
-                    ScriptClip { exact: false,
+                    ScriptClip {
+                        exact: false,
+                        gain_db: None,
                         sentences: None,
                         framing: None,
                         video_id: 2,
@@ -5126,7 +4322,9 @@ mod tests {
                         why: None,
                         tracks: None,
                     },
-                    ScriptClip { exact: false,
+                    ScriptClip {
+                        exact: false,
+                        gain_db: None,
                         sentences: None,
                         framing: None,
                         video_id: 2,
@@ -5151,6 +4349,40 @@ mod tests {
         assert!(bed.duration_s() > 13.0, "bed covers the cutaways too: {}", bed.duration_s());
         assert!(script.beats[0].clips.iter().all(|c| c.audio == Audio::Mute), "pictures play silent");
         assert!(issues.iter().any(|i| i.message.contains("run under the pictures")));
+
+        // When the second picture is somebody else talking, it is not a cutaway: muted under her
+        // voice, his lips would move to her words. No bed; every clip keeps its own sound.
+        db.conn
+            .execute(
+                "INSERT INTO transcript_segments(video_id, start_s, end_s, text, off_mic)
+                 VALUES (2, 20.0, 25.0, 'and I think the events are great', 0)",
+                [],
+            )
+            .unwrap();
+        let beat = &mut script.beats[0];
+        beat.bed = None;
+        beat.clips[0].audio = Audio::Source;
+        beat.clips[2].audio = Audio::Source;
+        lay_audio_beds(&db, &mut script, &sc());
+        assert!(script.beats[0].bed.is_none(), "no voice over a talking head");
+        assert_eq!(script.beats[0].clips[2].audio, Audio::Source);
+        // And a bed written that way is flagged.
+        let mut bedded = script.clone();
+        bedded.beats[0].bed = Some(crate::script::AudioBed {
+            sentences: None,
+            video_id: 1,
+            in_s: 10.0,
+            out_s: 24.0,
+            why: None,
+            inferred: false,
+            tracks: None,
+        });
+        let issues = crate::script_check::check(&db, project_id_of(&db), &bedded, &sc(), &Default::default()).unwrap();
+        assert!(issues.iter().any(|i| i.clip_index == Some(2) && i.message.contains("their lips move")), "{issues:?}");
+    }
+
+    fn project_id_of(db: &Db) -> i64 {
+        db.conn.query_row("SELECT id FROM projects LIMIT 1", [], |r| r.get(0)).unwrap_or(0)
     }
 
     /// The bed has to stay in step with the face: when the picture of the speaker comes second,
@@ -5189,7 +4421,9 @@ mod tests {
                 title_layout: None,
                 notes: None,
                 clips: vec![
-                    ScriptClip { exact: false,
+                    ScriptClip {
+                        exact: false,
+                        gain_db: None,
                         sentences: None,
                         framing: None,
                         video_id: 2,
@@ -5199,7 +4433,9 @@ mod tests {
                         why: None,
                         tracks: None,
                     },
-                    ScriptClip { exact: false,
+                    ScriptClip {
+                        exact: false,
+                        gain_db: None,
                         sentences: None,
                         framing: None,
                         video_id: 1,
@@ -5246,7 +4482,9 @@ mod tests {
                 on_screen_text: None,
                 title_layout: None,
                 notes: None,
-                clips: vec![ScriptClip { exact: false,
+                clips: vec![ScriptClip {
+                    exact: false,
+                    gain_db: None,
                     sentences: None,
                     framing: None,
                     video_id: 1,
@@ -5272,6 +4510,46 @@ mod tests {
         let issues = lay_audio_beds(&db, &mut script, &sc());
         assert!(script.beats[0].bed.is_none(), "a bed with no speech in it is dropped");
         assert!(issues.iter().any(|i| i.message.contains("nobody speaks")));
+    }
+
+    /// A draft that opens on the interviewer is left for the finishing chain's span rule, which
+    /// trims it to the answer. The draft stage used to slide the whole clip forward to the next
+    /// line on the microphone, keeping its length, so it played on past the answer into whatever
+    /// came next.
+    #[test]
+    fn a_draft_opening_on_the_interviewer_is_trimmed_not_slid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = Db::open_in_memory().unwrap();
+        let p = db.create_project(&NewProject::named("P")).unwrap();
+        let folder = db.add_folder(p.id, tmp.path(), true).unwrap();
+        db.conn.execute("INSERT INTO videos(id, content_hash, size, duration_s) VALUES (1, 'h', 1, 60.0)", []).unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO video_files(video_id, folder_id, path, size, mtime, last_seen) VALUES (1, ?1, 'a.mp4', 1, 0, 0)",
+                [folder.id],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO transcript_segments(video_id, start_s, end_s, text, off_mic) VALUES
+                 (1, 6.5, 8.5, 'What made you want to sponsor the bar?', 1),
+                 (1, 9.0, 14.0, 'We love this hotel and the people who come here.', 0),
+                 (1, 14.5, 17.0, 'And what about the music, then?', 1)",
+                [],
+            )
+            .unwrap();
+        let mut s: Script = serde_json::from_value(json!({ "title": "t", "beats": [{ "id": "b1", "purpose": "p",
+            "narration": "", "clips": [{ "video_id": 1, "in_s": 6.5, "out_s": 14.0, "audio": "source" }] }] }))
+        .unwrap();
+        let mut g = Grounding::default();
+        g.add(1, 0.0, 60.0);
+        enforce_grounding_and_pacing(&db, p.id, &mut s, &g, false, &sc());
+        let c = &s.beats[0].clips[0];
+        assert_eq!((c.in_s, c.out_s), (6.5, 14.0), "the draft keeps its edges for the finish to judge");
+        repair::finish_script(&db, p.id, &mut s, false, &sc()).unwrap().expect("a script");
+        let c = &s.beats[0].clips[0];
+        assert!((8.5..=9.0).contains(&c.in_s), "opens on the answer: {c:?}");
+        assert!(c.out_s < 14.5, "and stops before the next question: {c:?}");
     }
 
     #[test]
@@ -5328,7 +4606,9 @@ mod tests {
                 on_screen_text: None,
                 title_layout: None,
                 notes: None,
-                clips: vec![ScriptClip { exact: false,
+                clips: vec![ScriptClip {
+                    exact: false,
+                    gain_db: None,
                     sentences: None,
                     framing: None,
                     video_id: 1,
@@ -5343,13 +4623,15 @@ mod tests {
             }],
             card_style: None,
         };
-        let issues = enforce_grounding_and_pacing(&db, p.id, &mut script, &grounding, false, &sc());
+        // A finishing rule now, the same for every editor's cut (`finish::draft`).
+        let _ = &grounding;
+        let issues = crate::finish::draft::steady_camera(&db, &mut script, &sc());
         let c = &script.beats[0].clips[0];
         assert!(
             (c.in_s - 8.0).abs() < 1e-9 && (c.out_s - 12.2).abs() < 1e-9,
             "moved to the steady run: {c:?} {issues:?}"
         );
-        assert!(issues.iter().any(|i| i.message.contains("moved clip off a shaky stretch")), "{issues:?}");
+        assert!(issues.iter().any(|i| i.contains("moved clip off a shaky stretch")), "{issues:?}");
     }
 
     /// The three actions a turn can take. A reply carries words and no script, which is what lets
@@ -5528,7 +4810,9 @@ for line in sys.stdin:
 
         // The model opened nothing, so nothing is grounded by tool results.
         let grounding = Grounding::default();
-        let clip = |in_s: f64, out_s: f64| ScriptClip { exact: false,
+        let clip = |in_s: f64, out_s: f64| ScriptClip {
+            exact: false,
+            gain_db: None,
             sentences: None,
             framing: None,
             video_id: 1,
@@ -5631,7 +4915,9 @@ for line in sys.stdin:
     #[test]
     fn pacing_redraft_and_trim() {
         use crate::script::{Audio, Beat, ScriptClip};
-        let clip = |in_s: f64, out_s: f64| ScriptClip { exact: false,
+        let clip = |in_s: f64, out_s: f64| ScriptClip {
+            exact: false,
+            gain_db: None,
             sentences: None,
             framing: None,
             video_id: 1,
@@ -5756,6 +5042,50 @@ for line in sys.stdin:
         assert_eq!(requested_duration_s("leave people talking longer"), None);
     }
 
+    #[test]
+    fn the_format_chosen_wins_auto_follows_the_draft_and_a_cut_keeps_its_shape() {
+        use crate::clips::ClipFormat;
+        let db = Db::open_in_memory().unwrap();
+        let mut p = db.create_project(&NewProject::named("P")).unwrap();
+        p.width = 3840;
+        p.height = 2160;
+        let draft = |w: Option<i64>, h: Option<i64>| -> Script {
+            let mut s: Script = serde_json::from_value(serde_json::json!({"title": "t", "beats": []})).unwrap();
+            s.width = w;
+            s.height = h;
+            s
+        };
+        let vertical = draft(Some(1080), Some(1920));
+        let none = draft(None, None);
+        // Chosen: wins over what the model drafted.
+        assert_eq!(turn_shape(&p, Some(ClipFormat::Original), None, &vertical), Some((3840, 2160, false)));
+        assert_eq!(turn_shape(&p, Some(ClipFormat::Vertical), None, &none), Some((1080, 1920, true)));
+        // Auto: the model's shape, cropped; the project's when it set none.
+        assert_eq!(turn_shape(&p, None, None, &vertical), Some((1080, 1920, true)));
+        assert_eq!(turn_shape(&p, None, None, &none), Some((3840, 2160, false)));
+        // A revision keeps the cut's shape whatever the model writes.
+        let landscape = draft(Some(3840), Some(2160));
+        assert_eq!(turn_shape(&p, None, Some(&landscape), &vertical), Some((3840, 2160, false)));
+        // Back to the footage's own shape: no crop framing left over.
+        let mut s = vertical.clone();
+        s.framing = Some(crate::framing::Framing::default());
+        assert!(apply_shape(&db, &mut s, (3840, 2160, false), &sc()));
+        assert_eq!((s.width, s.height, s.framing.is_none()), (Some(3840), Some(2160), true));
+    }
+
+    #[test]
+    fn a_new_cut_brief_says_its_shape_in_its_header() {
+        use crate::clips::ClipFormat;
+        assert_eq!(
+            requested_format("[Draft \"Reel\" — Target: 30s — Format: 9:16]\nUpbeat"),
+            Some(ClipFormat::Vertical)
+        );
+        assert_eq!(requested_format("[Draft \"Sq\" — Target: 30s — Format: 1:1]"), Some(ClipFormat::Square));
+        assert_eq!(requested_format("[Draft \"Old\" — Target: 30s]\nbrief"), None);
+        assert_eq!(requested_format("make it Format: 9:16 please"), None, "only a draft header says it");
+        assert_eq!(requested_format("[Draft \"A\" — Target: 30s — Format: auto]"), None, "auto: the model decides");
+    }
+
     /// A b-roll chat: the sound is decided, not drafted — ambience or silence as chosen, anyone on
     /// the microphone muted either way, and no narration or bed survives. Its checks are about
     /// pictures: a shot of somebody talking is the thing to fix, missing narration is not.
@@ -5785,7 +5115,9 @@ for line in sys.stdin:
         for t in [20.0, 105.0] {
             db.conn.execute("INSERT INTO frames(video_id, t_s, description_json) VALUES (1, ?1, '{}')", [t]).unwrap();
         }
-        let clip = |in_s: f64, out_s: f64, audio| ScriptClip { exact: false,
+        let clip = |in_s: f64, out_s: f64, audio| ScriptClip {
+            exact: false,
+            gain_db: None,
             sentences: None,
             video_id: 1,
             in_s,
@@ -5888,7 +5220,9 @@ for line in sys.stdin:
             )
             .unwrap();
         db.conn.execute("INSERT INTO frames(video_id, t_s, description_json) VALUES (1, 20.0, '{}')", []).unwrap();
-        let clip = |in_s: f64, out_s: f64| ScriptClip { exact: false,
+        let clip = |in_s: f64, out_s: f64| ScriptClip {
+            exact: false,
+            gain_db: None,
             sentences: None,
             framing: None,
             video_id: 1,
@@ -5960,7 +5294,7 @@ for line in sys.stdin:
         pad_speech(&db, &mut talk, &sc());
         assert!((talk.beats[1].clips[0].out_s - 111.5).abs() < 1e-9, "finishes the sentence, then holds");
 
-        assert_eq!(mute_silent_clips(&db, &mut s), 2);
+        assert_eq!(mute_clips_without_speech(&db, &mut s), 2);
         assert_eq!(s.beats[1].clips[0].audio, Audio::Source, "speech without narration keeps its audio");
     }
 
@@ -6086,7 +5420,9 @@ for line in sys.stdin:
                 on_screen_text: None,
                 title_layout: None,
                 notes: None,
-                clips: vec![ScriptClip { exact: false,
+                clips: vec![ScriptClip {
+                    exact: false,
+                    gain_db: None,
                     sentences: None,
                     framing: None,
                     video_id: 1,
@@ -6112,8 +5448,16 @@ for line in sys.stdin:
 
         let held = hold_the_last_picture(&db, 1, &mut script, &sc());
         assert!((held - 2.0).abs() < 0.01, "held {held}");
+        // The shot runs on as a clip of its own, so the next finish can take the hold back
+        // (`drop_closing_picture`) instead of finding a longer picture and holding again.
         let clip = &script.beats[0].clips[0];
-        assert!((clip.out_s - 22.0).abs() < 0.01, "the picture runs on: {}", clip.out_s);
+        assert!((clip.out_s - 20.0).abs() < 0.01, "the chosen picture keeps its length: {}", clip.out_s);
+        let hold = &script.beats[0].clips[1];
+        assert_eq!(hold.why.as_deref(), Some(crate::script::CLOSING_PICTURE));
+        assert_eq!((hold.video_id, hold.audio), (1, Audio::Mute));
+        assert!((hold.in_s - 20.0).abs() < 0.01 && (hold.out_s - 22.0).abs() < 0.01, "the picture runs on: {hold:?}");
+        assert!(drop_closing_picture(&mut script), "and the next finish takes it back");
+        assert_eq!(script.beats[0].clips.len(), 1);
         // The voice is not extended with it: the quiet is the point.
         assert!((script.beats[0].bed.as_ref().unwrap().out_s - 20.0).abs() < 0.01);
     }
@@ -6133,7 +5477,9 @@ for line in sys.stdin:
             notes: None,
             // A beat that ends on someone speaking: the case a hold is for. A last picture that
             // is already silent has ended the piece by itself and is left alone.
-            clips: vec![ScriptClip { exact: false,
+            clips: vec![ScriptClip {
+                exact: false,
+                gain_db: None,
                 sentences: None,
                 framing: None,
                 video_id: 1,
@@ -6203,7 +5549,9 @@ for line in sys.stdin:
                 on_screen_text: None,
                 title_layout: None,
                 notes: None,
-                clips: vec![ScriptClip { exact: false,
+                clips: vec![ScriptClip {
+                    exact: false,
+                    gain_db: None,
                     sentences: None,
                     framing: None,
                     video_id: 1,
@@ -6258,7 +5606,9 @@ for line in sys.stdin:
                 notes: None,
                 // Her face, then a cutaway: 14.5 s of picture over 11.9 s of voice.
                 clips: vec![
-                    ScriptClip { exact: false,
+                    ScriptClip {
+                        exact: false,
+                        gain_db: None,
                         sentences: None,
                         framing: None,
                         video_id: 1,
@@ -6268,7 +5618,9 @@ for line in sys.stdin:
                         why: None,
                         tracks: None,
                     },
-                    ScriptClip { exact: false,
+                    ScriptClip {
+                        exact: false,
+                        gain_db: None,
                         sentences: None,
                         framing: None,
                         video_id: 2,
@@ -6327,7 +5679,9 @@ for line in sys.stdin:
                 notes: None,
                 // 40 s of pictures over 8 s of voice.
                 clips: vec![
-                    ScriptClip { exact: false,
+                    ScriptClip {
+                        exact: false,
+                        gain_db: None,
                         sentences: None,
                         framing: None,
                         video_id: 1,
@@ -6337,7 +5691,9 @@ for line in sys.stdin:
                         why: None,
                         tracks: None,
                     },
-                    ScriptClip { exact: false,
+                    ScriptClip {
+                        exact: false,
+                        gain_db: None,
                         sentences: None,
                         framing: None,
                         video_id: 2,
@@ -6347,7 +5703,9 @@ for line in sys.stdin:
                         why: None,
                         tracks: None,
                     },
-                    ScriptClip { exact: false,
+                    ScriptClip {
+                        exact: false,
+                        gain_db: None,
                         sentences: None,
                         framing: None,
                         video_id: 3,
@@ -6401,7 +5759,9 @@ for line in sys.stdin:
                 // 12 s of picture over 7 s of voice: a tail worth taking, but not enough give in
                 // the two shots to reach it without one of them going.
                 clips: vec![
-                    ScriptClip { exact: false,
+                    ScriptClip {
+                        exact: false,
+                        gain_db: None,
                         sentences: None,
                         framing: None,
                         video_id: 1,
@@ -6411,7 +5771,9 @@ for line in sys.stdin:
                         why: None,
                         tracks: None,
                     },
-                    ScriptClip { exact: false,
+                    ScriptClip {
+                        exact: false,
+                        gain_db: None,
                         sentences: None,
                         framing: None,
                         video_id: 2,
@@ -6468,7 +5830,9 @@ for line in sys.stdin:
                 on_screen_text: None,
                 title_layout: None,
                 notes: None,
-                clips: vec![ScriptClip { exact: false,
+                clips: vec![ScriptClip {
+                    exact: false,
+                    gain_db: None,
                     sentences: None,
                     framing: None,
                     video_id: 2,
@@ -6532,7 +5896,9 @@ for line in sys.stdin:
                 title_layout: None,
                 notes: None,
                 clips: vec![
-                    ScriptClip { exact: false,
+                    ScriptClip {
+                        exact: false,
+                        gain_db: None,
                         sentences: None,
                         framing: None,
                         video_id: 1,
@@ -6542,7 +5908,9 @@ for line in sys.stdin:
                         why: None,
                         tracks: None,
                     },
-                    ScriptClip { exact: false,
+                    ScriptClip {
+                        exact: false,
+                        gain_db: None,
                         sentences: None,
                         framing: None,
                         video_id: 2,
@@ -6609,7 +5977,9 @@ for line in sys.stdin:
                 title_layout: None,
                 notes: None,
                 // Only 12 s of pictures.
-                clips: vec![ScriptClip { exact: false,
+                clips: vec![ScriptClip {
+                    exact: false,
+                    gain_db: None,
                     sentences: None,
                     framing: None,
                     video_id: 1,

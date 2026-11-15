@@ -133,11 +133,33 @@ if [ ! -x "$APP_SRC" ]; then
 fi
 [ -x "$APP_SRC" ] || die "App not found in $TARGET/release (GhostReel or ghostreel-app) — run without --no-build first."
 
-# ---- stop any running instance so we can replace the binary --------------------------
+# ---- stop any running instance so the next start is the new build ---------------------
+# `install` replaces each file rather than writing into it, so a running app keeps working on the
+# old binary. Stopping it is only a convenience — never worth a draft or an index run in progress:
+# that work dies with the process. Set GHOSTREEL_INSTALL_STOP=1 to stop it anyway.
 if pgrep -x ghostreel-app >/dev/null 2>&1; then
-    info "Stopping the running GhostReel instance…"
-    pkill -x ghostreel-app 2>/dev/null || true
-    sleep 1
+    DB_FILE="${GHOSTREEL_DATA:-${GHOSTREEL_HOME:-$HOME/.ghostreel}}/ghostreel.db"
+    STOP_APP=0
+    if [ "${GHOSTREEL_INSTALL_STOP:-0}" = "1" ]; then
+        STOP_APP=1
+    elif ! command -v sqlite3 >/dev/null 2>&1; then
+        info "GhostReel is running (sqlite3 not found to check active runs): leaving it running. Set GHOSTREEL_INSTALL_STOP=1 to stop it anyway."
+    elif [ ! -f "$DB_FILE" ]; then
+        info "GhostReel is running (database not found at $DB_FILE): leaving it running. Set GHOSTREEL_INSTALL_STOP=1 to stop it anyway."
+    elif BUSY=$(sqlite3 -init /dev/null -batch -noheader -list -cmd ".timeout 2000" "$DB_FILE" "SELECT COUNT(*) FROM runs WHERE state = 'running'" 2>/dev/null) && [[ "$BUSY" =~ ^[0-9]+$ ]]; then
+        if [ "$BUSY" -gt 0 ]; then
+            info "GhostReel is working ($BUSY run(s) in progress): leaving it running. Restart it when they finish to use the new build."
+        else
+            STOP_APP=1
+        fi
+    else
+        info "GhostReel is running (could not check active runs): leaving it running. Set GHOSTREEL_INSTALL_STOP=1 to stop it anyway."
+    fi
+    if [ "$STOP_APP" -eq 1 ]; then
+        info "Stopping the running GhostReel instance…"
+        pkill -x ghostreel-app 2>/dev/null || true
+        sleep 1
+    fi
 fi
 
 # ---- install binaries ----------------------------------------------------------------
