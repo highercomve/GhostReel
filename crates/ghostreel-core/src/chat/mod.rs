@@ -700,6 +700,10 @@ fn approx_tokens(messages: &[Value]) -> usize {
 /// responses are gone is protocol-invalid and OpenAI-compatible servers reject it outright (400),
 /// which would kill the turn exactly when this exists to prevent.
 const DROPPED_RESULT: &str = "[result dropped to save room]";
+/// What an old assistant `tool_call`'s arguments become when even the tool results are not enough:
+/// short, valid JSON, keeping `id`, `type` and `function.name` so the call/response pairing and the
+/// protocol stay valid (an argument the server can parse is all a forgotten call needs).
+const DROPPED_ARGS: &str = r#"{"dropped":"to save room"}"#;
 pub(crate) fn make_room(messages: &mut [Value], budget_tokens: usize) -> bool {
     if approx_tokens(messages) <= budget_tokens {
         return true;
@@ -720,7 +724,45 @@ pub(crate) fn make_room(messages: &mut [Value], budget_tokens: usize) -> bool {
             Some(i) => {
                 messages[i]["content"] = json!(DROPPED_RESULT);
             }
-            None => return false,
+            None => {
+                // Every result is already stubbed: the arguments themselves are the room that is
+                // left — one carries a whole script, and `approx_tokens` counts them. Shrink the
+                // oldest assistant message's tool_call arguments, skipping the newest assistant
+                // message (the round being extended keeps its calls whole). All three fields of
+                // the call stay, so its responses still pair with it.
+                let newest_assistant =
+                    messages.iter().rposition(|m| m.get("role").and_then(Value::as_str) == Some("assistant"));
+                let arg_victim = messages
+                    .iter()
+                    .enumerate()
+                    .skip(2)
+                    .find(|(i, m)| {
+                        Some(*i) != newest_assistant
+                            && m.get("role").and_then(Value::as_str) == Some("assistant")
+                            && m.get("tool_calls").and_then(Value::as_array).is_some_and(|calls| {
+                                !calls.is_empty()
+                                    && calls.iter().any(|c| {
+                                        c.get("function").and_then(|f| f.get("arguments")).and_then(Value::as_str)
+                                            != Some(DROPPED_ARGS)
+                                    })
+                            })
+                    })
+                    .map(|(i, _)| i);
+                match arg_victim {
+                    Some(i) => {
+                        if let Some(calls) = messages[i].get_mut("tool_calls").and_then(Value::as_array_mut) {
+                            for c in calls {
+                                if let Some(args) = c.get_mut("function").and_then(|f| f.get_mut("arguments"))
+                                    && args.as_str() != Some(DROPPED_ARGS)
+                                {
+                                    *args = json!(DROPPED_ARGS);
+                                }
+                            }
+                        }
+                    }
+                    None => return false,
+                }
+            }
         }
     }
     true
@@ -1714,6 +1756,7 @@ pub async fn run_turn(
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_turn_inner(
     ctx: &mut ChatContext,
     project_id: i64,
@@ -1754,10 +1797,10 @@ async fn run_turn_inner(
     let mut baseline_script: Option<Script> = None;
 
     // Explicit baseline script_id has top priority (handles multi-cut, sessionless cuts, or revision of specific versions)
-    if let Some(sid) = baseline_script_id {
-        if let Ok(stored) = crate::script::load(&ctx.db, sid) {
-            baseline_script = Some(stored.script);
-        }
+    if let Some(sid) = baseline_script_id
+        && let Ok(stored) = crate::script::load(&ctx.db, sid)
+    {
+        baseline_script = Some(stored.script);
     }
 
     if !is_new_session {
@@ -3197,6 +3240,19 @@ async fn complete_cli_streaming_mcp(
     result
 }
 
+/// The lines of a file being written as we read it that are complete: those ending in a newline,
+/// blanks dropped. A trailing partial line stays out, so the next drain sees it once the writer
+/// has finished it — counting a torn line as seen now would skip it forever.
+pub(crate) fn complete_lines(content: &str) -> Vec<&str> {
+    content
+        .split_inclusive('\n')
+        .filter_map(|line| {
+            let line = line.strip_suffix('\n')?;
+            if line.trim().is_empty() { None } else { Some(line) }
+        })
+        .collect()
+}
+
 fn drain_mcp_events(
     path: &std::path::Path,
     seen_lines: &mut usize,
@@ -3206,7 +3262,7 @@ fn drain_mcp_events(
     saved_script: &mut Option<i64>,
 ) {
     let Ok(content) = std::fs::read_to_string(path) else { return };
-    let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+    let lines = complete_lines(&content);
     if lines.len() <= *seen_lines {
         return;
     }
@@ -3438,6 +3494,7 @@ mod tests {
                     why: None,
                     inferred: true,
                     tracks: None,
+                    gain_db: None,
                 }),
                 notes: None,
                 card: None,
@@ -3763,6 +3820,7 @@ mod tests {
                     why: None,
                     inferred: true,
                     tracks: None,
+                    gain_db: None,
                 }),
                 card: None,
             }],
@@ -3858,6 +3916,7 @@ mod tests {
                     why: None,
                     inferred: true,
                     tracks: None,
+                    gain_db: None,
                 }),
                 card: None,
             }],
@@ -4097,6 +4156,104 @@ mod tests {
         assert_eq!(already, snapshot, "an already-stubbed result is left alone");
     }
 
+    /// Arguments count too (`approx_tokens` reads `tool_calls`): a `save_script` call carries a
+    /// whole script and can overflow on its own. Once every tool result is stubbed, the oldest
+    /// assistant arguments are replaced with a short valid-JSON placeholder — keeping `id`,
+    /// `type` and `function.name` so the pairing stays valid — and the newest assistant message
+    /// keeps its arguments whole.
+    #[test]
+    fn making_room_stubs_old_assistant_arguments_once_the_results_are_gone() {
+        let mut messages = vec![
+            json!({ "role": "system", "content": "rules" }),
+            json!({ "role": "user", "content": "make me a teaser" }),
+        ];
+        for i in 0..3 {
+            let args = if i == 0 { json!({ "script": "x".repeat(4000) }).to_string() } else { "{}".into() };
+            messages.push(json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{ "id": format!("call_{i}"), "type": "function",
+                    "function": { "name": "save_script", "arguments": args } }]
+            }));
+            messages.push(json!({
+                "role": "tool", "tool_call_id": format!("call_{i}"),
+                "content": DROPPED_RESULT
+            }));
+        }
+        let before = approx_tokens(&messages);
+        assert!(make_room(&mut messages, before / 2), "the arguments gave room");
+        assert!(approx_tokens(&messages) <= before / 2);
+        // The pairing survives: every call keeps its id, type and function name, and its
+        // arguments are still valid JSON.
+        for m in messages.iter().filter(|m| m["role"] == "assistant") {
+            for tc in m["tool_calls"].as_array().cloned().unwrap_or_default() {
+                assert_eq!(tc["type"], "function", "type kept");
+                assert!(tc["id"].as_str().is_some_and(|id| id.starts_with("call_")), "id kept");
+                assert_eq!(tc["function"]["name"], "save_script", "name kept");
+                serde_json::from_str::<Value>(tc["function"]["arguments"].as_str().expect("arguments are a string"))
+                    .expect("arguments are still valid JSON");
+            }
+        }
+        // The oldest call's script payload went; the newest assistant message kept its arguments.
+        assert_eq!(
+            messages[2]["tool_calls"][0]["function"]["arguments"].as_str(),
+            Some(DROPPED_ARGS),
+            "the oldest arguments were stubbed"
+        );
+        assert_eq!(
+            messages[6]["tool_calls"][0]["function"]["arguments"],
+            json!("{}"),
+            "the newest assistant message keeps its arguments"
+        );
+        // Nothing left at all: the caller is told to stop looking and draft.
+        assert!(!make_room(&mut messages, 1), "nothing left to shrink");
+    }
+
+    /// A drain must not count a torn, still-unterminated last line as seen: the writer is mid-
+    /// line, and once it is consumed it never comes back. The torn line stays out until it is
+    /// completed, then the next drain delivers it.
+    #[test]
+    fn draining_mcp_events_leaves_a_torn_last_line_for_the_next_drain() {
+        let file = tempfile::NamedTempFile::new().expect("temp file");
+        let path = file.path();
+        std::fs::write(path, "{\"kind\":\"tool_started\",\"tool\":\"search\",\"args\":{}}\n")
+            .expect("first complete line");
+        let mut seen = 0usize;
+        let mut events: Vec<ChatEvent> = Vec::new();
+        let mut records: Vec<ToolCallRecord> = Vec::new();
+        let mut saved = None;
+        drain_mcp_events(path, &mut seen, &mut |e| events.push(e), &mut records, &|_| {}, &mut saved);
+        assert_eq!(seen, 1, "the complete line was consumed");
+
+        // The writer starts the next line but has not finished it.
+        std::fs::write(
+            path,
+            "{\"kind\":\"tool_started\",\"tool\":\"search\",\"args\":{}}\n{\"kind\":\"tool_finished\",\"tool\":\"search\",\"su",
+        )
+        .expect("torn second line");
+        drain_mcp_events(path, &mut seen, &mut |e| events.push(e), &mut records, &|_| {}, &mut saved);
+        assert_eq!(seen, 1, "the torn line was not counted as seen");
+
+        // The writer finishes the line; the next drain sees it exactly once.
+        std::fs::write(
+            path,
+            "{\"kind\":\"tool_started\",\"tool\":\"search\",\"args\":{}}\n{\"kind\":\"tool_finished\",\"tool\":\"search\",\"summary\":\"found 2\",\"script_id\":7}\n",
+        )
+        .expect("second line completed");
+        drain_mcp_events(path, &mut seen, &mut |e| events.push(e), &mut records, &|_| {}, &mut saved);
+        assert_eq!(seen, 2);
+        assert_eq!(
+            events,
+            vec![
+                ChatEvent::ToolStarted { tool: "search".into(), args: json!({}) },
+                ChatEvent::ToolFinished { tool: "search".into(), summary: "found 2".into() },
+            ],
+            "the completed line was delivered exactly once"
+        );
+        assert_eq!(records.len(), 1, "the tool_finished record was kept");
+        assert_eq!(saved, Some(7));
+    }
+
     /// The model never hears about a repair in the turn that caused it, so the note rides on the
     /// assistant message the next turn replays. Errors are the model's problem to fix and are
     /// reported separately; this is only what was already done for it.
@@ -4207,6 +4364,7 @@ mod tests {
                     why: None,
                     inferred: true,
                     tracks: None,
+                    gain_db: None,
                 }),
                 card: None,
             }],
@@ -4376,6 +4534,7 @@ mod tests {
             why: None,
             inferred: false,
             tracks: None,
+            gain_db: None,
         });
         let issues = crate::script_check::check(&db, project_id_of(&db), &bedded, &sc(), &Default::default()).unwrap();
         assert!(issues.iter().any(|i| i.clip_index == Some(2) && i.message.contains("their lips move")), "{issues:?}");
@@ -4502,6 +4661,7 @@ mod tests {
                     why: None,
                     inferred: false,
                     tracks: None,
+                    gain_db: None,
                 }),
                 card: None,
             }],
@@ -5154,6 +5314,7 @@ for line in sys.stdin:
                     why: None,
                     inferred: false,
                     tracks: None,
+                    gain_db: None,
                 }),
                 card: None,
             }],
@@ -5440,6 +5601,7 @@ for line in sys.stdin:
                     why: None,
                     inferred: true,
                     tracks: None,
+                    gain_db: None,
                 }),
                 card: None,
             }],
@@ -5639,6 +5801,7 @@ for line in sys.stdin:
                     why: None,
                     inferred: true,
                     tracks: None,
+                    gain_db: None,
                 }),
                 card: None,
             }],
@@ -5724,6 +5887,7 @@ for line in sys.stdin:
                     why: None,
                     inferred: true,
                     tracks: None,
+                    gain_db: None,
                 }),
                 card: None,
             }],
@@ -5792,6 +5956,7 @@ for line in sys.stdin:
                     why: None,
                     inferred: true,
                     tracks: None,
+                    gain_db: None,
                 }),
                 card: None,
             }],
@@ -5850,6 +6015,7 @@ for line in sys.stdin:
                     why: None,
                     inferred: true,
                     tracks: None,
+                    gain_db: None,
                 }),
                 card: None,
             }],
@@ -5929,6 +6095,7 @@ for line in sys.stdin:
                     why: None,
                     inferred: true,
                     tracks: None,
+                    gain_db: None,
                 }),
                 card: None,
             }],
@@ -5997,6 +6164,7 @@ for line in sys.stdin:
                     why: None,
                     inferred: true,
                     tracks: None,
+                    gain_db: None,
                 }),
                 card: None,
             }],

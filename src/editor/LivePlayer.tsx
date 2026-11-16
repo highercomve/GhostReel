@@ -472,6 +472,7 @@ export default function LivePlayer({
       return;
     }
     a.muted = !ownAudible(bed.video_id);
+    setLiveGain(a, bed.gain_db ?? 0, a.muted);
     const url = urlsRef.current[bed.video_id];
     if (!url) {
       ensureUrl(bed.video_id);
@@ -503,7 +504,7 @@ export default function LivePlayer({
     if (span && bed && bed.out_s > bed.in_s) {
       const off = t - span.start;
       if (off >= bed.out_s - bed.in_s || !usesTracks(bed.video_id, bed.tracks)) return null;
-      return { videoId: bed.video_id, srcTime: bed.in_s + off, tracks: bed.tracks };
+      return { videoId: bed.video_id, srcTime: bed.in_s + off, tracks: bed.tracks, gainDb: bed.gain_db };
     }
     const seg = layoutRef.current.segments[segAt(t)];
     if (!seg || t < seg.start || t > seg.end || !usesTracks(seg.videoId, seg.tracks)) return null;

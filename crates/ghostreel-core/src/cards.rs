@@ -115,7 +115,9 @@ mod tests {
             narration: None,
             on_screen_text: None,
             title_layout: None,
-            clips: vec![ScriptClip { exact: false, gain_db: None,
+            clips: vec![ScriptClip {
+                exact: false,
+                gain_db: None,
                 video_id,
                 in_s,
                 out_s: in_s + 5.0,

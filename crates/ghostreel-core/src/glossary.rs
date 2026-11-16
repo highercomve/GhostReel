@@ -55,7 +55,7 @@ impl Glossary {
                 let h_trimmed = h.trim().to_string();
                 if !h_trimmed.is_empty()
                     && !same(&h_trimmed, &term_trimmed)
-                    && !heard_cleaned.iter().any(|existing: &String| same(&existing, &h_trimmed))
+                    && !heard_cleaned.iter().any(|existing: &String| same(existing, &h_trimmed))
                 {
                     heard_cleaned.push(h_trimmed);
                 }
@@ -64,7 +64,7 @@ impl Glossary {
             if let Some(existing) = merged.iter_mut().find(|t| same(&t.term, &key)) {
                 // Union heard_as
                 for h in heard_cleaned {
-                    if !existing.heard_as.iter().any(|existing_h| same(&existing_h, &h)) {
+                    if !existing.heard_as.iter().any(|existing_h| same(existing_h, &h)) {
                         existing.heard_as.push(h);
                     }
                 }
@@ -78,7 +78,7 @@ impl Glossary {
         }
 
         // Sort terms case-insensitively
-        merged.sort_by(|a, b| a.term.to_lowercase().cmp(&b.term.to_lowercase()));
+        merged.sort_by_key(|a| a.term.to_lowercase());
         self.terms = merged;
     }
 
@@ -177,12 +177,11 @@ impl Glossary {
                 }
 
                 // Start boundary check: preceding char cannot be alphanumeric
-                if start > 0 {
-                    if let Some(prev) = text[..start].chars().next_back() {
-                        if prev.is_alphanumeric() {
-                            continue;
-                        }
-                    }
+                if start > 0
+                    && let Some(prev) = text[..start].chars().next_back()
+                    && prev.is_alphanumeric()
+                {
+                    continue;
                 }
 
                 // Try to match variant chars case-insensitively
@@ -209,12 +208,11 @@ impl Glossary {
                 let end = start + bytes_consumed;
 
                 // End boundary check: following char cannot be alphanumeric
-                if end < text.len() {
-                    if let Some(next) = text[end..].chars().next() {
-                        if next.is_alphanumeric() {
-                            continue;
-                        }
-                    }
+                if end < text.len()
+                    && let Some(next) = text[end..].chars().next()
+                    && next.is_alphanumeric()
+                {
+                    continue;
                 }
 
                 // Check overlap with any already claimed range:

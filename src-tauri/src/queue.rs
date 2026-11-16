@@ -49,10 +49,16 @@ pub enum TaskKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         out: Option<String>,
     },
+    /// A timeline file (`otio`, `fcp_xml`) or, with format `premiere_package`, the zip a
+    /// co-worker opens in Premiere (`media`: "trimmed" | "full"; `handles_s` for trimmed).
     Export {
         script_id: i64,
         format: String,
         path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        media: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        handles_s: Option<f64>,
     },
     Chat {
         project_id: i64,
@@ -654,7 +660,13 @@ async fn run_task(
             let opts = PreviewRequest { burn_titles, burn_narration, burn_captions, normalize_audio, out };
             run_preview(rep, script_id, opts, cancel).await
         }
-        TaskKind::Export { script_id, format, path } => run_export(rep, script_id, &format, &path).await,
+        TaskKind::Export { script_id, format, path, media, handles_s } => {
+            if format == ghostreel_core::package::FORMAT {
+                run_export_package(rep, script_id, &path, media.as_deref(), handles_s, cancel).await
+            } else {
+                run_export(rep, script_id, &format, &path).await
+            }
+        }
         TaskKind::Chat { project_id, session_id } => {
             let req = app.state::<Queue>().chat_requests.lock().await.remove(&id);
             let Some((message, images, script_id, tx)) = req else {
@@ -1041,6 +1053,55 @@ async fn run_export(rep: &Reporter, script_id: i64, format_str: &str, out_path_s
     Ok(Outcome::done(format!("Exported to {format}"))
         .link(RunLink::Script { id: script_id })
         .file(res.path.to_string_lossy().to_string()))
+}
+
+/// "Export for Premiere": encode the used stretches (or copy whole files), then zip.
+async fn run_export_package(
+    rep: &Reporter,
+    script_id: i64,
+    out_path: &str,
+    media: Option<&str>,
+    handles_s: Option<f64>,
+    cancel: Arc<AtomicBool>,
+) -> Result<Outcome, String> {
+    use std::str::FromStr;
+    let p = Paths::resolve().map_err(|e| e.to_string())?;
+    let ffmpeg = ghostreel_core::doctor::locate("ffmpeg").ok_or_else(|| "ffmpeg not found".to_string())?;
+    let mode = match media {
+        Some(m) => ghostreel_core::package::MediaMode::from_str(m).map_err(|e| e.to_string())?,
+        None => ghostreel_core::package::MediaMode::default(),
+    };
+    let opts = ghostreel_core::package::PackageOptions {
+        media: mode,
+        handles_s,
+        data_dir: Some(p.data_dir.clone()),
+        cancel: Some(cancel),
+    };
+    let out = std::path::PathBuf::from(out_path);
+    rep.step(0.0, "prepare", "Preparing the Premiere package…");
+    let rep2 = rep.clone();
+    let res = tokio::task::spawn_blocking(move || {
+        let db = Db::open(&p.db_file())?;
+        ghostreel_core::package::export_package(&db, &ffmpeg, script_id, &out, &opts, &mut |phase, f, note| {
+            rep2.step(f, phase, note)
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    match res {
+        Ok(r) => {
+            let n = r.media.len();
+            Ok(Outcome::done(format!(
+                "Premiere package with {n} media {} ({})",
+                if n == 1 { "file" } else { "files" },
+                if r.media_mode == ghostreel_core::package::MediaMode::Trimmed { "used parts" } else { "whole files" }
+            ))
+            .link(RunLink::Script { id: script_id })
+            .file(r.path.to_string_lossy().to_string()))
+        }
+        Err(e) if e.is_cancelled() => Ok(Outcome::cancelled()),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -349,29 +349,45 @@ fn trim_to_target_within(
     changed
 }
 
-/// Keep clips inside their video; drop the ones that start past its end.
-pub fn clamp_to_duration(db: &Db, script: &mut Script) {
+/// Keep clips inside their video; drop the ones that start past its end or are left under a
+/// second (a pinned clip stays while it has any length). Returns a note for each clip dropped.
+pub fn clamp_to_duration(db: &Db, script: &mut Script) -> Vec<String> {
+    let mut notes = Vec::new();
     for beat in &mut script.beats {
         beat.clips.retain_mut(|c| {
+            let (was_in, was_out) = (c.in_s, c.out_s);
             if let Some(d) = video_duration(db, c.video_id) {
                 c.out_s = c.out_s.min(d);
                 c.in_s = c.in_s.max(0.0);
             }
-            c.out_s - c.in_s >= 1.0 || (c.pinned() && c.out_s > c.in_s)
+            let keep = c.out_s - c.in_s >= 1.0 || (c.pinned() && c.out_s > c.in_s);
+            if !keep {
+                notes.push(format!(
+                    "dropped a clip of video #{} ({was_in:.1}-{was_out:.1} s): under a second of footage inside the video",
+                    c.video_id
+                ));
+            }
+            keep
         });
     }
     script.beats.retain(|b| !b.clips.is_empty());
+    notes
 }
 
 /// A later clip overlapping footage an earlier clip already showed (by more than 1 s) is dropped.
 /// Clips that play footage an earlier clip already played (more than a second of the same video):
 /// dropped, the first use kept. The same rule for every cut, however it was written (chat, save_script).
+/// The one "plays the same footage twice" test: `c` overlaps `video_id`'s `[a, b]` by over a second.
+pub fn repeats_footage(c: &ScriptClip, video_id: i64, a: f64, b: f64) -> bool {
+    c.video_id == video_id && c.out_s.min(b) - c.in_s.max(a) > 1.0
+}
+
 pub fn drop_repeated_footage(script: &mut Script) -> usize {
     let mut used: Vec<(i64, f64, f64)> = Vec::new();
     let mut dropped = 0;
     for beat in &mut script.beats {
         beat.clips.retain(|c| {
-            let repeat = used.iter().any(|&(v, a, b)| v == c.video_id && c.out_s.min(b) - c.in_s.max(a) > 1.0);
+            let repeat = used.iter().any(|&(v, a, b)| repeats_footage(c, v, a, b));
             if repeat {
                 dropped += 1;
             } else {

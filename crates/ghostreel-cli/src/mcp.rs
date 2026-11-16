@@ -362,7 +362,7 @@ mod tests {
         let (_dir, paths) = temp_paths();
         call_tool_content(&paths, "create_project", &json!({"name":"Pictures", "fps":30})).await.unwrap();
         {
-            let db = Db::open(&paths.db_file()).unwrap();
+            let mut db = Db::open(&paths.db_file()).unwrap();
             db.conn
                 .execute_batch(
                     "INSERT INTO videos(id,content_hash,size,duration_s) VALUES
@@ -371,6 +371,18 @@ mod tests {
                 (12,2,20,30,'Answer.'),(13,3,20,30,'Voice.');",
                 )
                 .unwrap();
+            // The videos belong to the project (a save drops footage from outside it).
+            let project = db.require_project("Pictures").unwrap();
+            let folder = db.add_folder(project.id, &_dir.0, true).unwrap();
+            for video in [1, 2, 3] {
+                db.conn
+                    .execute_batch(&format!(
+                        "INSERT INTO video_files(video_id, folder_id, path, size, mtime, last_seen) \
+                         VALUES ({video}, {}, '{video}.mp4', 1, 0, 0)",
+                        folder.id
+                    ))
+                    .unwrap();
+            }
         }
         let scope = McpScope::default();
         let mut session = ToolSession::new(32_000);

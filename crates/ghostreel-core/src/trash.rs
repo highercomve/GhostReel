@@ -126,7 +126,10 @@ fn new_trash_id() -> String {
     format!("t{}", &crate::runs::new_run_id()[1..])
 }
 
-fn row_to_item(r: &rusqlite::Row) -> rusqlite::Result<(String, i64, String, String, i64, i64, String, i64)> {
+/// The columns of a trash row, in the order `row_to_item` reads them.
+type TrashRow = (String, i64, String, String, i64, i64, String, i64);
+
+fn row_to_item(r: &rusqlite::Row) -> rusqlite::Result<TrashRow> {
     Ok((
         r.get("id")?,
         r.get("project_id")?,
@@ -515,7 +518,7 @@ mod tests {
         assert!(crate::clips::load_set(&db, "cs1").is_err());
         assert_eq!(titles(&db), vec![("Promo".into(), 1)]);
         assert_eq!(
-            crate::runs::links_state(&db, &[item.link.clone()]).unwrap(),
+            crate::runs::links_state(&db, std::slice::from_ref(&item.link)).unwrap(),
             vec![LinkState::Trashed { trash_id: item.id.clone() }]
         );
 

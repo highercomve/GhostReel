@@ -14,11 +14,11 @@ or the [GitHub releases](https://github.com/highercomve/GhostReel/releases).
 | Platform | File | Notes |
 | --- | --- | --- |
 | Windows 10/11 | `GhostReel_x.y.z_x64-setup.exe` | NVIDIA driver 570+ for the GPU (the CUDA 12.8 runtime is bundled) |
-| Linux | `GhostReel_x.y.z_amd64.AppImage` | NVIDIA driver 570+ for the GPU |
+| Linux (glibc 2.39+: Ubuntu 24.04, Debian 13, Fedora 40 or newer) | `GhostReel_x.y.z_amd64.AppImage` | NVIDIA driver 570+ for the GPU |
 | Windows 10/11 · Vulkan | `GhostReel_x.y.z_x64_vulkan-setup.exe` | AMD, Intel or NVIDIA GPU with a Vulkan 1.2-capable driver |
-| Linux · Vulkan | `GhostReel_x.y.z_amd64_vulkan.AppImage` | AMD, Intel or NVIDIA GPU with a Vulkan 1.2-capable driver |
+| Linux · Vulkan (glibc 2.39+) | `GhostReel_x.y.z_amd64_vulkan.AppImage` | AMD, Intel or NVIDIA GPU with a Vulkan 1.2-capable driver |
 | macOS 14+ · Apple Silicon | `GhostReel_x.y.z_aarch64.dmg` | MLX for vision and chat, Metal for Whisper |
-| macOS 12+ · Intel | `GhostReel_x.y.z_x64.dmg` | llama.cpp and Whisper with Metal |
+| macOS 12+ · Intel | `GhostReel_x.y.z_x64.dmg` | llama.cpp and Whisper with Metal; face and speaker matching need macOS 13.4+ |
 
 - **Windows**: run the installer.
 - **Linux**: make the AppImage executable (`chmod +x GhostReel_*.AppImage`)

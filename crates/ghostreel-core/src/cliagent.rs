@@ -1230,14 +1230,13 @@ pub fn list_models(cfg: &CliAgentConfig) -> Vec<String> {
             .ok()
             .map(|s| parse_codex_models(&s))
             .unwrap_or_default();
-        if let Ok(config) = std::fs::read_to_string(dir.join("config.toml")) {
-            if let Some(model) = config
+        if let Ok(config) = std::fs::read_to_string(dir.join("config.toml"))
+            && let Some(model) = config
                 .lines()
                 .find_map(|l| l.trim().strip_prefix("model = ").map(|v| v.trim().trim_matches(['"', '\'']).to_string()))
                 .filter(|s| !s.is_empty())
-            {
-                models.push(model);
-            }
+        {
+            models.push(model);
         }
         models.sort();
         models.dedup();
@@ -1483,13 +1482,21 @@ mod brief_tests {
         });
 
         let r1 = agent
-            .complete_continuing_with_env("first", false, &[("GHOSTREEL_MCP_PROFILE", "clip_run"), ("GHOSTREEL_MCP_PROJECT", "42")])
+            .complete_continuing_with_env(
+                "first",
+                false,
+                &[("GHOSTREEL_MCP_PROFILE", "clip_run"), ("GHOSTREEL_MCP_PROJECT", "42")],
+            )
             .await
             .unwrap();
         assert_eq!(r1, r#"{"ok":true}"#);
 
         let r2 = agent
-            .complete_continuing_with_env("second", true, &[("GHOSTREEL_MCP_PROFILE", "clip_run"), ("GHOSTREEL_MCP_PROJECT", "42")])
+            .complete_continuing_with_env(
+                "second",
+                true,
+                &[("GHOSTREEL_MCP_PROFILE", "clip_run"), ("GHOSTREEL_MCP_PROJECT", "42")],
+            )
             .await
             .unwrap();
         assert_eq!(r2, r#"{"ok":true}"#);

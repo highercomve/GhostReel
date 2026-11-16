@@ -83,10 +83,8 @@ async fn serve(
             // sound through Web Audio (a clip's volume above 100%). The random token in the path
             // is what keeps anyone else out, not the origin.
             let mut r = r.into_response();
-            r.headers_mut().insert(
-                axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN,
-                axum::http::HeaderValue::from_static("*"),
-            );
+            r.headers_mut()
+                .insert(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN, axum::http::HeaderValue::from_static("*"));
             r
         }
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),

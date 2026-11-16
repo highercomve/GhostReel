@@ -151,7 +151,9 @@ pub fn run(
                 note(Pass::Draft, message);
             }
         }
-        clamp_to_duration(db, s);
+        for message in clamp_to_duration(db, s) {
+            note(Pass::Fit, message);
+        }
         if profile.fit_target {
             let before = s.total_duration_s();
             if fit_to_target(db, s, cfg) {
@@ -224,7 +226,9 @@ pub fn run(
     if profile.pad {
         pad_speech(db, s, cfg);
     }
-    clamp_to_duration(db, s);
+    for message in clamp_to_duration(db, s) {
+        note(Pass::Fit, message);
+    }
 
     // These finish the cut rather than fit it. A range stops where the speaker stopped, then on a
     // whole sentence (`end_on_turns` moves an edge and `end_on_sentences` puts it on a boundary).
@@ -366,6 +370,8 @@ pub fn run(
     if renamed > 0 {
         note(Pass::Ranges, format!("updated the sentence ids of {renamed} range(s) to the sentences they now play"));
     }
+    // A finished cut has no beat without pictures, whichever pass emptied it.
+    s.beats.retain(|b| !b.clips.is_empty());
 
     Ok(unless_unchanged(&before, s, notes))
 }
@@ -806,6 +812,7 @@ mod tests {
             why: None,
             inferred: false,
             tracks: None,
+            gain_db: None,
             sentences: None,
         };
         let mut s = cut(None, &[&[(0.0, 2.5, "mute")], &[(0.0, 5.0, "source")]]);

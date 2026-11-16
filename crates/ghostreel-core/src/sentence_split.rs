@@ -268,18 +268,13 @@ const MAX_UNTRANSCRIBED_S: f64 = 2.0;
 /// one of those. Only where those times are the engine's own (a segment edge, or timed words):
 /// a time estimated inside a segment says nothing about what lies between. `(end, start)`: the
 /// pause before the first such region and the one after the last, both on the measured speech.
-fn untranscribed_between(
-    last: &Tok,
-    next: &Tok,
-    regions: &[SpeechRegion],
-    gaps: &[(f64, f64)],
-) -> Option<(f64, f64)> {
+fn untranscribed_between(last: &Tok, next: &Tok, regions: &[SpeechRegion], gaps: &[(f64, f64)]) -> Option<(f64, f64)> {
     if gaps.is_empty() || !(last.seg_last || (last.timed && next.timed)) {
         return None;
     }
     let mut lost = regions.iter().filter(|r| r.start_s >= last.end - 0.02 && r.end_s <= next.start + 0.02);
     let first = lost.next()?;
-    let final_ = lost.last().unwrap_or(first);
+    let final_ = lost.next_back().unwrap_or(first);
     if final_.end_s - first.start_s > MAX_UNTRANSCRIBED_S {
         return None;
     }
@@ -398,10 +393,10 @@ pub fn split(segs: &[SegIn], regions: &[SpeechRegion]) -> Vec<SentenceOut> {
                 };
                 cost(x).total_cmp(&cost(y))
             });
-        if let Some(i) = near {
-            if pause_at[i].is_none_or(|(a, b)| b - a < gb - ga) {
-                pause_at[i] = Some((ga, gb));
-            }
+        if let Some(i) = near
+            && pause_at[i].is_none_or(|(a, b)| b - a < gb - ga)
+        {
+            pause_at[i] = Some((ga, gb));
         }
     }
     let pause_len = |i: usize| pause_at[i].map(|(a, b)| b - a).unwrap_or(0.0);
@@ -748,6 +743,33 @@ pub fn invalidate(conn: &rusqlite::Connection, video_id: i64) -> Result<(), Erro
     Ok(())
 }
 
+/// Tests: one sentence per stored segment, with the segment's id, so a fixture that writes
+/// segments as whole sentences can quote `s<segment id>`.
+#[cfg(test)]
+pub fn mirror_segments(db: &Db, video_id: i64) {
+    db.conn.execute("DELETE FROM transcript_sentences WHERE video_id = ?1", [video_id]).unwrap();
+    db.conn
+        .execute(
+            "INSERT INTO transcript_sentences(id, video_id, start_s, end_s, text)
+             SELECT id, video_id, start_s, end_s, text FROM transcript_segments WHERE video_id = ?1",
+            [video_id],
+        )
+        .unwrap();
+    // A segment's own timed words become its sentence's words.
+    db.conn
+        .execute(
+            "UPDATE transcript_sentences SET words_json = (
+                 SELECT json_group_array(json_array(w.start_s, w.end_s))
+                   FROM (SELECT start_s, end_s FROM transcript_words WHERE segment_id = transcript_sentences.id
+                          ORDER BY idx) w)
+              WHERE video_id = ?1 AND EXISTS (SELECT 1 FROM transcript_words WHERE segment_id = transcript_sentences.id)",
+            [video_id],
+        )
+        .unwrap();
+    // Built as the current rules would want them left alone.
+    db.conn.execute("UPDATE videos SET sentence_split = ?2 WHERE id = ?1", params![video_id, SPLIT_VERSION]).unwrap();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -888,11 +910,8 @@ mod tests {
             seg(48.81, 58.08, "We share the same goals for our children and for our growth."),
             seg(59.3, 61.18, "It's just a great community to live in."),
         ];
-        let regions = [
-            SpeechRegion::new(48.9, 58.03),
-            SpeechRegion::new(58.12, 58.92),
-            SpeechRegion::new(59.45, 61.17),
-        ];
+        let regions =
+            [SpeechRegion::new(48.9, 58.03), SpeechRegion::new(58.12, 58.92), SpeechRegion::new(59.45, 61.17)];
         let out = split(&segs, &regions);
         assert_eq!(out.len(), 2, "{out:?}");
         assert_eq!((out[0].end, out[1].start), (58.03, 59.45));
@@ -1202,31 +1221,4 @@ mod tests {
         db.conn.execute("ALTER TABLE chapters_bak RENAME TO chapters", []).unwrap();
         assert_eq!(crate::chapters::load(&db, 1).unwrap().len(), 1);
     }
-}
-
-/// Tests: one sentence per stored segment, with the segment's id, so a fixture that writes
-/// segments as whole sentences can quote `s<segment id>`.
-#[cfg(test)]
-pub fn mirror_segments(db: &Db, video_id: i64) {
-    db.conn.execute("DELETE FROM transcript_sentences WHERE video_id = ?1", [video_id]).unwrap();
-    db.conn
-        .execute(
-            "INSERT INTO transcript_sentences(id, video_id, start_s, end_s, text)
-             SELECT id, video_id, start_s, end_s, text FROM transcript_segments WHERE video_id = ?1",
-            [video_id],
-        )
-        .unwrap();
-    // A segment's own timed words become its sentence's words.
-    db.conn
-        .execute(
-            "UPDATE transcript_sentences SET words_json = (
-                 SELECT json_group_array(json_array(w.start_s, w.end_s))
-                   FROM (SELECT start_s, end_s FROM transcript_words WHERE segment_id = transcript_sentences.id
-                          ORDER BY idx) w)
-              WHERE video_id = ?1 AND EXISTS (SELECT 1 FROM transcript_words WHERE segment_id = transcript_sentences.id)",
-            [video_id],
-        )
-        .unwrap();
-    // Built as the current rules would want them left alone.
-    db.conn.execute("UPDATE videos SET sentence_split = ?2 WHERE id = ?1", params![video_id, SPLIT_VERSION]).unwrap();
 }

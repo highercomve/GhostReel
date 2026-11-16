@@ -473,7 +473,7 @@ fn runs_on(db: &Db, video_id: i64, end_s: f64, next_s: f64) -> bool {
     let paused = regions.windows(2).any(|w| {
         let (a, b) = (w[0].end_s, w[1].start_s);
         b - a >= RUN_ON_S && b > lo && a < hi
-    // Or no voice is measured from the next sentence on: whatever the transcript says, it is quiet.
+        // Or no voice is measured from the next sentence on: whatever the transcript says, it is quiet.
     }) || regions.last().is_some_and(|r| r.end_s <= next_s);
     !paused
 }
@@ -932,8 +932,11 @@ mod tests {
                 [],
             )
             .unwrap();
-        db.set_speech_regions(104, &[SpeechRegion::new(1.0, 4.0), SpeechRegion::new(4.6, 6.0), SpeechRegion::new(6.09, 9.0)])
-            .unwrap();
+        db.set_speech_regions(
+            104,
+            &[SpeechRegion::new(1.0, 4.0), SpeechRegion::new(4.6, 6.0), SpeechRegion::new(6.09, 9.0)],
+        )
+        .unwrap();
         crate::sentence_split::mirror_segments(&db, 104);
         let runs_on = |out_s| story(&db, 104, 0.9, out_s).iter().any(|n| n.starts_with("ends where the speaker runs"));
         assert!(runs_on(6.0), "a 0.09 s breath is no pause");
@@ -1052,6 +1055,7 @@ mod tests {
             why: None,
             inferred: false,
             tracks: None,
+            gain_db: None,
         });
         let r = read_cut(&db, pid, &s, &ScriptConfig::default(), Vec::new()).unwrap();
         assert!(r.beats[0].clips[0].heard.is_empty() && r.beats[0].clips[0].end.is_none());

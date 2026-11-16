@@ -72,11 +72,11 @@ Download the latest build from [Releases](https://github.com/highercomve/ghostre
 | Platform | File | Notes |
 |---|---|---|
 | **Windows 10/11** | `GhostReel_x.y.z_x64-setup.exe` | NVIDIA driver 570+ for GPU (CUDA 12.8 runtime is bundled) |
-| **Linux** | `.AppImage` | NVIDIA driver 570+ for GPU |
+| **Linux** (glibc 2.39+: Ubuntu 24.04, Debian 13, Fedora 40 or newer) | `.AppImage` | NVIDIA driver 570+ for GPU |
 | Windows 10/11 · Vulkan | `GhostReel_x.y.z_x64_vulkan-setup.exe` | AMD, Intel or NVIDIA GPU with a Vulkan 1.2-capable driver |
-| Linux · Vulkan | `GhostReel_x.y.z_amd64_vulkan.AppImage` | AMD, Intel or NVIDIA GPU with a Vulkan 1.2-capable driver |
+| Linux · Vulkan (glibc 2.39+) | `GhostReel_x.y.z_amd64_vulkan.AppImage` | AMD, Intel or NVIDIA GPU with a Vulkan 1.2-capable driver |
 | **macOS 14+ · Apple Silicon** | `GhostReel_x.y.z_aarch64.dmg` | MLX vision/chat, Metal Whisper, self-signed |
-| **macOS 12+ · Intel** | `GhostReel_x.y.z_x64.dmg` | llama.cpp / Whisper with Metal, self-signed |
+| **macOS 12+ · Intel** | `GhostReel_x.y.z_x64.dmg` | llama.cpp / Whisper with Metal, self-signed; face and speaker matching need macOS 13.4+ |
 | **CLI only** | `ghostreel-cli-*.zip` / `.tar.gz` | same helpers and ffmpeg, no desktop app |
 
 On macOS, open the DMG and drag **GhostReel** to **Applications**. The app is self-signed

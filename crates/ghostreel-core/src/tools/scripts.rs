@@ -74,7 +74,7 @@ static GET_SCRIPT: ToolSpec = ToolSpec {
 };
 
 async fn get_script(ctx: &mut ToolCtx<'_>, a: Args<'_>) -> ToolResult {
-    let stored = script::load(ctx.db, a.i64("script_id")?)?;
+    let stored = ctx.load_script(a.i64("script_id")?)?;
     let min = crate::clips::length_range(ctx.db, stored.project_id, &stored.title).map(|r| r.0);
     let opts = script_check::CheckOptions { trim_min_s: min, ..Default::default() };
     let issues = script_check::check(ctx.db, stored.project_id, &stored.script, &ctx.config.script, &opts)?;
@@ -104,7 +104,7 @@ static APPLY_FIX: ToolSpec = ToolSpec {
 };
 
 async fn apply_fix(ctx: &mut ToolCtx<'_>, a: Args<'_>) -> ToolResult {
-    let stored = script::load(ctx.db, a.i64("script_id")?)?;
+    let stored = ctx.load_script(a.i64("script_id")?)?;
     let mut raw_fix = a.get("fix").cloned().ok_or_else(|| ToolError::invalid("missing 'fix' object"))?;
     // A trim that moves one edge says nothing about the other: it stays where the clip has it.
     if raw_fix["kind"] == "trim"
@@ -318,6 +318,7 @@ fn prepare_script(
     if by_sentence > 0 {
         notes.push(format!("resolved {by_sentence} sentence range(s) to seconds (see `script`)"));
     }
+    notes.extend(crate::finish::draft::drop_foreign_clips(ctx.db, p.id, &mut s));
     if repair {
         // The finish every cut gets, whoever wrote it: the same chain as a chat turn's, at the
         // length the editor wrote.
@@ -421,7 +422,7 @@ static READ_CUT: ToolSpec = ToolSpec {
 
 async fn read_cut(ctx: &mut ToolCtx<'_>, a: Args<'_>) -> ToolResult {
     let (project_id, s, min) = if let Some(id) = a.opt_i64("script_id") {
-        let stored = script::load(ctx.db, id)?;
+        let stored = ctx.load_script(id)?;
         let min = crate::clips::length_range(ctx.db, stored.project_id, &stored.title).map(|r| r.0);
         (stored.project_id, stored.script, min)
     } else if let Some(raw) = a.get("script") {
@@ -477,13 +478,13 @@ fn captions_text(cues: &[crate::captions::Cue]) -> String {
 static EXPORT_SCRIPT: ToolSpec = ToolSpec {
     name: "export_script",
     effect: Effect::Write,
-    summary: "Export a script version: fcp_xml (Premiere Pro) or otio as an editable timeline, or mp4 as the finished \
-              full-size video.",
+    summary: "Export a script version: fcp_xml (Premiere Pro) or otio as an editable timeline, premiere_package \
+              (zip + footage), or mp4 as the finished full-size video.",
     when: "When the cut is ready: a timeline to finish in an editor, or format mp4 for the deliverable. mp4 renders at \
            the cut's own size (e.g. 1080x1920) with the script's titles and speech captions burnt in and every clip at \
-           the same loudness, the way a clip set is exported; it takes minutes. For a light 540p look while you edit \
+           the same loudness; it takes minutes. For a light 540p look while you edit \
            use preview_script. Writes a file at `out`.",
-    returns: "{path, format}; for mp4 also {duration_s, encoder}.",
+    returns: "{path, format}; mp4 also {duration_s, encoder}.",
     misuse: &[
         "An existing file at `out` is overwritten.",
         "mp4 re-encodes the real footage: do not start two at once.",
@@ -491,8 +492,8 @@ static EXPORT_SCRIPT: ToolSpec = ToolSpec {
     chains_with: &["read_cut / preview_script to check the cut before exporting."],
     params: &[
         ToolParam::new("script_id", T::Integer, true, ""),
-        ToolParam::new("format", T::Enum(&["fcp_xml", "otio", "mp4"]), false, "default fcp_xml."),
-        ToolParam::new("out", T::String, true, "Output file path."),
+        ToolParam::new("format", T::Enum(&["fcp_xml", "otio", "mp4", "premiere_package"]), false, "default fcp_xml."),
+        ToolParam::new("out", T::String, true, "Output path."),
         ToolParam::new(
             "burn_captions",
             T::Boolean,
@@ -500,12 +501,20 @@ static EXPORT_SCRIPT: ToolSpec = ToolSpec {
             "mp4 only, default false: burn in the speech captions (read_cut captions: true lists them). A cut \
              that carries a caption style (clips do) burns them either way.",
         ),
+        ToolParam::new(
+            "media",
+            T::Enum(&["trimmed", "full"]),
+            false,
+            "premiere_package: used parts (default) or whole.",
+        ),
+        ToolParam::new("handles_s", T::Number, false, "premiere_package trimmed: seconds each side, default 2."),
     ],
 };
 
 async fn export_script(ctx: &mut ToolCtx<'_>, a: Args<'_>) -> ToolResult {
     ctx.check_cancel()?;
     let script_id = a.i64("script_id")?;
+    ctx.check_script(script_id)?;
     let format = a.opt_str("format").unwrap_or("fcp_xml");
     let out = PathBuf::from(a.str("out")?);
     if format.trim().trim_start_matches('.').eq_ignore_ascii_case("mp4") {
@@ -520,6 +529,26 @@ async fn export_script(ctx: &mut ToolCtx<'_>, a: Args<'_>) -> ToolResult {
             "encoder": res.encoder,
         }))
         .summary("exported mp4"));
+    }
+    if format.trim().eq_ignore_ascii_case(crate::package::FORMAT) {
+        let ffmpeg = crate::doctor::locate("ffmpeg").ok_or_else(|| ToolError::invalid("ffmpeg not found"))?;
+        let opts = crate::package::PackageOptions {
+            media: a.opt_str("media").map(crate::package::MediaMode::from_str).transpose()?.unwrap_or_default(),
+            handles_s: a.opt_f64("handles_s"),
+            data_dir: Some(ctx.paths.data_dir.clone()),
+            cancel: ctx.cancel.clone(),
+        };
+        let res = crate::package::export_package(ctx.db, &ffmpeg, script_id, &out, &opts, &mut |_, _, _| {})?;
+        let summary = format!("exported premiere_package ({} media files)", res.media.len());
+        return Ok(ToolOutput::json(json!({
+            "path": res.path,
+            "format": res.format,
+            "media_mode": res.media_mode,
+            "media": res.media,
+            "preview": res.preview,
+            "bytes": res.bytes,
+        }))
+        .summary(summary));
     }
     let fmt = crate::export::ExportFormat::from_str(format)?;
     let res = crate::export::export_script(ctx.db, script_id, fmt, &out)?;
@@ -561,6 +590,7 @@ static PREVIEW_SCRIPT: ToolSpec = ToolSpec {
 
 async fn preview_script(ctx: &mut ToolCtx<'_>, a: Args<'_>) -> ToolResult {
     let script_id = a.i64("script_id")?;
+    ctx.check_script(script_id)?;
     let ffmpeg = crate::doctor::locate("ffmpeg").ok_or_else(|| ToolError::invalid("ffmpeg not found"))?;
     let cfg = &ctx.config.script;
     let opts = crate::preview::PreviewOptions {
@@ -606,7 +636,7 @@ static REVIEW_RENDER: ToolSpec = ToolSpec {
 async fn review_render(ctx: &mut ToolCtx<'_>, a: Args<'_>) -> ToolResult {
     ctx.check_cancel()?;
     let script_id = a.i64("script_id")?;
-    let stored = script::load(ctx.db, script_id)?;
+    let stored = ctx.load_script(script_id)?;
     let path = match a.opt_str("path") {
         Some(p) => PathBuf::from(p),
         None => crate::render_review::latest_render(ctx.db, script_id).ok_or_else(|| {
@@ -655,6 +685,55 @@ async fn review_render(ctx: &mut ToolCtx<'_>, a: Args<'_>) -> ToolResult {
 mod preparation_tests {
     use super::*;
 
+    #[tokio::test]
+    async fn saved_script_tools_reject_foreign_project_before_work() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::paths::Paths::in_dir(tmp.path());
+        let config = crate::config::Config::default();
+        let mut db = crate::db::Db::open_in_memory().unwrap();
+        let p = db.create_project(&crate::projects::NewProject::named("P")).unwrap();
+        let other = db.create_project(&crate::projects::NewProject::named("Other")).unwrap();
+        let script: script::Script = serde_json::from_value(json!({"title":"foreign","beats":[]})).unwrap();
+        let id = script::save_version(&db, other.id, &script, None).unwrap();
+        let trash = crate::trash::trash_script(&db, id, "test").unwrap();
+        crate::trash::restore(&db, &trash.id, "test").unwrap();
+        let mut embedder = None;
+        let mut ctx =
+            ToolCtx::new(&paths, &config, &mut db, &mut embedder, super::super::Origin::External).with_project(p);
+        for tool in ["get_script", "apply_fix", "read_cut", "export_script", "preview_script", "review_render"] {
+            let mut args = json!({"script_id":id});
+            if tool == "apply_fix" {
+                args["fix"] = json!({});
+            }
+            if tool == "export_script" {
+                args["out"] = json!("unused.xml");
+            }
+            let error = super::super::call(&mut ctx, tool, &args).await.unwrap_err();
+            assert!(error.to_string().contains("scope"), "{tool}: {error}");
+        }
+        let trash = crate::trash::trash_script(ctx.db, id, "test").unwrap();
+        let error = super::super::call(&mut ctx, "restore_trash", &json!({"id":trash.id})).await.unwrap_err();
+        assert!(error.to_string().contains("scope"));
+        ctx.project = None;
+        assert!(super::super::call(&mut ctx, "restore_trash", &json!({"id":trash.id})).await.is_ok());
+        assert!(ctx.load_script(id).is_ok());
+    }
+
+    #[test]
+    fn repair_false_drops_foreign_footage_with_notes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::paths::Paths::in_dir(tmp.path());
+        let config = crate::config::Config::default();
+        let mut db = crate::db::Db::open_in_memory().unwrap();
+        let p = db.create_project(&crate::projects::NewProject::named("P")).unwrap();
+        let mut embedder = None;
+        let mut ctx = ToolCtx::new(&paths, &config, &mut db, &mut embedder, super::super::Origin::External);
+        let raw = json!({"title":"foreign", "beats":[{"id":"1","purpose":"test","clips":[{"video_id":99,"in_s":0,"out_s":5}]}]});
+        let (s, _, notes) = prepare_script(&mut ctx, &p, &raw, false).unwrap();
+        assert!(s.beats.is_empty());
+        assert!(notes.iter().any(|n| n.contains("not in this project")));
+    }
+
     #[test]
     fn prepare_keeps_correction_notes_and_resolves_clips_and_beds_once() {
         let tmp = tempfile::tempdir().unwrap();
@@ -669,6 +748,10 @@ mod preparation_tests {
                     rusqlite::params![v, format!("h{v}")],
                 )
                 .unwrap();
+        }
+        let folder = db.add_folder(project.id, tmp.path(), true).unwrap();
+        for v in [1, 2] {
+            db.conn.execute("INSERT INTO video_files(video_id, folder_id, path, size, mtime, last_seen) VALUES (?1, ?2, ?3, 1, 0, 0)", rusqlite::params![v, folder.id, format!("{v}.mp4")]).unwrap();
         }
         db.conn
             .execute(

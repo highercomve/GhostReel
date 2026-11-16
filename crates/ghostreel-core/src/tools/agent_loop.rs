@@ -24,7 +24,7 @@ use super::{
 };
 use crate::Error;
 use crate::agents::{AgentError, AgentErrorKind};
-use crate::chat::{ChatBackend, workers};
+use crate::chat::{ChatBackend, complete_lines, workers};
 use crate::config::Config;
 use crate::db::Db;
 use crate::embed::Embedder;
@@ -425,10 +425,8 @@ impl TempTrailFile {
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = std::env::temp_dir().join("ghostreel-mcp-trails");
         std::fs::create_dir_all(&dir).ok()?;
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
+        let nanos =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
         let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let path = dir.join(format!("{prefix}-{}-{}-{seq}.log", std::process::id(), nanos));
         std::fs::write(&path, "").ok()?;
@@ -448,7 +446,9 @@ impl Drop for TempTrailFile {
 
 fn drain_mcp_trail(path: &std::path::Path, seen_lines: &mut usize, trail: Option<&ToolTrail>) {
     let Ok(content) = std::fs::read_to_string(path) else { return };
-    let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+    // Same rule as the chat event drain: only newline-terminated lines count as seen, so a torn
+    // last line is not consumed before the writer has finished it.
+    let lines = complete_lines(&content);
     if lines.len() <= *seen_lines {
         return;
     }
@@ -557,5 +557,41 @@ pub(super) fn read_step_for_test(reply: Value, schema: &Value) -> String {
         Ok(Step::Answer(_)) => "answer".into(),
         Ok(Step::Tool { name, .. }) => format!("tool {name}"),
         Err(_) => "unusable".into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Same rule as the chat event drain: a torn, still-unterminated last line must not be
+    /// counted as seen, or it is consumed mid-write and lost forever. It stays out until the
+    /// writer finishes it, then the next drain picks it up exactly once.
+    #[test]
+    fn draining_mcp_trail_leaves_a_torn_last_line_for_the_next_drain() {
+        let file = tempfile::NamedTempFile::new().expect("temp file");
+        let path = file.path();
+        std::fs::write(path, "first complete line\n").expect("first complete line");
+        let mut seen = 0usize;
+        let trail: ToolTrail = Arc::new(std::sync::Mutex::new(Vec::new()));
+        drain_mcp_trail(path, &mut seen, Some(&trail));
+        assert_eq!(seen, 1, "the complete line was consumed");
+        assert_eq!(*trail.lock().expect("trail"), vec!["first complete line"]);
+
+        // The writer starts the next line but has not finished it.
+        std::fs::write(path, "first complete line\nsecond line half-writ").expect("torn second line");
+        drain_mcp_trail(path, &mut seen, Some(&trail));
+        assert_eq!(seen, 1, "the torn line was not counted as seen");
+        assert_eq!(*trail.lock().expect("trail"), vec!["first complete line"]);
+
+        // The writer finishes the line; the next drain sees it exactly once.
+        std::fs::write(path, "first complete line\nsecond line\n").expect("second line completed");
+        drain_mcp_trail(path, &mut seen, Some(&trail));
+        assert_eq!(seen, 2);
+        assert_eq!(
+            *trail.lock().expect("trail"),
+            vec!["first complete line", "second line"],
+            "the completed line was delivered exactly once"
+        );
     }
 }

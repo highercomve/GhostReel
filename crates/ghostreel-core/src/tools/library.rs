@@ -226,7 +226,13 @@ struct HitSentence {
 }
 
 /// The sentences a search window holds, and the one closest to the query by shared words.
-fn hit_sentences(db: &crate::db::Db, video_id: i64, start: f64, end: f64, query: &str) -> (Option<String>, Option<HitSentence>) {
+fn hit_sentences(
+    db: &crate::db::Db,
+    video_id: i64,
+    start: f64,
+    end: f64,
+    query: &str,
+) -> (Option<String>, Option<HitSentence>) {
     let Ok(mut st) = db.conn.prepare(
         "SELECT id, start_s, text FROM transcript_sentences WHERE video_id = ?1 AND end_s > ?2 AND start_s < ?3 ORDER BY start_s",
     ) else {
@@ -501,7 +507,9 @@ async fn get_transcript(ctx: &mut ToolCtx<'_>, a: Args<'_>) -> ToolResult {
     if as_text {
         // Words alone: a model that chooses clips from them has never seen the picture under them.
         let mut text = transcript_text(&videos, cut);
-        text.push_str("(words only: what is on screen under these lines, the faces and the frames, is in get_manifest)\n");
+        text.push_str(
+            "(words only: what is on screen under these lines, the faces and the frames, is in get_manifest)\n",
+        );
         out = out.text(text);
     }
     Ok(out)
@@ -526,7 +534,12 @@ static GET_MANIFEST: ToolSpec = ToolSpec {
     chains_with: &["save_script with clips {video_id, from: \"s412\", to: \"s418\"}; read_cut to check the result."],
     params: &[
         ToolParam::new("video_id", T::Integer, false, "From list_videos or get_outline."),
-        ToolParam::new("video_ids", T::List(&T::Integer), false, "Several (short) videos at once, instead of video_id."),
+        ToolParam::new(
+            "video_ids",
+            T::List(&T::Integer),
+            false,
+            "Several (short) videos at once, instead of video_id.",
+        ),
         ToolParam::new("start_s", T::Number, false, "Seconds; omit for the start."),
         ToolParam::new("end_s", T::Number, false, "Seconds; omit for the end."),
         ToolParam::new(
@@ -655,7 +668,11 @@ async fn get_manifest(ctx: &mut ToolCtx<'_>, a: Args<'_>) -> ToolResult {
         texts.push(text);
         values.insert(id.to_string(), serde_json::to_value(&m)?);
     }
-    let value = if ids.len() == 1 { values.into_iter().next().map(|(_, v)| v).unwrap_or_default() } else { Value::Object(values) };
+    let value = if ids.len() == 1 {
+        values.into_iter().next().map(|(_, v)| v).unwrap_or_default()
+    } else {
+        Value::Object(values)
+    };
     let videos = if ids.len() > 1 { format!("{} videos, ", ids.len()) } else { String::new() };
     let mut out = ToolOutput::json(value).summary(format!("{videos}{sentences} sentences, {lines} lines"));
     if a.opt_str("format").unwrap_or("text") == "text" {

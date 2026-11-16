@@ -655,6 +655,12 @@ fn a_linked_agent_has_one_source_for_its_model() {
 
 #[tokio::test]
 async fn preflight_downgrades_an_agent_others_can_cover() {
+    // The working agent is a local model, which needs its helper (MLX on a Mac, llama.cpp
+    // elsewhere); a bare test machine may have neither.
+    let helper = if crate::models::uses_mlx() { "ghostreel-mlx" } else { "ghostreel-llm" };
+    if crate::runtime::locate_helper(helper).is_none() {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let paths = crate::paths::Paths { config_file: dir.path().join("config.toml"), data_dir: dir.path().join("data") };
     let cfg = Config::default();

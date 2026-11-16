@@ -172,7 +172,9 @@ impl TryFrom<FramingWire> for Framing {
     type Error = String;
     fn try_from(w: FramingWire) -> Result<Self, String> {
         Ok(match w {
-            FramingWire::Name(name) => Framing { layout: name.parse().map_err(|e: Error| e.to_string())?, ..Default::default() },
+            FramingWire::Name(name) => {
+                Framing { layout: name.parse().map_err(|e: Error| e.to_string())?, ..Default::default() }
+            }
             FramingWire::Full { layout, person_id, box_, overrides } => Framing { layout, person_id, box_, overrides },
         })
     }

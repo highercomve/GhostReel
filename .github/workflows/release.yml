@@ -95,7 +95,7 @@ jobs:
               body: [
                 `**Windows:** \`GhostReel_*-setup.exe\` · **Linux:** \`.AppImage\` · **macOS:** \`.dmg\` (Apple Silicon / Intel). **CLI bundles:** available in the [build artifacts](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}).`,
                 "",
-                "Linux/Windows offer CUDA (NVIDIA driver 570+, CUDA runtime bundled) and Vulkan (AMD, Intel or NVIDIA with a Vulkan 1.2-capable driver). Vulkan downloads have `_vulkan` in their filenames. Apple Silicon uses MLX for vision/chat and Metal Whisper (macOS 14+); Intel uses llama.cpp/Whisper (macOS 12+). On first start open **Models** and download the models.",
+                "Linux/Windows offer CUDA (NVIDIA driver 570+, CUDA runtime bundled) and Vulkan (AMD, Intel or NVIDIA with a Vulkan 1.2-capable driver). Vulkan downloads have `_vulkan` in their filenames. Linux AppImages need glibc 2.39+ (Ubuntu 24.04, Debian 13, Fedora 40 or newer). Apple Silicon uses MLX for vision/chat and Metal Whisper (macOS 14+); Intel uses llama.cpp/Whisper (macOS 12+). On first start open **Models** and download the models.",
                 "",
                 "macOS builds use a self-signed certificate. Drag GhostReel to Applications; on first launch approve it in System Settings → Privacy & Security → Open Anyway.",
                 ...(notes ? ["", "---", "", notes] : []),
@@ -110,7 +110,9 @@ jobs:
     needs: create-release
     # Also when create-release is skipped (a cache run).
     if: ${{ !cancelled() && needs.create-release.result != 'failure' }}
-    runs-on: ${{ github.event.inputs.runner == 'blacksmith' && 'blacksmith-16vcpu-ubuntu-2204' || 'ubuntu-22.04' }}
+    # 24.04: the onnxruntime that ort downloads (face/speaker embeddings) needs glibc 2.38+
+    # (__isoc23_strtol), so the AppImage now needs glibc 2.39 (Ubuntu 24.04, Debian 13, Fedora 40+).
+    runs-on: ${{ github.event.inputs.runner == 'blacksmith' && 'blacksmith-16vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
     strategy:
       fail-fast: false
       matrix:
@@ -140,7 +142,7 @@ jobs:
             libayatana-appindicator3-dev \
             librsvg2-dev \
             libssl-dev \
-            libfuse2 \
+            libfuse2t64 \
             patchelf \
             build-essential \
             curl \
@@ -168,7 +170,7 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: linux-${{ matrix.backend }}
+          shared-key: linux-2404-${{ matrix.backend }}
           save-if: ${{ github.ref == 'refs/heads/master' }}
 
       - name: Setup Node.js
@@ -704,8 +706,16 @@ jobs:
       - name: Fetch sidecars
         run: node scripts/fetch-sidecars.mjs
 
+      # Intel Macs load ONNX Runtime at run time (no prebuilt static one exists for them):
+      # fetch Microsoft's 1.23.2 dylib, checksum-verified, for the app bundle and the CLI.
+      - name: Fetch ONNX Runtime (Intel)
+        if: matrix.arch == 'x64'
+        run: scripts/fetch-onnxruntime.sh
+
       - name: Stage helpers
         run: node scripts/stage-helpers.mjs
+        env:
+          GHOSTREEL_REQUIRE_ONNXRUNTIME: ${{ matrix.arch == 'x64' && '1' || '0' }}
 
       - name: Check standalone sidecars
         run: scripts/check-macos-sidecars.sh '${{ matrix.triple }}'
@@ -737,6 +747,13 @@ jobs:
         if: env.RELEASE == 'true'
         run: |
           codesign --verify --deep --strict --verbose=2 target/release/bundle/macos/GhostReel.app
+          if [ '${{ matrix.arch }}' = x64 ]; then
+            ort=target/release/bundle/macos/GhostReel.app/Contents/Frameworks/libonnxruntime.dylib
+            test -f "$ort" || { echo "::error::$ort missing: face matching would be unavailable"; exit 1; }
+            codesign --verify --strict --verbose=2 "$ort"
+            codesign -d --entitlements - target/release/bundle/macos/GhostReel.app 2>&1 | grep -q disable-library-validation \
+              || { echo '::error::GhostReel.app lacks disable-library-validation; it cannot load the bundled onnxruntime'; exit 1; }
+          fi
           shopt -s nullglob
           dmgs=(target/release/bundle/dmg/*.dmg)
           [ ${#dmgs[@]} -gt 0 ] || { echo 'No DMG produced' >&2; exit 1; }

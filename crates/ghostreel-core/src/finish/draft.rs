@@ -258,8 +258,10 @@ pub fn cap_clip_length(db: &Db, s: &mut Script, cfg: &ScriptConfig, pad: bool) -
                 if let Some(i) = segs.iter().position(|&(_, e)| e > c.in_s + EDGE_SLACK_S)
                     && segs[i].1 <= c.out_s + EDGE_SLACK_S
                 {
+                    // Never past where the clip ended before: that is footage the editor did not
+                    // choose, and may run past the end of the video.
                     let end = if pad { padded_end(&segs, i, cfg) } else { segs[i].1 + cfg.speech_overrun_s };
-                    c.out_s = end;
+                    c.out_s = end.min(c.out_s);
                 }
                 notes.push(format!(
                     "kept a {len:.1} s clip over the {:.0} s limit: its first sentence alone runs past it (video #{} \
@@ -281,13 +283,8 @@ fn voice_over(db: &Db, beat: &Beat) -> bool {
 /// Whether `beat` plays somebody speaking: a clip that plays its own sound with speech in range,
 /// or a bed with speech in it — the voice is the voice whether it lives on a clip or on a bed.
 fn beat_speaks(db: &Db, beat: &Beat) -> bool {
-    beat.clips.iter().any(|c| {
-        c.audio == Audio::Source
-            && c.tracks.as_ref().is_none_or(|t| !t.is_empty())
-            && clip_has_speech(db, c.video_id, c.in_s, c.out_s)
-    }) || beat.bed.as_ref().is_some_and(|b| {
-        b.tracks.as_ref().is_none_or(|t| !t.is_empty()) && clip_has_speech(db, b.video_id, b.in_s, b.out_s)
-    })
+    beat.clips.iter().any(|c| c.plays_sound() && clip_has_speech(db, c.video_id, c.in_s, c.out_s))
+        || beat.bed.as_ref().is_some_and(|b| b.plays_sound() && clip_has_speech(db, b.video_id, b.in_s, b.out_s))
 }
 
 /// A clip with nobody transcribed in its range plays no sound of its own when something else is

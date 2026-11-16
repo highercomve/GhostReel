@@ -362,6 +362,7 @@ mod tests {
                     why: None,
                     inferred: true,
                     tracks: None,
+                    gain_db: None,
                 }),
             )],
             Some(30.0),

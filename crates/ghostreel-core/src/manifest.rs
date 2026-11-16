@@ -308,7 +308,9 @@ pub fn build(db: &Db, video_id: i64, opts: &Options) -> Result<Manifest, Error> 
                     .unwrap_or_default()
                     .into_iter()
                     .filter(|t| !t.is_cut())
-                    .min_by(|a, b| ((a.start + a.end) / 2.0 - s.start).abs().total_cmp(&((b.start + b.end) / 2.0 - s.start).abs()))
+                    .min_by(|a, b| {
+                        ((a.start + a.end) / 2.0 - s.start).abs().total_cmp(&((b.start + b.end) / 2.0 - s.start).abs())
+                    })
             })
             .flatten();
         events.push(Event::Picture {
@@ -338,7 +340,7 @@ pub fn build(db: &Db, video_id: i64, opts: &Options) -> Result<Manifest, Error> 
                     keep[k] = true;
                 }
             }
-            if frames.first().is_some() && spans.is_empty() {
+            if !frames.is_empty() && spans.is_empty() {
                 keep[0] = true;
             }
         }

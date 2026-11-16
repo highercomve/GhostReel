@@ -12,7 +12,6 @@ dirs = "7.0.0"
 futures-util = "0.3.34"
 image = { version = "0.25.10", default-features = false, features = ["jpeg"] }
 notify = "8.2.0"
-ort = { version = "2.0.0-rc.15", features = ["download-binaries"] }
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "multipart", "rustls", "stream"] }
 rustfft = "6.4.1"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
@@ -27,6 +26,18 @@ tokio = { version = "1.53.1", features = ["rt", "macros", "time", "process", "ne
 toml = { version = "1.1.6", features = ["preserve_order"] }
 tracing = "0.1.44"
 walkdir = "2.5.0"
+zip = { version = "4.6.1", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+
+# ONNX Runtime (faces, speakers). pyke ships no prebuilt onnxruntime for Intel Macs, and Microsoft's
+# last x86_64 macOS build is 1.23.2 (API 23). Intel Macs therefore load the official 1.23.2 dylib
+# at run time (bundled by CI, scripts/fetch-onnxruntime.sh; found by onnx.rs) and compile against
+# API 23 so ort accepts it. Every other target links pyke's download as before. The two tables
+# must stay disjoint, or Cargo unifies download-binaries into the Intel build.
+[target.'cfg(not(all(target_os = "macos", target_arch = "x86_64")))'.dependencies]
+ort = { version = "2.0.0-rc.15", features = ["download-binaries"] }
+
+[target.'cfg(all(target_os = "macos", target_arch = "x86_64"))'.dependencies]
+ort = { version = "2.0.0-rc.15", default-features = false, features = ["std", "load-dynamic", "api-23"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

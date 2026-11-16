@@ -191,6 +191,7 @@ static RESTORE_TRASH: ToolSpec = ToolSpec {
 };
 
 async fn restore_trash(ctx: &mut ToolCtx<'_>, a: Args<'_>) -> ToolResult {
+    ctx.check_project(crate::trash::get(ctx.db, a.str("id")?)?.project_id)?;
     let item = crate::trash::restore(ctx.db, a.str("id")?, ctx.origin.source())?;
     let summary = format!("restored {}", item.label);
     Ok(ToolOutput::json(json!({ "restored": item.label, "item": item })).summary(summary))

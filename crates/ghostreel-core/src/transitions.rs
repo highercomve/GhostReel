@@ -73,6 +73,7 @@ pub fn measure(ffmpeg: &Path, video: &Path, from: f64, to: f64) -> Option<Vec<Ch
         }
         h
     };
+    #[allow(clippy::chunks_exact_to_as_chunks)] // one frame per chunk; frames are compared by slice
     let frames: Vec<&[u8]> = out.stdout.chunks_exact(W * H).collect();
     Some(
         frames

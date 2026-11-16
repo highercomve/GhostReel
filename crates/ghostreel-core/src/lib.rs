@@ -42,6 +42,7 @@ pub mod organize;
 pub mod otio;
 pub mod outline;
 pub mod overlays;
+pub mod package;
 pub mod paths;
 pub mod preflight;
 pub mod preview;

@@ -13,7 +13,8 @@ concurrency:
 jobs:
   rust:
     name: Rust
-    runs-on: ubuntu-22.04
+    # 24.04: ghostreel-core links an onnxruntime built against glibc 2.38+ (same as release.yml).
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -159,6 +160,12 @@ jobs:
         if: matrix.arch == 'arm64'
         run: scripts/build-mlx.sh
 
+      # Intel Macs load ONNX Runtime at run time: the core tests and the app bundle need the dylib.
+      - name: Fetch ONNX Runtime (Intel)
+        if: matrix.arch == 'x64'
+        run: |
+          scripts/fetch-onnxruntime.sh
+          echo "ORT_DYLIB_PATH=$PWD/src-tauri/binaries/onnxruntime-x86_64-apple-darwin/libonnxruntime.dylib" >> "$GITHUB_ENV"
       - name: Fetch and stage sidecars
         run: npm run sidecars
       - name: Check standalone sidecars

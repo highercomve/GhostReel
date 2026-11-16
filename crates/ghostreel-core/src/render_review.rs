@@ -284,7 +284,11 @@ impl RenderReview {
             None => {
                 out.push_str("heard (re-transcribed from the render):\n");
                 for h in &self.heard {
-                    let silent = if h.voiced < 0.2 { " (no voice measured here: likely invented by the transcriber)" } else { "" };
+                    let silent = if h.voiced < 0.2 {
+                        " (no voice measured here: likely invented by the transcriber)"
+                    } else {
+                        ""
+                    };
                     out.push_str(&format!("  [{} clip {}] {}{silent}\n", clock(h.start_s), h.clip, h.text));
                 }
             }

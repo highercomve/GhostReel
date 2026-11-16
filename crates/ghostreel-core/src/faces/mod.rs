@@ -1,3 +1,7 @@
+// Tensor offsets are written out in full (`0 * H * W + y * W + x`, `1 * 3 * 112 * 112`) so each
+// plane and shape reads as the model defines it.
+#![allow(clippy::identity_op, clippy::erasing_op)]
+
 pub mod detector;
 pub mod embedder;
 pub mod track;
@@ -27,15 +31,11 @@ pub fn embedding_to_blob(embedding: &[f32]) -> Vec<u8> {
 
 /// Deserializes a little-endian BLOB into a 128-d f32 embedding.
 pub fn blob_to_embedding(blob: &[u8]) -> Result<Vec<f32>, Error> {
-    if blob.len() % 4 != 0 {
+    let (floats, rest) = blob.as_chunks::<4>();
+    if !rest.is_empty() {
         return Err(Error::Invalid(format!("invalid embedding BLOB length: {}", blob.len())));
     }
-    let mut embedding = Vec::with_capacity(blob.len() / 4);
-    for chunk in blob.chunks_exact(4) {
-        let arr: [u8; 4] = chunk.try_into().map_err(|_| Error::Invalid("chunk slice error".into()))?;
-        embedding.push(f32::from_le_bytes(arr));
-    }
-    Ok(embedding)
+    Ok(floats.iter().map(|b| f32::from_le_bytes(*b)).collect())
 }
 
 /// Detect and track faces through a video file at 5 fps using ffmpeg and YuNet + SFace.
@@ -222,10 +222,7 @@ mod tests {
 
     #[test]
     fn test_embedding_blob_roundtrip() {
-        let mut original = vec![0.0f32; 128];
-        for i in 0..128 {
-            original[i] = ((i as f32) * 1.37 - 64.0).sin();
-        }
+        let original: Vec<f32> = (0..128).map(|i| ((i as f32) * 1.37 - 64.0).sin()).collect();
         let blob = embedding_to_blob(&original);
         assert_eq!(blob.len(), 512, "128 f32s must serialize to 512 bytes");
 

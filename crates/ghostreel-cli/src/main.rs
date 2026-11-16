@@ -1067,10 +1067,10 @@ fn project_cmd(paths: &Paths, action: ProjectAction) -> anyhow::Result<ExitCode>
             let mut glossary = p.glossary.clone();
             let mut changed = false;
 
-            if let Some(term_to_remove) = remove {
-                if glossary.remove(&term_to_remove) {
-                    changed = true;
-                }
+            if let Some(term_to_remove) = remove
+                && glossary.remove(&term_to_remove)
+            {
+                changed = true;
             }
 
             if let Some(term_to_add) = add {
@@ -2104,12 +2104,10 @@ async fn faces_cmd(paths: &Paths, project: Option<&str>, force: bool) -> anyhow:
                 }
             }
             Event::JobFailed { video_id, stage, error } => println!("  ✗ {stage} #{video_id}: {error}"),
-            Event::Progress(p) => {
-                if tty {
-                    eprint!("\r\x1b[2K{}", progress_line(&p));
-                    let _ = std::io::stderr().flush();
-                    bar_visible = true;
-                }
+            Event::Progress(p) if tty => {
+                eprint!("\r\x1b[2K{}", progress_line(&p));
+                let _ = std::io::stderr().flush();
+                bar_visible = true;
             }
             _ => {}
         }

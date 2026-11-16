@@ -734,7 +734,7 @@ pub fn check(
         .flat_map(|(b, beat)| beat.clips.iter().enumerate().map(move |(c, clip)| (b, c, beat, clip)))
         .filter(|(_, _, beat, clip)| beat.bed.is_none() && clip.audio == Audio::Source)
         .map(|(b, c, _, _)| (b, c))
-        .last();
+        .next_back();
     for (beat_idx, beat) in script.beats.iter().enumerate() {
         for (clip_idx, clip) in beat.clips.iter().enumerate() {
             let heard =
@@ -871,7 +871,7 @@ pub fn check(
                 .filter(|(s_start, s_end)| *s_end > clip.in_s + 0.05 && *s_start < clip.out_s - 0.05)
                 .filter(|(_s_start, s_end)| *s_end <= clip.out_s + 0.05)
                 .map(|(_s_start, s_end)| *s_end)
-                .last();
+                .next_back();
 
             if let Some(seg_end) = last_seg_end
                 && clip.out_s >= seg_end - 0.05
@@ -892,27 +892,27 @@ pub fn check(
     for beat in &script.beats {
         for (clip_idx, clip) in beat.clips.iter().enumerate() {
             let len = (clip.out_s - clip.in_s).max(0.0);
-            if let Some(min_s) = opts.clip_min_s {
-                if len < min_s {
-                    issues.push(Issue {
-                        fixes: Vec::new(),
-                        severity: IssueSeverity::Warning,
-                        beat_id: Some(beat.id.clone()),
-                        clip_index: Some(clip_idx),
-                        message: format!("clip duration {:.1}s is shorter than minimum {:.1}s", len, min_s),
-                    });
-                }
+            if let Some(min_s) = opts.clip_min_s
+                && len < min_s
+            {
+                issues.push(Issue {
+                    fixes: Vec::new(),
+                    severity: IssueSeverity::Warning,
+                    beat_id: Some(beat.id.clone()),
+                    clip_index: Some(clip_idx),
+                    message: format!("clip duration {:.1}s is shorter than minimum {:.1}s", len, min_s),
+                });
             }
-            if let Some(max_s) = opts.clip_max_s {
-                if len > max_s {
-                    issues.push(Issue {
-                        fixes: Vec::new(),
-                        severity: IssueSeverity::Warning,
-                        beat_id: Some(beat.id.clone()),
-                        clip_index: Some(clip_idx),
-                        message: format!("clip duration {:.1}s is longer than maximum {:.1}s", len, max_s),
-                    });
-                }
+            if let Some(max_s) = opts.clip_max_s
+                && len > max_s
+            {
+                issues.push(Issue {
+                    fixes: Vec::new(),
+                    severity: IssueSeverity::Warning,
+                    beat_id: Some(beat.id.clone()),
+                    clip_index: Some(clip_idx),
+                    message: format!("clip duration {:.1}s is longer than maximum {:.1}s", len, max_s),
+                });
             }
         }
     }
@@ -1243,6 +1243,7 @@ mod tests {
             why: None,
             inferred: false,
             tracks: None,
+            gain_db: None,
         });
         assert!(silent(&bedded, &db).is_empty(), "a bed carries the voice");
     }
@@ -1273,6 +1274,7 @@ mod tests {
                 why: None,
                 inferred: true,
                 tracks: None,
+                gain_db: None,
             });
             s
         };

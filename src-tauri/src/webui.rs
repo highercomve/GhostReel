@@ -599,8 +599,9 @@ async fn dispatch(app: &AppHandle, cmd: &str, args: Value) -> Result<Value, Stri
             ok(crate::export_clip_set(app.clone(), queue(), set_id, dir, accepted_only).await?)
         }
         "enqueue_export" => {
-            let (script_id, format, path) = args!(args; script_id: i64, format: String, path: String);
-            ok(crate::enqueue_export(app.clone(), queue(), script_id, format, path).await?)
+            let (script_id, format, path, media, handles_s) = args!(args;
+                script_id: i64, format: String, path: String, media: Option<String>, handles_s: Option<f64>);
+            ok(crate::enqueue_export(app.clone(), queue(), script_id, format, path, media, handles_s).await?)
         }
         "preview_plan" => {
             let (script_id,) = args!(args; script_id: i64);

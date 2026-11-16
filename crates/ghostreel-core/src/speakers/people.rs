@@ -87,8 +87,9 @@ pub fn group_tracks(tracks: &[FaceTrack]) -> (Vec<Vec<usize>>, usize) {
     let embs: Vec<&[f32]> = quality.iter().map(|&i| tracks[i].mean_embedding.as_slice()).collect();
     // Two faces on screen together are two people, however alike the model finds them: a couple
     // interviewed side by side came out as one person.
-    let clusters =
-        cluster_average_linkage_apart(&embs, PEOPLE_THRESHOLD, |a, b| together(&tracks[quality[a]], &tracks[quality[b]]));
+    let clusters = cluster_average_linkage_apart(&embs, PEOPLE_THRESHOLD, |a, b| {
+        together(&tracks[quality[a]], &tracks[quality[b]])
+    });
     let mut scored: Vec<(f64, Vec<usize>)> = clusters
         .into_iter()
         .map(|c| {
@@ -339,7 +340,7 @@ impl Db {
                     None => counts.push((n, 1)),
                 }
             }
-            counts.sort_by(|a, b| b.1.cmp(&a.1));
+            counts.sort_by_key(|c| std::cmp::Reverse(c.1));
             let name = counts[0].0.clone();
             self.conn.execute("UPDATE people SET name = ?2 WHERE id = ?1", params![p.id, name])?;
             set.push((p.id, name));

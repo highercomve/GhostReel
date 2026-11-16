@@ -81,14 +81,19 @@ pub fn export_script(db: &Db, script_id: i64, format: ExportFormat, out_path: &P
         }
     }
 
-    let now = crate::projects::now();
-    db.conn.execute(
-        "INSERT INTO exports(script_id, format, path, created_at) VALUES (?1, ?2, ?3, ?4)",
-        params![stored.id, format.as_str(), out_path.to_string_lossy(), now],
-    )?;
-    let export_id = db.conn.last_insert_rowid();
+    let export_id = record(db, stored.id, format.as_str(), out_path)?;
 
     Ok(ExportResult { export_id, path: out_path.to_path_buf(), format })
+}
+
+/// Record a finished export of a script version (`format`: an `exports.format` value: a timeline
+/// format, `preview_mp4`, or [`crate::package::FORMAT`]).
+pub(crate) fn record(db: &Db, script_id: i64, format: &str, path: &Path) -> Result<i64, Error> {
+    db.conn.execute(
+        "INSERT INTO exports(script_id, format, path, created_at) VALUES (?1, ?2, ?3, ?4)",
+        params![script_id, format, path.to_string_lossy(), crate::projects::now()],
+    )?;
+    Ok(db.conn.last_insert_rowid())
 }
 
 /// Read an exported timeline back and report what it contains: how many clips landed on which
@@ -174,7 +179,9 @@ mod tests {
                 narration: Some("Hello".into()),
                 on_screen_text: Some("Title".into()),
                 title_layout: None,
-                clips: vec![script::ScriptClip { exact: false, gain_db: None,
+                clips: vec![script::ScriptClip {
+                    exact: false,
+                    gain_db: None,
                     sentences: None,
                     framing: None,
                     video_id: 1,
@@ -199,7 +206,165 @@ mod tests {
         assert!(out_xml.is_file());
 
         let validation = validate_export(&out_xml).unwrap();
-        assert_eq!(validation["clips"].as_i64(), Some(2)); // 1 V1 + 1 A1
+        // One picture plus its sound on one audio track per channel the XML lays out.
+        assert!(validation["clips"].as_i64().unwrap() >= 2, "{validation}");
         assert_eq!(validation["duration_s"].as_f64(), Some(4.0));
+    }
+
+    #[test]
+    fn export_otio_and_fcpxml_preserve_clip_and_bed_gain() {
+        let mut db = Db::open_in_memory().unwrap();
+        let project = db.create_project(&NewProject::named("GainExport")).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let folder = db.add_folder(project.id, temp.path(), true).unwrap();
+
+        for (id, name) in [(1, "clip.mp4"), (2, "bed.mp4")] {
+            let path = temp.path().join(name);
+            std::fs::write(&path, b"test").unwrap();
+            db.conn
+                .execute(
+                    "INSERT INTO videos(id, content_hash, size, duration_s, fps, has_audio)
+                     VALUES (?1, ?2, 100, 10.0, 25.0, 1)",
+                    params![id, format!("hash{id}")],
+                )
+                .unwrap();
+            db.conn
+                .execute(
+                    "INSERT INTO video_files(video_id, folder_id, path, size, mtime, last_seen)
+                     VALUES (?1, ?2, ?3, 100, 0, 0)",
+                    params![id, folder.id, path.to_str().unwrap()],
+                )
+                .unwrap();
+        }
+
+        let script = script::Script {
+            framing: None,
+            captions: None,
+            title_style: None,
+            caption_edits: Vec::new(),
+            agents: None,
+            title: "Gain Test".into(),
+            target_duration_s: None,
+            fps: Some(script::Fps::new(25, 1)),
+            width: Some(1920),
+            height: Some(1080),
+            beats: vec![
+                script::Beat {
+                    id: "b1".into(),
+                    purpose: "speak".into(),
+                    narration: None,
+                    on_screen_text: None,
+                    title_layout: None,
+                    clips: vec![
+                        script::ScriptClip {
+                            exact: false,
+                            gain_db: Some(6.0),
+                            sentences: None,
+                            framing: None,
+                            video_id: 1,
+                            in_s: 0.0,
+                            out_s: 2.0,
+                            audio: script::Audio::Source,
+                            why: None,
+                            tracks: None,
+                        },
+                        script::ScriptClip {
+                            exact: false,
+                            gain_db: Some(9.0),
+                            sentences: None,
+                            framing: None,
+                            video_id: 1,
+                            in_s: 2.0,
+                            out_s: 4.0,
+                            audio: script::Audio::Mute,
+                            why: None,
+                            tracks: None,
+                        },
+                        script::ScriptClip {
+                            exact: false,
+                            gain_db: None,
+                            sentences: None,
+                            framing: None,
+                            video_id: 1,
+                            in_s: 4.0,
+                            out_s: 6.0,
+                            audio: script::Audio::Source,
+                            why: None,
+                            tracks: None,
+                        },
+                    ],
+                    notes: None,
+                    bed: None,
+                    card: None,
+                },
+                script::Beat {
+                    id: "b2".into(),
+                    purpose: "broll".into(),
+                    narration: None,
+                    on_screen_text: None,
+                    title_layout: None,
+                    clips: vec![script::ScriptClip {
+                        exact: false,
+                        gain_db: Some(5.0),
+                        sentences: None,
+                        framing: None,
+                        video_id: 1,
+                        in_s: 6.0,
+                        out_s: 8.0,
+                        audio: script::Audio::Mute,
+                        why: None,
+                        tracks: None,
+                    }],
+                    notes: None,
+                    bed: Some(script::AudioBed {
+                        video_id: 2,
+                        in_s: 0.0,
+                        out_s: 2.0,
+                        why: None,
+                        inferred: false,
+                        tracks: None,
+                        gain_db: Some(-3.0),
+                        sentences: None,
+                    }),
+                    card: None,
+                },
+            ],
+            card_style: None,
+        };
+
+        let script_id = script::save_version(&db, project.id, &script, None).unwrap();
+
+        let out_otio = temp.path().join("out.otio");
+        export_script(&db, script_id, ExportFormat::Otio, &out_otio).unwrap();
+        let otio_doc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&out_otio).unwrap()).unwrap();
+        let a1 = &otio_doc["tracks"]["children"][1]["children"];
+        assert_eq!(a1[0]["effects"][0]["effect_name"], "AudioVolume");
+        assert_eq!(a1[0]["effects"][0]["metadata"]["ghostreel"]["gain_db"], 6.0);
+        assert_eq!(a1[0]["metadata"]["ghostreel"]["gain_db"], 6.0);
+        // Muted clip is a Gap on A1 (no gain).
+        assert_eq!(a1[1]["OTIO_SCHEMA"], "Gap.1");
+        // No-gain clip has no effects.
+        assert_eq!(a1[2]["effects"].as_array().unwrap().len(), 0);
+        // Bed has -3 dB.
+        assert_eq!(a1[3]["effects"][0]["effect_name"], "AudioVolume");
+        assert_eq!(a1[3]["effects"][0]["metadata"]["ghostreel"]["gain_db"], -3.0);
+        assert_eq!(a1[3]["metadata"]["ghostreel"]["gain_db"], -3.0);
+
+        let out_xml = temp.path().join("out.xml");
+        export_script(&db, script_id, ExportFormat::FcpXml, &out_xml).unwrap();
+        let xml = std::fs::read_to_string(&out_xml).unwrap();
+        // Audio clipitems name their source track; picture clipitems do not.
+        let clipitems: Vec<&str> =
+            xml.split("<clipitem").skip(1).map(|c| c.split("</clipitem>").next().unwrap()).collect();
+        let (audio, video): (Vec<&str>, Vec<&str>) = clipitems.iter().partition(|c| c.contains("<sourcetrack>"));
+        assert!(!video.is_empty() && !audio.is_empty());
+        assert!(video.iter().all(|c| !c.contains("audiolevels")), "video clipitems must not get audio filters");
+        let plus6 = format!("<value>{:.6}</value>", 10.0_f64.powf(6.0 / 20.0));
+        let minus3 = format!("<value>{:.6}</value>", 10.0_f64.powf(-3.0 / 20.0));
+        let levelled: Vec<&&str> = audio.iter().filter(|c| c.contains("<effectid>audiolevels</effectid>")).collect();
+        // The +6 dB clip and the -3 dB bed, on every channel they are laid out on; nothing else.
+        assert!(levelled.len() >= 2, "{xml}");
+        assert!(levelled.iter().all(|c| c.contains(&plus6) || c.contains(&minus3)));
+        assert!(levelled.iter().any(|c| c.contains(&plus6)) && levelled.iter().any(|c| c.contains(&minus3)));
     }
 }

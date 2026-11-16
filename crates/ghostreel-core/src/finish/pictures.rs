@@ -181,7 +181,16 @@ const CUTAWAY_FLOOR_S: f64 = 1.5;
 /// left alone. Returns how many beats changed.
 pub fn open_on_the_speaker(db: &Db, script: &mut Script) -> usize {
     let mut changed = 0;
-    for beat in &mut script.beats {
+    for bi in 0..script.beats.len() {
+        // Footage the rest of the cut plays: a face over it would be dropped as a repeat.
+        let elsewhere: Vec<ScriptClip> = script
+            .beats
+            .iter()
+            .enumerate()
+            .filter(|&(j, _)| j != bi)
+            .flat_map(|(_, b)| b.clips.iter().cloned())
+            .collect();
+        let beat = &mut script.beats[bi];
         if beat.narration.as_deref().map(str::trim).is_some_and(|n| !n.is_empty()) {
             continue;
         }
@@ -236,6 +245,14 @@ pub fn open_on_the_speaker(db: &Db, script: &mut Script) -> usize {
             continue;
         }
         face_s = face_s.min(bed_len - CUTAWAY_FLOOR_S);
+        // The beat already cuts back to the speaker over this very range (a short cutaway, then the
+        // face in sync): a face prepended there is footage the cut plays twice, and the repeat
+        // rule would drop the speaker's own clip. The face is already coming.
+        let (face_in, face_out) = (a, a + face_s);
+        // The same holds cut-wide: another beat playing that footage keeps it, and the face goes.
+        if clips.iter().chain(&elsewhere).any(|c| super::fit::repeats_footage(c, bed.video_id, face_in, face_out)) {
+            continue;
+        }
         let face = ScriptClip {
             exact: false,
             gain_db: None,
@@ -674,10 +691,7 @@ pub fn lay_audio_beds(db: &Db, s: &mut Script, cfg: &crate::config::ScriptConfig
         let mut offset = 0.0f64;
         let mut source: Option<(usize, f64)> = None;
         for (i, c) in beat.clips.iter().enumerate() {
-            if c.audio == crate::script::Audio::Source
-                && c.tracks.as_ref().is_none_or(|t| !t.is_empty())
-                && clip_has_speech(db, c.video_id, c.in_s, c.out_s)
-            {
+            if c.plays_sound() && clip_has_speech(db, c.video_id, c.in_s, c.out_s) {
                 source = Some((i, offset));
                 break;
             }
@@ -734,7 +748,10 @@ pub fn lay_audio_beds(db: &Db, s: &mut Script, cfg: &crate::config::ScriptConfig
             why: None,
             inferred: true,
             tracks: clip.tracks.clone(),
+            gain_db: clip.gain_db,
         });
+        // The volume moves with the sound: the clip's own sound no longer plays.
+        beat.clips[idx].gain_db = None;
         for c in &mut beat.clips {
             c.audio = crate::script::Audio::Mute;
         }

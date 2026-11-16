@@ -258,7 +258,7 @@ impl TryFrom<ScriptClipWire> for ScriptClip {
         let (in_s, out_s, sentences) = wire_range("a clip", w.in_s, w.out_s, w.from, w.to)?;
         Ok(ScriptClip {
             exact: w.exact,
-            gain_db: w.gain_db.map(|g| g.clamp(-24.0, 24.0)).filter(|g| g.abs() > 0.05),
+            gain_db: clamp_gain(w.gain_db),
             video_id: w.video_id,
             in_s,
             out_s,
@@ -269,6 +269,16 @@ impl TryFrom<ScriptClipWire> for ScriptClip {
             sentences,
         })
     }
+}
+
+/// A gain as stored: within ±24 dB, and none when it is too small to hear.
+pub fn clamp_gain(gain_db: Option<f64>) -> Option<f64> {
+    gain_db.map(|g| g.clamp(-24.0, 24.0)).filter(|g| g.abs() > 0.05)
+}
+
+/// A track choice that plays something: the automatic track (None) or at least one chosen.
+fn tracks_play(tracks: Option<&Vec<u32>>) -> bool {
+    tracks.is_none_or(|t| !t.is_empty())
 }
 
 /// One end of a clip or a bed.
@@ -284,6 +294,12 @@ impl ScriptClip {
         self.sentences.is_some() && self.in_s == 0.0 && self.out_s == 0.0
     }
 
+    /// Whether the clip plays its own sound: `source` audio with at least one track selected
+    /// (`tracks: []` is explicitly silent). The one rule every pass asks.
+    pub fn plays_sound(&self) -> bool {
+        self.audio == Audio::Source && tracks_play(self.tracks.as_ref())
+    }
+
     /// Whether code may move this edge of the clip: the one answer every pass that moves an edge
     /// asks (snapping, trimming what is off the microphone, padding, turn and sentence ends, the
     /// fit, the hold, framing, a shaky stretch, cut placement).
@@ -292,6 +308,11 @@ impl ScriptClip {
     /// both are an editor's instruction, not a draft to tidy. The one thing still done to a word
     /// edge is to settle it on the quiet between that word and its neighbour in the sound
     /// ([`crate::cuts::place_cuts`]), never past the middle of that gap: it stays on its word.
+    ///
+    /// One accepted exception: when cut placement shortens a bed after the pictures were fitted to
+    /// it, the last muted picture under that bed gives the time back
+    /// ([`crate::finish::pictures::fit_pictures_to_bed`]), even when written `exact`: that time
+    /// is code's (the bed's edge it follows was code's), and the shot stays the same shot.
     pub fn movable(&self, side: Side) -> bool {
         !self.exact && !on_word(self.sentences.as_ref(), side == Side::In)
     }
@@ -323,6 +344,10 @@ pub struct AudioBed {
     /// automatic track (today's behaviour). Empty = silent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tracks: Option<Vec<u32>>,
+    /// The bed's sound made louder or softer, in dB, as a clip's `gain_db` (0/absent = as recorded).
+    /// A speaking clip turned into a bed keeps its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gain_db: Option<f64>,
     /// The sentences the bed was asked for, when it was written that way (see [`ScriptClip`]).
     #[serde(flatten, skip_serializing_if = "Option::is_none")]
     pub sentences: Option<SentenceRange>,
@@ -345,6 +370,8 @@ struct AudioBedWire {
     inferred: bool,
     #[serde(default)]
     tracks: Option<Vec<u32>>,
+    #[serde(default)]
+    gain_db: Option<f64>,
 }
 
 impl TryFrom<AudioBedWire> for AudioBed {
@@ -359,6 +386,7 @@ impl TryFrom<AudioBedWire> for AudioBed {
             why: w.why,
             inferred: w.inferred,
             tracks: w.tracks,
+            gain_db: clamp_gain(w.gain_db),
             sentences,
         })
     }
@@ -368,6 +396,12 @@ impl AudioBed {
     /// Written with sentences and not yet resolved to seconds.
     pub fn is_unresolved(&self) -> bool {
         self.sentences.is_some() && self.in_s == 0.0 && self.out_s == 0.0
+    }
+
+    /// Whether the bed plays any sound: `tracks: []` is explicitly silent (see
+    /// [`ScriptClip::plays_sound`]).
+    pub fn plays_sound(&self) -> bool {
+        tracks_play(self.tracks.as_ref())
     }
 
     /// Whether code may move this edge of the bed: an edge written on a word stays, as a clip's
@@ -1517,7 +1551,11 @@ mod tests {
                 let path = path.clone();
                 std::thread::spawn(move || {
                     let db = Db::open(&path).unwrap();
-                    (0..8).map(|_| save_version(&db, project.id, &titled("Same"), None).unwrap()).count()
+                    (0..8)
+                        .inspect(|_| {
+                            save_version(&db, project.id, &titled("Same"), None).unwrap();
+                        })
+                        .count()
                 })
             })
             .collect();

@@ -27,10 +27,8 @@ pub fn finish_script(
         return Ok(None);
     }
     let notes = crate::finish::run(db, project_id, s, cfg, &crate::finish::Profile::chat(enforce_target))?;
-    // The passes can drop every clip — a foreign-video draft, pacing against a tight target — and
-    // an empty cut must not be handed back to save. Beats left with no clips go too, the way every
-    // finishing pass treats them, so the caller sees a script that is honestly empty.
-    s.beats.retain(|b| !b.clips.is_empty());
+    // The passes can drop every clip (a foreign-video draft, pacing against a tight target), and
+    // an empty cut must not be handed back to save. finish::run leaves no empty beats.
     if s.clip_count() == 0 || s.beats.is_empty() {
         return Ok(None);
     }

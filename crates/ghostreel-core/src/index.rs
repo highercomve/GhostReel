@@ -1455,7 +1455,9 @@ async fn run_word_timings(
             Ok(t) => {
                 let segments: Vec<(i64, f64, f64)> = db
                     .conn
-                    .prepare("SELECT id, start_s, end_s FROM transcript_segments WHERE video_id = ?1 ORDER BY start_s, id")?
+                    .prepare(
+                        "SELECT id, start_s, end_s FROM transcript_segments WHERE video_id = ?1 ORDER BY start_s, id",
+                    )?
                     .query_map([video_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
                     .collect::<Result<_, _>>()?;
                 let stored = crate::sentences::store_words(db, &segments, &t.words)?;
@@ -3761,7 +3763,9 @@ echo '{"streams":[{"codec_type":"video","codec_name":"h264","width":1920,"height
     #[tokio::test]
     async fn ghostreels_own_renders_are_not_indexed_as_footage() {
         let tmp = tempfile::tempdir().unwrap();
-        let media = tmp.path().join("media");
+        // The folder is scanned by its real path (macOS temp dirs sit behind the /var symlink), and
+        // renders are recorded where the app writes them: under that real path.
+        let media = tmp.path().canonicalize().unwrap().join("media");
         write(&media.join("interview.mp4"), b"real footage");
         let bin = fake_ffprobe(tmp.path());
         let mut db = Db::open_in_memory().unwrap();

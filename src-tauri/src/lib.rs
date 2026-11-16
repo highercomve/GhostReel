@@ -540,6 +540,7 @@ fn set_chat_system_prompt(prompt: String) -> CmdResult<ChatSettingsView> {
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)] // one per field the UI sends
 async fn enqueue_preview(
     app: AppHandle,
     queue: State<'_, queue::Queue>,
@@ -579,11 +580,22 @@ async fn enqueue_export(
     script_id: i64,
     format: String,
     path: String,
+    media: Option<String>,
+    handles_s: Option<f64>,
 ) -> CmdResult<u64> {
     let db = open_db()?;
     let stored = ghostreel_core::script::load(&db, script_id).map_err(err)?;
-    let label = format!("Export “{}” → {}", stored.title, format);
-    Ok(queue.enqueue(&app, queue::TaskKind::Export { script_id, format, path }, label).await)
+    let is_package = format == ghostreel_core::package::FORMAT;
+    if is_package && let Some(m) = &media {
+        <ghostreel_core::package::MediaMode as std::str::FromStr>::from_str(m).map_err(err)?;
+    }
+    let label = if is_package {
+        format!("Export “{}” for Premiere", stored.title)
+    } else {
+        format!("Export “{}” → {}", stored.title, format)
+    };
+    let (media, handles_s) = if is_package { (media, handles_s) } else { (None, None) };
+    Ok(queue.enqueue(&app, queue::TaskKind::Export { script_id, format, path, media, handles_s }, label).await)
 }
 
 #[tauri::command]
@@ -1552,7 +1564,7 @@ async fn queue_needed_stages(
         let tasks = queue.snapshot().await;
         let same = |t: &&queue::Task| t.kind.key() == kind.key() && t.project_id == Some(project_id);
         let active = tasks.iter().filter(same).any(|t| t.state.is_active());
-        let failed = tasks.iter().filter(same).last().is_some_and(|t| t.state == queue::TaskState::Failed);
+        let failed = tasks.iter().rfind(same).is_some_and(|t| t.state == queue::TaskState::Failed);
         if failed {
             continue;
         }
@@ -1564,6 +1576,7 @@ async fn queue_needed_stages(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)] // one per field the UI sends
 async fn chat_turn(
     app: AppHandle,
     queue: State<'_, queue::Queue>,

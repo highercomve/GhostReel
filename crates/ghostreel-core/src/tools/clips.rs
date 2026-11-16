@@ -70,9 +70,7 @@ fn clip_options(a: Args<'_>) -> Result<crate::clips::ClipOptions, ToolError> {
 fn clip_picks(a: Args<'_>) -> Result<Vec<crate::clips::Pick>, ToolError> {
     let raw = a.get("clips").ok_or_else(|| ToolError::invalid("missing 'clips' array"))?;
     let picks: Vec<crate::clips::Pick> = serde_json::from_value(raw.clone()).map_err(|e| {
-        ToolError::Invalid(format!(
-            "clips must be [{{video_id, from?, to?, in_s?, out_s?, title?, hook?, ...}}]: {e}"
-        ))
+        ToolError::Invalid(format!("clips must be [{{video_id, from?, to?, in_s?, out_s?, title?, hook?, ...}}]: {e}"))
     })?;
     if picks.is_empty() {
         return Err(ToolError::invalid("no clips given"));
@@ -80,7 +78,11 @@ fn clip_picks(a: Args<'_>) -> Result<Vec<crate::clips::Pick>, ToolError> {
     Ok(picks)
 }
 
-fn resolve_picks(db: &crate::db::Db, picks: &mut [crate::clips::Pick]) -> Result<(), ToolError> {
+fn resolve_picks(ctx: &ToolCtx<'_>, picks: &mut [crate::clips::Pick]) -> Result<(), ToolError> {
+    for pk in picks.iter() {
+        ctx.check_video(pk.video_id)?;
+    }
+    let db = &*ctx.db;
     let mut surveys: std::collections::HashMap<i64, crate::clips::VideoSurvey> = std::collections::HashMap::new();
     for pk in picks {
         pk.from = pk.from.take().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
@@ -105,9 +107,7 @@ fn resolve_picks(db: &crate::db::Db, picks: &mut [crate::clips::Pick]) -> Result
         }
         let survey = match surveys.entry(pk.video_id) {
             std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-            std::collections::hash_map::Entry::Vacant(e) => {
-                e.insert(crate::clips::VideoSurvey::load(db, pk.video_id)?)
-            }
+            std::collections::hash_map::Entry::Vacant(e) => e.insert(crate::clips::VideoSurvey::load(db, pk.video_id)?),
         };
         pk.visual = survey.visual(pk.in_s, pk.out_s);
         if pk.speakers.is_empty() {
@@ -120,6 +120,9 @@ fn resolve_picks(db: &crate::db::Db, picks: &mut [crate::clips::Pick]) -> Result
 async fn find_clip_candidates(ctx: &mut ToolCtx<'_>, a: Args<'_>) -> ToolResult {
     let p = ctx.project_for(a)?;
     let opts = clip_options(a)?;
+    for &id in &opts.video_ids {
+        ctx.check_video(id)?;
+    }
     let mut cands = crate::clips::find_candidates(ctx.db, p.id, &ctx.config.script, &opts)?;
     let total = cands.len();
     cands.sort_by(|x, y| y.prescore.total_cmp(&x.prescore));
@@ -145,7 +148,12 @@ static CHECK_CLIPS: ToolSpec = ToolSpec {
     chains_with: &["save_clips with the same list once errors and warnings are addressed."],
     params: &[
         PROJECT,
-        ToolParam::new("clips", T::List(&T::Object), true, "[{video_id, from?, to?, in_s?, out_s?, title?, hook?, ...}]"),
+        ToolParam::new(
+            "clips",
+            T::List(&T::Object),
+            true,
+            "[{video_id, from?, to?, in_s?, out_s?, title?, hook?, ...}]",
+        ),
         ToolParam::new("format", FORMAT, false, ""),
         ToolParam::new("min_s", T::Number, false, ""),
         ToolParam::new("max_s", T::Number, false, ""),
@@ -156,7 +164,7 @@ async fn check_clips(ctx: &mut ToolCtx<'_>, a: Args<'_>) -> ToolResult {
     let p = ctx.project_for(a)?;
     let opts = clip_options(a)?;
     let mut picks = clip_picks(a)?;
-    resolve_picks(ctx.db, &mut picks)?;
+    resolve_picks(ctx, &mut picks)?;
     let checked = crate::clips::check_clips(ctx.db, &p, &ctx.config.script, &picks, &opts)?;
     let mut total_errors = 0usize;
     let mut total_warnings = 0usize;
@@ -267,7 +275,7 @@ async fn save_clips(ctx: &mut ToolCtx<'_>, a: Args<'_>) -> ToolResult {
     let p = ctx.project_for(a)?;
     let opts = clip_options(a)?;
     let mut picks = clip_picks(a)?;
-    resolve_picks(ctx.db, &mut picks)?;
+    resolve_picks(ctx, &mut picks)?;
     let source = match ctx.origin {
         super::Origin::External => "mcp save_clips",
         super::Origin::ScriptChat => "script chat save_clips",
@@ -298,9 +306,7 @@ static GENERATE_CLIPS: ToolSpec = ToolSpec {
               orchestrator pick N and write hooks, check, and save a clip set (captions on, hook title).",
     when: "When GhostReel's models should pick. Slow (minutes). Refused inside a clip run or script chat.",
     returns: "The set, each clip's script id and issues, and the run log with timings.",
-    misuse: &[
-        "Refused inside a clip run or script chat: pick with find_clip_candidates and save_clips.",
-    ],
+    misuse: &["Refused inside a clip run or script chat: pick with find_clip_candidates and save_clips."],
     chains_with: &["list_clip_sets for the saved set."],
     params: &[
         PROJECT,
@@ -342,6 +348,9 @@ async fn generate_clips(ctx: &mut ToolCtx<'_>, a: Args<'_>) -> ToolResult {
     ctx.refuse_nested("generate_clips")?;
     let p = ctx.project_for(a)?;
     let opts = clip_options(a)?;
+    for &id in &opts.video_ids {
+        ctx.check_video(id)?;
+    }
     let backends = crate::clips::Backends::resolve(ctx.paths, ctx.config, &opts).await?;
     let res = crate::clips::run(
         ctx.db,
@@ -377,4 +386,26 @@ async fn list_clip_sets(ctx: &mut ToolCtx<'_>, a: Args<'_>) -> ToolResult {
     }
     let n = sets.len();
     Ok(ToolOutput::json(serde_json::to_value(sets)?).summary(format!("{n} clip sets")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn foreign_picks_are_rejected_before_sentence_lookup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::paths::Paths::in_dir(tmp.path());
+        let config = crate::config::Config::default();
+        let mut db = crate::db::Db::open_in_memory().unwrap();
+        let p = db.create_project(&crate::projects::NewProject::named("Scoped")).unwrap();
+        let mut embedder = None;
+        let mut ctx =
+            ToolCtx::new(&paths, &config, &mut db, &mut embedder, super::super::Origin::External).with_project(p);
+        for pick in [json!({"video_id":99,"from":"s999","to":"s999"}), json!({"video_id":99,"in_s":0,"out_s":30})] {
+            let args = json!({"clips":[pick]});
+            for result in [check_clips(&mut ctx, Args(&args)).await, save_clips(&mut ctx, Args(&args)).await] {
+                assert!(result.unwrap_err().to_string().contains("not in project"));
+            }
+        }
+    }
 }

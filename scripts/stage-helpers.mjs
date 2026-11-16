@@ -61,6 +61,62 @@ function getHostTriple() {
   return null;
 }
 
+const SIDECAR_NAMES = ['ffmpeg', 'ffprobe', 'ghostreel-asr', 'ghostreel-llm', 'ghostreel-mlx'];
+const ONNX_DIR = 'onnxruntime-x86_64-apple-darwin';
+
+// tauri-build copies every externalBin into the cargo profile dir as <name> (no triple), and first
+// deletes what is there with `fs::remove_file(..).unwrap()`. On the macOS runners that delete
+// failed with EPERM ("Operation not permitted") for target/release/ghostreel-asr, the binary cargo
+// itself had just built there, and panicked the app build. The helpers are staged under
+// src-tauri/binaries by now, so the profile-dir copies are no longer needed: remove them here,
+// clearing any user-immutable flag first, and fail with a listing of the file if even that fails.
+function clearSidecarCopies(profileDir) {
+  for (const name of SIDECAR_NAMES) {
+    const path = join(profileDir, name);
+    if (!existsSync(path)) continue;
+    const listing = spawnSync('ls', ['-ldO@', path], { encoding: 'utf8' });
+    const described = `${listing.stdout || ''}${listing.stderr || ''}`.trim();
+    spawnSync('chflags', ['-R', 'nouchg', path], { stdio: 'ignore' });
+    try {
+      rmSync(path, { recursive: true, force: true });
+      console.log(`Removed ${relative(repoRoot, path)} before tauri-build replaces it (${described})`);
+    } catch (error) {
+      console.error(`Error: cannot remove ${path}, which tauri-build must replace: ${error.message}`);
+      console.error(described);
+      process.exit(1);
+    }
+  }
+}
+
+// Intel Macs load ONNX Runtime at run time (crates/ghostreel-core/Cargo.toml). Bundle the dylib
+// that scripts/fetch-onnxruntime.sh staged into Contents/Frameworks, where ghostreel-core/src/onnx.rs looks;
+// Tauri signs it with the app. The app runs with the hardened runtime and a self-signed identity
+// without a Team ID, so library validation would refuse to dlopen it: the app gets
+// disable-library-validation (Intel only, written next to the dylib).
+function onnxRuntimeBundle(binariesDir) {
+  const dylib = join(binariesDir, ONNX_DIR, 'libonnxruntime.dylib');
+  if (!existsSync(dylib)) {
+    const message = `${relative(repoRoot, dylib)} not staged; run scripts/fetch-onnxruntime.sh (face and speaker matching would be unavailable)`;
+    if (process.env.GHOSTREEL_REQUIRE_ONNXRUNTIME === '1') {
+      console.error(`Error: ${message}`);
+      process.exit(1);
+    }
+    console.warn(`Warning: ${message}`);
+    return {};
+  }
+  const entitlements = join(binariesDir, ONNX_DIR, 'GhostReel.entitlements');
+  writeFileSync(entitlements, `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>com.apple.security.cs.disable-library-validation</key>
+  <true/>
+</dict>
+</plist>
+`);
+  return { frameworks: [dylib], entitlements };
+}
+
 function main() {
   let target = null;
   let targetDirArg = null;
@@ -132,10 +188,18 @@ function main() {
   const llmPath = join(binDir, `ghostreel-llm${exeExt}`);
   const mlxPath = join(binDir, 'ghostreel-mlx');
 
+  // Destination directories
+  const binariesDir = join(repoRoot, 'src-tauri', 'binaries');
+  // On macOS a previous run removed the profile-dir copies (clearSidecarCopies): until cargo
+  // rebuilds them, the helpers staged then are still the latest build.
+  const isDarwin = target.includes('apple-darwin');
+  const stagedPath = name => join(binariesDir, `${name}-${target}${exeExt}`);
+  const available = (src, name) => existsSync(src) || (isDarwin && existsSync(stagedPath(name)));
+
   const missingHelpers = [];
-  if (!existsSync(asrPath)) missingHelpers.push(`ghostreel-asr${exeExt}`);
-  if (!existsSync(llmPath)) missingHelpers.push(`ghostreel-llm${exeExt}`);
-  if (isMlx && !existsSync(mlxPath)) missingHelpers.push('ghostreel-mlx (run scripts/build-mlx.sh)');
+  if (!available(asrPath, 'ghostreel-asr')) missingHelpers.push(`ghostreel-asr${exeExt}`);
+  if (!available(llmPath, 'ghostreel-llm')) missingHelpers.push(`ghostreel-llm${exeExt}`);
+  if (isMlx && !available(mlxPath, 'ghostreel-mlx')) missingHelpers.push('ghostreel-mlx (run scripts/build-mlx.sh)');
 
   if (missingHelpers.length > 0) {
     console.error(`Error: Missing required helper(s) in ${binDir}: ${missingHelpers.join(', ')}`);
@@ -143,8 +207,6 @@ function main() {
     process.exit(1);
   }
 
-  // Destination directories
-  const binariesDir = join(repoRoot, 'src-tauri', 'binaries');
   mkdirSync(binariesDir, { recursive: true });
 
   const helpersToStage = [
@@ -155,13 +217,20 @@ function main() {
   // Copy helpers
   const stagedHelpers = [];
   for (const helper of helpersToStage) {
-    const destName = `${helper.name}-${target}${exeExt}`;
-    const destPath = join(binariesDir, destName);
-    copyFileSync(helper.src, destPath);
+    const destPath = stagedPath(helper.name);
+    if (existsSync(helper.src)) {
+      copyFileSync(helper.src, destPath);
+    } else {
+      console.log(`Keeping ${relative(repoRoot, destPath)}: ${relative(repoRoot, helper.src)} was cleared by an earlier run`);
+    }
     if (!isWindows) {
       chmodSync(destPath, 0o755);
     }
     stagedHelpers.push({ name: helper.name, path: destPath });
+  }
+
+  if (isDarwin) {
+    clearSidecarCopies(binDir);
   }
 
   // Prepare src-tauri/lib/ (empty first, ensure .keep is always present)
@@ -306,10 +375,19 @@ function main() {
       console.warn(`Warning: ${name} not staged; run node scripts/fetch-sidecars.mjs --target ${target}`);
     }
   }
+  const macOS = {
+    ...(isMlx ? { minimumSystemVersion: '14.0' } : {}),
+    ...(target === 'x86_64-apple-darwin' ? onnxRuntimeBundle(binariesDir) : {}),
+  };
+  const onnxResources = target === 'x86_64-apple-darwin'
+    ? Object.fromEntries([['LICENSE', 'onnxruntime-LICENSE.txt'], ['ThirdPartyNotices.txt', 'onnxruntime-ThirdPartyNotices.txt']]
+      .filter(([source]) => existsSync(join(binariesDir, ONNX_DIR, source)))
+      .map(([source, name]) => [`binaries/${ONNX_DIR}/${source}`, name]))
+    : {};
   const overlay = {
     bundle: {
       externalBin,
-      ...(isMlx ? { macOS: { minimumSystemVersion: '14.0' } } : {}),
+      ...(Object.keys(macOS).length ? { macOS } : {}),
       // Linux: usr/lib/GhostReel/lib (helper RUNPATH $ORIGIN/../lib/GhostReel/lib).
       // Windows: next to the exe, where the DLL loader looks.
       resources: {
@@ -319,6 +397,7 @@ function main() {
             ? `${name.slice(0, -4)}-${target}.txt` : name }))
           .filter(({ source }) => existsSync(join(binariesDir, source)))
           .map(({ name, source }) => [`binaries/${source}`, name])),
+        ...onnxResources,
       },
     },
   };

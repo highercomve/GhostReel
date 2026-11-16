@@ -120,10 +120,14 @@ impl CutMove {
             }
             CutKind::EndBeforeOffMic => format!("ended {subject} before the off-mic line it closed on ({moved})"),
             CutKind::EndBeforeUnworded => {
-                format!("ended {subject} on its last word, before an \"umm\" or other sound no word accounts for ({moved})")
+                format!(
+                    "ended {subject} on its last word, before an \"umm\" or other sound no word accounts for ({moved})"
+                )
             }
             CutKind::StartAfterUnworded => {
-                format!("opened {subject} on its first word, after an \"umm\" or other sound no word accounts for ({moved})")
+                format!(
+                    "opened {subject} on its first word, after an \"umm\" or other sound no word accounts for ({moved})"
+                )
             }
             CutKind::StartAfterFiller => {
                 format!("started {subject} after its opening reply or filler, said on its own breath ({moved})")
@@ -816,7 +820,13 @@ pub fn after_opening_filler(db: &Db, video_id: i64, in_s: f64) -> Option<f64> {
 /// covers: the "umm", "uh" or laugh Whisper does not write, which the sentence split leaves between
 /// sentences ([`crate::sentence_split`]). `(start, end)`, each `None` where that edge is on words.
 /// A range that holds no sentence at all is left alone: it was chosen for its sound.
-fn unworded_edges(db: &Db, video_id: i64, in_s: f64, out_s: f64, regions: &[SpeechRegion]) -> (Option<f64>, Option<f64>) {
+fn unworded_edges(
+    db: &Db,
+    video_id: i64,
+    in_s: f64,
+    out_s: f64,
+    regions: &[SpeechRegion],
+) -> (Option<f64>, Option<f64>) {
     let sentences: Vec<(f64, f64)> = crate::sentence_split::edges(db, video_id)
         .into_iter()
         .filter(|&(a, b)| b > in_s + 0.05 && a < out_s - 0.05)
@@ -826,10 +836,8 @@ fn unworded_edges(db: &Db, video_id: i64, in_s: f64, out_s: f64, regions: &[Spee
     };
     let worded = |r: &SpeechRegion| sentences.iter().any(|&(a, b)| a < r.end_s - 0.02 && b > r.start_s + 0.02);
     // Voiced sound after the last sentence ends, inside the range, that no sentence covers.
-    let tail = last.1 < out_s
-        && regions.iter().any(|r| r.start_s >= last.1 && r.start_s < out_s - 0.05 && !worded(r));
-    let head = first.0 > in_s
-        && regions.iter().any(|r| r.end_s <= first.0 && r.end_s > in_s + 0.05 && !worded(r));
+    let tail = last.1 < out_s && regions.iter().any(|r| r.start_s >= last.1 && r.start_s < out_s - 0.05 && !worded(r));
+    let head = first.0 > in_s && regions.iter().any(|r| r.end_s <= first.0 && r.end_s > in_s + 0.05 && !worded(r));
     (head.then_some(first.0), tail.then_some(last.1))
 }
 
@@ -1519,7 +1527,7 @@ mod tests {
         let mut s = script(vec![c]);
         place_cuts(&db, &mut s, &ScriptConfig::default());
         let out = s.beats[0].clips[0].out_s;
-        assert!(out >= 21.4 - 1e-9 && out <= 21.45, "ends after word 3, before word 4: {out}");
+        assert!((21.4 - 1e-9..=21.45).contains(&out), "ends after word 3, before word 4: {out}");
         // And the check says it ends where it was written to, not that it clips a word.
         let c = &s.beats[0].clips[0];
         let words = crate::sentences::WordEdges::of(&db, c.sentences.as_ref());
@@ -1532,7 +1540,7 @@ mod tests {
         let mut s = script(vec![c]);
         place_cuts(&db, &mut s, &ScriptConfig::default());
         let start = s.beats[0].clips[0].in_s;
-        assert!(start >= 20.9 && start < 20.95, "opens between word 2 and word 3: {start}");
+        assert!((20.9..20.95).contains(&start), "opens between word 2 and word 3: {start}");
     }
 
     #[test]
@@ -1625,6 +1633,7 @@ mod tests {
             why: None,
             inferred: false,
             tracks: None,
+            gain_db: None,
         });
         assert!(place_cuts(&db, &mut s, &ScriptConfig::default()).is_empty());
         assert!(place_cuts(&db, &mut bedded, &ScriptConfig::default()).is_empty());
@@ -1760,6 +1769,7 @@ mod tests {
             why: None,
             inferred: false,
             tracks: None,
+            gain_db: None,
         });
         place_cuts(&db, &mut s, &ScriptConfig::default());
         let bed = s.beats[0].bed.as_ref().unwrap();
@@ -1784,6 +1794,7 @@ mod tests {
             why: None,
             inferred: true,
             tracks: None,
+            gain_db: None,
         });
         let moves = place_cuts(&db, &mut s, &ScriptConfig::default());
         let bed = s.beats[0].bed.as_ref().unwrap();

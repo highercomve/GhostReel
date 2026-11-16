@@ -42,6 +42,20 @@ impl EndpointKey {
         }
     }
 
+    /// The endpoint an agent's settings name, whether or not it resolves here (a CLI that is not
+    /// installed still names the endpoint whose quota another run used up). `None` for local models.
+    pub fn for_config(cfg: &crate::config::VisionConfig) -> Option<Self> {
+        match cfg.backend {
+            crate::config::Backend::Cli => {
+                Some(EndpointKey::Cli { tool: cfg.cli.tool.clone(), model: cfg.cli.model.clone() })
+            }
+            crate::config::Backend::Server => {
+                Some(EndpointKey::Server { url: cfg.url.trim_end_matches('/').to_string(), model: cfg.model.clone() })
+            }
+            _ => None,
+        }
+    }
+
     pub fn is_local(&self) -> bool {
         matches!(self, EndpointKey::Local)
     }

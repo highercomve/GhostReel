@@ -274,8 +274,7 @@ impl ToolSession {
     }
 
     fn should_refuse_save(&mut self, tool: &str, args: &Value) -> bool {
-        if self.persistent || !matches!(tool, "save_script" | "apply_fix") || args["dry_run"].as_bool().unwrap_or(false)
-        {
+        if self.persistent || !matches!(tool, "save_script" | "apply_fix") || is_dry_run(args) {
             return false;
         }
         self.saves += 1;
@@ -338,7 +337,7 @@ impl ToolSession {
         let key = ToolMemo::key(&tool, args);
         let mut called = Called { tool: tool.clone(), args: args.clone(), ..Called::default() };
 
-        match self.guard.check(&key) {
+        match if self.persistent { Verdict::Allow } else { self.guard.check(&key) } {
             Verdict::Allow => {}
             Verdict::Refuse { times } => return refused(called, times, false),
             Verdict::Stop { times } => return refused(called, times, true),
@@ -369,7 +368,8 @@ impl ToolSession {
             );
             return called;
         }
-        if effect == Some(Effect::Read)
+        if !self.persistent
+            && effect == Some(Effect::Read)
             && let Some((text, summary)) = self.memo.recall(&tool, args)
         {
             self.guard.note_same(&key);
@@ -399,17 +399,17 @@ impl ToolSession {
                 called.summary = if out.summary.is_empty() { "ok".into() } else { out.summary.clone() };
                 called.empty = out.empty;
                 called.images = std::mem::take(&mut out.images);
-                if effect == Some(Effect::Read) {
+                if !self.persistent && effect == Some(Effect::Read) {
                     self.memo.remember(&tool, args, &called.model_text, &called.summary);
                 }
                 // A write changes what the reads said: answer them afresh after it.
-                if effect == Some(Effect::Write) && !args["dry_run"].as_bool().unwrap_or(false) {
+                if matches!(effect, Some(Effect::Write | Effect::Destructive)) && !is_dry_run(args) {
                     self.invalidate_reads();
                 }
                 self.guard.note(&key, fingerprint(&called.model_text));
                 if effect == Some(Effect::Write)
                     && matches!(tool.as_str(), "save_script" | "apply_fix")
-                    && !args["dry_run"].as_bool().unwrap_or(false)
+                    && !is_dry_run(args)
                     && let Some(id) = out.value["script_id"].as_i64()
                 {
                     self.saved_script = Some(id);
@@ -554,9 +554,62 @@ pub fn shrink_value(value: &mut Value, max: usize) {
     }
 }
 
+fn is_dry_run(args: &serde_json::Value) -> bool {
+    super::Args(args).bool_or("dry_run", false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn string_dry_runs_do_not_use_save_quota() {
+        let mut session = ToolSession::new(8000);
+        for _ in 0..(MAX_SAVES_PER_TURN + 5) {
+            assert!(!session.should_refuse_save("save_script", &json!({"dry_run":"true"})));
+        }
+        assert!(is_dry_run(&json!({"dry_run":"true"})));
+        assert!(!is_dry_run(&json!({"dry_run":"false"})));
+    }
+
+    #[tokio::test]
+    async fn persistent_reads_repeat_and_observe_external_writes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::paths::Paths::in_dir(tmp.path());
+        let config = crate::config::Config::default();
+        let mut db = crate::db::Db::open_in_memory().unwrap();
+        let mut embedder = None;
+        let mut ctx = ToolCtx::new(&paths, &config, &mut db, &mut embedder, super::super::Origin::External);
+        let mut session = ToolSession::persistent(8000);
+        let first = session.call(&mut ctx, "list_projects", &json!({})).await;
+        for _ in 0..6 {
+            let next = session.call(&mut ctx, "list_projects", &json!({})).await;
+            assert!(!next.is_error && !next.stop);
+            assert_eq!(first.model_text, next.model_text);
+        }
+        ctx.db.create_project(&crate::projects::NewProject::named("Fresh")).unwrap();
+        let fresh = session.call(&mut ctx, "list_projects", &json!({})).await;
+        assert!(fresh.model_text.contains("Fresh"));
+        assert!(session.memo.recall("list_projects", &json!({})).is_none());
+    }
+
+    #[tokio::test]
+    async fn destructive_call_invalidates_reads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::paths::Paths::in_dir(tmp.path());
+        let config = crate::config::Config::default();
+        let mut db = crate::db::Db::open_in_memory().unwrap();
+        db.create_project(&crate::projects::NewProject::named("Gone")).unwrap();
+        let mut embedder = None;
+        let mut ctx = ToolCtx::new(&paths, &config, &mut db, &mut embedder, super::super::Origin::External);
+        let mut session = ToolSession::new(8000);
+        session.call(&mut ctx, "list_projects", &json!({})).await;
+        let removed = session.call(&mut ctx, "delete_project", &json!({"project":"Gone"})).await;
+        assert!(!removed.is_error, "{}", removed.model_text);
+        assert!(session.memo.recall("list_projects", &json!({})).is_none());
+        let fresh = session.call(&mut ctx, "list_projects", &json!({})).await;
+        assert!(!fresh.model_text.contains("Gone"));
+    }
 
     #[test]
     fn picture_warning_uses_resolved_sentence_video() {

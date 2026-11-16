@@ -5,6 +5,51 @@ versions follow [SemVer](https://semver.org/) while the project is 0.x (minor = 
 
 ## [Unreleased]
 
+## [0.17.0] — 2026-11-16
+
+### Added
+
+- **Export for Premiere**: one action writes a `.zip` a co-worker can open in Adobe Premiere — the
+  cut as Final Cut Pro 7 XML (File > Import) and OpenTimelineIO (Premiere 26+), the footage in
+  `media/`, the latest preview render, and a README with the steps for macOS and Windows. The
+  footage is either the parts the cut uses plus 2 s handles each side, re-encoded so every cut
+  stays frame-accurate, or the whole source files untouched; the choice is remembered. Agents get
+  it as `export_script` with `format: "premiere_package"`.
+- A beat's voice-over bed has its own **volume** (`gain_db`): a speaking clip turned into a bed
+  takes its volume with it, the inspector shows a bed volume slider, and renders, the live viewer
+  and both timeline exports play it.
+
+### Changed
+
+- **FCP7 XML is written the way Premiere writes it**: the sequence carries the cut's frame size (a
+  9:16 cut imports vertical), every source file describes its streams, picture and sound are
+  linked, audio names the track it plays, paths use `file://localhost/`, and no clip runs past the
+  end of its file. Reframing (follow speaker, fixed crops) exports as keyframed Basic Motion, and
+  volume as Audio Levels. OTIO carries volume, sizes and framing in metadata and reads back
+  unchanged in OpenTimelineIO 0.18.
+- Linux builds need glibc 2.39 or newer (Ubuntu 24.04, Debian 13, Fedora 40). On Intel Macs, face
+  and speaker matching need macOS 13.4 or newer (the app still runs on 12).
+
+### Fixed
+
+- Releases build again: 0.15.0 and 0.16.0 never published. Linux builds on Ubuntu 24.04, Intel Macs
+  bundle their own ONNX Runtime 1.23.2 (Microsoft no longer ships newer Intel builds), and stale
+  sidecar copies no longer stop the Apple Silicon build.
+- MCP connections: reads are never answered from a cache or refused as repeats (other writers —
+  the app, the indexer, other clients — change the data), and a delete refreshes reads like a save.
+- A session tied to a project can no longer reach another project's scripts, trash or footage
+  through their ids (`get_script`, `apply_fix`, `read_cut`, renders, exports, `restore_trash`,
+  `check_clips`, `save_clips`), and `save_script` drops footage from outside the project even with
+  `repair: false`.
+- A tool event half written by an agent's MCP process is no longer lost; a long chat turn that runs
+  out of room also shortens old tool-call arguments.
+- Putting the speaker's face before a b-roll beat no longer repeats footage another beat plays (the
+  repeat check then dropped the speaker's own clip); a clip whose first sentence alone is too long
+  is never stretched past where it ended; every clip dropped for having under a second of footage
+  is reported.
+- An agent resting after a used-up quota is reported as resting even when its CLI isn't installed.
+- A `"dry_run": "true"` string no longer counts as a real save.
+
 ## [0.16.0] — 2026-11-15
 
 ### Added

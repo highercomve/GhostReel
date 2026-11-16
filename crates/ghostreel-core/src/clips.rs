@@ -2232,26 +2232,12 @@ fn cancelled(cancel: &Option<Arc<AtomicBool>>) -> Result<(), Error> {
     Ok(())
 }
 
-async fn wait_cancelled(cancel: &Option<Arc<AtomicBool>>) {
-    let Some(flag) = cancel.as_ref() else {
-        std::future::pending::<()>().await;
-        return;
-    };
-    while !flag.load(Ordering::SeqCst) {
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-}
-
+/// A model turn that stops as soon as the run is cancelled ([`crate::cancel::race`]).
 async fn run_cancellable<T>(
     cancel: &Option<Arc<AtomicBool>>,
     fut: impl std::future::Future<Output = Result<T, Error>>,
 ) -> Result<T, Error> {
-    cancelled(cancel)?;
-    tokio::select! {
-        biased;
-        _ = wait_cancelled(cancel) => Err(Error::Invalid(crate::chat::CANCELLED.into())),
-        res = fut => res,
-    }
+    crate::cancel::race(cancel.as_ref(), fut).await?
 }
 
 fn apply_verified_repair<F>(

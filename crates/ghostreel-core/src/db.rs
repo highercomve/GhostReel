@@ -548,6 +548,22 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE transcript_sentences_new RENAME TO transcript_sentences;
     CREATE INDEX transcript_sentences_video ON transcript_sentences(video_id, start_s);
     "#,
+    // v29 — `premiere_package` exports (`package.rs`: the zip a co-worker opens in Premiere) are
+    // recorded like the timeline exports; the format CHECK gains the value.
+    r#"
+    CREATE TABLE exports_new (
+        id INTEGER PRIMARY KEY,
+        script_id INTEGER NOT NULL REFERENCES scripts(id) ON DELETE CASCADE,
+        format TEXT NOT NULL CHECK (format IN ('otio', 'fcp_xml', 'preview_mp4', 'premiere_package')),
+        path TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+    );
+    INSERT INTO exports_new(id, script_id, format, path, created_at)
+        SELECT id, script_id, format, path, created_at FROM exports;
+    DROP TABLE exports;
+    ALTER TABLE exports_new RENAME TO exports;
+    CREATE INDEX exports_script ON exports(script_id);
+    "#,
 ];
 
 static REGISTER_VEC: Once = Once::new();
@@ -627,9 +643,7 @@ impl Db {
                 all_ok = false;
             }
         }
-        if all_ok
-            && let Err(e) = self.conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?1, '1')", [KEY])
-        {
+        if all_ok && let Err(e) = self.conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?1, '1')", [KEY]) {
             tracing::warn!("voice_off_mic backfill failed to record completion: {e}");
         }
     }
@@ -1130,8 +1144,8 @@ mod tests {
         assert_eq!(db.schema_version().unwrap(), MIGRATIONS.len() as u32);
         assert_eq!(
             MIGRATIONS.len(),
-            28,
-            "transcript_words is v23, chapters v24, sentences v25, their words v26, the split version v27, monotonic sentence ids v28"
+            29,
+            "transcript_words is v23, chapters v24, sentences v25, their words v26, the split version v27, monotonic sentence ids v28, premiere_package exports v29"
         );
         // Nothing lost; the sentence the word and the chapter will hang on is still there.
         let text: String =
@@ -1180,12 +1194,15 @@ mod tests {
         assert_eq!(kept[0].title, "hola");
         let first_exists: bool = db
             .conn
-            .query_row("SELECT EXISTS (SELECT 1 FROM transcript_sentences WHERE id = ?1)", [kept[0].first_sentence_id], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM transcript_sentences WHERE id = ?1)",
+                [kept[0].first_sentence_id],
+                |r| r.get(0),
+            )
             .unwrap();
         assert!(first_exists);
-        let version: i64 = db.conn.query_row("SELECT sentence_split FROM videos WHERE id = 7", [], |r| r.get(0)).unwrap();
+        let version: i64 =
+            db.conn.query_row("SELECT sentence_split FROM videos WHERE id = 7", [], |r| r.get(0)).unwrap();
         assert_eq!(version, crate::sentence_split::SPLIT_VERSION);
         // Transcribed again: the words go with their segment, the chapters with their sentences.
         crate::sentence_split::invalidate(&db.conn, 7).unwrap();

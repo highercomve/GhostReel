@@ -1,3 +1,7 @@
+// Tensor offsets are written out in full (`0 * H * W + y * W + x`, `1 * 3 * 112 * 112`) so each
+// plane and shape reads as the model defines it.
+#![allow(clippy::identity_op, clippy::erasing_op)]
+
 use crate::Error;
 use ort::value::Tensor as OrtTensor;
 use std::sync::Arc;
@@ -50,6 +54,7 @@ impl OrtDetector {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // the model's three output heads and the frame geometry
 pub fn decode_yunet(
     cls_outputs: [&[f32]; 3],
     obj_outputs: [&[f32]; 3],

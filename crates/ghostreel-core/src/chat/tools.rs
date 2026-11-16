@@ -75,7 +75,9 @@ mod tests {
         let short = serde_json::to_string(&render_openai(CHAT(Detail::Short))).unwrap().len();
         // 54k since get_manifest: one read that stands in for get_transcript + get_scenes +
         // get_faces + get_video saves more rounds (each re-sending this schema) than it costs.
-        assert!(full < 54_000, "full tool schema is {full} chars (~{} tokens)", full / 4);
+        // 54.3k since export_script's premiere_package (media, handles_s): the hand-off to a
+        // co-worker in Premiere is one call instead of an export plus copying footage by hand.
+        assert!(full < 54_300, "full tool schema is {full} chars (~{} tokens)", full / 4);
         // 23.5k since review_render: still under 6k tokens, well inside a 16k window.
         assert!(short < 23_500, "short tool schema is {short} chars (~{} tokens)", short / 4);
         assert!(short * 2 < full, "short rendering saves little: {short} vs {full}");
@@ -83,7 +85,8 @@ mod tests {
         assert!(prose_short < 13_000, "short prose is {prose_short} chars (~{} tokens)", prose_short / 4);
         assert!(prose_short * 2 < tools_prose(CHAT(Detail::Full)).len());
         let grammar = serde_json::to_string(&crate::tools::action_branches(CHAT(Detail::Full))).unwrap().len();
-        assert!(grammar < 18_000, "the action grammar's tool branches are {grammar} chars");
+        // 18.1k since export_script's premiere_package (two parameters).
+        assert!(grammar < 18_100, "the action grammar's tool branches are {grammar} chars");
     }
 
     #[test]

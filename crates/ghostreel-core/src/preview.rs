@@ -69,6 +69,9 @@ pub struct BedSpan {
     /// Tracks the script chose for this audio (see `ScriptClip::tracks`); None = `audio_track`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tracks: Option<Vec<u32>>,
+    /// The bed's own volume (dB), after levelling (`AudioBed::gain_db`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gain_db: Option<f64>,
 }
 
 /// A beat's span on the preview timeline for on-screen titles and narration captions.
@@ -454,6 +457,7 @@ pub fn plan_bed_spans(
             timeline_start_s: first.timeline_start_s,
             audio_track: res.audio_track,
             tracks: bed.tracks.clone(),
+            gain_db: bed.gain_db,
         });
     }
     beds
@@ -1100,6 +1104,10 @@ pub fn render_preview(
             let mut af = fades;
             if opts.normalize_audio {
                 af.push_str("loudnorm=I=-16:TP=-1.5:LRA=11,");
+            }
+            // The editor's volume after levelling, as for a clip.
+            if let Some(g) = bed.gain_db {
+                af.push_str(&format!("volume={g:.1}dB,"));
             }
             af.push_str("aresample=48000,apad");
 
@@ -1751,7 +1759,7 @@ mod tests {
             "title": "t", "beats": [{
                 "id": "b1", "purpose": "p",
                 "clips": [{"video_id": 1, "in_s": 0.0, "out_s": 2.0, "tracks": [0, 1]}],
-                "bed": {"video_id": 1, "in_s": 5.0, "out_s": 7.0, "tracks": []}
+                "bed": {"video_id": 1, "in_s": 5.0, "out_s": 7.0, "tracks": [], "gain_db": 6.0}
             }]
         }))
         .unwrap();
@@ -1771,6 +1779,7 @@ mod tests {
         assert_eq!(segs[0].tracks, Some(vec![0, 1]));
         let beds = plan_bed_spans(&script, &segs, &media);
         assert_eq!(beds[0].tracks, Some(vec![]));
+        assert_eq!(beds[0].gain_db, Some(6.0), "the bed's volume reaches the render");
     }
 
     #[test]
@@ -2425,6 +2434,7 @@ mod tests {
                     why: None,
                     inferred: false,
                     tracks: None,
+                    gain_db: None,
                 });
             }
             let media = HashMap::from([(

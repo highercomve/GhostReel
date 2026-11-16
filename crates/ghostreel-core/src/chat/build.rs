@@ -504,6 +504,7 @@ pub fn lay_out(project: &Project, lines: &[Quote], shots: &[Option<Shot>], targe
                 why: Some("the voice runs on under the pictures".into()),
                 inferred: false,
                 tracks: None,
+                gain_db: None,
             }),
             notes: None,
             card: None,

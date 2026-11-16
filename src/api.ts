@@ -478,7 +478,7 @@ export type TaskKind =
   | { type: "index"; project_id: number }
   | { type: "chat"; project_id: number; session_id: number }
   | { type: "render_preview"; script_id: number; burn_titles: boolean; burn_narration: boolean; burn_captions: boolean; normalize_audio: boolean }
-  | { type: "export"; script_id: number; format: string; path: string }
+  | { type: "export"; script_id: number; format: string; path: string; media?: PackageMedia; handles_s?: number }
   | { type: "download_model"; model_id: string }
   | { type: "steadiness"; project_id: number; force?: boolean }
   | { type: "faces"; project_id: number; force?: boolean }
@@ -545,6 +545,11 @@ export const enqueuePreview = (
 ) => call<number>("enqueue_preview", { scriptId, burnTitles, burnNarration, burnCaptions, normalizeAudio, out: out ?? null });
 export const enqueueExport = (scriptId: number, format: string, path: string) =>
   call<number>("enqueue_export", { scriptId, format, path });
+/** What a Premiere package carries: the used parts with handles (re-encoded), or whole files. */
+export type PackageMedia = "trimmed" | "full";
+/** "Export for Premiere": a zip with the FCP XML, the OTIO, the footage and a README. */
+export const enqueuePremierePackage = (scriptId: number, path: string, media: PackageMedia, handlesS?: number) =>
+  call<number>("enqueue_export", { scriptId, format: "premiere_package", path, media, handlesS: handlesS ?? null });
 export const previewPlan = (scriptId: number) => call<PlannedSegment[]>("preview_plan", { scriptId });
 export const getScriptPreview = (scriptId: number) =>
   call<string | null>("get_script_preview", { scriptId });
@@ -900,6 +905,8 @@ export interface AudioBed {
   inferred?: boolean;
   /** Source audio tracks to play; absent = the file's automatic track, empty = silent. */
   tracks?: number[];
+  /** Its sound louder or softer, in dB; absent = as recorded. */
+  gain_db?: number;
 }
 
 export interface Beat {

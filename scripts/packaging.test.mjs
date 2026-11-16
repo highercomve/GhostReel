@@ -75,6 +75,34 @@ for (const target of ['aarch64-apple-darwin', 'x86_64-apple-darwin']) {
     assert.equal(overlay.bundle.macOS?.minimumSystemVersion, target.startsWith('aarch64') ? '14.0' : undefined);
     assert.equal(overlay.bundle.resources[`binaries/ffmpeg-LICENSE-${target}.txt`], 'ffmpeg-LICENSE.txt');
     assert.equal(overlay.bundle.resources[`binaries/ffmpeg-NOTICE-${target}.txt`], 'ffmpeg-NOTICE.txt');
+    // tauri-build must find no copy of its own to delete in the profile dir (EPERM on macOS runners).
+    await writeFile(join(f.root, 'target/release/ffmpeg'), 'stale copy');
+    await f.run('stage-helpers.mjs');
+    for (const name of ['ffmpeg', 'ghostreel-asr', 'ghostreel-llm']) {
+      await assert.rejects(stat(join(f.root, 'target/release', name)), { code: 'ENOENT' });
+    }
+    assert.equal(await readFile(join(f.root, 'src-tauri/binaries', `ghostreel-asr-${target}`), 'utf8'), 'helper');
+    if (target === 'x86_64-apple-darwin') {
+      // Intel bundles the onnxruntime dylib it loads at run time, with its licence.
+      assert.equal(overlay.bundle.macOS?.frameworks, undefined);
+      const onnx = join(f.root, 'src-tauri/binaries/onnxruntime-x86_64-apple-darwin');
+      await mkdir(onnx, { recursive: true });
+      await writeFile(join(onnx, 'libonnxruntime.dylib'), 'dylib');
+      await writeFile(join(onnx, 'LICENSE'), 'license');
+      await f.run('stage-helpers.mjs');
+      const withOrt = JSON.parse(await readFile(join(f.root, 'src-tauri/tauri.bundle.json'), 'utf8'));
+      assert.deepEqual(withOrt.bundle.macOS.frameworks, [join(onnx, 'libonnxruntime.dylib')]);
+      assert.match(await readFile(withOrt.bundle.macOS.entitlements, 'utf8'), /disable-library-validation/);
+      assert.equal(withOrt.bundle.resources['binaries/onnxruntime-x86_64-apple-darwin/LICENSE'], 'onnxruntime-LICENSE.txt');
+      // Release builds refuse to ship an Intel app without it.
+      await rm(join(onnx, 'libonnxruntime.dylib'));
+      await assert.rejects(f.run('stage-helpers.mjs', { GHOSTREEL_REQUIRE_ONNXRUNTIME: '1' }), /not staged/);
+    } else {
+      // Apple Silicon links onnxruntime: the requirement does not apply.
+      await f.run('stage-helpers.mjs', { GHOSTREEL_REQUIRE_ONNXRUNTIME: '1' });
+      const arm = JSON.parse(await readFile(join(f.root, 'src-tauri/tauri.bundle.json'), 'utf8'));
+      assert.equal(arm.bundle.macOS.frameworks, undefined);
+    }
   });
 }
 

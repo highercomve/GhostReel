@@ -13,6 +13,7 @@ use ghostreel_core::preflight::Level;
 use serde_json::json;
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)] // parsed once from the command line
 pub enum AgentsAction {
     /// List the configured agents (or the implicit ones an older config stands for).
     List {

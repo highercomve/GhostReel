@@ -14,6 +14,7 @@ import {
 } from "lucide-react";
 import {
   enqueueExport,
+  enqueuePremierePackage,
   enqueuePreview,
   getScriptPreview,
   mediaUrl,
@@ -77,6 +78,8 @@ export default function PreviewPlayer({
   const [burnNarration, setBurnNarration] = useStoredFlag("ghostreel.burnNarration", false);
   const [showCaptions, setShowCaptions] = useStoredFlag("ghostreel.showCaptions", true);
   const [normalizeAudio, setNormalizeAudio] = useStoredFlag("ghostreel.normalizeAudio", false);
+  // Premiere package media: the used parts with handles (default) or the whole source files.
+  const [packageWholeFiles, setPackageWholeFiles] = useStoredFlag("ghostreel.packageWholeFiles", false);
   useEffect(() => {
     onShowFlags?.({ titles: burnTitles, captions: showCaptions });
   }, [burnTitles, showCaptions, onShowFlags]);
@@ -259,6 +262,33 @@ export default function PreviewPlayer({
       });
       if (typeof path === "string") {
         const taskId = await enqueueExport(targetScriptId, format, path);
+        setExportTaskId(taskId);
+      }
+    } catch (err) {
+      setError(String(err));
+    }
+  };
+
+  const onExportPackage = async () => {
+    if (isAiWorking) {
+      setError("Sonar AI is drafting an update. Please wait for the turn to complete before exporting.");
+      return;
+    }
+    setError(null);
+    let targetScriptId = scriptId;
+    if (isDirty && onSaveBeforeAction) {
+      const savedId = await onSaveBeforeAction();
+      if (savedId == null) return;
+      targetScriptId = savedId;
+    }
+    const cleanTitle = scriptTitle.trim().replace(/[^a-zA-Z0-9_\-]/g, "_") || "timeline";
+    try {
+      const path = await save({
+        defaultPath: `${cleanTitle}.zip`,
+        filters: [{ name: "Premiere package (zip)", extensions: ["zip"] }],
+      });
+      if (typeof path === "string") {
+        const taskId = await enqueuePremierePackage(targetScriptId, path, packageWholeFiles ? "full" : "trimmed");
         setExportTaskId(taskId);
       }
     } catch (err) {
@@ -450,6 +480,36 @@ export default function PreviewPlayer({
             </button>
             <button type="button" onClick={() => onExport("otio")} title="OpenTimelineIO interchange">
               OpenTimelineIO (.otio)…
+            </button>
+            <div className="nle-menu-sep" />
+            <div className="nle-menu-heading">Package for a co-worker</div>
+            <label
+              className="checkbox-label small"
+              title="Only the parts of each video the cut uses, plus 2 s each side, re-encoded so cuts stay frame-accurate"
+            >
+              <input
+                type="radio"
+                name={`package-media-${scriptId}`}
+                checked={!packageWholeFiles}
+                onChange={() => setPackageWholeFiles(false)}
+              />
+              Used parts + 2 s handles
+            </label>
+            <label className="checkbox-label small" title="Every source video the cut uses, copied whole">
+              <input
+                type="radio"
+                name={`package-media-${scriptId}`}
+                checked={packageWholeFiles}
+                onChange={() => setPackageWholeFiles(true)}
+              />
+              Whole source files
+            </label>
+            <button
+              type="button"
+              onClick={onExportPackage}
+              title="A .zip with the Premiere XML, the OTIO, the footage, the latest render and a README on opening it"
+            >
+              Export for Premiere…
             </button>
           </div>
         </details>

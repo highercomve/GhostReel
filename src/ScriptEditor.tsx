@@ -921,39 +921,23 @@ const ScriptEditor = forwardRef<ScriptEditorHandle, ScriptEditorProps>(function 
                 </div>
                 <div className="small muted">{beat.bed ? "The beat’s sound bed plays instead of clip sound." : soundOn ? "Plays the selected source tracks." : "Muted: source tracks are off."}</div>
                 {soundOn && !beat.bed && (
-                  <div className="insp-volume-row">
-                    <label className="insp-volume-label" htmlFor="clip-volume">
-                      Volume
-                    </label>
-                    <input
-                      id="clip-volume"
-                      type="range"
-                      min={-24}
-                      max={24}
-                      step={1}
-                      value={clip.gain_db ?? 0}
-                      disabled={isAiWorking}
-                      onChange={(e) => {
-                        const v = Number(e.target.value);
-                        updateClip(selBeat, selClip, { gain_db: v === 0 ? undefined : v });
-                      }}
-                      title="Make this clip's sound louder or softer. Exports level every clip first; this is applied on top."
-                    />
-                    <span className="insp-volume-value">
-                      {(clip.gain_db ?? 0) > 0 ? "+" : ""}
-                      {clip.gain_db ?? 0} dB
-                    </span>
-                    {(clip.gain_db ?? 0) !== 0 && (
-                      <button
-                        type="button"
-                        className="insp-volume-reset"
-                        disabled={isAiWorking}
-                        onClick={() => updateClip(selBeat, selClip, { gain_db: undefined })}
-                      >
-                        Reset
-                      </button>
-                    )}
-                  </div>
+                  <VolumeRow
+                    id="clip-volume"
+                    gainDb={clip.gain_db}
+                    disabled={isAiWorking}
+                    title="Make this clip's sound louder or softer. Exports level every clip first; this is applied on top."
+                    onChange={(v) => updateClip(selBeat, selClip, { gain_db: v })}
+                  />
+                )}
+                {beat.bed && (
+                  <VolumeRow
+                    id="bed-volume"
+                    label="Bed volume"
+                    gainDb={beat.bed.gain_db}
+                    disabled={isAiWorking}
+                    title="Make the beat's sound bed louder or softer. Exports level it first; this is applied on top."
+                    onChange={(v) => beat.bed && updateBeat(selBeat, { bed: { ...beat.bed, gain_db: v } })}
+                  />
                 )}
                 <div className="nle-insp-subtitle">Audio tracks</div>
                 <AudioTracksSection
@@ -1543,3 +1527,52 @@ function ShortcutsSheet({ onClose }: { onClose: () => void }) {
 }
 
 export default ScriptEditor;
+
+/** A sound's volume in dB (-24..+24, 0 = as recorded): a clip's or a bed's `gain_db`. */
+function VolumeRow({
+  id,
+  label = "Volume",
+  gainDb,
+  disabled,
+  title,
+  onChange,
+}: {
+  id: string;
+  label?: string;
+  gainDb: number | undefined;
+  disabled?: boolean;
+  title: string;
+  onChange: (db: number | undefined) => void;
+}) {
+  const v = gainDb ?? 0;
+  return (
+    <div className="insp-volume-row">
+      <label className="insp-volume-label" htmlFor={id}>
+        {label}
+      </label>
+      <input
+        id={id}
+        type="range"
+        min={-24}
+        max={24}
+        step={1}
+        value={v}
+        disabled={disabled}
+        onChange={(e) => {
+          const n = Number(e.target.value);
+          onChange(n === 0 ? undefined : n);
+        }}
+        title={title}
+      />
+      <span className="insp-volume-value">
+        {v > 0 ? "+" : ""}
+        {v} dB
+      </span>
+      {v !== 0 && (
+        <button type="button" className="insp-volume-reset" disabled={disabled} onClick={() => onChange(undefined)}>
+          Reset
+        </button>
+      )}
+    </div>
+  );
+}

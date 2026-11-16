@@ -63,7 +63,7 @@ impl Store {
             self.cursors.retain(|c| c.0 != id);
         }
         let mut file = OpenOptions::new().create(true).read(true).append(true).open(path)?;
-        if !self.next.contains_key(&id) {
+        if let std::collections::hash_map::Entry::Vacant(e) = self.next.entry(id) {
             let mut reader = BufReader::new(&file);
             let mut line = Vec::new();
             let (mut next, mut end) = (1, 0);
@@ -81,7 +81,7 @@ impl Store {
                 end = reader.stream_position()?;
             }
             file.set_len(end)?;
-            self.next.insert(id, next);
+            e.insert(next);
         }
         let seq = self.next[&id];
         let entry = LogEntry {
@@ -119,19 +119,19 @@ impl Store {
             if reader.read_until(b'\n', &mut line)? == 0 || !line.ends_with(b"\n") {
                 break;
             }
-            if let Ok(e) = serde_json::from_slice::<LogEntry>(&line) {
-                if e.seq > after {
-                    bytes += line.len();
-                    let seq = e.seq;
-                    out.push(e);
-                    self.cursors.push_back((id, seq, reader.stream_position()?));
-                    while self.cursors.len() > 64 {
-                        self.cursors.pop_front();
-                    }
-                    // Catch up over multiple polls rather than allocating an entire huge log.
-                    if bytes >= 2 * 1024 * 1024 || out.len() >= 256 {
-                        break;
-                    }
+            if let Ok(e) = serde_json::from_slice::<LogEntry>(&line)
+                && e.seq > after
+            {
+                bytes += line.len();
+                let seq = e.seq;
+                out.push(e);
+                self.cursors.push_back((id, seq, reader.stream_position()?));
+                while self.cursors.len() > 64 {
+                    self.cursors.pop_front();
+                }
+                // Catch up over multiple polls rather than allocating an entire huge log.
+                if bytes >= 2 * 1024 * 1024 || out.len() >= 256 {
+                    break;
                 }
             }
         }

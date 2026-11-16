@@ -43,13 +43,26 @@ fn same_cut(a: &Script, b: &Script) -> Result<(), String> {
             return Err(format!("beat {i}: narration {:?}, then {:?}", x.narration, y.narration));
         }
         for (j, (c, d)) in x.clips.iter().zip(&y.clips).enumerate() {
-            if c.video_id != d.video_id || c.audio != d.audio || !near(c.in_s, d.in_s) || !near(c.out_s, d.out_s) {
+            if c.video_id != d.video_id
+                || c.audio != d.audio
+                || c.tracks != d.tracks
+                || c.gain_db != d.gain_db
+                || c.sentences != d.sentences
+                || !near(c.in_s, d.in_s)
+                || !near(c.out_s, d.out_s)
+            {
                 return Err(format!("beat {i} clip {j}: {c:?}, then {d:?}"));
             }
         }
         match (&x.bed, &y.bed) {
             (None, None) => {}
-            (Some(p), Some(q)) if near(p.in_s, q.in_s) && near(p.out_s, q.out_s) => {}
+            (Some(p), Some(q))
+                if p.video_id == q.video_id
+                    && p.tracks == q.tracks
+                    && p.gain_db == q.gain_db
+                    && p.sentences == q.sentences
+                    && near(p.in_s, q.in_s)
+                    && near(p.out_s, q.out_s) => {}
             (p, q) => return Err(format!("beat {i}: bed {p:?}, then {q:?}")),
         }
     }
@@ -72,8 +85,13 @@ fn ranged(in_s: f64, out_s: f64, from: &str, to: &str) -> ScriptClip {
     .unwrap()
 }
 
-fn profiles() -> [(&'static str, Profile); 3] {
-    [("save", Profile::save(None)), ("chat", Profile::chat(false)), ("import", Profile::import(None))]
+fn profiles() -> [(&'static str, Profile); 4] {
+    [
+        ("save", Profile::save(None)),
+        ("chat", Profile::chat(false)),
+        ("chat-fit", Profile::chat(true)),
+        ("import", Profile::import(None)),
+    ]
 }
 
 /// Finish `s` twice under `profile`; the second finish must leave the first's cut as it was.
@@ -493,7 +511,7 @@ fn generated_cuts_settle_and_keep_the_rules_through_every_profile() {
             }
         }
     }
-    assert_eq!(checked, 6 * 40 * 3);
+    assert_eq!(checked, 6 * 40 * profiles().len());
 }
 
 #[test]
@@ -521,7 +539,7 @@ fn pinned_pictures_are_fixed_budget_and_short_pins_survive() {
     assert!((s.total_duration_s() - 15.0).abs() < 0.01);
     assert_eq!(s.beats[0].clips[0].out_s, 10.0);
     s.beats[0].clips[0].out_s = 0.8;
-    super::fit::clamp_to_duration(&db, &mut s);
+    assert!(super::fit::clamp_to_duration(&db, &mut s).is_empty());
     assert_eq!(s.clip_count(), 2);
     assert_eq!(s.beats[0].clips[0].out_s, 0.8);
 }
@@ -540,4 +558,117 @@ fn inferred_beds_preserve_selected_tracks_and_skip_silent_sources() {
             assert_eq!(s.beats[0].bed.as_ref().expect("inferred bed").tracks, tracks);
         }
     }
+}
+
+/// sol-r2-3 / opus-r3-1: a speaking clip turned into a bed moves its own volume to the bed, and a bed's
+/// volume survives a save and a load.
+#[test]
+fn inferred_beds_keep_the_source_clips_gain() {
+    let (db, _) = video(&[(0.0, 6.0, "the answer continues under the picture.", false)]);
+    let cfg = ScriptConfig { infer_audio_beds: true, ..ScriptConfig::default() };
+    let mut s = cut(None, &[&[(0.0, 3.0, "source"), (100.0, 105.0, "mute")]]);
+    s.beats[0].clips[0].gain_db = Some(6.0);
+    super::pictures::lay_audio_beds(&db, &mut s, &cfg);
+    let bed = s.beats[0].bed.clone().expect("inferred bed");
+    assert_eq!(bed.gain_db, Some(6.0));
+    assert_eq!(s.beats[0].clips[0].gain_db, None, "opus-r3-1: the gain moves to the bed, off the muted clip");
+    let back: crate::script::AudioBed = serde_json::from_value(serde_json::to_value(&bed).unwrap()).unwrap();
+    assert_eq!(back.gain_db, Some(6.0));
+    let loud: crate::script::AudioBed =
+        serde_json::from_value(serde_json::json!({"video_id":7,"in_s":0.0,"out_s":8.0,"gain_db":40.0})).unwrap();
+    assert_eq!(loud.gain_db, Some(24.0), "clamped like a clip's");
+}
+
+/// gemini-r2-5: a clip whose first sentence alone runs past the length limit is ended on that
+/// sentence, never past where it ended before (here the end of the video).
+#[test]
+fn an_over_long_first_sentence_never_pushes_the_clip_past_its_old_end() {
+    let (db, _) = video(&[(260.5, 299.9, "one sentence that runs on and on past every limit.", false)]);
+    let cfg = ScriptConfig::default();
+    for pad in [true, false] {
+        let mut s = cut(None, &[&[(260.0, 300.0, "source")]]);
+        let notes = super::draft::cap_clip_length(&db, &mut s, &cfg, pad);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        let c = &s.beats[0].clips[0];
+        assert!(c.out_s <= 300.0 + 1e-9, "pad {pad}: out {} past the old end", c.out_s);
+        assert!(c.out_s >= 299.9 - 1e-9, "pad {pad}: the sentence is kept whole ({})", c.out_s);
+    }
+}
+
+/// opus-r2-6: a clip `clamp_to_duration` drops (under a second inside the video) is reported.
+#[test]
+fn clamp_to_duration_reports_each_clip_it_drops() {
+    let (db, _) = video(&[]);
+    let mut s = cut(None, &[&[(10.0, 20.0, "mute"), (299.5, 310.0, "mute")], &[(400.0, 410.0, "mute")]]);
+    let notes = super::fit::clamp_to_duration(&db, &mut s);
+    assert_eq!(s.clip_count(), 1);
+    assert_eq!(notes.len(), 2, "{notes:?}");
+    assert!(notes[0].contains("video #7") && notes[0].contains("299.5"), "{notes:?}");
+}
+
+/// opus-r2-4: one rule for "plays its own sound", on clips and on beds.
+#[test]
+fn plays_sound_is_source_audio_with_a_track() {
+    let mut s = cut(None, &[&[(0.0, 3.0, "source"), (5.0, 8.0, "mute")]]);
+    let c = &mut s.beats[0].clips;
+    assert!(c[0].plays_sound());
+    assert!(!c[1].plays_sound());
+    c[0].tracks = Some(vec![]);
+    assert!(!c[0].plays_sound());
+    c[0].tracks = Some(vec![1]);
+    assert!(c[0].plays_sound());
+    let bed: crate::script::AudioBed =
+        serde_json::from_value(serde_json::json!({"video_id":7,"in_s":0.0,"out_s":8.0,"tracks":[]})).unwrap();
+    assert!(!bed.plays_sound());
+    let bed: crate::script::AudioBed =
+        serde_json::from_value(serde_json::json!({"video_id":7,"in_s":0.0,"out_s":8.0})).unwrap();
+    assert!(bed.plays_sound());
+}
+
+/// gemini-r2-4 (b): a bed beat that opens on a short cutaway and cuts back to the speaker in sync.
+/// Prepending the speaker's face over a range that returning clip already plays made
+/// `drop_repeated_footage` drop the returning clip. The beat already shows the speaker: leave it.
+#[test]
+fn opening_on_the_speaker_never_repeats_the_speakers_own_clip() {
+    let (db, _) = video(&[(10.0, 19.5, "the answer runs under the pictures.", false)]);
+    let mut s = cut(None, &[&[(100.0, 101.0, "mute"), (11.0, 18.0, "mute")]]);
+    s.beats[0].clips[0].video_id = 8;
+    s.beats[0].bed = Some(serde_json::from_value(serde_json::json!({"video_id":7,"in_s":10.0,"out_s":18.0})).unwrap());
+    super::pictures::open_on_the_speaker(&db, &mut s);
+    assert_eq!(super::fit::drop_repeated_footage(&mut s), 0, "{:?}", s.beats[0].clips);
+    assert!(s.beats[0].clips.iter().any(|c| c.video_id == 7 && c.out_s - c.in_s > 3.0));
+}
+
+/// opus-r3-4: another beat already plays the speaker's footage over the face's range. A face
+/// prepended there is dropped as a repeat (the beat loses time it gave the face); it is not added.
+#[test]
+fn opening_on_the_speaker_never_repeats_footage_another_beat_plays() {
+    let (db, _) = video(&[(10.0, 19.5, "the answer runs under the pictures.", false)]);
+    let mut s = cut(None, &[&[(9.0, 14.0, "mute")], &[(100.0, 104.0, "mute"), (110.0, 114.0, "mute")]]);
+    for c in &mut s.beats[1].clips {
+        c.video_id = 8;
+    }
+    s.beats[1].bed = Some(serde_json::from_value(serde_json::json!({"video_id":7,"in_s":10.0,"out_s":18.0})).unwrap());
+    let before = s.clone();
+    assert_eq!(super::pictures::open_on_the_speaker(&db, &mut s), 0, "{:?}", s.beats[1].clips);
+    assert_eq!(super::fit::drop_repeated_footage(&mut s), 0);
+    assert_eq!(s.beats[1].clips.len(), before.beats[1].clips.len());
+    // With the earlier beat elsewhere in the video, the face is still opened on.
+    let mut t = before.clone();
+    t.beats[0].clips[0].in_s = 200.0;
+    t.beats[0].clips[0].out_s = 205.0;
+    assert_eq!(super::pictures::open_on_the_speaker(&db, &mut t), 1);
+}
+
+/// gemini-r2-4 (a): the closing hold is reserved before the fit; the fitted cut plus the hold
+/// lands on the target.
+#[test]
+fn the_fit_leaves_room_for_the_hold_it_reserved() {
+    let (db, project_id) = video(&[(0.5, 9.0, "the last thing said, a whole sentence.", false)]);
+    let cfg = ScriptConfig::default();
+    let mut s = cut(Some(25.0), &[&[(100.0, 140.0, "mute")], &[(0.0, 10.0, "source")]]);
+    run(&db, project_id, &mut s, &cfg, &Profile::chat(true)).unwrap();
+    let total = s.total_duration_s();
+    let slack = 25.0 * (cfg.final_target_tolerance - 1.0) + FRAME_S;
+    assert!((total - 25.0).abs() <= slack, "total {total} vs target 25: {:?}", s.beats);
 }

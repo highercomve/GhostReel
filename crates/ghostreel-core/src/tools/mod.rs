@@ -37,11 +37,10 @@ use serde_json::Value;
 
 pub(crate) use agent_loop::TempTrailFile;
 pub use agent_loop::{ToolAccess, ToolTrail, run_agent_json};
-pub use instructions::INSTRUCTIONS;
 pub use ctx::{Args, Grounding, Origin, ToolCtx, ToolError, ToolImage, ToolOutput, ToolResult};
+pub use instructions::INSTRUCTIONS;
 pub use render::{
-    RenderOpts, TOOL_CONTRACT, action_branches, render_mcp, render_mcp_for, render_mcp_with, render_openai,
-    tools_prose,
+    RenderOpts, TOOL_CONTRACT, action_branches, render_mcp, render_mcp_for, render_mcp_with, render_openai, tools_prose,
 };
 pub use session::{CallGuard, Called, ToolBudget, ToolMemo, ToolSession};
 pub use spec::{Detail, Effect, ParamType, ToolParam, ToolSpec, params_schema};

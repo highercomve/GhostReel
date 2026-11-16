@@ -79,7 +79,9 @@ pub async fn check_availability(paths: &Paths, config: &Config, spec: &AgentSpec
     let setup = crate::runtime::resolve_agent(paths, config, spec, role).await;
     let id = spec.id.clone();
     let resolved = setup.describe();
-    if let Some(c) = EndpointKey::for_setup(&setup).and_then(|k| Cooldowns::global().get(&k)) {
+    // A resting endpoint is reported as resting first, installed here or not.
+    let key = EndpointKey::for_setup(&setup).or_else(|| EndpointKey::for_config(&spec.llm_config(config, role)));
+    if let Some(c) = key.and_then(|k| Cooldowns::global().get(&k)) {
         let mut av = Availability::new(id, Level::Error, resolved, c.reason(), None);
         av.error = Some(c.error.clone().for_agent(&spec.id));
         return av;
