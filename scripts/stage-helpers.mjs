@@ -64,12 +64,11 @@ function getHostTriple() {
 const SIDECAR_NAMES = ['ffmpeg', 'ffprobe', 'ghostreel-asr', 'ghostreel-llm', 'ghostreel-mlx'];
 const ONNX_DIR = 'onnxruntime-x86_64-apple-darwin';
 
-// tauri-build copies every externalBin into the cargo profile dir as <name> (no triple), and first
-// deletes what is there with `fs::remove_file(..).unwrap()`. On the macOS runners that delete
-// failed with EPERM ("Operation not permitted") for target/release/ghostreel-asr, the binary cargo
-// itself had just built there, and panicked the app build. The helpers are staged under
-// src-tauri/binaries by now, so the profile-dir copies are no longer needed: remove them here,
-// clearing any user-immutable flag first, and fail with a listing of the file if even that fails.
+// tauri-build copies every externalBin into the cargo profile dir as <name> (no triple), deleting
+// what is there first. The helpers are staged under src-tauri/binaries by now, so stale copies in
+// the profile dir are not needed: remove them, clearing any user-immutable flag first. (The
+// "Operation not permitted" / "Is a directory" failures of 0.15–0.17 were tauri-build < 2.7 finding
+// the wrong profile dir under Cargo's newer build-dir layout, fixed by tauri-build 2.7.)
 function clearSidecarCopies(profileDir) {
   for (const name of SIDECAR_NAMES) {
     const path = join(profileDir, name);
